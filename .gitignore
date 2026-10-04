@@ -1,0 +1,10 @@
+a.out
+.zig-cache/
+zig-out/
+output_emitted.zig
+backend*.zig
+build*.zig
+program*.zig
+program.ast.json
+compiler_env*
+*.o

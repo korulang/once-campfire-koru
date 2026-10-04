@@ -1,0 +1,9 @@
+{
+  "name": "once-campfire-koru",
+  "version": "0.1.0",
+  "paths": {
+    "orisha": "../orisha/lib",
+    "koru": "../koru-libs",
+    "std": "../koru/koru_std"
+  }
+}
