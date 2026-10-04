@@ -1,0 +1,25 @@
+// pages.kz — per-request response accumulation.
+//
+// A `! row` arm fires once per row but a handler produces one body, so rows
+// fold into a buffer. Safety: orisha workers are single-threaded and a
+// handler runs to completion — a threadlocal buffer is request-scoped.
+// If handlers ever interleave mid-request this must become an explicit *Buf.
+
+const std = @import("std");
+
+threadlocal var buf: std.ArrayList(u8) = .empty;
+
+~pub tor page-begin {}
+~proc page-begin|zig {
+    buf.clearRetainingCapacity();
+}
+
+~pub tor page-write { text: string }
+~proc page-write|zig {
+    buf.appendSlice(std.heap.page_allocator, text) catch unreachable;
+}
+
+~pub tor page-take {} -> string
+~proc page-take|zig {
+    return buf.items;
+}
