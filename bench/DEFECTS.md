@@ -14,6 +14,16 @@ falsifier re-ran clean — not merely that a load test looked quieter.
 | 6 | koru codegen | produce-type annotation must sit on the `->` decl line; bare-pun record produce emits positional `.{a,b}` | session tor produced `void` Output | worked around in `session-login` | **open** — compiler ergonomics, unpinned |
 | 7 | orisha pump | 85% throughput regression on Linux epoll/io-uring path since Aug (reported by adjacent session) | board run | — | **open** — unverified by this session |
 | 8 | orisha pump | `conn_states` claimed "no index is ever touched twice" — false at the accept boundary: accept thread + worker race on fd reissue could return a dirty state; `releaseConn` on fd≥4096 also leaked the fd | race window, not observed directly — surfaced by the same audit | orisha `e8a8881` (mutex + detach-before-close) | **fixed** — mechanism closed; did not move the -c16 metric on its own (arena was the live desync) |
+| 9 | koru import | dir-scanned companion submodule kept the readdir-first dirent as `canonical_path` while `import dir/sub` resolved probe-order (`.kz` before `.k`) — one module, two canonicals → transform decl collected twice → `duplicate struct member name 'call_handler_orisha_pump_run'` in emitted backend. Deterministic on ext4, invisible on APFS | minimal orisha app on Linux: 2 handlers vs 1 on macOS | koru `7bbfc3a` (dir scan routes stem through `resolveKoruFile`) + pin `140_030` | **fixed** — Linux emits 1 handler + 1 registration; Campfire builds and serves on the droplet |
+
+## Measured baselines (droplet, c-4 lon1, epoll pump, Debug build)
+
+| Date | Cell | Result |
+|------|------|--------|
+| 2026-10-05 | /up @ -c16, 15s | 774,549 reqs, 51,296 rps, **0 non-2xx** |
+| 2026-10-05 | /up @ -c1, 15s | 97,244 reqs, 6,440 rps, **0** |
+| 2026-10-05 | storm 1500 | 1500×200, alive |
+| 2026-10-05 | routes | `/up` 200; anon `/` → 302 `/session/new` |
 
 ## Measured baselines (laptop, smoke tier)
 

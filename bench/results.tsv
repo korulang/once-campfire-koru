@@ -8,3 +8,6 @@ date	app	compiler	orisha	sqlite	bcrypt	cell	requests	duration_s	rps	non2xx	detai
 2026-10-05T20:50:02Z	103da2d-dirty	8950bb8 (route-cont-splice)	254d3af-dirty	8cfdc3d	f9d27d0	up_c16	1965514	15.10,	130149.15	0	alive=yes
 2026-10-05T20:50:17Z	103da2d-dirty	8950bb8 (route-cont-splice)	254d3af-dirty	8cfdc3d	f9d27d0	up_c1	453912	15.10,	30051.76	0	alive=
 2026-10-05T20:50:20Z	103da2d-dirty	8950bb8 (route-cont-splice)	254d3af-dirty	8cfdc3d	f9d27d0	storm	1500	-	-	0	1500x200  alive=yes
+2026-10-05T23:55:00Z	69ae09b-dirty	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	up_c16	774549	15.10	51296.12	0	droplet c-4 lon1 epoll Debug alive=yes
+2026-10-05T23:55:30Z	69ae09b-dirty	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	up_c1	97244	15.10	6440.16	0	droplet c-4 lon1 epoll Debug alive=yes
+2026-10-05T23:56:00Z	69ae09b-dirty	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	storm	1500	-	-	0	droplet epoll 1500x200 alive=yes

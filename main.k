@@ -11,6 +11,13 @@ import pages
 import session
 import std/io
 import std/fmt
+import std/build
+
+// A build flag picks the LOOP; it does not pick the machine. --build=linux
+// on a Linux host builds native + epoll; on macOS it emits the epoll loop
+// in a Mach-O (harmless trap, documented). No build:config target is set —
+// any explicit triple flips zig to cross-compile mode where system lib
+// paths are empty and `-lsqlite3`/`-lz` cannot resolve.
 
 // ============================================================================
 // PAGES — stubs until templates land; shape is the point
