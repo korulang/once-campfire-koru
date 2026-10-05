@@ -1,0 +1,8 @@
+{
+  "name": "if-route-repro",
+  "version": "0.1.0",
+  "paths": {
+    "orisha": "../../orisha/.claude/worktrees/http-surface/lib",
+    "std": "../../koru/koru_std"
+  }
+}
