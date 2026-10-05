@@ -2,3 +2,9 @@ date	app	compiler	orisha	sqlite	bcrypt	cell	requests	duration_s	rps	non2xx	detai
 2026-10-05T19:05:36Z	8478797	8950bb8 (route-cont-splice)	254d3af (http-surface)	8cfdc3d (sqlite-transient-fix)	f9d27d0 (bcrypt-pkg)	up_c16	1999603	15.00	133311.50	2239	alive=yes
 2026-10-05T19:05:51Z	8478797	8950bb8 (route-cont-splice)	254d3af (http-surface)	8cfdc3d (sqlite-transient-fix)	f9d27d0 (bcrypt-pkg)	up_c1	494692	15.10	32762.09	0	alive=yes
 2026-10-05T19:05:55Z	8478797	8950bb8 (route-cont-splice)	254d3af (http-surface)	8cfdc3d (sqlite-transient-fix)	f9d27d0 (bcrypt-pkg)	storm	1500	-	-	0	1500x200 alive=yes
+2026-10-05T20:47:01Z	103da2d-dirty	8950bb8 (route-cont-splice)	254d3af-dirty	8cfdc3d	f9d27d0	up_c16	1767705	15.10,	117062.37	3166	alive=yes
+2026-10-05T20:47:17Z	103da2d-dirty	8950bb8 (route-cont-splice)	254d3af-dirty	8cfdc3d	f9d27d0	up_c1	471946	15.10,	31250.28	0	alive=
+2026-10-05T20:47:21Z	103da2d-dirty	8950bb8 (route-cont-splice)	254d3af-dirty	8cfdc3d	f9d27d0	storm	1500	-	-	0	1500x200  alive=yes
+2026-10-05T20:50:02Z	103da2d-dirty	8950bb8 (route-cont-splice)	254d3af-dirty	8cfdc3d	f9d27d0	up_c16	1965514	15.10,	130149.15	0	alive=yes
+2026-10-05T20:50:17Z	103da2d-dirty	8950bb8 (route-cont-splice)	254d3af-dirty	8cfdc3d	f9d27d0	up_c1	453912	15.10,	30051.76	0	alive=
+2026-10-05T20:50:20Z	103da2d-dirty	8950bb8 (route-cont-splice)	254d3af-dirty	8cfdc3d	f9d27d0	storm	1500	-	-	0	1500x200  alive=yes
