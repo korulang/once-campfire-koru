@@ -2,7 +2,7 @@
   "name": "once-campfire-koru",
   "version": "0.1.0",
   "paths": {
-    "orisha": "../orisha/lib",
+    "orisha": "../orisha/.claude/worktrees/http-surface/lib",
     "koru": "../koru-libs/.claude/worktrees/sqlite-transient-fix",
     "std": "../koru/koru_std",
     "pages": "./pages"

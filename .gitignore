@@ -8,3 +8,6 @@ program*.zig
 program.ast.json
 compiler_env*
 *.o
+server.log
+seed/*-shm
+seed/*-wal

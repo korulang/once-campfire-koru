@@ -23,3 +23,15 @@ threadlocal var buf: std.ArrayList(u8) = .empty;
 ~proc page-take|zig {
     return buf.items;
 }
+
+~pub tor page-has-content {} -> bool
+~proc page-has-content|zig {
+    return buf.items.len > 0;
+}
+
+// 200 when the buffer holds a page, 204 when it's empty — mirrors the
+// controller's `head :no_content` on an empty collection.
+~pub tor page-status {} -> u16
+~proc page-status|zig {
+    return if (buf.items.len > 0) 200 else 204;
+}
