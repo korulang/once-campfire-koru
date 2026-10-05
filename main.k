@@ -248,10 +248,23 @@ orisha:handler = orisha:router(req)
                   |> orisha:form(req, name: "password"): password
                   |> orisha:header(req, name: "User-Agent"): ua
                   |> session-login(email, password, user_agent: ua): res -> res
-! [GET /rooms/:id] p |> room-page(p.id): page -> { status: 200, body: page, content_type: "text/html" }
-! [GET /rooms/:id/messages] p |> orisha:query-param(req, name: "before"): before |> messages-page(p.id, before): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
-! [GET /users/me/sidebar] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue |> sidebar-page(user_email: ue): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
-! [GET /searches] |> orisha:cookie(req, name: "session_token"): tok |> orisha:query-param(req, name: "q"): q |> current-email(token: tok): ue |> search-page(user_email: ue, q): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
+! [GET /rooms/:id] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+    |> if(ue != null)
+    | then |> room-page(p.id): page -> { status: 200, body: page, content_type: "text/html" }
+    | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
+! [GET /rooms/:id/messages] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+    |> orisha:query-param(req, name: "before"): before
+    |> if(ue != null)
+    | then |> messages-page(p.id, before): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
+    | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
+! [GET /users/me/sidebar] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+    |> if(ue != null)
+    | then |> sidebar-page(user_email: ue): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
+    | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
+! [GET /searches] |> orisha:cookie(req, name: "session_token"): tok |> orisha:query-param(req, name: "q"): q |> current-email(token: tok): ue
+    |> if(ue != null)
+    | then |> search-page(user_email: ue, q): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
+    | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [*]                -> { status: 404, body: "Not Found", content_type: "text/plain" }
 
 orisha:serve(port: 3109)
