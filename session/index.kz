@@ -1,0 +1,90 @@
+// session — login-flow helpers.
+//
+// The SELECT user + bcrypt verify happens inside a `! row` arm, which
+// cannot produce the tor's terminal — so the authenticated user id rides
+// a threadlocal cell from the row body to the `| done` continuation.
+// Same worker-thread scoping argument as the pages buffer: a handler
+// runs to completion on one worker thread, so the cell is request-scoped.
+// If handlers ever interleave mid-request this must move into an explicit
+// request record threaded through the flow.
+
+const std = @import("std");
+
+threadlocal var auth_uid: i64 = -1;
+
+~pub tor stash-if { ok: bool, uid: i64 }
+~proc stash-if|zig {
+    if (ok) auth_uid = uid;
+}
+
+~pub tor take-uid {} -> i64
+~proc take-uid|zig {
+    const v = auth_uid;
+    auth_uid = -1;
+    return v;
+}
+
+// Rails `has_secure_token` is SecureRandom.base58(24): 24 chars over the
+// alphabet with 0, O, I, l removed to stay unambiguous. The cookie only
+// ever round-trips through our own session lookup, so the raw token is
+// the value — Rails' cookies.signed HMAC wrapper is a separate concern
+// (cookie signing, not yet needed for the bench surface).
+~pub tor new-token {} -> string
+~proc new-token|zig {
+    const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    var rand: [24]u8 = undefined;
+    std.crypto.random.bytes(&rand);
+    const tok = std.heap.page_allocator.alloc(u8, 24) catch unreachable;
+    for (rand, 0..) |r, i| tok[i] = alphabet[r % alphabet.len];
+    return tok;
+}
+
+// The 302's extra_headers block — Location + Set-Cookie spliced into the
+// response head. Built in a request-local buffer (same scoping argument
+// as the pages buffer) so the produced string carries no <allocated!>
+// obligation the response pipeline would have to settle.
+threadlocal var hdr_buf: [1024]u8 = undefined;
+
+~pub tor redirect-headers { token: string } -> string
+~proc redirect-headers|zig {
+    return std.fmt.bufPrint(&hdr_buf,
+        "Location: /\r\nSet-Cookie: session_token={s}; HttpOnly; SameSite=Lax; Path=/\r\n",
+        .{token}) catch unreachable;
+}
+
+// The row/done boundary again, this time carrying text: column text
+// borrows die with the row, so the cell owns a copy. Empty cell = no
+// session row matched (bad/expired cookie).
+threadlocal var email_buf: [256]u8 = undefined;
+threadlocal var email_len: usize = 0;
+
+// Bare redirect — Location only. WelcomeController#show and the auth
+// gate both spell redirects this way.
+~pub tor redirect-to { path: string } -> string
+~proc redirect-to|zig {
+    return std.fmt.bufPrint(&hdr_buf, "Location: {s}\r\n", .{path}) catch unreachable;
+}
+
+// Room id -> "/rooms/<id>" — its own buffer: `redirect-to` consumes the
+// path while writing hdr_buf, so the two can't share.
+threadlocal var path_buf: [256]u8 = undefined;
+
+~pub tor room-path { rid: i64 } -> string
+~proc room-path|zig {
+    return std.fmt.bufPrint(&path_buf, "/rooms/{d}", .{rid}) catch unreachable;
+}
+
+~pub tor stash-text { text: string }
+~proc stash-text|zig {
+    const n = @min(text.len, email_buf.len);
+    @memcpy(email_buf[0..n], text[0..n]);
+    email_len = n;
+}
+
+~pub tor take-text {} -> ?string
+~proc take-text|zig {
+    if (email_len == 0) return null;
+    const v = email_buf[0..email_len];
+    email_len = 0;
+    return v;
+}

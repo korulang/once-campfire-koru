@@ -6,7 +6,9 @@
 
 import orisha
 import koru/sqlite3
+import bcrypt
 import pages
+import session
 import std/io
 import std/fmt
 
@@ -81,7 +83,7 @@ messages-page = pages:page-begin()
 // directs (Rooms::Direct) sorted by room.updated_at desc, the rest by
 // LOWER(name); then placeholder users not already in a direct room.
 // user_email stands in for Current.user until sessions land.
-pub tor sidebar-page { user_email: string } -> string
+pub tor sidebar-page { user_email: ?string } -> string
 sidebar-page = pages:page-begin()
     |> pages:page-write(text: "<nav><h2>Pings</h2><ul>")
     |> koru/sqlite3:open(path: "seed/production.sqlite3")
@@ -134,7 +136,7 @@ sidebar-page = pages:page-begin()
 // Search (SearchesController): FTS5 phrase match over message_search_index,
 // scoped to rooms the user is a member of (reachable_messages), last 100.
 // NULL query -> no rows -> 204, matching `@messages = Message.none`.
-pub tor search-page { user_email: string, q: ?string } -> string
+pub tor search-page { user_email: ?string, q: ?string } -> string
 search-page = pages:page-begin()
     |> koru/sqlite3:open(path: "seed/production.sqlite3")
     | db d |> koru/sqlite3:default(conn: d) {
@@ -158,17 +160,98 @@ search-page = pages:page-begin()
         | err e |> koru/sqlite3:close(e.conn) -> "query failed"
     | err _ -> "db open failed"
 
+// SessionsController#create: authenticate_by(email, password) -> insert a
+// sessions row (has_secure_token = base58(24)) -> 302 to / with a
+// session_token cookie, or re-render the form at 401. The authenticated
+// uid crosses the row/done boundary in session's request-local cell; the
+// `if` lives here (a tor continuation, the sanctioned place) rather than
+// in the route arm where __koru_continue splices leak.
+// extra_headers carries Location + Set-Cookie; NULL user_agent binds NULL.
+pub tor session-login { email: ?string, password: ?string, user_agent: ?string } -> orisha:Response
+session-login =
+    koru/sqlite3:open(path: "seed/production.sqlite3")
+    | db d |> koru/sqlite3:default(conn: d) {
+            SELECT id, password_digest FROM users
+            WHERE email_address = {{email}} AND status = 0
+        }
+        ! row r |> koru/sqlite3:col.text(stmt: r, index: 1): dg
+                |> bcrypt:verify(password, digest: dg): ok
+                |> koru/sqlite3:col.int(stmt: r, index: 0): uid
+                |> session:stash-if(ok, uid)
+        | done d2 |> session:take-uid(): uid2
+                  |> if(uid2 > 0)
+                    | then |> session:new-token(): tok
+                           |> session:redirect-headers(token: tok): hdr
+                           |> koru/sqlite3:default(conn: d2) {
+                               INSERT INTO sessions
+                                   (user_id, token, user_agent, ip_address,
+                                    last_active_at, created_at, updated_at)
+                               VALUES ({{uid2}}, {{tok}}, {{user_agent}}, '',
+                                       datetime('now'), datetime('now'), datetime('now'))
+                           }
+                           | done d3 |> koru/sqlite3:close(conn: d3) -> { status: 302, body: "", content_type: "text/plain", extra_headers: hdr }
+                           | err e3 |> koru/sqlite3:close(e3.conn) -> { status: 500, body: "session insert failed", content_type: "text/plain", extra_headers: null }
+                    | else |> koru/sqlite3:close(conn: d2) -> { status: 401, body: "unauthorized", content_type: "text/html", extra_headers: null }
+        | err e |> koru/sqlite3:close(e.conn) -> { status: 500, body: "query failed", content_type: "text/plain", extra_headers: null }
+    | err _ -> { status: 500, body: "db open failed", content_type: "text/plain", extra_headers: null }
+
+// find_session_by_cookie: session_token -> sessions.token -> user's
+// email. NULL/unknown token -> NULL -> downstream queries return nothing
+// (Rails would redirect to /session/new; a 204-for-anonymous is the
+// visible divergence until a real auth gate exists).
+pub tor current-email { token: ?string } -> ?string
+current-email =
+    koru/sqlite3:open(path: "seed/production.sqlite3")
+    | db d2 |> koru/sqlite3:default(conn: d2) {
+            SELECT u.email_address FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token = {{token}}
+        }
+        ! row r |> koru/sqlite3:col.text(stmt: r, index: 0): e |> session:stash-text(text: e)
+        | done d3 |> koru/sqlite3:close(conn: d3) |> session:take-text(): ue -> ue
+        | err e2 |> koru/sqlite3:close(e2.conn) -> null
+    | err _ -> null
+
+// WelcomeController#show: signed in -> redirect to a room (last-room
+// cookie unimplemented; first non-direct membership stands in for
+// default_room). Anonymous -> /session/new, matching
+// require_authentication's redirect.
+pub tor landing { token: ?string } -> orisha:Response
+landing =
+    koru/sqlite3:open(path: "seed/production.sqlite3")
+    | db d |> koru/sqlite3:default(conn: d) {
+            SELECT r.id FROM memberships m
+            JOIN rooms r ON r.id = m.room_id
+            WHERE m.user_id = (SELECT u.id FROM users u
+                               JOIN sessions s ON s.user_id = u.id
+                               WHERE s.token = {{token}})
+              AND r.type != 'Rooms::Direct'
+            ORDER BY LOWER(r.name) LIMIT 1
+        }
+        ! row r |> koru/sqlite3:col.int(stmt: r, index: 0): rid |> session:stash-if(ok: true, uid: rid)
+        | done d2 |> koru/sqlite3:close(conn: d2) |> session:take-uid(): rid2
+                  |> if(rid2 > 0)
+                    | then |> session:room-path(rid: rid2): p |> session:redirect-to(path: p): hdr -> { status: 302, body: "", content_type: "text/plain", extra_headers: hdr }
+                    | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
+        | err e -> { status: 500, body: "query failed", content_type: "text/plain", extra_headers: null }
+    | err _ -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
+
 // ============================================================================
 // HANDLER
 // ============================================================================
 
 orisha:handler = orisha:router(req)
+! [GET /]            |> orisha:cookie(req, name: "session_token"): tok |> landing(token: tok): res -> res
 ! [GET /up]          -> { status: 200, body: "OK",   content_type: "text/plain" }
 ! [GET /session/new] |> sign-in-page(): page -> { status: 200, body: page, content_type: "text/html" }
+! [POST /session] |> orisha:form(req, name: "email_address"): email
+                  |> orisha:form(req, name: "password"): password
+                  |> orisha:header(req, name: "User-Agent"): ua
+                  |> session-login(email, password, user_agent: ua): res -> res
 ! [GET /rooms/:id] p |> room-page(p.id): page -> { status: 200, body: page, content_type: "text/html" }
 ! [GET /rooms/:id/messages] p |> orisha:query-param(req, name: "before"): before |> messages-page(p.id, before): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
-! [GET /users/me/sidebar] |> sidebar-page(user_email: "david@37signals.com"): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
-! [GET /searches] |> orisha:query-param(req, name: "q"): q |> search-page(user_email: "david@37signals.com", q): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
+! [GET /users/me/sidebar] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue |> sidebar-page(user_email: ue): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
+! [GET /searches] |> orisha:cookie(req, name: "session_token"): tok |> orisha:query-param(req, name: "q"): q |> current-email(token: tok): ue |> search-page(user_email: ue, q): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
 ! [*]                -> { status: 404, body: "Not Found", content_type: "text/plain" }
 
 orisha:serve(port: 3109)

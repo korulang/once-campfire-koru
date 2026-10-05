@@ -4,7 +4,9 @@
   "paths": {
     "orisha": "../orisha/.claude/worktrees/http-surface/lib",
     "koru": "../koru-libs/.claude/worktrees/sqlite-transient-fix",
+    "bcrypt": "../koru-libs/.claude/worktrees/bcrypt-pkg/bcrypt",
     "std": "../koru/koru_std",
-    "pages": "./pages"
+    "pages": "./pages",
+    "session": "./session"
   }
 }
