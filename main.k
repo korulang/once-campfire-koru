@@ -209,8 +209,8 @@ current-email =
         }
         ! row r |> koru/sqlite3:col.text(stmt: r, index: 0): e |> session:stash-text(text: e)
         | done d3 |> koru/sqlite3:close(conn: d3) |> session:take-text(): ue -> ue
-        | err e2 |> koru/sqlite3:close(e2.conn) -> null
-    | err _ -> null
+        | err e2 |> koru/sqlite3:close(e2.conn) |> std/io:print.ln("current-email query err {{ e2.code:d }} {{ e2.msg:s }}") -> null
+    | err oe |> std/io:print.ln("current-email open err {{ oe.code:d }} {{ oe.msg:s }}") -> null
 
 // WelcomeController#show: signed in -> redirect to a room (last-room
 // cookie unimplemented; first non-direct membership stands in for

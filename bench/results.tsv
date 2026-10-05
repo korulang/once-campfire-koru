@@ -1,0 +1,4 @@
+date	app	compiler	orisha	sqlite	bcrypt	cell	requests	duration_s	rps	non2xx	detail
+2026-10-05T19:05:36Z	8478797	8950bb8 (route-cont-splice)	254d3af (http-surface)	8cfdc3d (sqlite-transient-fix)	f9d27d0 (bcrypt-pkg)	up_c16	1999603	15.00	133311.50	2239	alive=yes
+2026-10-05T19:05:51Z	8478797	8950bb8 (route-cont-splice)	254d3af (http-surface)	8cfdc3d (sqlite-transient-fix)	f9d27d0 (bcrypt-pkg)	up_c1	494692	15.10	32762.09	0	alive=yes
+2026-10-05T19:05:55Z	8478797	8950bb8 (route-cont-splice)	254d3af (http-surface)	8cfdc3d (sqlite-transient-fix)	f9d27d0 (bcrypt-pkg)	storm	1500	-	-	0	1500x200 alive=yes
