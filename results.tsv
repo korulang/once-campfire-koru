@@ -1,0 +1,4 @@
+2026-10-06T11:45Z	orisha-main-merge	6a5e3a2	mac	kqueue	up_c16	1948097	129709	non2xx=0	iovec-bound fix; all dynamic routes live
+2026-10-06T11:46Z	orisha-main-merge	6a5e3a2	mac	kqueue	up_c1	262341	51448	non2xx=0
+2026-10-06T11:47Z	orisha-main-merge	6a5e3a2	mac	kqueue	rooms_anon_c16	1290516	127730	non2xx=0
+2026-10-06T11:48Z	orisha-main-merge	6a5e3a2	mac	kqueue	rooms_auth_c16	109020	10896	non2xx=0	stub-64B; per-request open+close still the floor
