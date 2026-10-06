@@ -11,3 +11,16 @@ date	app	compiler	orisha	sqlite	bcrypt	cell	requests	duration_s	rps	non2xx	detai
 2026-10-05T23:55:00Z	69ae09b-dirty	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	up_c16	774549	15.10	51296.12	0	droplet c-4 lon1 epoll Debug alive=yes
 2026-10-05T23:55:30Z	69ae09b-dirty	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	up_c1	97244	15.10	6440.16	0	droplet c-4 lon1 epoll Debug alive=yes
 2026-10-05T23:56:00Z	69ae09b-dirty	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	storm	1500	-	-	0	droplet epoll 1500x200 alive=yes
+2026-10-06T00:10:00Z	b3959aa	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	up_c16	1506160	15.10	99749.32	0	droplet c-4 lon1 epoll ReleaseFast alive=yes
+2026-10-06T00:10:30Z	b3959aa	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	up_c1	124281	15.10	8230.62	0	droplet c-4 lon1 epoll ReleaseFast alive=yes
+2026-10-06T00:11:00Z	b3959aa	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	storm	1500	-	-	0	droplet epoll ReleaseFast 1500x200 alive=yes
+2026-10-06T08:35:00Z	b3959aa	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	up_c16	1913943+1962987+1931496	15.10x3	128739 (med)	0	local kqueue ReleaseFast vs-rust-race
+2026-10-06T08:35:20Z	b3959aa	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	up_c1	753248	15.10	49886.65	0	local kqueue ReleaseFast vs-rust-race
+2026-10-06T08:35:40Z	RUST-PORT	-	-	-	-	up_c16	1576128+1598593	15.10x2	105110 (med)	0	rust direct axum same-machine
+2026-10-06T08:36:00Z	RUST-PORT	-	-	-	-	up_c16	1047994+958597+1107012	15.10x3	69793 (med)	0	rust thruster-front same-machine
+2026-10-06T08:36:20Z	RUST-PORT	-	-	-	-	up_c1	343849	15.10	22772.50	0	rust direct same-machine
+2026-10-06T08:45:00Z	b3959aa	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	rooms_anon_c16	218433	10.10	21625.88	-	302s only; pre-null-guard
+2026-10-06T08:50:00Z	local-dirty	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	rooms_anon_c16	1325771+1335398	10.10x2	131736 (med)	-	302s only; post-null-guard
+2026-10-06T08:50:30Z	RUST-PORT	-	-	-	-	rooms_anon_c16	587146+662947	10.10x2	62283 (med)	-	thruster 302s ~955B body
+2026-10-06T08:55:00Z	local-dirty	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	rooms_auth_c16	97926	10.01	9783.32	0	64B stub page; session lookup per req
+2026-10-06T08:55:30Z	RUST-PORT	-	-	-	-	rooms_auth_c16	214803	10.10	21265.47	0	355899B full render; pooled db

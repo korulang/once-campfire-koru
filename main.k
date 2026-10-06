@@ -206,8 +206,17 @@ session-login =
 // email. NULL/unknown token -> NULL -> downstream queries return nothing
 // (Rails would redirect to /session/new; a 204-for-anonymous is the
 // visible divergence until a real auth gate exists).
+// No cookie -> no session lookup: sqlite open+query+close is ~25µs of
+// wasted work per anonymous hit (measured: anon /rooms fell to 21.6k rps
+// against rust-direct's 58k before this guard).
 pub tor current-email { token: ?string } -> ?string
 current-email =
+    if(token != null)
+    | then |> session-email(token): ue -> ue
+    | else -> null
+
+pub tor session-email { token: ?string } -> ?string
+session-email =
     koru/sqlite3:open(path: "seed/production.sqlite3")
     | db d2 |> koru/sqlite3:default(conn: d2) {
             SELECT u.email_address FROM sessions s
