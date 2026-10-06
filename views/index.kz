@@ -1,0 +1,129 @@
+// views/index.kz — the zig half of the views module: timestamp shaping and
+// the day-separator fold. Markup lives in index.k (components); this file is
+// arithmetic and request-scoped state only.
+
+const std = @import("std");
+
+// ── Room stash — the room row fires once, the head needs its values ─────────
+// Same threadlocal-cell pattern as session/: a handler runs to completion on
+// one worker thread, so these cells are request-scoped.
+threadlocal var room_name_buf: [256]u8 = undefined;
+threadlocal var room_name_len: usize = 0;
+threadlocal var room_type_buf: [64]u8 = undefined;
+threadlocal var room_type_len: usize = 0;
+threadlocal var room_seen: bool = false;
+
+~proc stash-room|zig {
+    const n = @min(name.len, room_name_buf.len);
+    @memcpy(room_name_buf[0..n], name[0..n]);
+    room_name_len = n;
+    const t = @min(rtype.len, room_type_buf.len);
+    @memcpy(room_type_buf[0..t], rtype[0..t]);
+    room_type_len = t;
+    room_seen = true;
+}
+
+// The member gate the page's done arm reads: true only when the room query
+// produced a row this request (stash-room ran). Reset per request by
+// page-reset.
+~proc room-present|zig {
+    return room_seen;
+}
+
+~proc room-name|zig {
+    return room_name_buf[0..room_name_len];
+}
+
+// Rooms::Closed -> rooms_closed — the param_key that dom_id prefixes carry.
+~proc room-key|zig {
+    const t = room_type_buf[0..room_type_len];
+    if (std.mem.eql(u8, t, "Rooms::Closed")) return "rooms_closed";
+    if (std.mem.eql(u8, t, "Rooms::Open")) return "rooms_open";
+    if (std.mem.eql(u8, t, "Rooms::Direct")) return "rooms_direct";
+    return "rooms_room";
+}
+
+// ── Timestamps ──────────────────────────────────────────────────────────────
+// Seed datetimes are "YYYY-MM-DD HH:MM:SS" (optionally ".ffffff").
+
+// days-from-civil (Hinnant) — no epoch table.
+fn daysFromCivil(y0: i64, m: i64, d: i64) i64 {
+    const y = if (m <= 2) y0 - 1 else y0;
+    const era = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe = y - era * 400;
+    const mp = @mod(m + 9, 12);
+    const doy = @divTrunc(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn numAt(ts: []const u8, i: usize, n: usize) i64 {
+    var v: i64 = 0;
+    for (ts[i .. i + n]) |ch| v = v * 10 + (ch - '0');
+    return v;
+}
+
+// "YYYY-MM-DD HH:MM:SS[.ffffff]" -> epoch milliseconds.
+~proc ts-ms|zig {
+    if (ts.len < 19) return 0;
+    const days = daysFromCivil(numAt(ts, 0, 4), numAt(ts, 5, 2), numAt(ts, 8, 2));
+    return days * 86_400_000 + numAt(ts, 11, 2) * 3_600_000 + numAt(ts, 14, 2) * 60_000 + numAt(ts, 17, 2) * 1000;
+}
+
+// "YYYY-MM-DD HH:MM:SS[.ffffff]" -> "YYYY-MM-DDTHH:MM:SSZ" (fraction dropped,
+// matching the port's wire shape).
+threadlocal var iso_buf: [40]u8 = undefined;
+
+~proc ts-iso|zig {
+    if (ts.len < 19) return "";
+    @memcpy(iso_buf[0..10], ts[0..10]);
+    iso_buf[10] = 'T';
+    @memcpy(iso_buf[11..19], ts[11..19]);
+    iso_buf[19] = 'Z';
+    return iso_buf[0..20];
+}
+
+// "rooms_<key>_<rid>" — the messages container's dom_id, built once per page.
+threadlocal var dom_buf: [320]u8 = undefined;
+
+~proc msgdom|zig {
+    const key = blk: {
+        const t = room_type_buf[0..room_type_len];
+        if (std.mem.eql(u8, t, "Rooms::Closed")) break :blk "rooms_closed";
+        if (std.mem.eql(u8, t, "Rooms::Open")) break :blk "rooms_open";
+        if (std.mem.eql(u8, t, "Rooms::Direct")) break :blk "rooms_direct";
+        break :blk "rooms_room";
+    };
+    return std.fmt.bufPrint(&dom_buf, "{s}_{s}", .{ key, rid }) catch "";
+}
+
+// ── Day separator fold ──────────────────────────────────────────────────────
+// Rails emits the separator when the day differs from the previous message's.
+// Comparing date prefixes keeps the row arm flat (no `if` needed).
+threadlocal var last_day: [10]u8 = undefined;
+threadlocal var have_day: bool = false;
+
+~proc page-reset|zig {
+    have_day = false;
+    room_seen = false;
+}
+
+threadlocal var sep_buf: [160]u8 = undefined;
+
+~proc day-sep|zig {
+    if (ts.len < 10) return "";
+    if (have_day and std.mem.eql(u8, ts[0..10], &last_day)) return "";
+    @memcpy(&last_day, ts[0..10]);
+    have_day = true;
+    const iso = blk: {
+        var b: [20]u8 = undefined;
+        @memcpy(b[0..10], ts[0..10]);
+        b[10] = 'T';
+        @memcpy(b[11..19], ts[11..19]);
+        b[19] = 'Z';
+        break :blk b;
+    };
+    const sep = std.fmt.bufPrint(&sep_buf,
+        "<h2 class=\"message__day-separator\"><time datetime=\"{s}\" data-local-time-target=\"date\"></time></h2>", .{iso}) catch return "";
+    return sep;
+}

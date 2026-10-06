@@ -9,6 +9,7 @@ import koru/sqlite3
 import bcrypt
 import pages
 import session
+import views
 import std/io
 import std/fmt
 import std/build
@@ -20,40 +21,13 @@ import std/build
 // paths are empty and `-lsqlite3`/`-lz` cannot resolve.
 
 // ============================================================================
-// PAGES — stubs until templates land; shape is the point
+// PAGES — the room page lives in views/ on koru/dom components; sign-in is
+// still a stub string (a real component when it earns one).
 // ============================================================================
 
 pub tor sign-in-page {} -> string
-pub tor room-page { id: string } -> string
 
 sign-in-page -> "<!DOCTYPE html><html><head><meta name=\"csrf-token\" content=\"dev-token\"></head><body><h1>Sign in</h1><form action=\"/session\" method=\"post\"><input name=\"email_address\"><input name=\"password\" type=\"password\"><button>Sign in</button></form></body></html>"
-
-// Room page: messages joined to their ActionText bodies for one room.
-// Per-request buffer: ! row fires per row, the handler produces one body.
-// DB: the real parity seed (reference app, db:prepare + seeds/default.rb).
-room-page = pages:page-begin()
-    |> pages:page-write(text: "<!DOCTYPE html><html><body><h1>Room ")
-    |> pages:page-write(text: id)
-    |> pages:page-write(text: "</h1>")
-    |> koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
-    | db d |> koru/sqlite3:default(conn: d) {
-            SELECT u.name, rt.body FROM messages m
-            JOIN action_text_rich_texts rt
-              ON rt.record_type = 'Message' AND rt.record_id = m.id
-            JOIN users u ON u.id = m.creator_id
-            WHERE m.room_id = {{id}}
-            ORDER BY m.created_at
-        }
-        ! row r |> koru/sqlite3:col.text(stmt: r, index: 0): n
-                |> pages:page-write(text: "<div><b>")
-                |> pages:page-write(text: n)
-                |> pages:page-write(text: "</b>")
-                |> koru/sqlite3:col.text(stmt: r, index: 1): b
-                |> pages:page-write(text: b)
-                |> pages:page-write(text: "</div>")
-        | done d2 |> koru/sqlite3:close.pooled(conn: d2) |> pages:page-write(text: "</body></html>") |> pages:page-take(): body -> body
-        | err e |> koru/sqlite3:close.pooled(e.conn) |> pages:page-take(): partial -> "query failed"
-    | err _ -> "db open failed"
 
 // Messages index (Message::Pagination): last PAGE_SIZE=40 ordered by
 // created_at. `before=<id>` narrows to created_at < that message's — wired
@@ -266,7 +240,7 @@ orisha:handler = orisha:router(req)
                   |> session-login(email, password, user_agent: ua): res -> res
 ! [GET /rooms/:id] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> room-page(p.id): page -> { status: 200, body: page, content_type: "text/html" }
+    | then |> views:room-page(rid: p.id, email: ue): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html" }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [GET /rooms/:id/messages] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
     |> orisha:query-param(req, name: "before"): before

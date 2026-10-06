@@ -35,3 +35,10 @@ threadlocal var buf: std.ArrayList(u8) = .empty;
 ~proc page-status|zig {
     return if (buf.items.len > 0) 200 else 204;
 }
+
+// 200 when the buffer holds a page, `status` when it's empty — the room-show
+// empty case is a 404 (missing room / non-member), not a 204.
+~pub tor page-status-or { status: u16 } -> u16
+~proc page-status-or|zig {
+    return if (buf.items.len > 0) 200 else status;
+}

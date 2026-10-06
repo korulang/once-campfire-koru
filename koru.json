@@ -7,6 +7,7 @@
     "bcrypt": "../koru-libs/.claude/worktrees/bcrypt-pkg/bcrypt",
     "std": "../koru/koru_std",
     "pages": "./pages",
-    "session": "./session"
+    "session": "./session",
+    "views": "./views"
   }
 }
