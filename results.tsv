@@ -2,3 +2,4 @@
 2026-10-06T11:46Z	orisha-main-merge	6a5e3a2	mac	kqueue	up_c1	262341	51448	non2xx=0
 2026-10-06T11:47Z	orisha-main-merge	6a5e3a2	mac	kqueue	rooms_anon_c16	1290516	127730	non2xx=0
 2026-10-06T11:48Z	orisha-main-merge	6a5e3a2	mac	kqueue	rooms_auth_c16	109020	10896	non2xx=0	stub-64B; per-request open+close still the floor
+2026-10-06T12:05Z	sqlite-pooled	f435b4a	mac	kqueue	rooms_auth_c16	916101	90687	non2xx=0	open.pooled+close.pooled; was 10896 on per-request open+close — 8.3x

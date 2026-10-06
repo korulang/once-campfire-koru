@@ -35,7 +35,7 @@ room-page = pages:page-begin()
     |> pages:page-write(text: "<!DOCTYPE html><html><body><h1>Room ")
     |> pages:page-write(text: id)
     |> pages:page-write(text: "</h1>")
-    |> koru/sqlite3:open(path: "seed/production.sqlite3")
+    |> koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
     | db d |> koru/sqlite3:default(conn: d) {
             SELECT u.name, rt.body FROM messages m
             JOIN action_text_rich_texts rt
@@ -51,8 +51,8 @@ room-page = pages:page-begin()
                 |> koru/sqlite3:col.text(stmt: r, index: 1): b
                 |> pages:page-write(text: b)
                 |> pages:page-write(text: "</div>")
-        | done d2 |> koru/sqlite3:close(conn: d2) |> pages:page-write(text: "</body></html>") |> pages:page-take(): body -> body
-        | err e |> koru/sqlite3:close(e.conn) |> pages:page-take(): partial -> "query failed"
+        | done d2 |> koru/sqlite3:close.pooled(conn: d2) |> pages:page-write(text: "</body></html>") |> pages:page-take(): body -> body
+        | err e |> koru/sqlite3:close.pooled(e.conn) |> pages:page-take(): partial -> "query failed"
     | err _ -> "db open failed"
 
 // Messages index (Message::Pagination): last PAGE_SIZE=40 ordered by
@@ -63,7 +63,7 @@ room-page = pages:page-begin()
 // so the 200/204 decision lives in pages:page-status.)
 pub tor messages-page { id: string, before: ?string } -> string
 messages-page = pages:page-begin()
-    |> koru/sqlite3:open(path: "seed/production.sqlite3")
+    |> koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
     | db d |> koru/sqlite3:default(conn: d) {
         SELECT u.name, rt.body FROM (
             SELECT m.id, m.creator_id, m.created_at FROM messages m
@@ -82,8 +82,8 @@ messages-page = pages:page-begin()
                 |> koru/sqlite3:col.text(stmt: r, index: 1): b
                 |> pages:page-write(text: b)
                 |> pages:page-write(text: "\n")
-        | done d2 |> koru/sqlite3:close(conn: d2) |> pages:page-take(): body -> body
-        | err e |> koru/sqlite3:close(e.conn) -> "query failed"
+        | done d2 |> koru/sqlite3:close.pooled(conn: d2) |> pages:page-take(): body -> body
+        | err e |> koru/sqlite3:close.pooled(e.conn) -> "query failed"
     | err _ -> "db open failed"
 
 // Sidebar (Users::SidebarsController): visible memberships for the user,
@@ -93,7 +93,7 @@ messages-page = pages:page-begin()
 pub tor sidebar-page { user_email: ?string } -> string
 sidebar-page = pages:page-begin()
     |> pages:page-write(text: "<nav><h2>Pings</h2><ul>")
-    |> koru/sqlite3:open(path: "seed/production.sqlite3")
+    |> koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
     | db d |> koru/sqlite3:default(conn: d) {
         SELECT r.id, r.name FROM memberships m
         JOIN rooms r ON r.id = m.room_id
@@ -134,10 +134,10 @@ sidebar-page = pages:page-begin()
                                 ! row r3 |> pages:page-write(text: "<li>")
                                         |> koru/sqlite3:col.text(stmt: r3, index: 1): n3 |> pages:page-write(text: n3)
                                         |> pages:page-write(text: "</li>")
-                                | done d4 |> koru/sqlite3:close(conn: d4) |> pages:page-write(text: "</ul></nav>") |> pages:page-take(): body -> body
-                                | err e4 |> koru/sqlite3:close(e4.conn) -> "q3 failed"
-                    | err e3 |> koru/sqlite3:close(e3.conn) -> "q2 failed"
-        | err e2 |> koru/sqlite3:close(e2.conn) -> "q1 failed"
+                                | done d4 |> koru/sqlite3:close.pooled(conn: d4) |> pages:page-write(text: "</ul></nav>") |> pages:page-take(): body -> body
+                                | err e4 |> koru/sqlite3:close.pooled(e4.conn) -> "q3 failed"
+                    | err e3 |> koru/sqlite3:close.pooled(e3.conn) -> "q2 failed"
+        | err e2 |> koru/sqlite3:close.pooled(e2.conn) -> "q1 failed"
     | err _ -> "db open failed"
 
 // Search (SearchesController): FTS5 phrase match over message_search_index,
@@ -145,7 +145,7 @@ sidebar-page = pages:page-begin()
 // NULL query -> no rows -> 204, matching `@messages = Message.none`.
 pub tor search-page { user_email: ?string, q: ?string } -> string
 search-page = pages:page-begin()
-    |> koru/sqlite3:open(path: "seed/production.sqlite3")
+    |> koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
     | db d |> koru/sqlite3:default(conn: d) {
         SELECT u.name, rt.body FROM messages m
         JOIN message_search_index idx ON m.id = idx.rowid
@@ -163,8 +163,8 @@ search-page = pages:page-begin()
                 |> pages:page-write(text: "</b>")
                 |> koru/sqlite3:col.text(stmt: r, index: 1): b |> pages:page-write(text: b)
                 |> pages:page-write(text: "</div>")
-        | done d2 |> koru/sqlite3:close(conn: d2) |> pages:page-take(): body -> body
-        | err e |> koru/sqlite3:close(e.conn) -> "query failed"
+        | done d2 |> koru/sqlite3:close.pooled(conn: d2) |> pages:page-take(): body -> body
+        | err e |> koru/sqlite3:close.pooled(e.conn) -> "query failed"
     | err _ -> "db open failed"
 
 // SessionsController#create: authenticate_by(email, password) -> insert a
@@ -176,7 +176,7 @@ search-page = pages:page-begin()
 // extra_headers carries Location + Set-Cookie; NULL user_agent binds NULL.
 pub tor session-login { email: ?string, password: ?string, user_agent: ?string } -> orisha:Response
 session-login =
-    koru/sqlite3:open(path: "seed/production.sqlite3")
+    koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
     | db d |> koru/sqlite3:default(conn: d) {
             SELECT id, password_digest FROM users
             WHERE email_address = {{email}} AND status = 0
@@ -196,10 +196,10 @@ session-login =
                                VALUES ({{uid2}}, {{tok}}, {{user_agent}}, '',
                                        datetime('now'), datetime('now'), datetime('now'))
                            }
-                           | done d3 |> koru/sqlite3:close(conn: d3) -> { status: 302, body: "", content_type: "text/plain", extra_headers: hdr }
-                           | err e3 |> koru/sqlite3:close(e3.conn) -> { status: 500, body: "session insert failed", content_type: "text/plain", extra_headers: null }
-                    | else |> koru/sqlite3:close(conn: d2) -> { status: 401, body: "unauthorized", content_type: "text/html", extra_headers: null }
-        | err e |> koru/sqlite3:close(e.conn) -> { status: 500, body: "query failed", content_type: "text/plain", extra_headers: null }
+                           | done d3 |> koru/sqlite3:close.pooled(conn: d3) -> { status: 302, body: "", content_type: "text/plain", extra_headers: hdr }
+                           | err e3 |> koru/sqlite3:close.pooled(e3.conn) -> { status: 500, body: "session insert failed", content_type: "text/plain", extra_headers: null }
+                    | else |> koru/sqlite3:close.pooled(conn: d2) -> { status: 401, body: "unauthorized", content_type: "text/html", extra_headers: null }
+        | err e |> koru/sqlite3:close.pooled(e.conn) -> { status: 500, body: "query failed", content_type: "text/plain", extra_headers: null }
     | err _ -> { status: 500, body: "db open failed", content_type: "text/plain", extra_headers: null }
 
 // find_session_by_cookie: session_token -> sessions.token -> user's
@@ -217,15 +217,15 @@ current-email =
 
 pub tor session-email { token: ?string } -> ?string
 session-email =
-    koru/sqlite3:open(path: "seed/production.sqlite3")
+    koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
     | db d2 |> koru/sqlite3:default(conn: d2) {
             SELECT u.email_address FROM sessions s
             JOIN users u ON u.id = s.user_id
             WHERE s.token = {{token}}
         }
         ! row r |> koru/sqlite3:col.text(stmt: r, index: 0): e |> session:stash-text(text: e)
-        | done d3 |> koru/sqlite3:close(conn: d3) |> session:take-text(): ue -> ue
-        | err e2 |> koru/sqlite3:close(e2.conn) |> std/io:print.ln("current-email query err {{ e2.code:d }} {{ e2.msg:s }}") -> null
+        | done d3 |> koru/sqlite3:close.pooled(conn: d3) |> session:take-text(): ue -> ue
+        | err e2 |> koru/sqlite3:close.pooled(e2.conn) |> std/io:print.ln("current-email query err {{ e2.code:d }} {{ e2.msg:s }}") -> null
     | err oe |> std/io:print.ln("current-email open err {{ oe.code:d }} {{ oe.msg:s }}") -> null
 
 // WelcomeController#show: signed in -> redirect to a room (last-room
@@ -234,7 +234,7 @@ session-email =
 // require_authentication's redirect.
 pub tor landing { token: ?string } -> orisha:Response
 landing =
-    koru/sqlite3:open(path: "seed/production.sqlite3")
+    koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
     | db d |> koru/sqlite3:default(conn: d) {
             SELECT r.id FROM memberships m
             JOIN rooms r ON r.id = m.room_id
@@ -245,11 +245,11 @@ landing =
             ORDER BY LOWER(r.name) LIMIT 1
         }
         ! row r |> koru/sqlite3:col.int(stmt: r, index: 0): rid |> session:stash-if(ok: true, uid: rid)
-        | done d2 |> koru/sqlite3:close(conn: d2) |> session:take-uid(): rid2
+        | done d2 |> koru/sqlite3:close.pooled(conn: d2) |> session:take-uid(): rid2
                   |> if(rid2 > 0)
                     | then |> session:room-path(rid: rid2): p |> session:redirect-to(path: p): hdr -> { status: 302, body: "", content_type: "text/plain", extra_headers: hdr }
                     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-        | err e -> { status: 500, body: "query failed", content_type: "text/plain", extra_headers: null }
+        | err e |> koru/sqlite3:close.pooled(e.conn) -> { status: 500, body: "query failed", content_type: "text/plain", extra_headers: null }
     | err _ -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 
 // ============================================================================
