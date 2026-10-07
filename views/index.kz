@@ -1,10 +1,10 @@
-// views/index.kz — the zig half of the views module: timestamp shaping and
-// the day-separator fold. Markup lives in index.k (components); this file is
-// arithmetic and request-scoped state only.
+// views/index.kz — the zig half of the views module: request-scoped stashes
+// (room, current user, boost arena), timestamp shaping, path keys. Markup
+// lives in index.k (components); this file is arithmetic and state only.
 
 const std = @import("std");
 
-// ── Room stash — the room row fires once, the head needs its values ─────────
+// ── Room stash — the room row fires once, the shell needs its values ────────
 // Same threadlocal-cell pattern as session/: a handler runs to completion on
 // one worker thread, so these cells are request-scoped.
 threadlocal var room_name_buf: [256]u8 = undefined;
@@ -23,6 +23,52 @@ threadlocal var room_seen: bool = false;
     room_seen = true;
 }
 
+// ── User stash — the membership join also yields the current user ───────────
+threadlocal var user_id_v: i64 = 0;
+threadlocal var user_role_v: i64 = 0;
+threadlocal var user_name_buf: [256]u8 = undefined;
+threadlocal var user_name_len: usize = 0;
+threadlocal var user_ver_buf: [16]u8 = undefined;
+threadlocal var user_ver_len: usize = 0;
+
+~proc stash-user|zig {
+    user_id_v = uid;
+    user_role_v = role;
+    const n = @min(name.len, user_name_buf.len);
+    @memcpy(user_name_buf[0..n], name[0..n]);
+    user_name_len = n;
+    const v = @min(ver.len, user_ver_buf.len);
+    @memcpy(user_ver_buf[0..v], ver[0..v]);
+    user_ver_len = v;
+}
+
+~proc user-id|zig {
+    return user_id_v;
+}
+
+~proc user-name|zig {
+    return user_name_buf[0..user_name_len];
+}
+
+~proc user-ver|zig {
+    return user_ver_buf[0..user_ver_len];
+}
+
+// `User#title`: [ name, bio ].compact_blank.join(" – ").
+threadlocal var title_buf: [512]u8 = undefined;
+
+~proc user-title|zig {
+    if (bio.len == 0) return name;
+    return std.fmt.bufPrint(&title_buf, "{s} – {s}", .{ name, bio }) catch name;
+}
+
+// `body_classes`: [ body_class, admin_body_class, logo_class ].compact.join.
+// The show page's own body_class is "sidebar"; "admin" when the user can
+// administer; no account logo in the seed, so no logo class.
+~proc body-class|zig {
+    return if (user_role_v == 1) "sidebar admin" else "sidebar";
+}
+
 // The member gate the page's done arm reads: true only when the room query
 // produced a row this request (stash-room ran). Reset per request by
 // page-reset.
@@ -35,12 +81,16 @@ threadlocal var room_seen: bool = false;
 }
 
 // Rooms::Closed -> rooms_closed — the param_key that dom_id prefixes carry.
-~proc room-key|zig {
+fn roomKey() []const u8 {
     const t = room_type_buf[0..room_type_len];
     if (std.mem.eql(u8, t, "Rooms::Closed")) return "rooms_closed";
     if (std.mem.eql(u8, t, "Rooms::Open")) return "rooms_open";
     if (std.mem.eql(u8, t, "Rooms::Direct")) return "rooms_direct";
     return "rooms_room";
+}
+
+~proc room-key|zig {
+    return roomKey();
 }
 
 // ── Timestamps ──────────────────────────────────────────────────────────────
@@ -83,47 +133,89 @@ threadlocal var iso_buf: [40]u8 = undefined;
     return iso_buf[0..20];
 }
 
-// "rooms_<key>_<rid>" — the messages container's dom_id, built once per page.
-threadlocal var dom_buf: [320]u8 = undefined;
+// "YYYY-MM-DD HH:MM:SS" -> "YYYYMMDDHHMMSS" — the ?v= cache-buster shape Rails
+// stamps on avatar/logo URLs from a record's updated_at.
+threadlocal var ver_buf: [16]u8 = undefined;
+
+~proc ts-ver|zig {
+    if (ts.len < 19) return "";
+    @memcpy(ver_buf[0..4], ts[0..4]);
+    @memcpy(ver_buf[4..6], ts[5..7]);
+    @memcpy(ver_buf[6..8], ts[8..10]);
+    @memcpy(ver_buf[8..10], ts[11..13]);
+    @memcpy(ver_buf[10..12], ts[14..16]);
+    @memcpy(ver_buf[12..14], ts[17..19]);
+    return ver_buf[0..14];
+}
+
+// Render-time milliseconds — the messages container's loaded-at value.
+~proc now-ms|zig {
+    return std.time.milliTimestamp();
+}
+
+// "rooms_<key>_<rid>" — the room dom_id body, shared by messages_, edit_,
+// involvement_ prefixes.
+threadlocal var msgdom_buf: [320]u8 = undefined;
 
 ~proc msgdom|zig {
-    const key = blk: {
-        const t = room_type_buf[0..room_type_len];
-        if (std.mem.eql(u8, t, "Rooms::Closed")) break :blk "rooms_closed";
-        if (std.mem.eql(u8, t, "Rooms::Open")) break :blk "rooms_open";
-        if (std.mem.eql(u8, t, "Rooms::Direct")) break :blk "rooms_direct";
-        break :blk "rooms_room";
-    };
-    return std.fmt.bufPrint(&dom_buf, "{s}_{s}", .{ key, rid }) catch "";
+    return std.fmt.bufPrint(&msgdom_buf, "{s}_{s}", .{ roomKey(), rid }) catch "";
 }
 
-// ── Day separator fold ──────────────────────────────────────────────────────
-// Rails emits the separator when the day differs from the previous message's.
-// Comparing date prefixes keeps the row arm flat (no `if` needed).
-threadlocal var last_day: [10]u8 = undefined;
-threadlocal var have_day: bool = false;
+// /rooms/<plural>/<rid>/edit — the room edit path is type-pluralized.
+threadlocal var room_edit_buf: [320]u8 = undefined;
+
+~proc room-edit-path|zig {
+    const plural = blk: {
+        const t = room_type_buf[0..room_type_len];
+        if (std.mem.eql(u8, t, "Rooms::Closed")) break :blk "closeds";
+        if (std.mem.eql(u8, t, "Rooms::Open")) break :blk "opens";
+        if (std.mem.eql(u8, t, "Rooms::Direct")) break :blk "directs";
+        break :blk "rooms";
+    };
+    return std.fmt.bufPrint(&room_edit_buf, "/rooms/{s}/{s}/edit", .{ plural, rid }) catch "";
+}
+
+// Host header unwrap — HTTP/1.1 requires Host; absent means a malformed
+// request, and an empty value then renders as a visibly broken URL rather
+// than silently wrong content.
+~proc host-or|zig {
+    return h orelse "";
+}
+
+// ── Boost arena ─────────────────────────────────────────────────────────────
+// Boosts are queried in one shot for the page window (a join against the
+// last-40 subquery), rendered to markup, and stashed per message_id; the
+// message row arm reads them out via boost-rows. The arena resets per
+// request in page-reset — markup bytes live exactly as long as the page.
+threadlocal var boost_arena: std.ArrayList(u8) = .empty;
+threadlocal var boost_mid: [64]i64 = undefined;
+threadlocal var boost_off: [64]u32 = undefined;
+threadlocal var boost_len: [64]u32 = undefined;
+threadlocal var boost_n: usize = 0;
+
+~proc boost-stash|zig {
+    if (boost_n >= 64) return;
+    boost_mid[boost_n] = mid;
+    boost_off[boost_n] = @intCast(boost_arena.items.len);
+    boost_len[boost_n] = @intCast(html.len);
+    boost_arena.appendSlice(std.heap.page_allocator, html) catch return;
+    boost_n += 1;
+}
+
+threadlocal var boost_ret: std.ArrayList(u8) = .empty;
+
+~proc boost-rows|zig {
+    boost_ret.clearRetainingCapacity();
+    for (0..boost_n) |i| {
+        if (boost_mid[i] == mid)
+            boost_ret.appendSlice(std.heap.page_allocator,
+                boost_arena.items[boost_off[i]..boost_off[i] + boost_len[i]]) catch return "";
+    }
+    return boost_ret.items;
+}
 
 ~proc page-reset|zig {
-    have_day = false;
     room_seen = false;
-}
-
-threadlocal var sep_buf: [160]u8 = undefined;
-
-~proc day-sep|zig {
-    if (ts.len < 10) return "";
-    if (have_day and std.mem.eql(u8, ts[0..10], &last_day)) return "";
-    @memcpy(&last_day, ts[0..10]);
-    have_day = true;
-    const iso = blk: {
-        var b: [20]u8 = undefined;
-        @memcpy(b[0..10], ts[0..10]);
-        b[10] = 'T';
-        @memcpy(b[11..19], ts[11..19]);
-        b[19] = 'Z';
-        break :blk b;
-    };
-    const sep = std.fmt.bufPrint(&sep_buf,
-        "<h2 class=\"message__day-separator\"><time datetime=\"{s}\" data-local-time-target=\"date\"></time></h2>", .{iso}) catch return "";
-    return sep;
+    boost_n = 0;
+    boost_arena.clearRetainingCapacity();
 }

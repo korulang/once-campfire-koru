@@ -11,3 +11,4 @@ compiler_env*
 server.log
 seed/*-shm
 seed/*-wal
+campfire

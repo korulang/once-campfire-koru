@@ -240,7 +240,7 @@ orisha:handler = orisha:router(req)
                   |> session-login(email, password, user_agent: ua): res -> res
 ! [GET /rooms/:id] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> views:room-page(rid: p.id, email: ue): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html" }
+    | then |> orisha:header(req, name: "Host"): hst |> views:room-page(rid: p.id, email: ue, host: hst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html" }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [GET /rooms/:id/messages] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
     |> orisha:query-param(req, name: "before"): before
