@@ -5,10 +5,13 @@
 // verbatim from once-campfire-rust's crates/db/src/schema.sql).
 
 import orisha
+import orisha/pump
 import koru/sqlite3
 import bcrypt
+import cable
 import pages
 import session
+import signing
 import views
 import std/io
 import std/fmt
@@ -162,7 +165,8 @@ session-login =
         | done d2 |> session:take-uid(): uid2
                   |> if(uid2 > 0)
                     | then |> session:new-token(): tok
-                           |> session:redirect-headers(token: tok): hdr
+                           |> signing:cookie-header(token: tok): cv
+                           |> session:redirect-signed(cookie: cv): hdr
                            |> koru/sqlite3:default(conn: d2) {
                                INSERT INTO sessions
                                    (user_id, token, user_agent, ip_address,
@@ -177,7 +181,8 @@ session-login =
     | err _ -> { status: 500, body: "db open failed", content_type: "text/plain", extra_headers: null }
 
 // find_session_by_cookie: session_token -> sessions.token -> user's
-// email. NULL/unknown token -> NULL -> downstream queries return nothing
+// email. The cookie value is the Rails-signed blob — cookie-verify answers
+// the raw token or nil for absent/tampered/expired; nil -> NULL -> no rows
 // (Rails would redirect to /session/new; a 204-for-anonymous is the
 // visible divergence until a real auth gate exists).
 // No cookie -> no session lookup: sqlite open+query+close is ~25µs of
@@ -186,7 +191,7 @@ session-login =
 pub tor current-email { token: ?string } -> ?string
 current-email =
     if(token != null)
-    | then |> session-email(token): ue -> ue
+    | then |> signing:cookie-verify(raw: token): vt |> session-email(token: vt): ue -> ue
     | else -> null
 
 pub tor session-email { token: ?string } -> ?string
@@ -208,13 +213,14 @@ session-email =
 // require_authentication's redirect.
 pub tor landing { token: ?string } -> orisha:Response
 landing =
-    koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
+    signing:cookie-verify(raw: token): vtok
+    |> koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
     | db d |> koru/sqlite3:default(conn: d) {
             SELECT r.id FROM memberships m
             JOIN rooms r ON r.id = m.room_id
             WHERE m.user_id = (SELECT u.id FROM users u
                                JOIN sessions s ON s.user_id = u.id
-                               WHERE s.token = {{token}})
+                               WHERE s.token = {{vtok}})
               AND r.type != 'Rooms::Direct'
             ORDER BY LOWER(r.name) LIMIT 1
         }
@@ -255,7 +261,19 @@ orisha:handler = orisha:router(req)
     |> if(ue != null)
     | then |> search-page(user_email: ue, q): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
+! [GET /cable]       |> cable:route(req): res -> res
 ! [*]                -> { status: 404, body: "Not Found", content_type: "text/plain" }
+
+// Cable seams — a complete client message dispatches on the connection's fd;
+// teardown owes Membership#disconnected per presence sub via ! gone-room.
+orisha/pump:ws-frame = orisha/pump:raw(x: f): payload
+    |> orisha/pump:fileno(x: f): fd
+    |> cable:dispatch(fd, payload)
+
+orisha/pump:ws-closed = cable:dropped(fd)
+    ! gone-room g |> cable:gone(g)
+    | ok |> _
+    | stale |> _
 
 orisha:serve(port: 3109)
 | shutdown s |> std/io:print.ln(s)

@@ -1,0 +1,761 @@
+// cable — Action Cable's wire mechanisms: the fd-keyed connection registry
+// the pump's `! closed` prunes, the envelope spellings Rails puts on the
+// wire, and the 3s heartbeat beat. Channel policy (membership checks,
+// present/absent SQL, turbo markup) lives in the .k half where the flows
+// can reach sqlite.
+//
+// The registry mirrors the pump's own conn table: a fixed fd-indexed array
+// (fds past MAX_TRACKED_FD can never be upgraded connections — the pump
+// doesn't track them either). The pump is the only writer to the socket;
+// every send here is `ws-send-fd`, serialized on the connection's send
+// mutex inside the pump.
+//
+// Subscription model follows the observed reference: one entry per
+// (identifier, stream) pair. Resubscribing an identifier the connection
+// already holds runs the channel's subscribed() again — the stream is
+// re-registered and a broadcast delivers once per registration (the
+// golden transcript's unread fanout lands twice on a twice-subscribed
+// socket) — but the confirm frame is NOT resent.
+
+const std = @import("std");
+const pump = @import("root").koru_orisha.koru_pump;
+const yyjson = @import("root").koru_koru.koru_yyjson;
+
+const A = std.heap.page_allocator;
+const MAX_TRACKED_FD = 4096;
+
+// Channel codes stored on each subscription so teardown and message
+// dispatch can name the policy an entry carries. Keep in step with the
+// `channel-kind` arm list in index.k.
+pub const CH_BASE: i64 = 1;       // ApplicationCable::Channel
+pub const CH_HEARTBEAT: i64 = 2;  // HeartbeatChannel
+pub const CH_PRESENCE: i64 = 3;   // PresenceChannel
+pub const CH_READS: i64 = 4;      // ReadRoomsChannel
+pub const CH_ROOM: i64 = 5;       // RoomChannel
+pub const CH_MESSAGES: i64 = 6;   // RoomMessagesChannel
+pub const CH_TYPING: i64 = 7;     // TypingNotificationsChannel
+pub const CH_UNREADS: i64 = 8;    // UnreadRoomsChannel
+pub const CH_TURBO: i64 = 9;      // Turbo::StreamsChannel
+
+pub const GoneRoom = struct { uid: i64, rid: i64 };
+
+const Sub = struct {
+    ident: []u8,   // duped: the yyjson arenas these arrive from are freed
+    stream: []u8,
+    kind: i64,
+    rid: i64,
+};
+
+const Conn = struct {
+    uid: i64,
+    uname: []u8,
+    subs: std.ArrayListUnmanaged(Sub) = .{},
+};
+
+var reg_mu: std.Thread.Mutex = .{};
+var registry: [MAX_TRACKED_FD]?*Conn = .{null} ** MAX_TRACKED_FD;
+
+fn connEntry(fd: usize) ?*Conn {
+    if (fd >= MAX_TRACKED_FD) return null;
+    return registry[fd];
+}
+
+// ---------------------------------------------------------------------------
+// lifecycle
+// ---------------------------------------------------------------------------
+
+// Runs once per process on the first connection — the detached beat thread
+// is the Cable server's periodic_transmit ping (default 3s).
+var beat_started: std.atomic.Value(bool) = .init(false);
+
+fn beatLoop() void {
+    while (true) {
+        std.Thread.sleep(3 * std.time.ns_per_s);
+        var buf: [80]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"ping\",\"message\":{d}}}", .{std.time.timestamp()}) catch continue;
+        reg_mu.lock();
+        defer reg_mu.unlock();
+        for (0..MAX_TRACKED_FD) |fd| {
+            if (registry[fd] != null) _ = pump.wsSendFd(fd, 0x1, msg);
+        }
+    }
+}
+
+~proc connected|zig {
+    const conn = A.create(Conn) catch return;
+    conn.* = .{ .uid = uid, .uname = A.dupe(u8, uname) catch unreachable };
+    reg_mu.lock();
+    if (fd < MAX_TRACKED_FD) {
+        // A reissued fd could theoretically still hold a stale entry —
+        // dropped() ran first or the pump never armed it; either way an
+        // entry here is dead weight to free before overwrite.
+        if (registry[fd]) |old| freeConn(old);
+        registry[fd] = conn;
+    }
+    reg_mu.unlock();
+    if (!beat_started.swap(true, .acq_rel)) {
+        const t = std.Thread.spawn(.{}, beatLoop, .{}) catch return;
+        t.detach();
+    }
+}
+
+fn freeConn(conn: *Conn) void {
+    for (conn.subs.items) |sub| {
+        A.free(sub.ident);
+        A.free(sub.stream);
+    }
+    conn.subs.deinit(A);
+    A.free(conn.uname);
+    A.destroy(conn);
+}
+
+// Teardown — the pump fires `! closed` once per released upgraded
+// connection. Every presence subscription on it owes a `Membership#
+// disconnected` (`absent`) — handed to the flow side as `! gone-room`
+// firings AFTER the registry lock is released, since the arm runs SQL and
+// could itself take the registry.
+
+~proc dropped|zig {
+    if (fd >= $mod.MAX_TRACKED_FD) return .{ .stale = .{} };
+    $mod.reg_mu.lock();
+    const conn = $mod.registry[fd];
+    $mod.registry[fd] = null;
+    $mod.reg_mu.unlock();
+    const c = conn orelse return .{ .stale = .{} };
+    for (c.subs.items) |sub| {
+        if (sub.kind == $mod.CH_PRESENCE and sub.rid > 0) {
+            var gr = $mod.GoneRoom{ .uid = c.uid, .rid = sub.rid };
+            gone_room(&gr);
+        }
+    }
+    $mod.freeConn(c);
+    return .{ .ok = .{} };
+}
+
+// ---------------------------------------------------------------------------
+// subscriptions
+// ---------------------------------------------------------------------------
+
+~proc has-sub|zig {
+    reg_mu.lock();
+    defer reg_mu.unlock();
+    const c = connEntry(fd) orelse return 0;
+    for (c.subs.items) |sub| {
+        if (std.mem.eql(u8, sub.ident, ident)) return 1;
+    }
+    return 0;
+}
+
+~proc uid-of|zig {
+    reg_mu.lock();
+    defer reg_mu.unlock();
+    const c = connEntry(fd) orelse return -1;
+    return c.uid;
+}
+
+// Register (identifier, stream, channel-kind, room id). Always appends —
+// see the header note on resubscribe semantics; the flow decides whether a
+// confirm goes out.
+~proc add-sub|zig {
+    reg_mu.lock();
+    defer reg_mu.unlock();
+    const c = connEntry(fd) orelse return;
+    c.subs.append(A, .{
+        .ident = A.dupe(u8, ident) catch return,
+        .stream = A.dupe(u8, stream) catch return,
+        .kind = kind,
+        .rid = rid,
+    }) catch return;
+}
+
+// `unsubscribe`: drop every entry carrying this identifier. Presence subs
+// owe absent() — same `! gone-room` firing shape as dropped().
+
+~proc drop-sub|zig {
+    if (fd >= $mod.MAX_TRACKED_FD) return .{ .missing = .{} };
+    $mod.reg_mu.lock();
+    const c = $mod.registry[fd];
+    var gone_rooms: std.ArrayListUnmanaged($mod.GoneRoom) = .{};
+    if (c) |conn| {
+        var i: usize = 0;
+        while (i < conn.subs.items.len) {
+            const sub = conn.subs.items[i];
+            if (std.mem.eql(u8, sub.ident, ident)) {
+                if (sub.kind == $mod.CH_PRESENCE and sub.rid > 0) {
+                    gone_rooms.append($mod.A, .{ .uid = conn.uid, .rid = sub.rid }) catch {};
+                }
+                $mod.A.free(sub.ident);
+                $mod.A.free(sub.stream);
+                _ = conn.subs.orderedRemove(i);
+            } else i += 1;
+        }
+    }
+    $mod.reg_mu.unlock();
+    defer gone_rooms.deinit($mod.A);
+    for (gone_rooms.items) |*gr| gone_room(gr);
+    if (c != null) return .{ .ok = .{} };
+    return .{ .missing = .{} };
+}
+
+// The channel kind a subscription identifier carries (for `message`
+// dispatch), or -1 when the connection/subscription is unknown.
+~proc sub-kind|zig {
+    reg_mu.lock();
+    defer reg_mu.unlock();
+    const c = connEntry(fd) orelse return -1;
+    for (c.subs.items) |sub| {
+        if (std.mem.eql(u8, sub.ident, ident)) return sub.kind;
+    }
+    return -1;
+}
+
+// The stream a subscription registered — needed by `broadcast_to`-style
+// actions that fan out on the channel's own stream (typing notifications).
+~proc sub-stream|zig {
+    reg_mu.lock();
+    defer reg_mu.unlock();
+    const c = connEntry(fd) orelse return "";
+    for (c.subs.items) |sub| {
+        if (std.mem.eql(u8, sub.ident, ident)) {
+            // threadlocal copy: the registry string must not escape unlocked
+            const n = @min(sub.stream.len, stream_copy_buf.len);
+            @memcpy(stream_copy_buf[0..n], sub.stream[0..n]);
+            return stream_copy_buf[0..n];
+        }
+    }
+    return "";
+}
+threadlocal var stream_copy_buf: [512]u8 = undefined;
+
+// ---------------------------------------------------------------------------
+// wire envelopes — every payload spelled exactly as the reference emits it
+// ---------------------------------------------------------------------------
+
+fn escWrite(list: *std.ArrayList(u8), s: []const u8) void {
+    for (s) |ch| {
+        switch (ch) {
+            '"' => list.appendSlice(A, "\\\"") catch return,
+            '\\' => list.appendSlice(A, "\\\\") catch return,
+            '\n' => list.appendSlice(A, "\\n") catch return,
+            '\r' => list.appendSlice(A, "\\r") catch return,
+            '\t' => list.appendSlice(A, "\\t") catch return,
+            else => {
+                if (ch < 0x20) {
+                    var b: [6]u8 = undefined;
+                    const e = std.fmt.bufPrint(&b, "\\u{x:0>4}", .{ch}) catch return;
+                    list.appendSlice(A, e) catch return;
+                } else list.append(A, ch) catch return;
+            },
+        }
+    }
+}
+
+fn sendToFd(fd: usize, bytes: []const u8) bool {
+    return pump.wsSendFd(fd, 0x1, bytes);
+}
+
+~proc confirm|zig {
+    var out = std.ArrayList(u8).initCapacity(A, ident.len * 2 + 48) catch return;
+    defer out.deinit(A);
+    out.appendSlice(A, "{\"identifier\":\"") catch return;
+    escWrite(&out, ident);
+    out.appendSlice(A, "\",\"type\":\"confirm_subscription\"}") catch return;
+    _ = sendToFd(fd, out.items);
+}
+
+~proc reject|zig {
+    var out = std.ArrayList(u8).initCapacity(A, ident.len * 2 + 48) catch return;
+    defer out.deinit(A);
+    out.appendSlice(A, "{\"identifier\":\"") catch return;
+    escWrite(&out, ident);
+    out.appendSlice(A, "\",\"type\":\"reject_subscription\"}") catch return;
+    _ = sendToFd(fd, out.items);
+}
+
+// `ActionCable.server.broadcast(stream, message)`: the envelope goes to
+// every (connection, stream) registration — duplicates included, matching
+// the pubsub table's per-registration delivery.
+// `payload` is the already-encoded JSON value for `message`.
+~proc fanout|zig {
+    reg_mu.lock();
+    defer reg_mu.unlock();
+    for (0..MAX_TRACKED_FD) |fd| {
+        const c = registry[fd] orelse continue;
+        for (c.subs.items) |sub| {
+            if (!std.mem.eql(u8, sub.stream, stream)) continue;
+            var out = std.ArrayList(u8).initCapacity(A, sub.ident.len * 2 + payload.len + 48) catch continue;
+            defer out.deinit(A);
+            out.appendSlice(A, "{\"identifier\":\"") catch continue;
+            escWrite(&out, sub.ident);
+            out.appendSlice(A, "\",\"message\":") catch continue;
+            out.appendSlice(A, payload) catch continue;
+            out.appendSlice(A, "}") catch continue;
+            _ = sendToFd(fd, out.items);
+        }
+    }
+}
+
+// A JSON string literal, quotes included — turbo-stream markup travels as
+// the `message` string, so the flow wraps it before fanout.
+threadlocal var quote_buf: [65536]u8 = undefined;
+
+~proc json-quote|zig {
+    var list = std.ArrayList(u8).initCapacity(A, s.len * 2 + 2) catch return "";
+    defer list.deinit(A);
+    list.append(A, '"') catch return "";
+    escWrite(&list, s);
+    list.append(A, '"') catch return "";
+    const n = @min(list.items.len, quote_buf.len);
+    @memcpy(quote_buf[0..n], list.items[0..n]);
+    return quote_buf[0..n];
+}
+
+// `remote_connections.where(current_user:).disconnect(reconnect:)` —
+// every socket this user holds gets the remote-disconnect frame then a
+// normal close (code 1000 travels inside the close payload).
+~proc kick|zig {
+    var buf: [96]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf,
+        "{{\"type\":\"disconnect\",\"reason\":\"remote\",\"reconnect\":{s}}}",
+        .{if (reconnect) "true" else "false"}) catch return;
+    reg_mu.lock();
+    defer reg_mu.unlock();
+    for (0..MAX_TRACKED_FD) |fd| {
+        const c = registry[fd] orelse continue;
+        if (c.uid != uid) continue;
+        _ = sendToFd(fd, msg);
+        _ = pump.wsSendFd(fd, 0x8, "\x03\xe8");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// handshake + request helpers
+// ---------------------------------------------------------------------------
+
+threadlocal var head_buf: [1024]u8 = undefined;
+
+// The 101 head's own headers — status line is the pump's; these splice in
+// via extra_headers. Sec-WebSocket-Protocol only when the client offered a
+// supported one (its order wins).
+~proc upgrade-head|zig {
+    if (proto) |p| {
+        return std.fmt.bufPrint(&head_buf,
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Protocol: {s}\r\n",
+            .{ acc, p }) catch "";
+    }
+    return std.fmt.bufPrint(&head_buf,
+        "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n",
+        .{acc}) catch "";
+}
+
+const PROTOCOLS = [_][]const u8{ "actioncable-v1-json", "actioncable-unsupported" };
+
+threadlocal var proto_buf: [64]u8 = undefined;
+
+// First protocol in the CLIENT's list that we support — the client's order
+// wins, which is why `actioncable-unsupported` first means we take it.
+~proc protocol|zig {
+    const o = offered orelse return null;
+    var it = std.mem.splitScalar(u8, o, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " \t");
+        for (PROTOCOLS) |sup| {
+            if (std.mem.eql(u8, t, sup)) {
+                @memcpy(proto_buf[0..sup.len], sup);
+                return proto_buf[0..sup.len];
+            }
+        }
+    }
+    return null;
+}
+
+// `websocket?(env)`: GET, a Connection token carrying "upgrade", and
+// `Upgrade: websocket`, all case-insensitive. Orisha's router already
+// matched GET /cable; this checks the two header conditions.
+~proc upgrade-request|zig {
+    const conn = conn_hdr orelse return 0;
+    const up = up_hdr orelse return 0;
+    var found = false;
+    var it = std.mem.splitScalar(u8, conn, ',');
+    while (it.next()) |tok| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, tok, " \t"), "upgrade")) found = true;
+    }
+    if (!found) return 0;
+    return if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, up, " \t"), "websocket")) 1 else 0;
+}
+
+// `allow_request_origin?`: same-origin under the production `assume_ssl`
+// posture means Origin == "https://<Host>" (or http when DISABLE_SSL is
+// set or X-Forwarded-* says plain http). An absent Origin is NOT allowed —
+// Rails compares it like any other value.
+~proc origin-ok|zig {
+    const o = origin orelse return 0;
+    const h = host orelse "";
+    var proto: []const u8 = "https";
+    if (std.posix.getenv("DISABLE_SSL") != null) proto = "http";
+    if (fwd_proto) |p| {
+        var it = std.mem.splitScalar(u8, p, ',');
+        const first = std.mem.trim(u8, it.next() orelse "", " \t");
+        if (std.ascii.eqlIgnoreCase(first, "https")) proto = "https";
+    }
+    if (fwd_ssl) |s| {
+        var it = std.mem.splitScalar(u8, s, ',');
+        const first = std.mem.trim(u8, it.next() orelse "", " \t");
+        if (std.ascii.eqlIgnoreCase(first, "on")) proto = "https";
+    }
+    var buf: [256]u8 = undefined;
+    const want = std.fmt.bufPrint(&buf, "{s}://{s}", .{ proto, h }) catch return 0;
+    return if (std.mem.eql(u8, o, want)) 1 else 0;
+}
+
+// ---------------------------------------------------------------------------
+// params — Rails' casting semantics for subscription params
+// ---------------------------------------------------------------------------
+
+threadlocal var param_buf: [2048]u8 = undefined;
+
+// Borrow a string param out of the command doc — null for missing OR
+// non-string (Rails reads `params[:signed_stream_name]`; a number there is
+// nil for stream purposes).
+~proc param-borrow|zig {
+    _ = doc;
+    const r = yyjson.c.yyjson_obj_getn(v, key.ptr, key.len) orelse return null;
+    const s = yyjson.c.yyjson_get_str(r) orelse return null;
+    return s[0..yyjson.c.yyjson_get_len(r)];
+}
+
+// `params[:room_id]` under ActiveRecord's integer cast: numbers truncate,
+// bools are 1/0, strings go through `to_i` (whitespace, sign, `0d` prefix,
+// underscores between digits), anything else is nil — which the membership
+// lookup treats as no room. Returns null for nil.
+~proc param-id|zig {
+    _ = doc;
+    const r = yyjson.c.yyjson_obj_getn(v, key.ptr, key.len) orelse return null;
+    if (yyjson.c.yyjson_is_num(r)) {
+        if (yyjson.c.yyjson_is_int(r)) return yyjson.c.yyjson_get_sint(r);
+        const f = yyjson.c.yyjson_get_num(r);
+        if (@abs(f) < 9.2e18) return @intFromFloat(@trunc(f));
+        return null;
+    }
+    if (yyjson.c.yyjson_is_bool(r)) return if (yyjson.c.yyjson_is_true(r)) 1 else 0;
+    if (yyjson.c.yyjson_get_str(r)) |s| {
+        return rubyToI64(s[0..yyjson.c.yyjson_get_len(r)]);
+    }
+    return null;
+}
+
+fn isRubySpace(ch: u8) bool {
+    return ch == ' ' or ch == '\t' or ch == '\n' or ch == 0x0b or ch == 0x0c or ch == '\r';
+}
+
+// String#to_i, saturating at i64 bounds. Null when nothing digit-like
+// leads — the reference's `integer_cast` gates on that rather than
+// returning 0, because `to_i`'s 0 would find room 0 only when it exists.
+fn rubyToI64(s: []const u8) ?i64 {
+    var i: usize = 0;
+    while (i < s.len and isRubySpace(s[i])) i += 1;
+    var neg = false;
+    if (i < s.len and (s[i] == '-' or s[i] == '+')) {
+        neg = s[i] == '-';
+        i += 1;
+    }
+    if (i + 2 <= s.len and s[i] == '0' and (s[i + 1] == 'd' or s[i + 1] == 'D')) i += 2;
+    var n: i128 = 0;
+    var seen = false;
+    var prev_digit = false;
+    while (i < s.len) : (i += 1) {
+        const ch = s[i];
+        if (ch >= '0' and ch <= '9') {
+            n = n *| 10 +| (ch - '0');
+            seen = true;
+            prev_digit = true;
+        } else if (ch == '_' and prev_digit) {
+            prev_digit = false;
+        } else break;
+    }
+    if (!seen) return null;
+    const signed: i128 = if (neg) -n else n;
+    const clamped = std.math.clamp(signed, @as(i128, std.math.minInt(i64)), @as(i128, std.math.maxInt(i64)));
+    return @intCast(clamped);
+}
+
+// ---------------------------------------------------------------------------
+// GID + stream names
+// ---------------------------------------------------------------------------
+
+threadlocal var gtype_buf: [64]u8 = undefined;
+threadlocal var gid_gtype_len: usize = 0;
+
+// The STI class a room gid named ("Room" itself, "Rooms::Open", …), stashed
+// by `room-gid` for the SQL side to read. Threadlocal like session's cells.
+~proc gid-type|zig {
+    return gtype_buf[0..gid_gtype_len];
+}
+
+// `GlobalID::Locator.locate gp, only: Room` + the `*:messages` suffix a
+// RoomMessagesChannel stream carries. Returns the room id (>0) for a
+// well-formed room gid, -1 for "verified but not a room we serve" (the
+// reference maps those to `reject`), -2 for an unrecognised model class
+// (the reference raises NameError → logged, NO frame goes out).
+//
+// GID parse: the param is a urlsafe-b64 of `gid://campfire/<Model>/<id>`,
+// though the raw `gid://` URI form parses too (GlobalID.parse).
+~proc room-gid|zig {
+    gid_gtype_len = 0;
+    const colon = std.mem.indexOfScalar(u8, stream, ':') orelse return -1;
+    if (!std.mem.eql(u8, stream[colon + 1 ..], "messages")) return -1;
+    const gp = stream[0..colon];
+
+    var dec_buf: [256]u8 = undefined;
+    var gid: []const u8 = gp;
+    if (!std.mem.startsWith(u8, gp, "gid://")) {
+        const n = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(gp) catch return -1;
+        if (n > dec_buf.len) return -1;
+        std.base64.url_safe_no_pad.Decoder.decode(dec_buf[0..n], gp) catch return -1;
+        gid = dec_buf[0..n];
+    }
+    if (!std.mem.startsWith(u8, gid, "gid://campfire/")) return -1;
+    const rest = gid["gid://campfire/".len..];
+    const slash = std.mem.lastIndexOfScalar(u8, rest, '/') orelse return -1;
+    const model = rest[0..slash];
+    const id_str = rest[slash + 1 ..];
+    const rid = std.fmt.parseInt(i64, id_str, 10) catch return -1;
+
+    // find_allowed?(only: Room): "Room" names the base class — any STI
+    // type passes the filter. A "Rooms::*" name pins the STI type. Any
+    // other known model is turned away; an UNKNOWN name is NameError.
+    if (std.mem.eql(u8, model, "Room")) {
+        gtype_buf[0..4].* = "Room".*;
+        gid_gtype_len = 4;
+        return rid;
+    }
+    const sti = [_][]const u8{ "Rooms::Open", "Rooms::Closed", "Rooms::Direct" };
+    for (sti) |name| {
+        if (std.mem.eql(u8, model, name)) {
+            @memcpy(gtype_buf[0..name.len], name);
+            gid_gtype_len = name.len;
+            return rid;
+        }
+    }
+    const known = [_][]const u8{ "Account", "Ban", "Boost", "Current", "Membership", "Message", "Push::Subscription", "Search", "Session", "User", "Webhook" };
+    for (known) |name| {
+        if (std.mem.eql(u8, model, name)) return -1;
+    }
+    return -2;
+}
+
+// `record.to_gid_param` — urlsafe-b64 of the gid URI. The stream names
+// RoomChannel-family subscriptions register are built from it.
+threadlocal var gp_buf: [256]u8 = undefined;
+
+~proc gid-param|zig {
+    var gid_buf: [128]u8 = undefined;
+    const gid = std.fmt.bufPrint(&gid_buf, "gid://campfire/{s}/{d}", .{ rtype, rid }) catch return "";
+    const n = std.base64.url_safe_no_pad.Encoder.calcSize(gid.len);
+    if (n > gp_buf.len) return "";
+    _ = std.base64.url_safe_no_pad.Encoder.encode(gp_buf[0..n], gid);
+    return gp_buf[0..n];
+}
+
+// `user_<id>_reads` / `user_<id>_unreads` — the per-user streams
+// ReadRoomsChannel and UnreadRoomsChannel subscribe.
+threadlocal var ustream_buf: [96]u8 = undefined;
+
+~proc user-stream|zig {
+    return std.fmt.bufPrint(&ustream_buf, "user_{d}_{s}", .{ uid, suffix }) catch "";
+}
+
+// `broadcast_to @room, action:, user: {id:, name:}` — the typing payload,
+// then fanout on the sub's own stream. All mechanism: the sub's stored
+// stream is the broadcasting, the conn's user is the payload's user.
+~proc typing-cast|zig {
+    reg_mu.lock();
+    defer reg_mu.unlock();
+    const c = connEntry(fd) orelse return -1;
+    var stream: []const u8 = "";
+    for (c.subs.items) |sub| {
+        if (std.mem.eql(u8, sub.ident, ident)) stream = sub.stream;
+    }
+    if (stream.len == 0) return -1;
+    var out = std.ArrayList(u8).initCapacity(A, 4096) catch return -1;
+    defer out.deinit(A);
+    out.appendSlice(A, "{\"action\":\"") catch return -1;
+    escWrite(&out, action);
+    out.appendSlice(A, "\",\"user\":{\"id\":") catch return -1;
+    var idbuf: [24]u8 = undefined;
+    const ids = std.fmt.bufPrint(&idbuf, "{d}", .{c.uid}) catch return -1;
+    out.appendSlice(A, ids) catch return -1;
+    out.appendSlice(A, ",\"name\":\"") catch return -1;
+    escWrite(&out, c.uname);
+    out.appendSlice(A, "\"}}") catch return -1;
+    const payload = out.items;
+
+    // Fanout INSIDE the lock — same write path as `fanout`, spelling the
+    // per-subscriber envelope.
+    for (0..MAX_TRACKED_FD) |tfd| {
+        const tc = registry[tfd] orelse continue;
+        for (tc.subs.items) |sub| {
+            if (!std.mem.eql(u8, sub.stream, stream)) continue;
+            var env = std.ArrayList(u8).initCapacity(A, sub.ident.len * 2 + payload.len + 48) catch continue;
+            defer env.deinit(A);
+            env.appendSlice(A, "{\"identifier\":\"") catch continue;
+            escWrite(&env, sub.ident);
+            env.appendSlice(A, "\",\"message\":") catch continue;
+            env.appendSlice(A, payload) catch continue;
+            env.appendSlice(A, "}") catch continue;
+            _ = sendToFd(tfd, env.items);
+        }
+    }
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// small payloads + stream-name joins the flows spell often
+// ---------------------------------------------------------------------------
+
+threadlocal var payload_buf: [64]u8 = undefined;
+
+// `{"room_id":<rid>}` / `{"roomId":<rid>}` — the read_room and unread_room
+// broadcast payloads differ only in the key's casing.
+~proc room-payload|zig {
+    return std.fmt.bufPrint(&payload_buf, "{{\"{s}\":{d}}}", .{ key, rid }) catch "";
+}
+
+// `<channel stream prefix>:<room gid param>` — RoomChannel-family streams.
+threadlocal var chstream_buf: [512]u8 = undefined;
+
+~proc chan-stream|zig {
+    return std.fmt.bufPrint(&chstream_buf, "{s}:{s}", .{ prefix, gp }) catch "";
+}
+
+// The room's stored STI type rides a threadlocal out of the membership
+// join — same request-scoped cell convention as session/'s cells (a frame
+// dispatch runs to completion on one worker thread).
+threadlocal var rtype_buf: [64]u8 = undefined;
+threadlocal var rtype_len: usize = 0;
+
+~proc stash-rtype|zig {
+    rtype_seen = true;
+    const n = @min(s.len, rtype_buf.len);
+    @memcpy(rtype_buf[0..n], s[0..n]);
+    rtype_len = n;
+}
+
+~proc take-rtype|zig {
+    return rtype_buf[0..rtype_len];
+}
+
+// The room id a subscription carries — presence `perform`s act on the room
+// the subscription bound at subscribe time, not on anything in `data`.
+~proc sub-rid|zig {
+    reg_mu.lock();
+    defer reg_mu.unlock();
+    const c = connEntry(fd) orelse return -1;
+    for (c.subs.items) |sub| {
+        if (std.mem.eql(u8, sub.ident, ident)) return sub.rid;
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// command + channel classification — bare dispatch tables
+// ---------------------------------------------------------------------------
+
+// `command` field of a client frame. Anything else Rails logs and drops.
+
+~proc command-kind|zig {
+    const n = name orelse return .{ .unknown = .{} };
+    if (std.mem.eql(u8, n, "subscribe")) return .{ .subscribe = .{} };
+    if (std.mem.eql(u8, n, "unsubscribe")) return .{ .unsubscribe = .{} };
+    if (std.mem.eql(u8, n, "message")) return .{ .message = .{} };
+    return .{ .unknown = .{} };
+}
+
+// `identifier.channel` — `safe_constantize`: a leading "::" resolves fine
+// (Ruby constant lookup from top-level), unknown names are NameError → the
+// subscription is refused outright with NO frame (not even reject).
+
+~proc channel-kind|zig {
+    const n0 = name orelse return .{ .unknown = .{} };
+    const n = if (std.mem.startsWith(u8, n0, "::")) n0[2..] else n0;
+    if (std.mem.eql(u8, n, "ApplicationCable::Channel")) return .{ .base = .{} };
+    if (std.mem.eql(u8, n, "HeartbeatChannel")) return .{ .heartbeat = .{} };
+    if (std.mem.eql(u8, n, "PresenceChannel")) return .{ .presence = .{} };
+    if (std.mem.eql(u8, n, "ReadRoomsChannel")) return .{ .reads = .{} };
+    if (std.mem.eql(u8, n, "RoomChannel")) return .{ .room = .{} };
+    if (std.mem.eql(u8, n, "RoomMessagesChannel")) return .{ .messages = .{} };
+    if (std.mem.eql(u8, n, "TypingNotificationsChannel")) return .{ .typing = .{} };
+    if (std.mem.eql(u8, n, "UnreadRoomsChannel")) return .{ .unreads = .{} };
+    if (std.mem.eql(u8, n, "Turbo::StreamsChannel")) return .{ .turbo = .{} };
+    return .{ .unknown = .{} };
+}
+
+// PresenceChannel's `perform` dispatch — `subscribed` arrives in `data` too
+// (Rails send_action re-runs the callback by name); it maps to `present`.
+
+~proc presence-action|zig {
+    const n = name orelse return .{ .other = .{} };
+    if (std.mem.eql(u8, n, "present")) return .{ .present = .{} };
+    if (std.mem.eql(u8, n, "absent")) return .{ .absent = .{} };
+    if (std.mem.eql(u8, n, "refresh")) return .{ .refresh = .{} };
+    if (std.mem.eql(u8, n, "subscribed")) return .{ .subscribed = .{} };
+    return .{ .other = .{} };
+}
+
+// TypingNotificationsChannel's `perform` dispatch — "subscribed" re-runs
+// the subscribe (membership re-check + stream re-register, still silent).
+
+~proc typing-action|zig {
+    const n = name orelse return .{ .other = .{} };
+    if (std.mem.eql(u8, n, "start")) return .{ .start = .{} };
+    if (std.mem.eql(u8, n, "stop")) return .{ .stop = .{} };
+    if (std.mem.eql(u8, n, "subscribed")) return .{ .subscribed = .{} };
+    return .{ .other = .{} };
+}
+
+// Turbo::StreamsChannel's `guarded_stream?` — a verified name whose tail is
+// ":messages" belongs to RoomMessagesChannel and is rejected here. Runs on
+// the VERIFIED name; the reference feeds "" when verification failed, which
+// is not guarded — the reject falls out of the unverified match instead.
+~proc room-guard|zig {
+    const i = std.mem.indexOfScalar(u8, stream, ':') orelse return 0;
+    return if (std.mem.eql(u8, stream[i + 1 ..], "messages")) 1 else 0;
+}
+
+// ---------------------------------------------------------------------------
+// auth + membership cells — threadlocal, same convention as session/'s
+// ---------------------------------------------------------------------------
+
+threadlocal var auth_uid: i64 = -1;
+threadlocal var auth_name_buf: [128]u8 = undefined;
+threadlocal var auth_name_len: usize = 0;
+
+// The session-join row rides these cells out of the `! row` arm — -1 when
+// no session row matched (absent cookie and unknown token are the same
+// "unauthorized" on the wire).
+~proc stash-auth|zig {
+    auth_uid = uid;
+    const n = @min(name.len, auth_name_buf.len);
+    @memcpy(auth_name_buf[0..n], name[0..n]);
+    auth_name_len = n;
+}
+
+~proc auth-uid|zig {
+    const v = auth_uid;
+    auth_uid = -1;
+    return v;
+}
+
+~proc auth-name|zig {
+    return auth_name_buf[0..auth_name_len];
+}
+
+// Membership-hit flag — stash-rtype arms it on the row, rtype-seen reads
+// and clears it so `done` can tell "member" from "no row matched".
+threadlocal var rtype_seen: bool = false;
+
+~proc rtype-seen|zig {
+    const v = rtype_seen;
+    rtype_seen = false;
+    return if (v) 1 else 0;
+}

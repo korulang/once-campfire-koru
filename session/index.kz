@@ -88,3 +88,12 @@ threadlocal var path_buf: [256]u8 = undefined;
     email_len = 0;
     return v;
 }
+
+// The signed-cookie variant of redirect-headers — the Set-Cookie value
+// arrives already built by signing:cookie-header (Rack's attribute order:
+// path, expires, httponly, samesite — lowercase, escaped value).
+~pub tor redirect-signed { cookie: string } -> string
+~proc redirect-signed|zig {
+    return std.fmt.bufPrint(&hdr_buf,
+        "Location: /\r\nSet-Cookie: {s}\r\n", .{cookie}) catch unreachable;
+}
