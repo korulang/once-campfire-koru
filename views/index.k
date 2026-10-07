@@ -14,10 +14,7 @@
 //     client decides display from it; it is not a day-boundary element.
 //   - body class carries user role (`sidebar admin`), not a literal.
 //
-// Honest approximations (flagged, not hidden): avatar URLs are unsigned
-// (/users/<id>/avatar — Rails ships SGID-signed blob URLs), the
-// turbo-cable-stream-source element is omitted (signed stream name needs
-// HMAC; lands with the cable workstream), no CSRF meta (no CSRF yet),
+// Honest approximations (flagged, not hidden): no CSRF meta (no CSRF yet),
 // `message--emoji` all-emoji class unimplemented, attachment boost-menu
 // branch unimplemented (no seeded attachments), invitation block omitted
 // (paged rooms never render it). Asset hrefs carry the observed digest —
@@ -29,7 +26,7 @@ import koru/dom
 koru/dom:component(Boost) {
     <div id="boost_{{ bid:d }}" class="boost boost-item flex-inline postion--relative max-width align-center fill-white gap" data-controller="boost-delete" data-boost-delete-perform-class="boost--deleting" data-boost-delete-reveal-class="expanded" data-boost-delete-booster-id-value="{{ buid:d }}">
     <figure class="avatar boost__avatar flex-item-no-shrink">
-    <a title="{{ bname:s }}" class="btn avatar" data-turbo-frame="_top" href="/users/{{ buid:d }}"><img aria-label="{{ bname:s }} boosted {{ bcontent:s }}" src="/users/{{ buid:d }}/avatar?v={{ bver:s }}" width="48" height="48" /></a>
+    <a title="{{ bname:s }}" class="btn avatar" data-turbo-frame="_top" href="/users/{{ buid:d }}"><img aria-label="{{ bname:s }} boosted {{ bcontent:s }}" src="/users/{{ bsgid:s }}/avatar?v={{ bver:s }}" width="48" height="48" /></a>
     </figure>
     <span role="button" class="txt-small txt-medium" data-action="click-&gt;boost-delete#reveal keydown.enter-&gt;boost-delete#reveal:prevent" data-boost-delete-target="content">{{ bcontent:s }}</span>
     <form class="button_to" method="post" action="/messages/{{ mid:d }}/boosts/{{ bid:d }}"><input type="hidden" name="_method" value="delete" /><button data-action="boost-delete#perform" data-boost-delete-target="button" class="btn btn--negative flex-item-justify-end boost__delete" type="submit">
@@ -47,7 +44,7 @@ koru/dom:component(Msg) {
     <div id="message_{{ cmid:s }}" class="message " data-controller="reply" data-user-id="{{ uid:d }}" data-message-id="{{ mid:d }}" data-message-timestamp="{{ ms:d }}" data-message-updated-at="{{ ums:d }}" data-sort-value="{{ ms:d }}" data-messages-target="message" data-search-results-target="message" data-refresh-room-target="message" data-reply-composer-outlet="#composer">
     <h2 class="message__day-separator"><time datetime="{{ iso:s }}" data-local-time-target="date"></time></h2>
     <figure class="avatar message__avatar">
-    <a title="{{ atitle:s }}" class="btn avatar" data-turbo-frame="_top" href="/users/{{ uid:d }}"><img aria-hidden="true" src="/users/{{ uid:d }}/avatar?v={{ uver:s }}" width="48" height="48" /></a>
+    <a title="{{ atitle:s }}" class="btn avatar" data-turbo-frame="_top" href="/users/{{ uid:d }}"><img aria-hidden="true" src="/users/{{ usgid:s }}/avatar?v={{ uver:s }}" width="48" height="48" /></a>
     </figure>
     <turbo-frame id="edit_message_{{ cmid:s }}">
     <div class="message__body">
@@ -407,7 +404,7 @@ koru/dom:component(RoomPage) {
     <strong>Check your Curl settings</strong>
     <img aria-hidden="true" class="disclosure" src="/assets/disclosure-26d63471.svg" width="10" height="10" />
     </summary>
-    <p>Ensure notifications are enabled for <em>http://{{ host:s }}/</em> in your web browser settings.</p>
+    <p>Ensure notifications are enabled for <em>https://{{ host:s }}/</em> in your web browser settings.</p>
     </details>
     <details class="notifications-help hide-in-browser" data-notifications-target="details">
     <summary class="btn">
@@ -446,12 +443,12 @@ koru/dom:component(RoomPage) {
     </span>
     </nav>
     <main id="main-content">
-    <div id="message-area" class="message-area" contents="true" data-controller="messages presence drop-target" data-action="turbo:before-stream-render@document-&gt;messages#beforeStreamRender keydown.up@document-&gt;messages#editMyLastMessage dragenter-&gt;drop-target#dragenter dragover-&gt;drop-target#dragover drop-&gt;drop-target#drop visibilitychange@document-&gt;presence#visibilityChanged" data-messages-first-of-day-class="message--first-of-day" data-messages-formatted-class="message--formatted" data-messages-me-class="message--me" data-messages-mentioned-class="message--mentioned" data-messages-threaded-class="message--threaded" data-messages-page-url-value="http://{{ host:s }}/rooms/{{ rid:s }}/messages">
+    <div id="message-area" class="message-area" contents="true" data-controller="messages presence drop-target" data-action="turbo:before-stream-render@document-&gt;messages#beforeStreamRender keydown.up@document-&gt;messages#editMyLastMessage dragenter-&gt;drop-target#dragenter dragover-&gt;drop-target#dragover drop-&gt;drop-target#drop visibilitychange@document-&gt;presence#visibilityChanged" data-messages-first-of-day-class="message--first-of-day" data-messages-formatted-class="message--formatted" data-messages-me-class="message--me" data-messages-mentioned-class="message--mentioned" data-messages-threaded-class="message--threaded" data-messages-page-url-value="https://{{ host:s }}/rooms/{{ rid:s }}/messages">
     <script type="text/template" data-messages-target="template">
     <div class="message message--me $messageClasses$" id="message_$clientMessageId$" data-format-message-target="message" data-user-id="{{ uid:d }}" data-message-timestamp="$messageTimestamp$" data-messages-target="message">
     <div class="message__day-separator"><time class="message__timestamp" datetime="$messageDatetime$" data-local-time-target="date"></time></div>
     <figure class="avatar message__avatar">
-    <a title="{{ uname:s }}" class="btn avatar" data-turbo-frame="_top" href="/users/{{ uid:d }}"><img aria-hidden="true" src="/users/{{ uid:d }}/avatar?v={{ uver:s }}" width="48" height="48" /></a>
+    <a title="{{ uname:s }}" class="btn avatar" data-turbo-frame="_top" href="/users/{{ uid:d }}"><img aria-hidden="true" src="/users/{{ usgid:s }}/avatar?v={{ uver:s }}" width="48" height="48" /></a>
     </figure>
     <div class="message__body">
     <div class="message__body-content">
@@ -474,7 +471,8 @@ koru/dom:component(RoomPage) {
     </div>
     </div>
     </script>
-    <div id="messages_{{ msgdom:s }}" class="messages" data-controller="maintain-scroll refresh-room" data-action="turbo:before-stream-render@document-&gt;maintain-scroll#beforeStreamRender visibilitychange@document-&gt;refresh-room#visibilityChanged online@window-&gt;refresh-room#online" data-messages-target="messages" data-refresh-room-loaded-at-value="{{ loaded:d }}" data-refresh-room-url-value="http://{{ host:s }}/rooms/{{ rid:s }}/refresh">{{ rows:h }}</div>
+    <div id="messages_{{ msgdom:s }}" class="messages" data-controller="maintain-scroll refresh-room" data-action="turbo:before-stream-render@document-&gt;maintain-scroll#beforeStreamRender visibilitychange@document-&gt;refresh-room#visibilityChanged online@window-&gt;refresh-room#online" data-messages-target="messages" data-refresh-room-loaded-at-value="{{ loaded:d }}" data-refresh-room-url-value="https://{{ host:s }}/rooms/{{ rid:s }}/refresh">{{ rows:h }}</div>
+    <turbo-cable-stream-source channel="RoomMessagesChannel" signed-stream-name="{{ stream:s }}"></turbo-cable-stream-source>
     <button class="message-area__return-to-latest btn" data-action="messages#returnToLatest" data-messages-target="latest" hidden="hidden"><img aria-hidden="true" src="/assets/arrow-down-3f174d76.svg" width="20" height="20" /><span class="for-screen-reader">Jump to newest message</span></button>
     </div>
     <footer id="footer">
@@ -492,7 +490,7 @@ koru/dom:component(RoomPage) {
     <div class="flex align-end gap full-width">
     <img aria-hidden="true" class="composer__input-hint colorize--black" style="view-transition-name: input-btn;" src="/assets/messages-outlined-87ff0331.svg" width="22" height="22" />
     <div class="flex flex-column flex-item-grow min-width gap">
-    <lexxy-editor rows="1" class="input lexxy-content" style="order: -1" aria-multiline="true" aria-label="Write a message" permitted-attachment-types="application/vnd.campfire.mention application/vnd.actiontext.opengraph-embed" data-controller="unfurl" data-action="lexxy:change-&gt;typing-notifications#start keydown-&gt;composer#submitByKeyboard:capture lexxy:change-&gt;composer#saveDraft lexxy:insert-link-&gt;unfurl#unfurl" data-composer-target="text" data-direct-upload-url="http://{{ host:s }}/rails/active_storage/direct_uploads" data-blob-url-template="http://{{ host:s }}/rails/active_storage/blobs/redirect/:signed_id/:filename" id="message_body" input="message_body_trix_input_message" name="message[body]">
+    <lexxy-editor rows="1" class="input lexxy-content" style="order: -1" aria-multiline="true" aria-label="Write a message" permitted-attachment-types="application/vnd.campfire.mention application/vnd.actiontext.opengraph-embed" data-controller="unfurl" data-action="lexxy:change-&gt;typing-notifications#start keydown-&gt;composer#submitByKeyboard:capture lexxy:change-&gt;composer#saveDraft lexxy:insert-link-&gt;unfurl#unfurl" data-composer-target="text" data-direct-upload-url="https://{{ host:s }}/rails/active_storage/direct_uploads" data-blob-url-template="https://{{ host:s }}/rails/active_storage/blobs/redirect/:signed_id/:filename" id="message_body" input="message_body_trix_input_message" name="message[body]">
     <lexxy-prompt trigger="@" name="mention" src="/autocompletable/users?room_id={{ rid:s }}" remote-filtering="true" empty-results="No matches"></lexxy-prompt>
     </lexxy-editor>
     </div>
@@ -542,6 +540,7 @@ koru/dom:component(RoomPage) {
 // ── Page flows ──────────────────────────────────────────────────────────────
 import koru/sqlite3
 import pages
+import signing
 import std/io
 
 // Helper tors (impls in index.kz — the .k companion is the contract file).
@@ -552,6 +551,7 @@ pub tor stash-user { uid: i64, name: string, role: i64, ver: string }
 pub tor room-present {} -> bool
 pub tor room-name {} -> string
 pub tor room-key {} -> string
+pub tor room-type {} -> string
 pub tor ts-ms { ts: string } -> i64
 pub tor ts-iso { ts: string } -> string
 pub tor ts-ver { ts: string } -> string
@@ -618,7 +618,8 @@ room-page = pages:page-begin()
                      |> koru/sqlite3:col.text(stmt: br, index: 4): bnm
                      |> koru/sqlite3:col.text(stmt: br, index: 5): buat
                      |> ts-ver(ts: buat): bver
-                     |> Boost-render(bid, mid: bmid, buid, bname: bnm, bcontent: bct, bver): bf
+                     |> signing:user-sgid(id: buid): bsg
+                     |> Boost-render(bid, mid: bmid, buid, bsgid: bsg, bname: bnm, bcontent: bct, bver): bf
                      |> boost-stash(mid: bmid, html: bf)
                      |> std/io:free(content: bf)
             | done d3 |> koru/sqlite3:default(conn: d3) {
@@ -657,8 +658,9 @@ room-page = pages:page-begin()
                         |> ts-ver(ts: auat): uver
                         |> room-name(): rn3
                         |> boost-rows(mid): brow
+                        |> signing:user-sgid(id: uid): usg
                         |> Msg-render(cmid: cid, mid, uid, rid, ms, ums, iso,
-                                      author: anm, atitle, uver,
+                                      author: anm, atitle, uver, usgid: usg,
                                       roomname: rn3, body, boosts: brow): mt
                         |> pages:page-write(text: mt)
                         |> std/io:free(content: mt)
@@ -687,14 +689,17 @@ page-shell = pages:page-take(): rows
     |> user-id(): uid
     |> user-name(): unm
     |> user-ver(): uver
+    |> signing:user-sgid(id: uid): usg
+    |> room-type(): rt
+    |> signing:messages-stream(rtype: rt, rid): stm
     |> body-class(): bc
     |> now-ms(): lat
     |> RoomPage-render(title: rn, rid, msgdom: md,
-                       uid, uname: unm, uver,
+                       uid, uname: unm, uver, usgid: usg,
                        bodyclass: bc, loaded: lat,
                        host: hst, editpath: ep,
                        logo: "20260101160000",
-                       rows): page
+                       stream: stm, rows): page
     |> pages:page-begin()
     |> pages:page-write(text: "<!DOCTYPE html>")
     |> pages:page-write(text: page)

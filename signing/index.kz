@@ -1,0 +1,82 @@
+// signing — Rails-compatible message signing, kept out of the views module.
+//
+// Two consumers on the room page:
+//   - `user-sgid`: `record.signed_id(purpose: :avatar)` for avatar URLs
+//     (ActiveRecord::SignedId). Envelope {"_rails":{"data":<id>,
+//     "pur":"user/avatar"}}, urlsafe-base64 unpadded, HMAC-SHA256 hex sig,
+//     joined "--". Key PBKDF2-HMAC-SHA256(SECRET_KEY_BASE,
+//     "active_record/signed_id", 1000, 64).
+//   - `messages-stream`: `Turbo::StreamsChannel.signed_stream_name(
+//     [room, :messages])` — streamables joined ":", the room becoming its
+//     gid.to_param (urlsafe-b64 of gid://campfire/<Type>/<id>); the name is
+//     JSON-dumped, strict-base64'd (no metadata envelope), signed
+//     HMAC-SHA256 with key derived under salt
+//     "turbo/signed_stream_verifier_key".
+//
+// SECRET_KEY_BASE comes from the environment like the reference; unset
+// renders an empty signature — a visibly broken URL, never a silent
+// substitute.
+
+const std = @import("std");
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+
+// Keys derive once per thread — Rails likewise builds a verifier once and
+// reuses it; PBKDF2's 1000 iterations are a derivation cost, not per-sign.
+threadlocal var sgid_key: [64]u8 = undefined;
+threadlocal var sgid_key_ok: bool = false;
+threadlocal var stream_key: [64]u8 = undefined;
+threadlocal var stream_key_ok: bool = false;
+
+fn derivedKey(salt: []const u8, cache: *[64]u8, ok: *bool) ?*const [64]u8 {
+    if (ok.*) return cache;
+    const secret = std.posix.getenv("SECRET_KEY_BASE") orelse return null;
+    std.crypto.pwhash.pbkdf2(cache, secret, salt, 1000, HmacSha256) catch return null;
+    ok.* = true;
+    return cache;
+}
+
+fn hmacHex(key: []const u8, msg: []const u8) [64]u8 {
+    var mac: [32]u8 = undefined;
+    HmacSha256.create(&mac, msg, key);
+    return std.fmt.bytesToHex(mac, .lower);
+}
+
+threadlocal var sgid_buf: [256]u8 = undefined;
+
+~pub tor user-sgid { id: i64 } -> string
+~proc user-sgid|zig {
+    const key = derivedKey("active_record/signed_id", &sgid_key, &sgid_key_ok) orelse return "";
+    var env_buf: [128]u8 = undefined;
+    const envelope = std.fmt.bufPrint(&env_buf,
+        "{{\"_rails\":{{\"data\":{d},\"pur\":\"user/avatar\"}}}}", .{id}) catch return "";
+    const enc_len = std.base64.url_safe_no_pad.Encoder.calcSize(envelope.len);
+    const enc = sgid_buf[0..enc_len];
+    _ = std.base64.url_safe_no_pad.Encoder.encode(enc, envelope);
+    const sig = hmacHex(key, enc);
+    sgid_buf[enc_len] = '-';
+    sgid_buf[enc_len + 1] = '-';
+    @memcpy(sgid_buf[enc_len + 2 .. enc_len + 66], &sig);
+    return sgid_buf[0 .. enc_len + 66];
+}
+
+threadlocal var stream_buf: [512]u8 = undefined;
+
+~pub tor messages-stream { rtype: string, rid: string } -> string
+~proc messages-stream|zig {
+    const key = derivedKey("turbo/signed_stream_verifier_key", &stream_key, &stream_key_ok) orelse return "";
+    var gid_buf: [128]u8 = undefined;
+    const gid = std.fmt.bufPrint(&gid_buf, "gid://campfire/{s}/{s}", .{ rtype, rid }) catch return "";
+    const gp_len = std.base64.url_safe_no_pad.Encoder.calcSize(gid.len);
+    var gp_buf: [128]u8 = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(gp_buf[0..gp_len], gid);
+    var dumped_buf: [192]u8 = undefined;
+    const dumped = std.fmt.bufPrint(&dumped_buf, "\"{s}:messages\"", .{gp_buf[0..gp_len]}) catch return "";
+    const enc_len = std.base64.standard.Encoder.calcSize(dumped.len);
+    const enc = stream_buf[0..enc_len];
+    _ = std.base64.standard.Encoder.encode(enc, dumped);
+    const sig = hmacHex(key, enc);
+    stream_buf[enc_len] = '-';
+    stream_buf[enc_len + 1] = '-';
+    @memcpy(stream_buf[enc_len + 2 .. enc_len + 66], &sig);
+    return stream_buf[0 .. enc_len + 66];
+}

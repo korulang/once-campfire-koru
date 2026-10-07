@@ -93,6 +93,12 @@ fn roomKey() []const u8 {
     return roomKey();
 }
 
+// The STI class name verbatim ("Rooms::Closed") — the GID in the signed
+// stream name needs it, unlike the param_key above.
+~proc room-type|zig {
+    return room_type_buf[0..room_type_len];
+}
+
 // ── Timestamps ──────────────────────────────────────────────────────────────
 // Seed datetimes are "YYYY-MM-DD HH:MM:SS" (optionally ".ffffff").
 

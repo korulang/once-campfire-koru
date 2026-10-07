@@ -8,6 +8,7 @@
     "std": "../koru/koru_std",
     "pages": "./pages",
     "session": "./session",
+    "signing": "./signing",
     "views": "./views"
   }
 }
