@@ -705,3 +705,18 @@ page-shell = pages:page-take(): rows
     |> pages:page-write(text: page)
     |> std/io:free(content: page)
     |> pages:page-take(): body -> body
+
+// Detached render of one message row — the partial `messages/create`
+// broadcasts and re-renders (`render @message` outside a request). The Msg
+// component is private to this module; this is its public face, with the
+// same slots the room-page row arm fills and `boosts` empty for a fresh
+// message.
+pub tor message-render { cmid: string, mid: i64, uid: i64, rid: string,
+                         ms: i64, ums: i64, iso: string, author: string,
+                         atitle: string, uver: string, usgid: string,
+                         roomname: string, body: string, boosts: string } -> string<std/io:allocated!>
+
+// The impl is a zig proc (index.kz): an `allocated!` value auto-discharges
+// at a chain's end before it can satisfy the flow's return, so the call to
+// the component's render event happens host-side where the return hands
+// the buffer straight to the caller.

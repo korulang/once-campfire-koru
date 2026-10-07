@@ -9,6 +9,7 @@ import orisha/pump
 import koru/sqlite3
 import bcrypt
 import cable
+import messages
 import pages
 import session
 import signing
@@ -253,6 +254,11 @@ orisha:handler = orisha:router(req)
     |> if(ue != null)
     | then |> messages-page(p.id, before): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
+! [POST /rooms/:id/messages] p |> orisha:cookie(req, name: "session_token"): tok
+    |> signing:cookie-verify(raw: tok): vtok
+    |> orisha:form(req, name: "message[body]"): mbody
+    |> orisha:form(req, name: "message[client_message_id]"): mcmid
+    |> messages:create(rid: p.id, token: vtok, body: mbody, cmid: mcmid): res -> res
 ! [GET /users/me/sidebar] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
     |> if(ue != null)
     | then |> sidebar-page(user_email: ue): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html" }

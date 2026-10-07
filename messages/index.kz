@@ -1,0 +1,264 @@
+// messages/index.kz — the zig half of the messages module: request-scoped
+// cells for the creator row and inserted id, timestamp shaping, the
+// client_message_id oracle, plain-text extraction for the FTS index, and
+// the turbo-stream envelope. The flow in index.k spells MessagesController
+// #create; these are its working parts.
+
+const std = @import("std");
+
+const A = std.heap.page_allocator;
+
+// ── Request-scoped cells ─────────────────────────────────────────────────
+// Same convention as session/'s cells: the route arm runs to completion on
+// one worker thread, so the cells are request-scoped. `! row` arms cannot
+// produce the tor's terminal, so the creator row and the RETURNING id ride
+// cells across the `| done` continuations.
+
+threadlocal var cr_uid: i64 = 0;
+threadlocal var cr_name_buf: [128]u8 = undefined;
+threadlocal var cr_name_len: usize = 0;
+threadlocal var cr_bio_buf: [256]u8 = undefined;
+threadlocal var cr_bio_len: usize = 0;
+threadlocal var cr_ver_buf: [40]u8 = undefined;
+threadlocal var cr_ver_len: usize = 0;
+threadlocal var new_mid: i64 = 0;
+
+~proc msg-reset|zig {
+    cr_uid = 0;
+    cr_name_len = 0;
+    cr_bio_len = 0;
+    cr_ver_len = 0;
+    new_mid = 0;
+}
+
+fn stashStr(buf: []u8, len: *usize, s: []const u8) void {
+    len.* = @min(s.len, buf.len);
+    @memcpy(buf[0..len.*], s[0..len.*]);
+}
+
+~proc stash-creator|zig {
+    cr_uid = uid;
+    stashStr(&cr_name_buf, &cr_name_len, name);
+    stashStr(&cr_bio_buf, &cr_bio_len, bio);
+    stashStr(&cr_ver_buf, &cr_ver_len, ver);
+}
+
+// The `| done` gates: a missing row leaves cr_uid at the reset value.
+~proc cr-authed|zig { return cr_uid != 0; }
+~proc cr-uid|zig { return cr_uid; }
+~proc cr-name|zig { return cr_name_buf[0..cr_name_len]; }
+~proc cr-bio|zig { return cr_bio_buf[0..cr_bio_len]; }
+~proc cr-ver|zig { return cr_ver_buf[0..cr_ver_len]; }
+~proc stash-mid|zig { new_mid = mid; }
+~proc get-mid|zig { return new_mid; }
+
+// ── Timestamps ───────────────────────────────────────────────────────────
+// tx.now() — the reference's database clock truncates to microseconds and
+// writes "YYYY-MM-DD HH:MM:SS.ffffff". Inverse Hinnant for the civil half.
+// NOTE the year is cast unsigned before formatting: Zig 0.15's {d:0>4}
+// renders a signed year "+2046", which the signing module's parser then
+// misreads — the cookie bug this port already shipped once.
+
+const Civil = struct { y: i64, m: i64, d: i64 };
+
+fn civilOf(z0: i64) Civil {
+    const z = z0 + 719468;
+    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    return .{ .y = if (m <= 2) y + 1 else y, .m = m, .d = d };
+}
+
+fn fmtMicros(buf: []u8, micros: i64) []const u8 {
+    const days = @divFloor(micros, 86_400_000_000);
+    const rem = micros - days * 86_400_000_000;
+    const c = civilOf(days);
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
+        @as(u64, @intCast(c.y)),
+        @as(u64, @intCast(c.m)),
+        @as(u64, @intCast(c.d)),
+        @as(u64, @intCast(@divFloor(rem, 3_600_000_000))),
+        @as(u64, @intCast(@mod(@divFloor(rem, 60_000_000), 60))),
+        @as(u64, @intCast(@mod(@divFloor(rem, 1_000_000), 60))),
+        @as(u64, @intCast(@mod(rem, 1_000_000))),
+    }) catch "";
+}
+
+// Distinct buffers — msg-now's slice is bound into the same SQL statement
+// as msg-cutoff's (the unread sweep), so they may not share storage.
+threadlocal var now_buf: [40]u8 = undefined;
+threadlocal var cut_buf: [40]u8 = undefined;
+
+~proc msg-now|zig {
+    return fmtMicros(&now_buf, std.time.microTimestamp());
+}
+
+// `Membership::connection_cutoff(now)` — a member counts as connected for
+// the unread sweep only when their heartbeat is fresher than 60s.
+~proc msg-cutoff|zig {
+    return fmtMicros(&cut_buf, std.time.microTimestamp() - 60_000_000);
+}
+
+// ── Ids ──────────────────────────────────────────────────────────────────
+// `SecureRandom.uuid` — v4, hyphenated.
+threadlocal var uuid_buf: [36]u8 = undefined;
+
+fn uuid4() []const u8 {
+    var b: [16]u8 = undefined;
+    std.crypto.random.bytes(&b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    const hex = "0123456789abcdef";
+    var j: usize = 0;
+    for (b, 0..) |byte, i| {
+        if (i == 4 or i == 6 or i == 8 or i == 10) {
+            uuid_buf[j] = '-';
+            j += 1;
+        }
+        uuid_buf[j] = hex[byte >> 4];
+        uuid_buf[j + 1] = hex[byte & 0xf];
+        j += 2;
+    }
+    return uuid_buf[0..36];
+}
+
+~proc msg-uuid|zig {
+    return uuid4();
+}
+
+// `params[:client_message_id].presence || SecureRandom.uuid` — a blank
+// supplied id does not survive presence.
+~proc cmid-or|zig {
+    if (supplied) |s| {
+        if (s.len > 0) return s;
+    }
+    return uuid4();
+}
+
+// `params[:id]` coerced — a non-numeric room id can never join, so it lands
+// on the not-found branch like the reference's find_or_not_found.
+~proc msg-int|zig {
+    return std.fmt.parseInt(i64, s, 10) catch 0;
+}
+
+~proc str-or|zig {
+    return s orelse "";
+}
+
+// ── Action Text surfaces ─────────────────────────────────────────────────
+// `body.to_plain_text` — the FTS index stores text, not markup. Tags drop,
+// block-level closes become newlines, entities decode. The stored body is
+// the submitted HTML verbatim (canonicalize_body's sanitizer pass is a
+// named gap, not this proc's job).
+threadlocal var plain_buf: [16384]u8 = undefined;
+
+fn blockTag(name: []const u8) bool {
+    const blocks = [_][]const u8{ "div", "p", "br", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "blockquote", "pre", "figure", "figcaption", "table", "tr", "td", "th", "hr" };
+    for (blocks) |b| if (std.mem.eql(u8, name, b)) return true;
+    return false;
+}
+
+const Entity = struct { eaten: usize, bytes: [4]u8, len: u3 };
+
+fn entityAt(s: []const u8, i: usize) ?Entity {
+    const rest = s[i..];
+    const semi = std.mem.indexOfScalar(u8, rest, ';') orelse return null;
+    if (semi > 10) return null;
+    const e = rest[1..semi];
+    var out: [4]u8 = undefined;
+    const named = [_]struct { e: []const u8, c: u8 }{
+        .{ .e = "amp", .c = '&' }, .{ .e = "lt", .c = '<' }, .{ .e = "gt", .c = '>' },
+        .{ .e = "quot", .c = '"' }, .{ .e = "apos", .c = '\'' },
+    };
+    for (named) |p| {
+        if (std.mem.eql(u8, e, p.e)) {
+            out[0] = p.c;
+            return .{ .eaten = semi + 1, .bytes = out, .len = 1 };
+        }
+    }
+    // &#39; / &#x27; — numeric codepoints encode utf8.
+    if (e.len > 1 and e[0] == '#') {
+        const cp: u21 = if (e[1] == 'x' or e[1] == 'X')
+            std.fmt.parseInt(u21, e[2..], 16) catch return null
+        else
+            std.fmt.parseInt(u21, e[1..], 10) catch return null;
+        const w: u3 = @intCast(std.unicode.utf8Encode(cp, &out) catch return null);
+        return .{ .eaten = semi + 1, .bytes = out, .len = w };
+    }
+    return null;
+}
+
+~proc plain-text|zig {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < html.len and n < plain_buf.len) {
+        if (html[i] == '<') {
+            // classify the tag before skipping it — block edges emit '\n'.
+            var tn: usize = i + 1;
+            if (tn < html.len and html[tn] == '/') tn += 1;
+            const ns = tn;
+            while (tn < html.len and (std.ascii.isAlphabetic(html[tn]))) : (tn += 1) {}
+            const blk = blockTag(html[ns..tn]);
+            while (i < html.len and html[i] != '>') : (i += 1) {}
+            if (i < html.len) i += 1;
+            if (blk and n > 0 and plain_buf[n - 1] != '\n') {
+                plain_buf[n] = '\n';
+                n += 1;
+            }
+        } else if (html[i] == '&') {
+            if (entityAt(html, i)) |ent| {
+                const take = @min(@as(usize, ent.len), plain_buf.len - n);
+                @memcpy(plain_buf[n .. n + take], ent.bytes[0..take]);
+                n += take;
+                i += ent.eaten;
+            } else {
+                plain_buf[n] = html[i];
+                n += 1;
+                i += 1;
+            }
+        } else {
+            plain_buf[n] = html[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    return plain_buf[0..n];
+}
+
+// The create response — `c.render(200, TURBO_STREAM, html)`: the same
+// append markup the broadcast carried, typed so the flow can produce it.
+~proc respond-created|zig {
+    return .{ .status = 200, .body = body, .content_type = "text/vnd.turbo-stream.html" };
+}
+
+// ── Turbo stream envelope ────────────────────────────────────────────────
+// `dom_id(room, :messages)` — the append target. room-key is the STI
+// param_key ("rooms_closed") the views module derives from the room row.
+threadlocal var tgt_buf: [320]u8 = undefined;
+
+~proc msg-target|zig {
+    return std.fmt.bufPrint(&tgt_buf, "messages_{s}_{s}", .{ key, rid }) catch "";
+}
+
+// `turbo_stream.append` — the broadcast body and the create response share
+// this exact markup (create.turbo_stream.html is one append whose template
+// is the detached message partial).
+threadlocal var wrap_buf: [262144]u8 = undefined;
+
+~proc turbo-wrap|zig {
+    var list = std.ArrayList(u8).initCapacity(A, html.len + target.len + 96) catch return "";
+    defer list.deinit(A);
+    list.appendSlice(A, "<turbo-stream action=\"append\" target=\"") catch return "";
+    list.appendSlice(A, target) catch return "";
+    list.appendSlice(A, "\"><template>") catch return "";
+    list.appendSlice(A, html) catch return "";
+    list.appendSlice(A, "</template></turbo-stream>") catch return "";
+    const n = @min(list.items.len, wrap_buf.len);
+    @memcpy(wrap_buf[0..n], list.items[0..n]);
+    return wrap_buf[0..n];
+}

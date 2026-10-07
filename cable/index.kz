@@ -276,7 +276,7 @@ fn sendToFd(fd: usize, bytes: []const u8) bool {
 // every (connection, stream) registration — duplicates included, matching
 // the pubsub table's per-registration delivery.
 // `payload` is the already-encoded JSON value for `message`.
-~proc fanout|zig {
+fn fanoutImpl(stream: []const u8, payload: []const u8) void {
     reg_mu.lock();
     defer reg_mu.unlock();
     for (0..MAX_TRACKED_FD) |fd| {
@@ -293,6 +293,39 @@ fn sendToFd(fd: usize, bytes: []const u8) bool {
             _ = sendToFd(fd, out.items);
         }
     }
+}
+
+~proc fanout|zig {
+    fanoutImpl(stream, payload);
+}
+
+// `broadcast_unread_room`: `{roomId}` to each member's `user_<id>_unreads`.
+// The message-create flow walks members on its own connection and stashes
+// the uids here; unreads-cast then fans out AFTER the append — the
+// reference's broadcast order (message_create, then unread_room).
+threadlocal var unread_uids: [256]i64 = undefined;
+threadlocal var unread_n: usize = 0;
+
+~proc members-reset|zig {
+    unread_n = 0;
+}
+
+~proc stash-member|zig {
+    if (unread_n < unread_uids.len) {
+        unread_uids[unread_n] = uid;
+        unread_n += 1;
+    }
+}
+
+~proc unreads-cast|zig {
+    var sbuf: [96]u8 = undefined;
+    var pbuf: [64]u8 = undefined;
+    for (unread_uids[0..unread_n]) |muid| {
+        const stream = std.fmt.bufPrint(&sbuf, "user_{d}_unreads", .{muid}) catch continue;
+        const payload = std.fmt.bufPrint(&pbuf, "{{\"roomId\":{d}}}", .{rid}) catch continue;
+        fanoutImpl(stream, payload);
+    }
+    unread_n = 0;
 }
 
 // A JSON string literal, quotes included — turbo-stream markup travels as

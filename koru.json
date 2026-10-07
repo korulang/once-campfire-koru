@@ -7,6 +7,7 @@
     "bcrypt": "../koru-libs/.claude/worktrees/bcrypt-pkg/bcrypt",
     "std": "../koru/koru_std",
     "cable": "./cable",
+    "messages": "./messages",
     "pages": "./pages",
     "session": "./session",
     "signing": "./signing",

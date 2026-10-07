@@ -159,6 +159,17 @@ threadlocal var ver_buf: [16]u8 = undefined;
     return std.time.milliTimestamp();
 }
 
+// `message-render` — the pub face of the Msg component for the broadcast
+// path. The component's render event emits as a sibling symbol in this
+// module, so the proc forwards its Input verbatim; the returned buffer
+// carries its `allocated!` obligation to the caller.
+~proc message-render|zig {
+    return Msg_render_event.handler(.{ .cmid = cmid, .mid = mid, .uid = uid,
+        .rid = rid, .ms = ms, .ums = ums, .iso = iso, .author = author,
+        .atitle = atitle, .uver = uver, .usgid = usgid, .roomname = roomname,
+        .body = body, .boosts = boosts });
+}
+
 // "rooms_<key>_<rid>" — the room dom_id body, shared by messages_, edit_,
 // involvement_ prefixes.
 threadlocal var msgdom_buf: [320]u8 = undefined;
