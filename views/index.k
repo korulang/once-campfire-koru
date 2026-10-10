@@ -565,7 +565,7 @@ pub tor user-ver {} -> string
 pub tor user-title { name: string, bio: string } -> string
 pub tor now-ms {} -> i64
 pub tor host-or { h: ?string } -> string
-pub tor boost-stash { mid: i64, html: string }
+pub tor boost-stash { mid: i64, html: string<*> }
 pub tor boost-rows { mid: i64 } -> string
 
 // The room page. Membership is an EXISTS-shaped join that also yields the

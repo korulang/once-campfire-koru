@@ -74,7 +74,7 @@ threadlocal var path_buf: [256]u8 = undefined;
     return std.fmt.bufPrint(&path_buf, "/rooms/{d}", .{rid}) catch unreachable;
 }
 
-~pub tor stash-text { text: string }
+~pub tor stash-text { text: string<*> }
 ~proc stash-text|zig {
     const n = @min(text.len, email_buf.len);
     @memcpy(email_buf[0..n], text[0..n]);

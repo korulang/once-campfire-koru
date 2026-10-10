@@ -42,9 +42,9 @@ pub tor msg-uuid {} -> string
 pub tor cmid-or { supplied: ?string } -> string
 pub tor msg-int { s: string } -> i64
 pub tor str-or { s: ?string } -> string
-pub tor plain-text { html: string } -> string
+pub tor plain-text { html: string<*> } -> string
 pub tor msg-target { key: string, rid: string } -> string
-pub tor turbo-wrap { target: string, html: string } -> string
+pub tor turbo-wrap { target: string, html: string<*> } -> string
 pub tor respond-created { body: string } -> orisha:Response
 
 pub tor create { rid: string, token: ?string, body: ?string, cmid: ?string } -> orisha:Response

@@ -14,7 +14,7 @@ threadlocal var buf: std.ArrayList(u8) = .empty;
     buf.clearRetainingCapacity();
 }
 
-~pub tor page-write { text: string }
+~pub tor page-write { text: string<*> }
 ~proc page-write|zig {
     buf.appendSlice(std.heap.page_allocator, text) catch unreachable;
 }
