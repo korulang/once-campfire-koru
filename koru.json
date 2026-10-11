@@ -2,7 +2,7 @@
   "name": "once-campfire-koru",
   "version": "0.1.0",
   "paths": {
-    "orisha": "../orisha/lib",
+    "orisha": "../orisha/.claude/worktrees/ws-fanout/lib",
     "koru": "../koru-libs/.claude/worktrees/cf-deps",
     "bcrypt": "../koru-libs/.claude/worktrees/bcrypt-pkg/bcrypt",
     "std": "../koru/koru_std",

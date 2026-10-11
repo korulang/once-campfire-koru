@@ -16,9 +16,15 @@
 //     no Active Storage, no bots.
 //   - RoomNotFound renders a 200 view inside the app layout upstream;
 //     this path answers a bare 404 status instead.
-//   - Writes run sequentially on one pooled connection rather than under
-//     db.transaction — a mid-write failure leaves partial rows the
-//     reference's rollback would erase.
+//   - Writes run under one transaction (BEGIN IMMEDIATE … COMMIT, with
+//     ROLLBACK on any failure) instead of the reference's db.transaction —
+//     same all-or-nothing guarantee. The transaction runs on ONE dedicated
+//     writer thread rather than the request workers' pooled connections,
+//     removing the WAL write-lock contention and the inline checkpoint
+//     from the POST path. The writer signals the inserted id EARLY (right
+//     after the INSERT), so the request thread renders the broadcast
+//     markup in parallel with the remaining statements, then fans out only
+//     after the commit signal.
 
 import orisha
 import koru/sqlite3
@@ -34,8 +40,6 @@ pub tor cr-uid {} -> i64
 pub tor cr-name {} -> string
 pub tor cr-bio {} -> string
 pub tor cr-ver {} -> string
-pub tor stash-mid { mid: i64 }
-pub tor get-mid {} -> i64
 pub tor msg-now {} -> string
 pub tor msg-cutoff {} -> string
 pub tor msg-uuid {} -> string
@@ -47,9 +51,28 @@ pub tor msg-target { key: string, rid: string } -> string
 pub tor turbo-wrap { target: string, html: string<*> } -> string
 pub tor respond-created { body: string } -> orisha:Response
 
+// The write pipeline, split into three request-thread steps around the
+// dedicated writer's FIFO:
+//   msg-enqueue   — enqueue the job (blocks while the ring is full).
+//   msg-wait-mid  — wait for the post-INSERT mid signal, hand back the id.
+//   msg-wait-done — wait for COMMIT/ROLLBACK; true only on commit.
+// The request thread renders between wait-mid and wait-done, overlapping
+// the writer's remaining statements, then broadcasts after wait-done.
+pub tor msg-enqueue { uid: i64, rid: i64, cmid: string, ts: string,
+                      body: string, cut: string, ptext: string }
+pub tor msg-wait-mid {} -> i64
+pub tor msg-wait-done {} -> bool
+
+// The render + broadcast halves of broadcast_create, so the render can run
+// before the commit while fanout/unreads/response wait for it.
+pub tor stash-render { stream: string, payload: string, body: string } -> string
+pub tor render-stream {} -> string
+pub tor render-payload {} -> string
+
 pub tor create { rid: string, token: ?string, body: ?string, cmid: ?string } -> orisha:Response
-pub tor broadcast-create { rid: string, ridn: i64, midn: i64, uidn: i64,
-                           cmidx: string, ts: string, mbody: string } -> orisha:Response
+pub tor broadcast-render { rid: string, ridn: i64, midn: i64, uidn: i64,
+                           cmidx: string, ts: string, mbody: string } -> string
+pub tor broadcast-send { rid: i64, body: string } -> orisha:Response
 
 create =
     msg-reset()
@@ -86,60 +109,34 @@ create =
                                            | then |> str-or(s: body): mbody
                                                   |> msg-now(): ts
                                                   |> cmid-or(supplied: cmid): cmidx
+                                                  |> msg-cutoff(): cut
+                                                  |> plain-text(html: mbody): ptxt
                                                   |> koru/sqlite3:default(conn: d3) {
-                                                      INSERT INTO messages
-                                                          (client_message_id, created_at, creator_id, room_id, updated_at)
-                                                      VALUES ({{cmidx}}, {{ts}}, {{uidn}}, {{ridn}}, {{ts}})
-                                                      RETURNING id
-                                                  }
-                                                  ! row ir |> koru/sqlite3:col.int(stmt: ir, index: 0): miv
-                                                           |> stash-mid(mid: miv)
-                                                  | done d4 |> get-mid(): midn
-                                                            |> koru/sqlite3:default(conn: d4) {
-                                                                INSERT INTO action_text_rich_texts
-                                                                    (name, body, record_type, record_id, created_at, updated_at)
-                                                                VALUES ('body', {{mbody}}, 'Message', {{midn}}, {{ts}}, {{ts}})
-                                                            }
-                                                            | done d5 |> koru/sqlite3:default(conn: d5) {
-                                                                    UPDATE rooms SET updated_at = {{ts}} WHERE id = {{ridn}}
-                                                                }
-                                                                | done d6 |> msg-cutoff(): cut
-                                                                          |> koru/sqlite3:default(conn: d6) {
-                                                                              UPDATE memberships SET unread_at = {{ts}}, updated_at = {{ts}}
-                                                                              WHERE room_id = {{ridn}}
-                                                                                AND involvement != 'invisible'
-                                                                                AND (connected_at IS NULL OR connected_at < {{cut}})
-                                                                                AND user_id != {{uidn}}
-                                                                          }
-                                                                          | done d7 |> plain-text(html: mbody): ptxt
-                                                                                    |> koru/sqlite3:default(conn: d7) {
-                                                                                        INSERT INTO message_search_index (rowid, body)
-                                                                                        VALUES ({{midn}}, {{ptxt}})
-                                                                                    }
-                                                                                    | done d8 |> koru/sqlite3:default(conn: d8) {
-                                                                                            SELECT m.user_id FROM memberships m
-                                                                                            WHERE m.room_id = {{ridn}}
-                                                                                        }
-                                                                                        ! row mr |> koru/sqlite3:col.int(stmt: mr, index: 0): muid
-                                                                                                 |> cable:stash-member(uid: muid)
-                                                                                        | done d9 |> koru/sqlite3:close.pooled(conn: d9)
-                                                                                                  |> broadcast-create(rid, ridn, midn, uidn, cmidx, ts, mbody): res -> res
-                                                                                        | err e8 |> koru/sqlite3:close.pooled(e8.conn) -> { status: 500, body: "member walk failed", content_type: "text/plain" }
-                                                                                    | err e7 |> koru/sqlite3:close.pooled(e7.conn) -> { status: 500, body: "index write failed", content_type: "text/plain" }
-                                                                          | err e6 |> koru/sqlite3:close.pooled(e6.conn) -> { status: 500, body: "unread sweep failed", content_type: "text/plain" }
-                                                                | err e5 |> koru/sqlite3:close.pooled(e5.conn) -> { status: 500, body: "room touch failed", content_type: "text/plain" }
-                                                            | err e4 |> koru/sqlite3:close.pooled(e4.conn) -> { status: 500, body: "rich text write failed", content_type: "text/plain" }
-                                                  | err e3 |> koru/sqlite3:close.pooled(e3.conn) -> { status: 500, body: "message write failed", content_type: "text/plain" }
+                                                          SELECT m.user_id FROM memberships m WHERE m.room_id = {{ridn}}
+                                                      }
+                                                      ! row mr |> koru/sqlite3:col.int(stmt: mr, index: 0): muid
+                                                               |> cable:member-stash(uid: muid)
+                                                      | done d4 |> koru/sqlite3:close.pooled(conn: d4)
+                                                                |> msg-enqueue(uid: uidn, rid: ridn, cmid: cmidx, ts, body: mbody, cut, ptext: ptxt)
+                                                                |> msg-wait-mid(): midn
+                                                                |> broadcast-render(rid, ridn, midn, uidn, cmidx, ts, mbody): shtml
+                                                                |> msg-wait-done(): wok
+                                                                |> if(wok)
+                                                                   | then |> broadcast-send(rid: ridn, body: shtml): res -> res
+                                                                   | else -> { status: 500, body: "write failed", content_type: "text/plain" }
+                                                      | err e4 |> koru/sqlite3:close.pooled(e4.conn) -> { status: 500, body: "member read failed", content_type: "text/plain" }
                                            | else |> koru/sqlite3:close.pooled(conn: d3) -> { status: 404, body: "Room not found", content_type: "text/plain" }
                                  | err e2 |> koru/sqlite3:close.pooled(e2.conn) -> { status: 500, body: "room lookup failed", content_type: "text/plain" }
                              | else |> koru/sqlite3:close.pooled(conn: d2) -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
                    | err e |> koru/sqlite3:close.pooled(e.conn) -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
                | err _ -> { status: 500, body: "db open failed", content_type: "text/plain" }
 
-// `broadcast_create` + the create response: render the detached partial,
-// append it to `<room gid>:messages`, deliver {roomId} to each member's
-// unreads, then answer the same turbo-stream markup the broadcast carried.
-broadcast-create =
+// Render half of broadcast_create: build the detached partial, wrap it in
+// the append turbo-stream, and JSON-quote it for the fanout. Runs between
+// msg-wait-mid and msg-wait-done — the CPU work overlaps the writer's
+// remaining statements. Stashes the fanout stream + quoted payload so
+// broadcast-send can fire them after the commit.
+broadcast-render =
     cr-name(): anm
     |> cr-bio(): abio
     |> cr-ver(): aver
@@ -158,6 +155,14 @@ broadcast-create =
     |> cable:gid-param(rtype: rt, rid: ridn): gp
     |> cable:chan-stream(prefix: gp, gp: "messages"): mstream
     |> cable:json-quote(s: shtml): qhtml
+    |> stash-render(stream: mstream, payload: qhtml, body: shtml): body -> body
+
+// Send half of broadcast_create: the append fanout, {roomId} to each
+// member's unreads, then the same turbo-stream markup as the response.
+// Runs only after msg-wait-done reports a committed write.
+broadcast-send =
+    render-stream(): mstream
+    |> render-payload(): qhtml
     |> cable:fanout(stream: mstream, payload: qhtml)
-    |> cable:unreads-cast(rid: ridn)
-    |> respond-created(body: shtml): res -> res
+    |> cable:unreads-cast(rid)
+    |> respond-created(body): res -> res

@@ -514,12 +514,12 @@ pub tor reject { fd: usize, ident: string }
 
 pub tor fanout { stream: string, payload: string }
 
-// `broadcast_unread_room` — member uids are stashed by the caller's row
-// walk (the message-create flow runs the memberships query on its own
-// connection), then unreads-cast delivers `{roomId}` to each
-// `user_<id>_unreads` stream after the append, matching broadcast order.
+// `broadcast_unread_room` — member uids are read on the request thread's
+// pooled conn before the write is enqueued (member-stash, one per row),
+// then unreads-cast delivers `{roomId}` to each `user_<id>_unreads` stream
+// after the append, matching broadcast order.
 pub tor members-reset {}
-pub tor stash-member { uid: i64 }
+pub tor member-stash { uid: i64 }
 pub tor unreads-cast { rid: i64 }
 
 pub tor json-quote { s: string } -> string

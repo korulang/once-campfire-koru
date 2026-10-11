@@ -8,6 +8,11 @@ const std = @import("std");
 
 const A = std.heap.page_allocator;
 
+// The dedicated writer thread reaches sqlite3's raw C bindings (one
+// non-pooled connection).
+const sqlite3 = @import("root").koru_koru.koru_sqlite3;
+const sqlc = sqlite3.c;
+
 // ── Request-scoped cells ─────────────────────────────────────────────────
 // Same convention as session/'s cells: the route arm runs to completion on
 // one worker thread, so the cells are request-scoped. `! row` arms cannot
@@ -21,14 +26,12 @@ threadlocal var cr_bio_buf: [256]u8 = undefined;
 threadlocal var cr_bio_len: usize = 0;
 threadlocal var cr_ver_buf: [40]u8 = undefined;
 threadlocal var cr_ver_len: usize = 0;
-threadlocal var new_mid: i64 = 0;
 
 ~proc msg-reset|zig {
     cr_uid = 0;
     cr_name_len = 0;
     cr_bio_len = 0;
     cr_ver_len = 0;
-    new_mid = 0;
 }
 
 fn stashStr(buf: []u8, len: *usize, s: []const u8) void {
@@ -49,8 +52,6 @@ fn stashStr(buf: []u8, len: *usize, s: []const u8) void {
 ~proc cr-name|zig { return cr_name_buf[0..cr_name_len]; }
 ~proc cr-bio|zig { return cr_bio_buf[0..cr_bio_len]; }
 ~proc cr-ver|zig { return cr_ver_buf[0..cr_ver_len]; }
-~proc stash-mid|zig { new_mid = mid; }
-~proc get-mid|zig { return new_mid; }
 
 // ── Timestamps ───────────────────────────────────────────────────────────
 // tx.now() — the reference's database clock truncates to microseconds and
@@ -250,15 +251,373 @@ threadlocal var tgt_buf: [320]u8 = undefined;
 // is the detached message partial).
 threadlocal var wrap_buf: [262144]u8 = undefined;
 
+// Bounded append into a fixed retained buffer — the request-thread render
+// scratch (turbo envelope, JSON quote, job buffers) never calls the
+// page_allocator, so the per-POST mmap/munmap churn stays zero. Overflow
+// truncates exactly like the old `@min(len, buf.len)` copies did.
+fn bufAppend(dst: []u8, n: *usize, s: []const u8) void {
+    if (n.* >= dst.len) return;
+    const take = @min(s.len, dst.len - n.*);
+    @memcpy(dst[n.* .. n.* + take], s[0..take]);
+    n.* += take;
+}
+
+// Request-thread scratch arena: the WriteJob's five owned buffers live
+// here, reset per request at msg-wait-done (after the writer's `finished`
+// signal). Retained across requests — same grow-then-reuse shape as
+// cable's deliver_arena.
+threadlocal var req_arena: std.heap.ArenaAllocator = undefined;
+threadlocal var req_arena_ready: bool = false;
+
+fn reqScratch() std.mem.Allocator {
+    if (!req_arena_ready) {
+        req_arena = std.heap.ArenaAllocator.init(A);
+        req_arena_ready = true;
+    }
+    return req_arena.allocator();
+}
+
 ~proc turbo-wrap|zig {
-    var list = std.ArrayList(u8).initCapacity(A, html.len + target.len + 96) catch return "";
-    defer list.deinit(A);
-    list.appendSlice(A, "<turbo-stream action=\"append\" target=\"") catch return "";
-    list.appendSlice(A, target) catch return "";
-    list.appendSlice(A, "\"><template>") catch return "";
-    list.appendSlice(A, html) catch return "";
-    list.appendSlice(A, "</template></turbo-stream>") catch return "";
-    const n = @min(list.items.len, wrap_buf.len);
-    @memcpy(wrap_buf[0..n], list.items[0..n]);
+    var n: usize = 0;
+    bufAppend(&wrap_buf, &n, "<turbo-stream action=\"append\" target=\"");
+    bufAppend(&wrap_buf, &n, target);
+    bufAppend(&wrap_buf, &n, "\"><template>");
+    bufAppend(&wrap_buf, &n, html);
+    bufAppend(&wrap_buf, &n, "</template></turbo-stream>");
     return wrap_buf[0..n];
+}
+
+// ── Dedicated message writer ────────────────────────────────────────────────
+// Every message-create write runs on ONE persistent connection owned by ONE
+// writer thread. Request workers do their session + membership reads on
+// pooled conns, then enqueue a write-job and block until it commits (or
+// rolls back). This removes the ~12-way BEGIN IMMEDIATE fight and the
+// inline WAL checkpoint (`wal_autocheckpoint` default 1000 pages) that was
+// the p99 tail — `sqlite3WalCheckpoint → unixSync/unixWrite/unixTruncate`
+// running inside commits.
+
+const W_CAP = 256;
+
+const WriteJob = struct {
+    uid: i64,
+    rid: i64,
+    cmid: []u8, // owned
+    ts: []u8, // owned
+    body: []u8, // owned
+    cut: []u8, // owned
+    ptext: []u8, // owned
+    // Two per-job signals, both under `mu`:
+    //   - mid_ready: fires right after INSERT ... RETURNING id, so the
+    //     request thread can render in parallel with the remaining
+    //     statements (rich_text, room touch, unread sweep, FTS, COMMIT).
+    //   - finished: fires after COMMIT/ROLLBACK; the request thread waits
+    //     on this before fanout + unreads-cast + response.
+    // The writer writes `mid`/`ok` before signalling the matching cv; the
+    // request thread reads them under `mu` after the cv wakes it.
+    mu: std.Thread.Mutex = .{},
+    cv: std.Thread.Condition = .{},
+    mid_cv: std.Thread.Condition = .{},
+    finished: bool = false,
+    ok: bool = false,
+    mid_ready: bool = false,
+    mid: i64 = 0,
+};
+
+var w_mu: std.Thread.Mutex = .{};
+var w_not_full: std.Thread.Condition = .{};
+var w_not_empty: std.Thread.Condition = .{};
+var w_ring: [W_CAP]*WriteJob = undefined;
+var w_head: usize = 0;
+var w_tail: usize = 0;
+var w_len: usize = 0;
+var w_started: std.atomic.Value(bool) = .init(false);
+
+fn writerOpen() *sqlc.sqlite3 {
+    var db: ?*sqlc.sqlite3 = null;
+    if (sqlc.sqlite3_open("seed/production.sqlite3", &db) != sqlc.SQLITE_OK)
+        @panic("message writer: sqlite open failed");
+    _ = sqlc.sqlite3_busy_timeout(db, 5000);
+    _ = sqlc.sqlite3_exec(db, "PRAGMA journal_mode=WAL", null, null, null);
+    _ = sqlc.sqlite3_exec(db, "PRAGMA synchronous=NORMAL", null, null, null);
+    // No inline checkpoint on commit. The 1000-page autocheckpoint was the
+    // tail's unixSync/unixWrite/unixTruncate; the WAL grows instead and
+    // checkpointing is out-of-band.
+    _ = sqlc.sqlite3_exec(db, "PRAGMA wal_autocheckpoint=0", null, null, null);
+    return db.?;
+}
+
+fn ensureWriter() void {
+    if (w_started.swap(true, .acq_rel)) return;
+    const t = std.Thread.spawn(.{}, writerLoop, .{}) catch
+        @panic("message writer: thread spawn failed");
+    t.detach();
+}
+
+fn writerLoop() void {
+    const db = writerOpen();
+    const wst = prepareWriterStmts(db);
+    while (true) {
+        w_mu.lock();
+        while (w_len == 0) w_not_empty.wait(&w_mu);
+        const job = w_ring[w_head];
+        w_head = (w_head + 1) % W_CAP;
+        w_len -= 1;
+        w_not_full.signal();
+        w_mu.unlock();
+
+        runJob(db, &wst, job);
+
+        job.mu.lock();
+        job.finished = true;
+        job.cv.signal();
+        job.mu.unlock();
+    }
+}
+
+// Enqueue (blocking while the ring is full). Ordering: enqueue order ==
+// commit order, since one writer drains the FIFO serially. The request
+// thread does NOT wait here — it waits on the job's two signals separately
+// (mid_ready for the parallel render, finished for the broadcast).
+fn enqueue(job: *WriteJob) void {
+    ensureWriter();
+    w_mu.lock();
+    while (w_len == W_CAP) w_not_full.wait(&w_mu);
+    w_ring[w_tail] = job;
+    w_tail = (w_tail + 1) % W_CAP;
+    w_len += 1;
+    w_not_empty.signal();
+    w_mu.unlock();
+}
+
+// ── Writer statement cache ────────────────────────────────────────────────
+// The writer owns its raw connection (not a pooled `Connection`), so the
+// package's stmt_cache doesn't cover it. Prepare the five txn statements
+// ONCE at writer startup; each post does reset + clear_bindings + bind +
+// step, dropping the ~40µs/post of prepare_v2+finalize the instrumented
+// run measured across the five statements.
+const WriterStmts = struct {
+    msg: ?*sqlc.sqlite3_stmt = null,
+    rich: ?*sqlc.sqlite3_stmt = null,
+    touch: ?*sqlc.sqlite3_stmt = null,
+    unread: ?*sqlc.sqlite3_stmt = null,
+    fts: ?*sqlc.sqlite3_stmt = null,
+};
+
+fn prepareWriterStmts(db: *sqlc.sqlite3) WriterStmts {
+    var s = WriterStmts{};
+    _ = sqlc.sqlite3_prepare_v2(db,
+        "INSERT INTO messages (client_message_id, created_at, creator_id, room_id, updated_at) VALUES (?1, ?2, ?3, ?4, ?2) RETURNING id",
+        -1, &s.msg, null);
+    _ = sqlc.sqlite3_prepare_v2(db,
+        "INSERT INTO action_text_rich_texts (name, body, record_type, record_id, created_at, updated_at) VALUES ('body', ?1, 'Message', ?2, ?3, ?3)",
+        -1, &s.rich, null);
+    _ = sqlc.sqlite3_prepare_v2(db,
+        "UPDATE rooms SET updated_at = ?1 WHERE id = ?2",
+        -1, &s.touch, null);
+    _ = sqlc.sqlite3_prepare_v2(db,
+        "UPDATE memberships SET unread_at = ?1, updated_at = ?1 WHERE room_id = ?2 AND involvement != 'invisible' AND (connected_at IS NULL OR connected_at < ?3) AND user_id != ?4",
+        -1, &s.unread, null);
+    _ = sqlc.sqlite3_prepare_v2(db,
+        "INSERT INTO message_search_index (rowid, body) VALUES (?1, ?2)",
+        -1, &s.fts, null);
+    if (s.msg == null or s.rich == null or s.touch == null or s.unread == null or s.fts == null)
+        @panic("message writer: statement prepare failed");
+    return s;
+}
+
+// BEGIN IMMEDIATE … COMMIT/ROLLBACK on the writer's connection. Any failing
+// statement bails to ROLLBACK; job.ok is true only on a successful COMMIT.
+fn runJob(db: *sqlc.sqlite3, wst: *const WriterStmts, job: *WriteJob) void {
+    job.ok = false;
+    if (sqlc.sqlite3_exec(db, "BEGIN IMMEDIATE", null, null, null) != sqlc.SQLITE_OK) {
+        _ = sqlc.sqlite3_exec(db, "ROLLBACK", null, null, null);
+        // Must still fire mid_ready or the request thread blocks forever in
+        // msg-wait-mid. Zero mid; msg-wait-done then reports the rollback
+        // and nothing is broadcast.
+        job.mu.lock();
+        job.mid_ready = true;
+        job.mid_cv.signal();
+        job.mu.unlock();
+        return;
+    }
+
+    var rc: c_int = sqlc.SQLITE_OK;
+
+    // 1. messages + RETURNING id
+    {
+        const stmt = wst.msg.?;
+        _ = sqlc.sqlite3_reset(stmt);
+        _ = sqlc.sqlite3_clear_bindings(stmt);
+        _ = sqlite3.bindValue(stmt, 1, job.cmid);
+        _ = sqlite3.bindValue(stmt, 2, job.ts);
+        _ = sqlite3.bindValue(stmt, 3, job.uid);
+        _ = sqlite3.bindValue(stmt, 4, job.rid);
+        _ = sqlite3.bindValue(stmt, 5, job.ts);
+        rc = sqlc.sqlite3_step(stmt);
+        if (rc == sqlc.SQLITE_ROW) {
+            job.mid = sqlc.sqlite3_column_int64(stmt, 0);
+            // The cached statement is never finalized, so it must not be
+            // left mid-ROW: an active statement blocks COMMIT ("SQL
+            // statements in progress"). Step once more to consume the lone
+            // row and reach DONE.
+            rc = sqlc.sqlite3_step(stmt);
+            if (rc == sqlc.SQLITE_DONE) rc = sqlc.SQLITE_OK;
+        }
+    }
+
+    // Signal mid EARLY — the request thread may now render concurrently
+    // with the rest of the txn (rich_text, room touch, unread sweep, FTS,
+    // COMMIT). Always signal: on INSERT failure the render still runs (with
+    // a zero mid) but `finished` reports the rollback and nothing is
+    // broadcast. Firing inside the txn at a fixed position, with jobs
+    // serial on the one writer, keeps job N's mid signal ahead of N+1's.
+    job.mu.lock();
+    job.mid_ready = true;
+    job.mid_cv.signal();
+    job.mu.unlock();
+
+    // 2. Action Text rich-text row
+    if (rc == sqlc.SQLITE_OK) {
+        const stmt = wst.rich.?;
+        _ = sqlc.sqlite3_reset(stmt);
+        _ = sqlc.sqlite3_clear_bindings(stmt);
+        _ = sqlite3.bindValue(stmt, 1, job.body);
+        _ = sqlite3.bindValue(stmt, 2, job.mid);
+        _ = sqlite3.bindValue(stmt, 3, job.ts);
+        rc = sqlc.sqlite3_step(stmt);
+        if (rc == sqlc.SQLITE_DONE) rc = sqlc.SQLITE_OK;
+    }
+
+    // 3. room touch
+    if (rc == sqlc.SQLITE_OK) {
+        const stmt = wst.touch.?;
+        _ = sqlc.sqlite3_reset(stmt);
+        _ = sqlc.sqlite3_clear_bindings(stmt);
+        _ = sqlite3.bindValue(stmt, 1, job.ts);
+        _ = sqlite3.bindValue(stmt, 2, job.rid);
+        rc = sqlc.sqlite3_step(stmt);
+        if (rc == sqlc.SQLITE_DONE) rc = sqlc.SQLITE_OK;
+    }
+
+    // 4. unread sweep
+    if (rc == sqlc.SQLITE_OK) {
+        const stmt = wst.unread.?;
+        _ = sqlc.sqlite3_reset(stmt);
+        _ = sqlc.sqlite3_clear_bindings(stmt);
+        _ = sqlite3.bindValue(stmt, 1, job.ts);
+        _ = sqlite3.bindValue(stmt, 2, job.rid);
+        _ = sqlite3.bindValue(stmt, 3, job.cut);
+        _ = sqlite3.bindValue(stmt, 4, job.uid);
+        rc = sqlc.sqlite3_step(stmt);
+        if (rc == sqlc.SQLITE_DONE) rc = sqlc.SQLITE_OK;
+    }
+
+    // 5. FTS index
+    if (rc == sqlc.SQLITE_OK) {
+        const stmt = wst.fts.?;
+        _ = sqlc.sqlite3_reset(stmt);
+        _ = sqlc.sqlite3_clear_bindings(stmt);
+        _ = sqlite3.bindValue(stmt, 1, job.mid);
+        _ = sqlite3.bindValue(stmt, 2, job.ptext);
+        rc = sqlc.sqlite3_step(stmt);
+        if (rc == sqlc.SQLITE_DONE) rc = sqlc.SQLITE_OK;
+    }
+
+    if (rc == sqlc.SQLITE_OK) {
+        if (sqlc.sqlite3_exec(db, "COMMIT", null, null, null) == sqlc.SQLITE_OK) {
+            job.ok = true;
+        } else {
+            _ = sqlc.sqlite3_exec(db, "ROLLBACK", null, null, null);
+        }
+    } else {
+        _ = sqlc.sqlite3_exec(db, "ROLLBACK", null, null, null);
+    }
+}
+
+// The request thread's in-flight job — one WriteJob per worker thread,
+// reused across requests. The struct's mutex/condvars init once (first
+// use) and are never re-zeroed: after msg-wait-done returns, mu is
+// unlocked and both condvars have no waiters, so the slot refills safely.
+// The job's five owned buffers live in req_arena (see msg-wait-done).
+threadlocal var job_slot: ?*WriteJob = null;
+
+fn getJobSlot() *WriteJob {
+    if (job_slot) |j| return j;
+    const j = A.create(WriteJob) catch unreachable;
+    // Init data fields; mu/cv/mid_cv/finished/ok/mid_ready/mid take their
+    // declared defaults (mutex/condvar init once, never re-zeroed).
+    j.* = .{ .uid = 0, .rid = 0, .cmid = "", .ts = "", .body = "", .cut = "", .ptext = "" };
+    job_slot = j;
+    return j;
+}
+
+~proc msg-enqueue|zig {
+    const job = getJobSlot();
+    const scr = reqScratch();
+    job.uid = uid;
+    job.rid = rid;
+    job.cmid = scr.dupe(u8, cmid) catch unreachable;
+    job.ts = scr.dupe(u8, ts) catch unreachable;
+    job.body = scr.dupe(u8, body) catch unreachable;
+    job.cut = scr.dupe(u8, cut) catch unreachable;
+    job.ptext = scr.dupe(u8, ptext) catch unreachable;
+    job.finished = false;
+    job.ok = false;
+    job.mid_ready = false;
+    job.mid = 0;
+    enqueue(job);
+}
+
+// Wait for the mid signal (post-INSERT) and hand back the inserted id so
+// the request thread can render while the writer finishes the txn.
+~proc msg-wait-mid|zig {
+    const job = job_slot orelse unreachable;
+    job.mu.lock();
+    while (!job.mid_ready) job.mid_cv.wait(&job.mu);
+    const mid = job.mid;
+    job.mu.unlock();
+    return mid;
+}
+
+// Wait for COMMIT/ROLLBACK. Returns whether the txn committed. Resets the
+// request arena — the writer set `finished` under mu, so it is done with
+// the job's owned buffers; resetting (retain_capacity) hands the arena's
+// pages back for the next request. LIFETIME RULE: the WriteJob crosses
+// request→writer, so the arena reset happens here, after the writer's
+// done-signal, never on the request thread's next-request reset.
+~proc msg-wait-done|zig {
+    const job = job_slot orelse unreachable;
+    job.mu.lock();
+    while (!job.finished) job.cv.wait(&job.mu);
+    const ok = job.ok;
+    job.mu.unlock();
+    _ = req_arena.reset(.retain_capacity);
+    return ok;
+}
+
+// ── Broadcast split ─────────────────────────────────────────────────────────
+// The render (message partial + turbo-stream envelope + JSON quote) runs
+// between msg-wait-mid and msg-wait-done, overlapping the writer's
+// remaining statements. Its fanout-side outputs (stream name + quoted
+// payload) are stashed here so broadcast-send can fire them after the
+// commit. All threadlocal — render and send run on the same request thread.
+threadlocal var bs_stream_buf: [512]u8 = undefined;
+threadlocal var bs_stream_len: usize = 0;
+threadlocal var bs_payload_buf: [65536]u8 = undefined;
+threadlocal var bs_payload_len: usize = 0;
+
+~proc stash-render|zig {
+    bs_stream_len = @min(stream.len, bs_stream_buf.len);
+    @memcpy(bs_stream_buf[0..bs_stream_len], stream[0..bs_stream_len]);
+    bs_payload_len = @min(payload.len, bs_payload_buf.len);
+    @memcpy(bs_payload_buf[0..bs_payload_len], payload[0..bs_payload_len]);
+    return body;
+}
+
+~proc render-stream|zig {
+    return bs_stream_buf[0..bs_stream_len];
+}
+
+~proc render-payload|zig {
+    return bs_payload_buf[0..bs_payload_len];
 }

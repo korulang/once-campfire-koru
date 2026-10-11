@@ -61,6 +61,76 @@ fn connEntry(fd: usize) ?*Conn {
 }
 
 // ---------------------------------------------------------------------------
+// subscription index — stream → ident → [fd...], a lookup side-table over
+// registry so deliver() collects a shard's fds without scanning all
+// MAX_TRACKED_FD slots. Keys are owned dupes (A) of the Sub's stream/ident
+// bytes — a Sub's own slices are separate dupes and can be freed by the sub
+// teardown paths without dangling the index. Values are fd lists that may
+// repeat an fd (one entry per registration: a twice-subscribed ident fans
+// out twice, matching the golden transcript's double unread fanout). Subs
+// whose `stream` is empty (base/heartbeat) are NOT indexed. All access is
+// under reg_mu.
+// ---------------------------------------------------------------------------
+
+const FdList = std.ArrayListUnmanaged(usize);
+const IdentMap = std.StringHashMapUnmanaged(FdList);
+var stream_index: std.StringHashMapUnmanaged(IdentMap) = .{};
+
+fn indexAdd(fd: usize, stream: []const u8, ident: []const u8) void {
+    if (stream.len == 0) return;
+    const sgop = stream_index.getOrPut(A, stream) catch return;
+    if (!sgop.found_existing) {
+        sgop.key_ptr.* = A.dupe(u8, stream) catch return;
+        sgop.value_ptr.* = .{};
+    }
+    const igop = sgop.value_ptr.getOrPut(A, ident) catch return;
+    if (!igop.found_existing) {
+        igop.key_ptr.* = A.dupe(u8, ident) catch return;
+        igop.value_ptr.* = .empty;
+    }
+    igop.value_ptr.append(A, fd) catch return;
+}
+
+fn indexRemove(fd: usize, stream: []const u8, ident: []const u8) void {
+    if (stream.len == 0) return;
+    const inner = stream_index.getPtr(stream) orelse return;
+    const list = inner.getPtr(ident) orelse return;
+    for (list.items, 0..) |f, i| {
+        if (f == fd) {
+            _ = list.orderedRemove(i);
+            break;
+        }
+    }
+    if (list.items.len == 0) {
+        if (inner.fetchRemove(ident)) |removed| {
+            A.free(removed.key);
+            var list_val = removed.value;
+            list_val.deinit(A);
+        }
+        if (inner.count() == 0) {
+            if (stream_index.fetchRemove(stream)) |removed| {
+                A.free(removed.key);
+                var inner_val = removed.value;
+                var iit = inner_val.iterator();
+                while (iit.next()) |e| {
+                    A.free(e.key_ptr.*);
+                    e.value_ptr.deinit(A);
+                }
+                inner_val.deinit(A);
+            }
+        }
+    }
+}
+
+// Remove every sub a conn holds from the index (the subs themselves are
+// freed separately by freeConn). Caller holds reg_mu.
+fn indexRemoveConn(fd: usize, conn: *Conn) void {
+    for (conn.subs.items) |sub| {
+        indexRemove(fd, sub.stream, sub.ident);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // lifecycle
 // ---------------------------------------------------------------------------
 
@@ -73,11 +143,17 @@ fn beatLoop() void {
         std.Thread.sleep(3 * std.time.ns_per_s);
         var buf: [80]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"ping\",\"message\":{d}}}", .{std.time.timestamp()}) catch continue;
+        // Snapshot fds under the lock, send outside it — `ws-send-fd` is
+        // fd-addressed and fails safe on a conn that died mid-beat, and the
+        // registry must not be held across N socket writes.
+        var fds: std.ArrayList(usize) = .empty;
+        defer fds.deinit(A);
         reg_mu.lock();
-        defer reg_mu.unlock();
         for (0..MAX_TRACKED_FD) |fd| {
-            if (registry[fd] != null) _ = pump.wsSendFd(fd, 0x1, msg);
+            if (registry[fd] != null) fds.append(A, fd) catch {};
         }
+        reg_mu.unlock();
+        for (fds.items) |fd| _ = pump.wsSendFd(fd, 0x1, msg);
     }
 }
 
@@ -89,7 +165,10 @@ fn beatLoop() void {
         // A reissued fd could theoretically still hold a stale entry —
         // dropped() ran first or the pump never armed it; either way an
         // entry here is dead weight to free before overwrite.
-        if (registry[fd]) |old| freeConn(old);
+        if (registry[fd]) |old| {
+            indexRemoveConn(fd, old);
+            freeConn(old);
+        }
         registry[fd] = conn;
     }
     reg_mu.unlock();
@@ -120,6 +199,7 @@ fn freeConn(conn: *Conn) void {
     $mod.reg_mu.lock();
     const conn = $mod.registry[fd];
     $mod.registry[fd] = null;
+    if (conn) |c| $mod.indexRemoveConn(fd, c);
     $mod.reg_mu.unlock();
     const c = conn orelse return .{ .stale = .{} };
     for (c.subs.items) |sub| {
@@ -166,6 +246,7 @@ fn freeConn(conn: *Conn) void {
         .kind = kind,
         .rid = rid,
     }) catch return;
+    indexAdd(fd, stream, ident);
 }
 
 // `unsubscribe`: drop every entry carrying this identifier. Presence subs
@@ -184,6 +265,7 @@ fn freeConn(conn: *Conn) void {
                 if (sub.kind == $mod.CH_PRESENCE and sub.rid > 0) {
                     gone_rooms.append($mod.A, .{ .uid = conn.uid, .rid = sub.rid }) catch {};
                 }
+                $mod.indexRemove(fd, sub.stream, sub.ident);
                 $mod.A.free(sub.ident);
                 $mod.A.free(sub.stream);
                 _ = conn.subs.orderedRemove(i);
@@ -231,20 +313,20 @@ threadlocal var stream_copy_buf: [512]u8 = undefined;
 // wire envelopes — every payload spelled exactly as the reference emits it
 // ---------------------------------------------------------------------------
 
-fn escWrite(list: *std.ArrayList(u8), s: []const u8) void {
+fn escWrite(list: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) void {
     for (s) |ch| {
         switch (ch) {
-            '"' => list.appendSlice(A, "\\\"") catch return,
-            '\\' => list.appendSlice(A, "\\\\") catch return,
-            '\n' => list.appendSlice(A, "\\n") catch return,
-            '\r' => list.appendSlice(A, "\\r") catch return,
-            '\t' => list.appendSlice(A, "\\t") catch return,
+            '"' => list.appendSlice(gpa, "\\\"") catch return,
+            '\\' => list.appendSlice(gpa, "\\\\") catch return,
+            '\n' => list.appendSlice(gpa, "\\n") catch return,
+            '\r' => list.appendSlice(gpa, "\\r") catch return,
+            '\t' => list.appendSlice(gpa, "\\t") catch return,
             else => {
                 if (ch < 0x20) {
                     var b: [6]u8 = undefined;
                     const e = std.fmt.bufPrint(&b, "\\u{x:0>4}", .{ch}) catch return;
-                    list.appendSlice(A, e) catch return;
-                } else list.append(A, ch) catch return;
+                    list.appendSlice(gpa, e) catch return;
+                } else list.append(gpa, ch) catch return;
             },
         }
     }
@@ -258,7 +340,7 @@ fn sendToFd(fd: usize, bytes: []const u8) bool {
     var out = std.ArrayList(u8).initCapacity(A, ident.len * 2 + 48) catch return;
     defer out.deinit(A);
     out.appendSlice(A, "{\"identifier\":\"") catch return;
-    escWrite(&out, ident);
+    escWrite(&out, A, ident);
     out.appendSlice(A, "\",\"type\":\"confirm_subscription\"}") catch return;
     _ = sendToFd(fd, out.items);
 }
@@ -267,7 +349,7 @@ fn sendToFd(fd: usize, bytes: []const u8) bool {
     var out = std.ArrayList(u8).initCapacity(A, ident.len * 2 + 48) catch return;
     defer out.deinit(A);
     out.appendSlice(A, "{\"identifier\":\"") catch return;
-    escWrite(&out, ident);
+    escWrite(&out, A, ident);
     out.appendSlice(A, "\",\"type\":\"reject_subscription\"}") catch return;
     _ = sendToFd(fd, out.items);
 }
@@ -276,23 +358,225 @@ fn sendToFd(fd: usize, bytes: []const u8) bool {
 // every (connection, stream) registration — duplicates included, matching
 // the pubsub table's per-registration delivery.
 // `payload` is the already-encoded JSON value for `message`.
-fn fanoutImpl(stream: []const u8, payload: []const u8) void {
-    reg_mu.lock();
-    defer reg_mu.unlock();
-    for (0..MAX_TRACKED_FD) |fd| {
-        const c = registry[fd] orelse continue;
-        for (c.subs.items) |sub| {
-            if (!std.mem.eql(u8, sub.stream, stream)) continue;
-            var out = std.ArrayList(u8).initCapacity(A, sub.ident.len * 2 + payload.len + 48) catch continue;
-            defer out.deinit(A);
-            out.appendSlice(A, "{\"identifier\":\"") catch continue;
-            escWrite(&out, sub.ident);
-            out.appendSlice(A, "\",\"message\":") catch continue;
-            out.appendSlice(A, payload) catch continue;
-            out.appendSlice(A, "}") catch continue;
-            _ = sendToFd(fd, out.items);
+//
+// Delivery is K bounded FIFOs of broadcasts (one per fd shard), each drained
+// by its own dedicated thread. Producers dupe `streams`+`payload` once and
+// enqueue a refcounted job into all K queues — no registry scan, no socket
+// writes, no kevents — so the POST path shrinks to sqlite + render +
+// queue-push. Each drainer pops its own queue's job, collects matching subs
+// under reg_mu filtered to its shard (`fd % K == shard_id`; a conn that died
+// post-enqueue is skipped when wsPublishFrame fails to resolve its fd), then
+// sends the built frames serially via wsPublishFrame. A connection's sends
+// all flow through exactly one shard's FIFO, so per-conn order is preserved;
+// cross-shard skew within one broadcast is acceptable — the client-visible
+// invariant is per-connection order, and Rust's sharded fanout has the same
+// shape. One serial drainer measured ~808/s at 100 conns, below the ~1.1K/s
+// post rate; K=4 spreads the ~12µs/conn inline send across 4 threads.
+//
+// Backpressure: a full shard queue blocks the enqueueing producer on that
+// shard's condvar until its drainer frees a slot. Blocking is correct — it
+// throttles the posters to the drainer's actual send rate instead of
+// dropping broadcasts (a dropped broadcast is a correctness bug).
+
+const K = 4;
+const Q_CAP = 512;
+// Job envelope slab: refs (8) + ≤256 stream slice headers (4096) + stream
+// bytes (≤256×96) + payload (≤64KiB) ≈ 94KiB. One contiguous allocation per
+// broadcast; oversized jobs fall back to a fresh A.alloc (freed directly).
+const JOB_CAP = 96 * 1024;
+const POOL_MAX = 64; // retained slabs ≈ 6MiB ceiling
+
+const Job = struct {
+    streams: [][]u8,                // slice headers, in the slab
+    payload: []u8,                  // in the slab
+    refs: *std.atomic.Value(usize), // slab offset 0, shared across K slots
+    slab: []u8,                     // owning slab (len == JOB_CAP => pooled)
+};
+
+var q_mu: [K]std.Thread.Mutex = .{ .{}, .{}, .{}, .{} };
+var q_not_full: [K]std.Thread.Condition = .{ .{}, .{}, .{}, .{} };
+var q_not_empty: [K]std.Thread.Condition = .{ .{}, .{}, .{}, .{} };
+var q_ring: [K][Q_CAP]Job = undefined;
+var q_head: [K]usize = .{ 0, 0, 0, 0 };
+var q_tail: [K]usize = .{ 0, 0, 0, 0 };
+var q_len: [K]usize = .{ 0, 0, 0, 0 };
+var drain_started: std.atomic.Value(bool) = .init(false);
+
+// Slab freelist. The job envelope crosses threads (request → K drainers),
+// so it cannot ride a request-thread arena whose reset would free memory
+// the drainers still hold: instead the LAST drainer (refcount → 0) returns
+// the slab here and the next enqueue pops it. Bounded fixed array (no
+// allocator) under one mutex; empty → fresh A.alloc, full → free.
+var pool_mu: std.Thread.Mutex = .{};
+var pool_slabs: [POOL_MAX][]u8 = undefined;
+var pool_len: usize = 0;
+
+fn jobAlloc(needed: usize) []u8 {
+    if (needed > JOB_CAP) return A.alloc(u8, needed) catch unreachable;
+    pool_mu.lock();
+    const s = if (pool_len > 0) blk: {
+        pool_len -= 1;
+        break :blk pool_slabs[pool_len];
+    } else (A.alloc(u8, JOB_CAP) catch unreachable);
+    pool_mu.unlock();
+    return s;
+}
+
+fn jobFree(slab: []u8) void {
+    if (slab.len != JOB_CAP) {
+        A.free(slab);
+        return;
+    }
+    pool_mu.lock();
+    if (pool_len < POOL_MAX) {
+        pool_slabs[pool_len] = slab;
+        pool_len += 1;
+    } else {
+        A.free(slab);
+    }
+    pool_mu.unlock();
+}
+
+// The job's slab is returned/freed by whichever drainer decrements the
+// refcount last. fetchSub(.acq_rel) makes that release happen-after every
+// other drainer's reads of the slices in deliver().
+fn jobRelease(job: Job) void {
+    if (job.refs.fetchSub(1, .acq_rel) == 1) {
+        jobFree(job.slab);
+    }
+}
+
+fn enqueueJob(streams: []const []const u8, payload: []const u8) void {
+    if (!drain_started.swap(true, .acq_rel)) {
+        for (0..K) |shard| {
+            const t = std.Thread.spawn(.{}, drainLoop, .{shard}) catch
+                @panic("cable: drain thread spawn failed");
+            t.detach();
         }
     }
+    // One contiguous slab: refs | stream slice headers | stream bytes | payload.
+    const n = streams.len;
+    var sb: usize = 0;
+    for (streams) |s| sb += s.len;
+    const needed = 8 + n * @sizeOf([]u8) + sb + payload.len;
+    const slab = jobAlloc(needed);
+
+    const refs: *std.atomic.Value(usize) = @ptrCast(@alignCast(slab.ptr));
+    refs.* = std.atomic.Value(usize).init(K);
+
+    const headers_ptr: [*][]u8 = @ptrCast(@alignCast(slab[8 .. 8 + n * @sizeOf([]u8)].ptr));
+    const hdrs = headers_ptr[0..n];
+    var off: usize = 8 + n * @sizeOf([]u8);
+    for (streams, 0..) |s, i| {
+        @memcpy(slab[off .. off + s.len], s);
+        hdrs[i] = slab[off .. off + s.len];
+        off += s.len;
+    }
+    const pay = slab[off .. off + payload.len];
+    @memcpy(pay, payload);
+
+    const job = Job{ .streams = hdrs, .payload = pay, .refs = refs, .slab = slab };
+
+    // Push the same refcounted job to every shard's ring. If any shard's
+    // queue is full, block here until that shard's drainer frees a slot.
+    for (0..K) |shard| {
+        q_mu[shard].lock();
+        while (q_len[shard] == Q_CAP) q_not_full[shard].wait(&q_mu[shard]);
+        q_ring[shard][q_tail[shard]] = job;
+        q_tail[shard] = (q_tail[shard] + 1) % Q_CAP;
+        q_len[shard] += 1;
+        q_not_empty[shard].signal();
+        q_mu[shard].unlock();
+    }
+}
+
+fn drainLoop(shard: usize) void {
+    while (true) {
+        q_mu[shard].lock();
+        while (q_len[shard] == 0) q_not_empty[shard].wait(&q_mu[shard]);
+        const job = q_ring[shard][q_head[shard]];
+        q_head[shard] = (q_head[shard] + 1) % Q_CAP;
+        q_len[shard] -= 1;
+        q_not_full[shard].signal();
+        q_mu[shard].unlock();
+
+        deliver(shard, job.streams, job.payload);
+        jobRelease(job);
+    }
+}
+
+// Collect the shard's fds from the subscription index under reg_mu, then
+// build frames and send OUTSIDE the lock. Per-(stream,ident) bucket is the
+// index's own unit — the map already dedupes identical (stream,ident) subs
+// across fds into one fd list — so no scan, no stream match, no bucket
+// dedupe. ident bytes are duped here (they outlive the lock); fd lists are
+// copied filtered to this shard. fds are sent in ≤64 chunks —
+// wsPublishFrame's `held` cap — all inline, serial, on the drainer thread.
+// Per-drainer scratch for collect+build. The buckets list, each bucket's
+// ident dupe and fd list, and each broadcast frame all allocate here; the
+// arena resets per job with .retain_capacity so the page_allocator's
+// mmap/munmap churn (~2K syscalls per sample window) becomes one
+// grow-then-reuse. Safe because wsPublishFrame copies frame.items into its
+// own refcounted Frame synchronously and reads the fd slice inline — nothing
+// here outlives the send loop, so reset() frees no slice the pump or another
+// conn still references.
+threadlocal var deliver_arena: std.heap.ArenaAllocator = undefined;
+threadlocal var deliver_arena_ready: bool = false;
+
+fn deliver(shard: usize, streams: [][]u8, payload: []const u8) void {
+    if (!deliver_arena_ready) {
+        deliver_arena = std.heap.ArenaAllocator.init(A);
+        deliver_arena_ready = true;
+    }
+    defer _ = deliver_arena.reset(.retain_capacity);
+    const scratch = deliver_arena.allocator();
+
+    const Bucket = struct {
+        ident: []u8, // owned (arena)
+        fds: std.ArrayList(usize),
+    };
+    var buckets: std.ArrayList(Bucket) = .empty;
+    reg_mu.lock();
+    for (streams) |s| {
+        const inner = stream_index.getPtr(s) orelse continue;
+        var it = inner.iterator();
+        while (it.next()) |entry| {
+            const ident = entry.key_ptr.*;
+            const list = entry.value_ptr.*;
+            const owned_ident = scratch.dupe(u8, ident) catch continue;
+            var b = Bucket{
+                .ident = owned_ident,
+                .fds = .empty,
+            };
+            for (list.items) |f| {
+                if (f % K == shard) b.fds.append(scratch, f) catch {};
+            }
+            if (b.fds.items.len == 0) continue;
+            buckets.append(scratch, b) catch {};
+        }
+    }
+    reg_mu.unlock();
+    for (buckets.items) |b| {
+        var frame = std.ArrayList(u8).initCapacity(scratch, b.ident.len * 2 + payload.len + 48) catch continue;
+        frame.appendSlice(scratch, "{\"identifier\":\"") catch continue;
+        escWrite(&frame, scratch, b.ident);
+        frame.appendSlice(scratch, "\",\"message\":") catch continue;
+        frame.appendSlice(scratch, payload) catch continue;
+        frame.appendSlice(scratch, "}") catch continue;
+        var start: usize = 0;
+        while (start < b.fds.items.len) : (start += 64) {
+            const end = @min(start + 64, b.fds.items.len);
+            _ = pump.wsPublishFrame(b.fds.items[start..end], 0x1, frame.items);
+        }
+    }
+}
+
+fn fanoutImpl(stream: []const u8, payload: []const u8) void {
+    enqueueJob(&.{stream}, payload);
+}
+
+fn fanoutStreams(streams: []const []const u8, payload: []const u8) void {
+    enqueueJob(streams, payload);
 }
 
 ~proc fanout|zig {
@@ -300,9 +584,10 @@ fn fanoutImpl(stream: []const u8, payload: []const u8) void {
 }
 
 // `broadcast_unread_room`: `{roomId}` to each member's `user_<id>_unreads`.
-// The message-create flow walks members on its own connection and stashes
-// the uids here; unreads-cast then fans out AFTER the append — the
-// reference's broadcast order (message_create, then unread_room).
+// The message-create flow stashes member uids here — the request thread
+// reads them on its pooled conn BEFORE the write is enqueued (one
+// member-stash per row) — and unreads-cast then fans out AFTER the append,
+// the reference's broadcast order (message_create, then unread_room).
 threadlocal var unread_uids: [256]i64 = undefined;
 threadlocal var unread_n: usize = 0;
 
@@ -310,36 +595,80 @@ threadlocal var unread_n: usize = 0;
     unread_n = 0;
 }
 
-~proc stash-member|zig {
+// One member uid per call — the request thread's member SELECT fires this
+// once per row (the `! row` arm), filling the unread cells that
+// unreads-cast reads.
+~proc member-stash|zig {
     if (unread_n < unread_uids.len) {
         unread_uids[unread_n] = uid;
         unread_n += 1;
     }
 }
 
+threadlocal var unreads_stream_buf: [256][96]u8 = undefined;
+threadlocal var unreads_streams: [256][]const u8 = undefined;
+
 ~proc unreads-cast|zig {
-    var sbuf: [96]u8 = undefined;
     var pbuf: [64]u8 = undefined;
+    const payload = std.fmt.bufPrint(&pbuf,
+        "{{\"roomId\":{d}}}", .{rid}) catch {
+        unread_n = 0;
+        return;
+    };
+    var n: usize = 0;
     for (unread_uids[0..unread_n]) |muid| {
-        const stream = std.fmt.bufPrint(&sbuf, "user_{d}_unreads", .{muid}) catch continue;
-        const payload = std.fmt.bufPrint(&pbuf, "{{\"roomId\":{d}}}", .{rid}) catch continue;
-        fanoutImpl(stream, payload);
+        unreads_streams[n] = std.fmt.bufPrint(&unreads_stream_buf[n],
+            "user_{d}_unreads", .{muid}) catch continue;
+        n += 1;
     }
     unread_n = 0;
+    // One scan + one send phase for all member streams — the frame is
+    // identical per sub, keyed by (stream, ident).
+    if (n > 0) fanoutStreams(unreads_streams[0..n], payload);
 }
 
 // A JSON string literal, quotes included — turbo-stream markup travels as
-// the `message` string, so the flow wraps it before fanout.
+// the `message` string, so the flow wraps it before fanout. Rendered into a
+// fixed retained buffer (no page_allocator churn); overflow truncates like
+// the old `@min(len, quote_buf.len)` copy.
 threadlocal var quote_buf: [65536]u8 = undefined;
 
+fn bufAppend(dst: []u8, n: *usize, s: []const u8) void {
+    if (n.* >= dst.len) return;
+    const take = @min(s.len, dst.len - n.*);
+    @memcpy(dst[n.* .. n.* + take], s[0..take]);
+    n.* += take;
+}
+
+fn escInto(dst: []u8, n: *usize, s: []const u8) void {
+    for (s) |ch| {
+        switch (ch) {
+            '"' => bufAppend(dst, n, "\\\""),
+            '\\' => bufAppend(dst, n, "\\\\"),
+            '\n' => bufAppend(dst, n, "\\n"),
+            '\r' => bufAppend(dst, n, "\\r"),
+            '\t' => bufAppend(dst, n, "\\t"),
+            else => {
+                if (ch < 0x20) {
+                    var b: [6]u8 = undefined;
+                    const e = std.fmt.bufPrint(&b, "\\u{x:0>4}", .{ch}) catch return;
+                    bufAppend(dst, n, e);
+                } else {
+                    if (n.* < dst.len) {
+                        dst[n.*] = ch;
+                        n.* += 1;
+                    }
+                }
+            },
+        }
+    }
+}
+
 ~proc json-quote|zig {
-    var list = std.ArrayList(u8).initCapacity(A, s.len * 2 + 2) catch return "";
-    defer list.deinit(A);
-    list.append(A, '"') catch return "";
-    escWrite(&list, s);
-    list.append(A, '"') catch return "";
-    const n = @min(list.items.len, quote_buf.len);
-    @memcpy(quote_buf[0..n], list.items[0..n]);
+    var n: usize = 0;
+    bufAppend(&quote_buf, &n, "\"");
+    escInto(&quote_buf, &n, s);
+    bufAppend(&quote_buf, &n, "\"");
     return quote_buf[0..n];
 }
 
@@ -602,43 +931,58 @@ threadlocal var ustream_buf: [96]u8 = undefined;
 // then fanout on the sub's own stream. All mechanism: the sub's stored
 // stream is the broadcasting, the conn's user is the payload's user.
 ~proc typing-cast|zig {
+    var out = std.ArrayList(u8).initCapacity(A, 4096) catch return -1;
+    defer out.deinit(A);
+    var stream_owned: ?[]u8 = null;
+    defer if (stream_owned) |s| A.free(s);
     reg_mu.lock();
-    defer reg_mu.unlock();
-    const c = connEntry(fd) orelse return -1;
+    const c = connEntry(fd) orelse {
+        reg_mu.unlock();
+        return -1;
+    };
     var stream: []const u8 = "";
     for (c.subs.items) |sub| {
         if (std.mem.eql(u8, sub.ident, ident)) stream = sub.stream;
     }
-    if (stream.len == 0) return -1;
-    var out = std.ArrayList(u8).initCapacity(A, 4096) catch return -1;
-    defer out.deinit(A);
-    out.appendSlice(A, "{\"action\":\"") catch return -1;
-    escWrite(&out, action);
-    out.appendSlice(A, "\",\"user\":{\"id\":") catch return -1;
-    var idbuf: [24]u8 = undefined;
-    const ids = std.fmt.bufPrint(&idbuf, "{d}", .{c.uid}) catch return -1;
-    out.appendSlice(A, ids) catch return -1;
-    out.appendSlice(A, ",\"name\":\"") catch return -1;
-    escWrite(&out, c.uname);
-    out.appendSlice(A, "\"}}") catch return -1;
-    const payload = out.items;
-
-    // Fanout INSIDE the lock — same write path as `fanout`, spelling the
-    // per-subscriber envelope.
-    for (0..MAX_TRACKED_FD) |tfd| {
-        const tc = registry[tfd] orelse continue;
-        for (tc.subs.items) |sub| {
-            if (!std.mem.eql(u8, sub.stream, stream)) continue;
-            var env = std.ArrayList(u8).initCapacity(A, sub.ident.len * 2 + payload.len + 48) catch continue;
-            defer env.deinit(A);
-            env.appendSlice(A, "{\"identifier\":\"") catch continue;
-            escWrite(&env, sub.ident);
-            env.appendSlice(A, "\",\"message\":") catch continue;
-            env.appendSlice(A, payload) catch continue;
-            env.appendSlice(A, "}") catch continue;
-            _ = sendToFd(tfd, env.items);
-        }
+    if (stream.len == 0) {
+        reg_mu.unlock();
+        return -1;
     }
+    stream_owned = A.dupe(u8, stream) catch {
+        reg_mu.unlock();
+        return -1;
+    };
+    out.appendSlice(A, "{\"action\":\"") catch {
+        reg_mu.unlock();
+        return -1;
+    };
+    escWrite(&out, A, action);
+    out.appendSlice(A, "\",\"user\":{\"id\":") catch {
+        reg_mu.unlock();
+        return -1;
+    };
+    var idbuf: [24]u8 = undefined;
+    const ids = std.fmt.bufPrint(&idbuf, "{d}", .{c.uid}) catch {
+        reg_mu.unlock();
+        return -1;
+    };
+    out.appendSlice(A, ids) catch {
+        reg_mu.unlock();
+        return -1;
+    };
+    out.appendSlice(A, ",\"name\":\"") catch {
+        reg_mu.unlock();
+        return -1;
+    };
+    escWrite(&out, A, c.uname);
+    out.appendSlice(A, "\"}}") catch {
+        reg_mu.unlock();
+        return -1;
+    };
+    reg_mu.unlock();
+
+    // Same write path as `fanout`: collect under the lock, send outside it.
+    fanoutImpl(stream_owned.?, out.items);
     return 1;
 }
 
