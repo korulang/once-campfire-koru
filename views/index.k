@@ -539,6 +539,7 @@ koru/dom:component(RoomPage) {
 
 // ── Page flows ──────────────────────────────────────────────────────────────
 import koru/sqlite3
+import config
 import pages
 import signing
 import std/io
@@ -556,6 +557,7 @@ pub tor ts-ms { ts: string } -> i64
 pub tor ts-iso { ts: string } -> string
 pub tor ts-ver { ts: string } -> string
 pub tor msgdom { rid: string } -> string
+pub tor html-esc { text: string } -> string
 pub tor room-edit-path { rid: string } -> string
 pub tor page-reset {}
 pub tor body-class {} -> string
@@ -579,7 +581,7 @@ pub tor boost-rows { mid: i64 } -> string
 pub tor room-page { rid: string, email: ?string, host: ?string } -> string
 room-page = pages:page-begin()
     |> page-reset()
-    |> koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
+    |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3:default(conn: d) {
             SELECT r.name, r.type, u.id, u.name, u.role, u.updated_at
             FROM rooms r

@@ -12,6 +12,7 @@
 import orisha
 import koru/yyjson
 import koru/sqlite3
+import config
 import signing
 
 // ============================================================================
@@ -56,7 +57,7 @@ pub tor cable-auth { token: ?string } -> i64
 cable-auth =
     if(token == null)
     | then -> 0
-    | else |> koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
+    | else |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
            | db d |> koru/sqlite3:default(conn: d) {
                    SELECT u.id, u.name FROM sessions s
                    JOIN users u ON u.id = s.user_id
@@ -193,7 +194,7 @@ sub-presence =
 pub tor present { uid: i64, rid: i64 }
 
 present =
-    koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
+    config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3:default(conn: d) {
             UPDATE memberships SET
               connections = CASE WHEN connected_at IS NOT NULL
@@ -221,7 +222,7 @@ read-room-fanout =
 pub tor membership-disconnect { uid: i64, rid: i64 }
 
 membership-disconnect =
-    koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
+    config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3:default(conn: d) {
             UPDATE memberships SET
               connections = CASE WHEN connected_at IS NOT NULL
@@ -245,7 +246,7 @@ membership-disconnect =
 pub tor membership-refresh { uid: i64, rid: i64 }
 
 membership-refresh =
-    koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
+    config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3:default(conn: d) {
             UPDATE memberships SET
               connections = CASE WHEN NOT (connected_at IS NOT NULL
@@ -265,7 +266,7 @@ membership-refresh =
 pub tor member-check { uid: i64, rid: i64 } -> i64
 
 member-check =
-    koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
+    config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3:default(conn: d) {
             SELECT r.type FROM rooms r
             JOIN memberships m ON m.room_id = r.id
@@ -327,7 +328,7 @@ sub-turbo =
 pub tor member-gid-check { uid: i64, rid: i64, gtype: string } -> i64
 
 member-gid-check =
-    koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
+    config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3:default(conn: d) {
             SELECT 1 FROM rooms r
             JOIN memberships m ON m.room_id = r.id

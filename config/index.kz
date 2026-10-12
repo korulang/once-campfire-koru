@@ -1,0 +1,20 @@
+// config — environment knobs matching the reference image's contract.
+//
+// The verification harness runs the production image with HTTP_PORT set
+// (the port bin/benchmark dials) and mounts the database at
+// /rails/storage/db/production.sqlite3. Locally, unset envs keep the dev
+// defaults: port 3109 and seed/production.sqlite3 — configuration
+// defaults, not degraded paths.
+
+const std = @import("std");
+
+~pub tor port {} -> u16
+~proc port|zig {
+    const raw = std.posix.getenv("HTTP_PORT") orelse return 3109;
+    return std.fmt.parseInt(u16, raw, 10) catch 3109;
+}
+
+~pub tor db-path {} -> string
+~proc db-path|zig {
+    return std.posix.getenv("CAMPFIRE_DATABASE_PATH") orelse "seed/production.sqlite3";
+}

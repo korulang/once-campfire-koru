@@ -12,3 +12,4 @@ server.log
 seed/*-shm
 seed/*-wal
 campfire
+*.sqlite3

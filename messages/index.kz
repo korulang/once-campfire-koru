@@ -334,7 +334,8 @@ var w_started: std.atomic.Value(bool) = .init(false);
 
 fn writerOpen() *sqlc.sqlite3 {
     var db: ?*sqlc.sqlite3 = null;
-    if (sqlc.sqlite3_open("seed/production.sqlite3", &db) != sqlc.SQLITE_OK)
+    const db_path = std.posix.getenv("CAMPFIRE_DATABASE_PATH") orelse "seed/production.sqlite3";
+    if (sqlc.sqlite3_open(db_path, &db) != sqlc.SQLITE_OK)
         @panic("message writer: sqlite open failed");
     _ = sqlc.sqlite3_busy_timeout(db, 5000);
     _ = sqlc.sqlite3_exec(db, "PRAGMA journal_mode=WAL", null, null, null);

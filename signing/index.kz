@@ -81,6 +81,45 @@ threadlocal var stream_buf: [512]u8 = undefined;
     return stream_buf[0 .. enc_len + 66];
 }
 
+// Turbo's signed_stream_name for arbitrary payloads: JSON-dump the stream
+// name, strict-b64 (PADDED — InJvb21zIg== keeps its ==), "--", hex hmac
+// under the turbo key. messages-stream inlines this; the sidebar's two
+// Turbo::StreamsChannel sources share it.
+fn turboSign(dumped: []const u8, out: []u8) []const u8 {
+    const key = derivedKey("turbo/signed_stream_verifier_key", &stream_key, &stream_key_ok) orelse return "";
+    const enc_len = std.base64.standard.Encoder.calcSize(dumped.len);
+    _ = std.base64.standard.Encoder.encode(out[0..enc_len], dumped);
+    const sig = hmacHex(key, out[0..enc_len]);
+    out[enc_len] = '-';
+    out[enc_len + 1] = '-';
+    @memcpy(out[enc_len + 2 .. enc_len + 66], &sig);
+    return out[0 .. enc_len + 66];
+}
+
+threadlocal var rooms_buf: [512]u8 = undefined;
+
+// The shared-rooms sidebar source: stream name is the bare string "rooms".
+~pub tor rooms-stream {} -> string
+~proc rooms-stream|zig {
+    return turboSign("\"rooms\"", &rooms_buf);
+}
+
+threadlocal var urooms_buf: [512]u8 = undefined;
+
+// The per-user sidebar source: "<b64url-nopad gid://campfire/User/<id>>:rooms",
+// the gid encoded the way messages-stream does it (url_safe, no pad).
+~pub tor user-rooms-stream { id: i64 } -> string
+~proc user-rooms-stream|zig {
+    var gid_buf: [128]u8 = undefined;
+    const gid = std.fmt.bufPrint(&gid_buf, "gid://campfire/User/{d}", .{id}) catch return "";
+    const gp_len = std.base64.url_safe_no_pad.Encoder.calcSize(gid.len);
+    var gp_buf: [128]u8 = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(gp_buf[0..gp_len], gid);
+    var dumped_buf: [192]u8 = undefined;
+    const dumped = std.fmt.bufPrint(&dumped_buf, "\"{s}:rooms\"", .{gp_buf[0..gp_len]}) catch return "";
+    return turboSign(dumped, &urooms_buf);
+}
+
 // ============================================================================
 // stream-verify — the READ side of messages-stream: Turbo's
 // verified_stream_name. Split at "--", recompute the HMAC over the encoded
@@ -415,4 +454,48 @@ threadlocal var cverify_buf: [1024]u8 = undefined;
     if (tlen > cverify_buf.len) return null;
     @memcpy(cverify_buf[0..tlen], tok[0..tlen]);
     return cverify_buf[0..tlen];
+}
+
+// -- SignedId read side -------------------------------------------------------
+//
+// Inverse of user-sgid: the avatar route gets the token back on the wire
+// and must authenticate it. Envelope is urlsafe-base64 unpadded of
+// {"_rails":{"data":<id>,"pur":"user/avatar"}}, sig is HMAC-SHA256 hex,
+// key PBKDF2 under salt "active_record/signed_id" — same key cache as
+// user-sgid. Answers the user id, or 0 for every failure — a verifier
+// answers no, never an error. `exp` honored if the envelope carries one.
+~pub tor sgid-verify { raw: string } -> i64
+~proc sgid-verify|zig {
+    const key = derivedKey("active_record/signed_id", &sgid_key, &sgid_key_ok) orelse return 0;
+    if (raw.len < 67) return 0;
+    const idx = raw.len - 66;
+    if (raw[idx] != '-' or raw[idx + 1] != '-') return 0;
+    const encoded = raw[0..idx];
+    const digest = raw[idx + 2 ..];
+    const want = hmacHex(key, encoded);
+    if (!std.crypto.timing_safe.eql([64]u8, want, digest[0..64].*)) return 0;
+
+    var dbuf: [256]u8 = undefined;
+    const dlen = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(encoded) catch return 0;
+    if (dlen > dbuf.len) return 0;
+    std.base64.url_safe_no_pad.Decoder.decode(dbuf[0..dlen], encoded) catch return 0;
+
+    const doc = yyjson.c.yyjson_read_opts(&dbuf, dlen, 0, null, null) orelse return 0;
+    defer yyjson.c.yyjson_doc_free(doc);
+    const root = yyjson.c.yyjson_doc_get_root(doc) orelse return 0;
+    const rails = yyjson.c.yyjson_obj_getn(root, "_rails", 6) orelse return 0;
+    const pur = yyjson.c.yyjson_obj_getn(rails, "pur", 3) orelse return 0;
+    const ps = yyjson.c.yyjson_get_str(pur) orelse return 0;
+    if (!std.mem.eql(u8, ps[0..yyjson.c.yyjson_get_len(pur)], "user/avatar")) return 0;
+    const expv = yyjson.c.yyjson_obj_getn(rails, "exp", 3);
+    if (expv != null and !yyjson.c.yyjson_is_null(expv)) {
+        const es = yyjson.c.yyjson_get_str(expv) orelse return 0;
+        const exp_secs = parseIso(es[0..yyjson.c.yyjson_get_len(expv)]) orelse return 0;
+        if (std.time.timestamp() >= exp_secs) return 0;
+    }
+    const data = yyjson.c.yyjson_obj_getn(rails, "data", 4) orelse return 0;
+    if (!yyjson.c.yyjson_is_num(data)) return 0;
+    // positive ids parse as yyjson UINT — get_int handles either subtype,
+    // get_sint would answer 0 and we'd 404 a perfectly valid token.
+    return yyjson.c.yyjson_get_int(data);
 }

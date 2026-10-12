@@ -1,0 +1,132 @@
+// avatar — Users::AvatarsController#show: signed avatar token → the
+// uploaded image's :square variant (resize_to_limit 512, webp), the
+// default bot avatar, or an initials SVG.
+//
+// The SQL side lives in main.k's route arm (same row/done/stash idiom as
+// session+messages): one join walks users → User/avatar attachment →
+// variant record → VariantRecord/image attachment → blob key. This module
+// is everything around it: stashing, the disk path, the initials render,
+// and the response heads.
+
+const std = @import("std");
+
+// Rails' disk service: <root>/<key[0:2]>/<key[2:4]>/<key>. Root is
+// CAMPFIRE_FILES_PATH, else CAMPFIRE_STORAGE_PATH/files, else
+// storage/files — matching the reference image's /rails/storage/files.
+threadlocal var root_buf: [512]u8 = undefined;
+
+fn filesRoot() []const u8 {
+    if (std.posix.getenv("CAMPFIRE_FILES_PATH")) |p| return p;
+    if (std.posix.getenv("CAMPFIRE_STORAGE_PATH")) |p|
+        return std.fmt.bufPrint(&root_buf, "{s}/files", .{p}) catch "storage/files";
+    return "storage/files";
+}
+
+threadlocal var path_buf: [768]u8 = undefined;
+
+~pub tor blob-path { key: string } -> string
+~proc blob-path|zig {
+    const root = filesRoot();
+    if (key.len < 4) return "";
+    return std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}/{s}", .{ root, key[0..2], key[2..4], key }) catch "";
+}
+
+// Read a blob file for a response body. `ok` carries a PLAIN string on
+// purpose: a body outlives this flow's lexical scope, so custody is manual —
+// the response sets body_allocated and the pump frees once. std/io:read-file
+// cannot serve here: its ok string carries allocated!, the ledger settles
+// that debt at scope end, and the pump's free then lands on freed memory.
+~pub tor read-blob { path: string }
+| ok string
+| missing
+| failed
+
+~proc read-blob|zig {
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .{ .missing = .{} },
+        else => return .{ .failed = .{} },
+    };
+    defer file.close();
+    const content = file.readToEndAlloc(koru_allocator(), std.math.maxInt(usize)) catch
+        return .{ .failed = .{} };
+    return .{ .ok = content };
+}
+
+// ── Row stash (row → done boundary, same argument as session's cells) ──
+threadlocal var av_role: i64 = -1;
+threadlocal var av_name_buf: [128]u8 = undefined;
+threadlocal var av_name_len: usize = 0;
+threadlocal var av_key_buf: [80]u8 = undefined;
+threadlocal var av_key_len: usize = 0;
+
+~pub tor av-reset {}
+~proc av-reset|zig {
+    av_role = -1;
+    av_name_len = 0;
+    av_key_len = 0;
+}
+
+// col.text hands "" for NULL, so empty name/key mark absence.
+~pub tor av-stash { role: i64, name: string, key: string }
+~proc av-stash|zig {
+    av_role = role;
+    av_name_len = @min(name.len, av_name_buf.len);
+    @memcpy(av_name_buf[0..av_name_len], name[0..av_name_len]);
+    av_key_len = @min(key.len, av_key_buf.len);
+    @memcpy(av_key_buf[0..av_key_len], key[0..av_key_len]);
+}
+
+// done-side reads: -1 role = no user row at all (find_signed! for a missing
+// user raises RecordNotFound → 404, not a fallback render).
+~pub tor av-role {} -> i64
+~proc av-role|zig { return av_role; }
+
+~pub tor av-key {} -> string
+~proc av-key|zig {
+    return av_key_buf[0..av_key_len];
+}
+
+// ── Initials SVG (users/avatars/show.svg) ──────────────────────────────
+// Palette is Users::AvatarsHelper::AVATAR_COLORS; index is
+// Zlib.crc32(user.to_param) — crc32 of the decimal id.
+const AVATAR_COLORS = [18][]const u8{
+    "#AF2E1B", "#CC6324", "#3B4B59", "#BFA07A", "#ED8008", "#ED3F1C",
+    "#BF1B1B", "#736B1E", "#D07B53", "#736356", "#AD1D1D", "#BF7C2A",
+    "#C09C6F", "#698F9C", "#7C956B", "#5D618F", "#3B3633", "#67695E",
+};
+
+// User#initials — name.scan(/\b\w/).join: ASCII word char at a boundary.
+// \w is ASCII-only but \b sees Unicode word characters — a multibyte byte
+// counts as word so "Élodie" contributes nothing, matching the reference.
+fn initialsOf(name: []const u8, out: []u8) []const u8 {
+    var n: usize = 0;
+    var prev_word = false; // start-of-string is a boundary
+    for (name) |c| {
+        const word = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+        if (word and !prev_word and n < out.len) {
+            out[n] = c;
+            n += 1;
+        }
+        prev_word = word or c >= 0x80;
+    }
+    return out[0..n];
+}
+
+threadlocal var svg_buf: [2048]u8 = undefined;
+threadlocal var ini_buf: [32]u8 = undefined;
+
+~pub tor initials-svg { uid: i64 } -> string
+~proc initials-svg|zig {
+    const name = av_name_buf[0..av_name_len];
+    const ini = initialsOf(name, &ini_buf);
+    var idbuf: [24]u8 = undefined;
+    const idstr = std.fmt.bufPrint(&idbuf, "{d}", .{uid}) catch return "";
+    const color = AVATAR_COLORS[std.hash.Crc32.hash(idstr) % AVATAR_COLORS.len];
+    const length_attr = if (ini.len >= 3) "textLength=\"85%\" lengthAdjust=\"spacingAndGlyphs\"" else "";
+    return std.fmt.bufPrint(&svg_buf,
+        "<svg version=\"1.1\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"\n  viewBox=\"0 0 512 512\" class=\"avatar\" aria-hidden=\"true\">\n  <defs>\n    <clipPath id=\"porthole\">\n      <circle cx=\"50%\" cy=\"50%\" r=\"50%\" />\n    </clipPath>\n  </defs>\n\n  <g>\n    <rect width=\"100%\" height=\"100%\" rx=\"50\" fill=\"{s}\" />\n\n    <text x=\"50%\" y=\"50%\" fill=\"#FFFFFF\"\n      text-anchor=\"middle\" dy=\"0.35em\"\n      {s}\n      font-family=\"-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif\"\n      font-size=\"230\"\n      font-weight=\"800\"\n      letter-spacing=\"-5\">\n      {s}\n    </text>\n  </g>\n</svg>\n",
+        .{ color, length_attr, ini }) catch "";
+}
+
+// expires_in 30.minutes, public: true, stale_while_revalidate: 1.week.
+pub const avatar_cache_headers = "Cache-Control: max-age=1800, public, stale-while-revalidate=604800\r\n";

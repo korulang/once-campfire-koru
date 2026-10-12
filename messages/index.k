@@ -28,6 +28,7 @@
 
 import orisha
 import koru/sqlite3
+import config
 import cable
 import signing
 import views
@@ -82,7 +83,7 @@ create =
     | else |> if(body == null)
         | then -> { status: 400, body: "param is missing or the value is empty: message", content_type: "text/plain" }
         | else |> msg-int(s: rid): ridn
-               |> koru/sqlite3:open.pooled(path: "seed/production.sqlite3")
+               |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
                | db d |> koru/sqlite3:default(conn: d) {
                        SELECT u.id, u.name, u.bio, u.updated_at FROM sessions s
                        JOIN users u ON u.id = s.user_id
@@ -122,7 +123,8 @@ create =
                                                                 |> broadcast-render(rid, ridn, midn, uidn, cmidx, ts, mbody): shtml
                                                                 |> msg-wait-done(): wok
                                                                 |> if(wok)
-                                                                   | then |> broadcast-send(rid: ridn, body: shtml): res -> res
+                                                                   | then |> orisha:generation-bump()
+                                                                          |> broadcast-send(rid: ridn, body: shtml): res -> res
                                                                    | else -> { status: 500, body: "write failed", content_type: "text/plain" }
                                                       | err e4 |> koru/sqlite3:close.pooled(e4.conn) -> { status: 500, body: "member read failed", content_type: "text/plain" }
                                            | else |> koru/sqlite3:close.pooled(conn: d3) -> { status: 404, body: "Room not found", content_type: "text/plain" }

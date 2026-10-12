@@ -24,3 +24,8 @@ date	app	compiler	orisha	sqlite	bcrypt	cell	requests	duration_s	rps	non2xx	detai
 2026-10-06T08:50:30Z	RUST-PORT	-	-	-	-	rooms_anon_c16	587146+662947	10.10x2	62283 (med)	-	thruster 302s ~955B body
 2026-10-06T08:55:00Z	local-dirty	7bbfc3a (route-cont-splice)	24d62c4-dirty	8cfdc3d	f9d27d0	rooms_auth_c16	97926	10.01	9783.32	0	64B stub page; session lookup per req
 2026-10-06T08:55:30Z	RUST-PORT	-	-	-	-	rooms_auth_c16	214803	10.10	21265.47	0	355899B full render; pooled db
+2026-10-10T12:27:48Z	592d872-dirty	89aba75d (main)	3848955-dirty	4828ee6	f9d27d0	up_c16	865625	10.02,	86409.86	0	alive=yes
+2026-10-10T12:27:58Z	592d872-dirty	89aba75d (main)	3848955-dirty	4828ee6	f9d27d0	up_c1	31146	10.04,	3103.46	0	alive=
+2026-10-10T12:28:04Z	592d872-dirty	89aba75d (main)	3848955-dirty	4828ee6	f9d27d0	storm	1500	-	-	0	1500x200  alive=yes
+2026-10-10T12:29:21Z	592d872	89aba75d (main)	3848955	4828ee6	f9d27d0	rooms_auth_c16	382006	10.01	38168.04	0	31KB real render; load~30 laptop steering
+2026-10-10T12:29:21Z	592d872	89aba75d (main)	3848955	4828ee6	f9d27d0	rooms_anon_c16	1194460	10.07	118568.38	0	302s; load~30 laptop steering

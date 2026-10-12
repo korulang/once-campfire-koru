@@ -69,6 +69,31 @@ threadlocal var title_buf: [512]u8 = undefined;
     return if (user_role_v == 1) "sidebar admin" else "sidebar";
 }
 
+// CGI.escapeHTML for non-component writes (sidebar/search row loops build
+// markup by hand): & < > " ' — same five the contract's escapeHTML produces.
+threadlocal var esc_buf: [512]u8 = undefined;
+
+~proc html-esc|zig {
+    var n: usize = 0;
+    for (text) |c| {
+        const rep: []const u8 = switch (c) {
+            '&' => "&amp;", '<' => "&lt;", '>' => "&gt;",
+            '"' => "&quot;", '\'' => "&#39;",
+            else => "",
+        };
+        if (rep.len == 0) {
+            if (n >= esc_buf.len) break;
+            esc_buf[n] = c;
+            n += 1;
+        } else {
+            if (n + rep.len > esc_buf.len) break;
+            @memcpy(esc_buf[n .. n + rep.len], rep);
+            n += rep.len;
+        }
+    }
+    return esc_buf[0..n];
+}
+
 // The member gate the page's done arm reads: true only when the room query
 // produced a row this request (stash-room ran). Reset per request by
 // page-reset.
