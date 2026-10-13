@@ -12,7 +12,7 @@ falsifier re-ran clean — not merely that a load test looked quieter.
 | 4 | orisha pump | `send()` on peer-closed socket → SIGPIPE → silent process death under connection storms | 1500-way curl storm killed server every run, empty log | orisha `254d3af` (`ignoreSigpipe` in all `drive` bodies) | **fixed** — storm survived, storm cell stays as regression probe |
 | 5 | orisha pump | `raw_arena` (x.raw copy) + `request_arena` (Request.allocator) were global FixedBufferAllocators shared by all workers — one worker's `reset()` overwrote a slice another worker's router was mid-parse on → mangled paths → 404, or landed on authed routes → 302 | `GET /up` @ -c16: ~0.10% non-2xx; single-conn clean | orisha `24d62c4` (threadlocal arenas) | **fixed** — 2× -c16 runs, ~3.8M reqs, **0** non-2xx |
 | 6 | koru codegen | produce-type annotation must sit on the `->` decl line; bare-pun record produce emits positional `.{a,b}` | session tor produced `void` Output | worked around in `session-login` | **open** — compiler ergonomics, unpinned |
-| 7 | orisha pump | 85% throughput regression on Linux epoll/io-uring path since Aug (reported by adjacent session) | board run | — | **open** — unverified by this session |
+| 7 | orisha pump | 85% throughput regression on Linux epoll/io-uring path since Aug (reported by adjacent session) | board run | — | **not reproduced** — 2026-10-13 droplet run: epoll pump, 4 pinned cores, contract-validated app routes sustained 73–115k rps (room_show c64 86k, up c64 114k), consistent with macOS/kqueue laptop numbers |
 | 8 | orisha pump | `conn_states` claimed "no index is ever touched twice" — false at the accept boundary: accept thread + worker race on fd reissue could return a dirty state; `releaseConn` on fd≥4096 also leaked the fd | race window, not observed directly — surfaced by the same audit | orisha `e8a8881` (mutex + detach-before-close) | **fixed** — mechanism closed; did not move the -c16 metric on its own (arena was the live desync) |
 | 9 | koru import | dir-scanned companion submodule kept the readdir-first dirent as `canonical_path` while `import dir/sub` resolved probe-order (`.kz` before `.k`) — one module, two canonicals → transform decl collected twice → `duplicate struct member name 'call_handler_orisha_pump_run'` in emitted backend. Deterministic on ext4, invisible on APFS | minimal orisha app on Linux: 2 handlers vs 1 on macOS | koru `7bbfc3a` (dir scan routes stem through `resolveKoruFile`) + pin `140_030` | **fixed** — Linux emits 1 handler + 1 registration; Campfire builds and serves on the droplet |
 
@@ -36,3 +36,30 @@ falsifier re-ran clean — not merely that a load test looked quieter.
 | 2026-10-05 | /up @ -c1, 15s | 464k reqs, ~31k rps, **0** errors |
 | 2026-10-05 | storm 1500 | pre-SIGPIPE: silent death; post-fix: alive, 1500×200 |
 | 2026-10-05 | app routes @ -c16 | ~11.2k rps, 190 non-2xx (pre-busy_timeout) |
+
+## Measured baselines (droplet, s-8vcpu-16gb-amd, contract-validated full-app HTTP)
+
+2026-10-13, `bench/droplet-run-2026-10-13/`. Koru (`--build=linux --release=fast`,
+epoll pump) vs Rust (`cargo build --release`, HEAD with `reference/` submodule),
+same shared fixture, alternating reps ×3, server pinned 0-3 / loadgen 4-7,
+8s cells, every response contract-validated (0 invalid in all 144 cells),
+write audits verified (koru 230k, rust 111k acknowledged+persisted).
+Rust note: a stale local binary failed `search: differs from seed SQL`
+(`created_at` order); the droplet build from current HEAD passes on first
+attempt every rep — the ordering defect was the artifact, not the code.
+Koru emits no `csrf-token` meta (no CSRF verify); loadgen omits the field
+when empty — POST cell symmetric.
+
+| Route | conc | Koru med rps | Rust med rps | K/R |
+|-------|-----:|-------------:|-------------:|----:|
+| room_show | 64 | 86,021 | 13,587 | 6.3x |
+| messages_page | 64 | 87,570 | 14,055 | 6.2x |
+| sidebar | 64 | 105,484 | 17,752 | 5.9x |
+| search | 64 | 98,731 | 17,075 | 5.8x |
+| avatar | 64 | 75,371 | 70,215 | 1.07x |
+| static_css | 64 | 108,831 | 81,030 | 1.34x |
+| up | 64 | 114,126 | 30,216 | 3.8x |
+| post_message | 64 | 3,203 | 1,812 | 1.8x |
+
+Cold start: koru ~50ms / rust ~180ms. Idle RSS: 17MB / 55MB.
+Peak RSS: 37MB / 127MB. Droplet destroyed post-run; no droplets remain.

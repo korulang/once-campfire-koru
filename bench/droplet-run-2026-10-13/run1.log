@@ -1,0 +1,171 @@
+compare-host.sh: line 249: git: command not found
+compare-host.sh: line 249: git: command not found
+[11:34:59] load before run: 0.00 0.18 0.49 (waited 0s)
+[11:34:59] koru rep 1: starting (load: 0.00 0.18 0.49)
+[11:35:10] koru rep 1: cold start 46ms, idle 16MB RSS (contract attempts: 1)
+[11:35:20] koru rep 1: room_show c=1 14317.8 rps p50 0.062 p99 0.131 {'200': 114546} err 0 invalid 0
+[11:35:28] koru rep 1: room_show c=16 92143.8 rps p50 0.165 p99 0.32 {'200': 737296} err 0 invalid 0
+[11:35:36] koru rep 1: room_show c=64 86199.3 rps p50 0.716 p99 1.38 {'200': 690166} err 0 invalid 0
+[11:35:46] koru rep 1: messages_page c=1 14257.5 rps p50 0.063 p99 0.122 {'200': 114066} err 0 invalid 0
+[11:35:54] koru rep 1: messages_page c=16 91325.5 rps p50 0.167 p99 0.313 {'200': 730792} err 0 invalid 0
+[11:36:02] koru rep 1: messages_page c=64 87107.8 rps p50 0.703 p99 1.4 {'200': 697690} err 0 invalid 0
+[11:36:12] koru rep 1: sidebar c=1 16482.9 rps p50 0.054 p99 0.107 {'200': 131866} err 0 invalid 0
+[11:36:20] koru rep 1: sidebar c=16 102900.7 rps p50 0.149 p99 0.281 {'200': 823312} err 0 invalid 0
+[11:36:28] koru rep 1: sidebar c=64 107634.1 rps p50 0.581 p99 1.092 {'200': 861512} err 0 invalid 0
+[11:36:39] koru rep 1: search c=1 15907.9 rps p50 0.057 p99 0.108 {'200': 127267} err 0 invalid 0
+[11:36:47] koru rep 1: search c=16 99359.4 rps p50 0.154 p99 0.289 {'200': 795029} err 0 invalid 0
+[11:36:55] koru rep 1: search c=64 97657.6 rps p50 0.639 p99 1.2 {'200': 781951} err 0 invalid 0
+[11:37:05] koru rep 1: avatar c=1 10586.1 rps p50 0.086 p99 0.16 {'200': 84691} err 0 invalid 0
+[11:37:13] koru rep 1: avatar c=16 73910.3 rps p50 0.188 p99 0.551 {'200': 591357} err 0 invalid 0
+[11:37:21] koru rep 1: avatar c=64 72714.0 rps p50 0.756 p99 2.521 {'200': 582049} err 0 invalid 0
+[11:37:31] koru rep 1: static_css c=1 16892.7 rps p50 0.053 p99 0.103 {'200': 135146} err 0 invalid 0
+[11:37:39] koru rep 1: static_css c=16 96810.7 rps p50 0.159 p99 0.29 {'200': 774609} err 0 invalid 0
+[11:37:47] koru rep 1: static_css c=64 108830.6 rps p50 0.575 p99 1.075 {'200': 871144} err 0 invalid 0
+[11:37:57] koru rep 1: up c=1 19111.1 rps p50 0.047 p99 0.093 {'200': 152892} err 0 invalid 0
+[11:38:05] koru rep 1: up c=16 100009.5 rps p50 0.152 p99 0.303 {'200': 800189} err 0 invalid 0
+[11:38:13] koru rep 1: up c=64 103770.5 rps p50 0.602 p99 1.137 {'200': 830560} err 0 invalid 0
+[11:38:24] koru rep 1: post_message c=1 1450.7 rps p50 0.598 p99 0.949 {'200': 11607} err 0 invalid 0
+[11:38:32] koru rep 1: post_message c=16 4080.9 rps p50 3.369 p99 10.335 {'200': 32664} err 0 invalid 0
+[11:38:40] koru rep 1: post_message c=64 3087.7 rps p50 17.439 p99 61.791 {'200': 24823} err 0 invalid 0
+[11:38:45] koru rep 1: done -> /root/ship/results-run1/koru-1.json
+[11:39:55] load before run: 1.36 1.96 1.25 (waited 70s)
+[11:39:55] rust rep 1: starting (load: 1.36 1.96 1.25)
+[11:40:07] rust rep 1: cold start 177ms, idle 55MB RSS (contract attempts: 1)
+[11:40:17] rust rep 1: room_show c=1 2797.6 rps p50 0.344 p99 0.55 {'200': 22382} err 0 invalid 0
+[11:40:25] rust rep 1: room_show c=16 14181.7 rps p50 1.071 p99 2.255 {'200': 113473} err 0 invalid 0
+[11:40:33] rust rep 1: room_show c=64 14289.1 rps p50 4.271 p99 8.751 {'200': 114420} err 0 invalid 0
+[11:40:43] rust rep 1: messages_page c=1 2900.3 rps p50 0.332 p99 0.543 {'200': 23203} err 0 invalid 0
+[11:40:51] rust rep 1: messages_page c=16 13750.0 rps p50 1.101 p99 2.319 {'200': 110023} err 0 invalid 0
+[11:40:59] rust rep 1: messages_page c=64 14910.7 rps p50 4.059 p99 8.519 {'200': 119376} err 0 invalid 0
+[11:41:09] rust rep 1: sidebar c=1 3643.8 rps p50 0.264 p99 0.436 {'200': 29151} err 0 invalid 0
+[11:41:17] rust rep 1: sidebar c=16 16495.5 rps p50 0.902 p99 2.077 {'200': 131980} err 0 invalid 0
+[11:41:25] rust rep 1: sidebar c=64 17751.8 rps p50 3.411 p99 7.583 {'200': 142092} err 0 invalid 0
+[11:41:35] rust rep 1: search c=1 3654.7 rps p50 0.262 p99 0.426 {'200': 29239} err 0 invalid 0
+[11:41:43] rust rep 1: search c=16 17453.0 rps p50 0.856 p99 1.93 {'200': 139646} err 0 invalid 0
+[11:41:52] rust rep 1: search c=64 16827.5 rps p50 3.585 p99 8.031 {'200': 134738} err 0 invalid 0
+[11:42:02] rust rep 1: avatar c=1 10156.1 rps p50 0.091 p99 0.175 {'200': 81251} err 0 invalid 0
+[11:42:10] rust rep 1: avatar c=16 65985.2 rps p50 0.228 p99 0.504 {'200': 527937} err 0 invalid 0
+[11:42:18] rust rep 1: avatar c=64 69317.4 rps p50 0.879 p99 1.962 {'200': 554862} err 0 invalid 0
+[11:42:28] rust rep 1: static_css c=1 11264.1 rps p50 0.08 p99 0.161 {'200': 90115} err 0 invalid 0
+[11:42:36] rust rep 1: static_css c=16 72957.3 rps p50 0.209 p99 0.434 {'200': 583739} err 0 invalid 0
+[11:42:44] rust rep 1: static_css c=64 81029.7 rps p50 0.759 p99 1.633 {'200': 648557} err 0 invalid 0
+[11:42:54] rust rep 1: up c=1 5587.5 rps p50 0.168 p99 0.294 {'200': 44701} err 0 invalid 0
+[11:43:02] rust rep 1: up c=16 30586.2 rps p50 0.515 p99 0.972 {'200': 244717} err 0 invalid 0
+[11:43:10] rust rep 1: up c=64 29806.4 rps p50 2.079 p99 4.399 {'200': 238562} err 0 invalid 0
+[11:43:21] rust rep 1: post_message c=1 582.9 rps p50 1.499 p99 2.609 {'200': 4664} err 0 invalid 0
+[11:43:29] rust rep 1: post_message c=16 1805.2 rps p50 8.019 p99 26.271 {'200': 14473} err 0 invalid 0
+[11:43:37] rust rep 1: post_message c=64 1811.6 rps p50 33.215 p99 70.719 {'200': 14543} err 0 invalid 0
+[11:43:39] rust rep 1: done -> /root/ship/results-run1/rust-1.json
+[11:44:49] load before run: 1.37 2.44 1.71 (waited 70s)
+[11:44:49] rust rep 2: starting (load: 1.37 2.44 1.71)
+[11:45:00] rust rep 2: cold start 167ms, idle 56MB RSS (contract attempts: 1)
+[11:45:10] rust rep 2: room_show c=1 2891.0 rps p50 0.332 p99 0.552 {'200': 23129} err 0 invalid 0
+[11:45:18] rust rep 2: room_show c=16 13579.5 rps p50 1.117 p99 2.347 {'200': 108660} err 0 invalid 0
+[11:45:26] rust rep 2: room_show c=64 13587.4 rps p50 4.483 p99 9.295 {'200': 108801} err 0 invalid 0
+[11:45:36] rust rep 2: messages_page c=1 3009.9 rps p50 0.32 p99 0.493 {'200': 24080} err 0 invalid 0
+[11:45:45] rust rep 2: messages_page c=16 14418.9 rps p50 1.055 p99 2.179 {'200': 115381} err 0 invalid 0
+[11:45:53] rust rep 2: messages_page c=64 14054.7 rps p50 4.299 p99 9.127 {'200': 112552} err 0 invalid 0
+[11:46:03] rust rep 2: sidebar c=1 3492.8 rps p50 0.274 p99 0.465 {'200': 27944} err 0 invalid 0
+[11:46:11] rust rep 2: sidebar c=16 16798.3 rps p50 0.888 p99 2.029 {'200': 134405} err 0 invalid 0
+[11:46:19] rust rep 2: sidebar c=64 18754.6 rps p50 3.215 p99 7.399 {'200': 150133} err 0 invalid 0
+[11:46:29] rust rep 2: search c=1 3764.3 rps p50 0.253 p99 0.415 {'200': 30116} err 0 invalid 0
+[11:46:37] rust rep 2: search c=16 16665.6 rps p50 0.895 p99 2.007 {'200': 133354} err 0 invalid 0
+[11:46:45] rust rep 2: search c=64 17074.7 rps p50 3.555 p99 7.807 {'200': 136726} err 0 invalid 0
+[11:46:55] rust rep 2: avatar c=1 11205.3 rps p50 0.081 p99 0.16 {'200': 89645} err 0 invalid 0
+[11:47:03] rust rep 2: avatar c=16 73202.1 rps p50 0.204 p99 0.447 {'200': 585701} err 0 invalid 0
+[11:47:11] rust rep 2: avatar c=64 70215.2 rps p50 0.864 p99 2.015 {'200': 562103} err 0 invalid 0
+[11:47:21] rust rep 2: static_css c=1 12137.4 rps p50 0.074 p99 0.149 {'200': 97102} err 0 invalid 0
+[11:47:29] rust rep 2: static_css c=16 83998.1 rps p50 0.179 p99 0.392 {'200': 672113} err 0 invalid 0
+[11:47:38] rust rep 2: static_css c=64 89911.7 rps p50 0.679 p99 1.507 {'200': 719642} err 0 invalid 0
+[11:47:48] rust rep 2: up c=1 5718.2 rps p50 0.164 p99 0.287 {'200': 45747} err 0 invalid 0
+[11:47:56] rust rep 2: up c=16 31045.0 rps p50 0.513 p99 0.924 {'200': 248391} err 0 invalid 0
+[11:48:04] rust rep 2: up c=64 30515.5 rps p50 2.017 p99 4.455 {'200': 244229} err 0 invalid 0
+[11:48:14] rust rep 2: post_message c=1 649.8 rps p50 1.351 p99 2.195 {'200': 5199} err 0 invalid 0
+[11:48:22] rust rep 2: post_message c=16 1856.3 rps p50 7.943 p99 24.079 {'200': 14866} err 0 invalid 0
+[11:48:31] rust rep 2: post_message c=64 1841.9 rps p50 32.831 p99 77.631 {'200': 14795} err 0 invalid 0
+[11:48:33] rust rep 2: done -> /root/ship/results-run1/rust-2.json
+[11:49:43] load before run: 1.36 2.54 1.99 (waited 70s)
+[11:49:43] koru rep 2: starting (load: 1.36 2.54 1.99)
+[11:49:54] koru rep 2: cold start 50ms, idle 17MB RSS (contract attempts: 1)
+[11:50:04] koru rep 2: room_show c=1 12288.7 rps p50 0.074 p99 0.145 {'200': 98313} err 0 invalid 0
+[11:50:12] koru rep 2: room_show c=16 78401.4 rps p50 0.195 p99 0.36 {'200': 627330} err 0 invalid 0
+[11:50:20] koru rep 2: room_show c=64 86020.8 rps p50 0.718 p99 1.361 {'200': 688732} err 0 invalid 0
+[11:50:30] koru rep 2: messages_page c=1 14122.0 rps p50 0.064 p99 0.118 {'200': 112980} err 0 invalid 0
+[11:50:38] koru rep 2: messages_page c=16 91353.7 rps p50 0.167 p99 0.316 {'200': 731015} err 0 invalid 0
+[11:50:46] koru rep 2: messages_page c=64 87569.6 rps p50 0.705 p99 1.339 {'200': 701229} err 0 invalid 0
+[11:50:56] koru rep 2: sidebar c=1 17157.5 rps p50 0.052 p99 0.103 {'200': 137264} err 0 invalid 0
+[11:51:04] koru rep 2: sidebar c=16 95439.5 rps p50 0.16 p99 0.306 {'200': 763628} err 0 invalid 0
+[11:51:13] koru rep 2: sidebar c=64 105484.4 rps p50 0.592 p99 1.122 {'200': 844323} err 0 invalid 0
+[11:51:23] koru rep 2: search c=1 16881.4 rps p50 0.053 p99 0.105 {'200': 135054} err 0 invalid 0
+[11:51:31] koru rep 2: search c=16 104947.7 rps p50 0.147 p99 0.268 {'200': 839749} err 0 invalid 0
+[11:51:39] koru rep 2: search c=64 104512.5 rps p50 0.597 p99 1.122 {'200': 836801} err 0 invalid 0
+[11:51:49] koru rep 2: avatar c=1 11457.3 rps p50 0.079 p99 0.15 {'200': 91661} err 0 invalid 0
+[11:51:57] koru rep 2: avatar c=16 84760.6 rps p50 0.165 p99 0.462 {'200': 678171} err 0 invalid 0
+[11:52:05] koru rep 2: avatar c=64 79736.3 rps p50 0.69 p99 2.287 {'200': 638247} err 0 invalid 0
+[11:52:15] koru rep 2: static_css c=1 18545.6 rps p50 0.049 p99 0.097 {'200': 148368} err 0 invalid 0
+[11:52:23] koru rep 2: static_css c=16 103666.2 rps p50 0.148 p99 0.276 {'200': 829468} err 0 invalid 0
+[11:52:31] koru rep 2: static_css c=64 108989.8 rps p50 0.573 p99 1.087 {'200': 872459} err 0 invalid 0
+[11:52:41] koru rep 2: up c=1 18347.3 rps p50 0.049 p99 0.099 {'200': 146783} err 0 invalid 0
+[11:52:49] koru rep 2: up c=16 115163.9 rps p50 0.133 p99 0.252 {'200': 921446} err 0 invalid 0
+[11:52:57] koru rep 2: up c=64 114126.4 rps p50 0.547 p99 1.038 {'200': 913495} err 0 invalid 0
+[11:53:08] koru rep 2: post_message c=1 1324.6 rps p50 0.65 p99 1.069 {'200': 10598} err 0 invalid 0
+[11:53:16] koru rep 2: post_message c=16 3743.5 rps p50 3.657 p99 11.263 {'200': 29976} err 0 invalid 0
+[11:53:24] koru rep 2: post_message c=64 3202.6 rps p50 17.183 p99 56.159 {'200': 25731} err 0 invalid 0
+[11:53:29] koru rep 2: done -> /root/ship/results-run1/koru-2.json
+[11:54:39] load before run: 1.27 2.75 2.31 (waited 70s)
+[11:54:39] koru rep 3: starting (load: 1.27 2.75 2.31)
+[11:54:51] koru rep 3: cold start 55ms, idle 18MB RSS (contract attempts: 1)
+[11:55:01] koru rep 3: room_show c=1 13825.1 rps p50 0.066 p99 0.124 {'200': 110605} err 0 invalid 0
+[11:55:09] koru rep 3: room_show c=16 73036.2 rps p50 0.208 p99 0.401 {'200': 584428} err 0 invalid 0
+[11:55:17] koru rep 3: room_show c=64 81619.4 rps p50 0.76 p99 1.444 {'200': 653568} err 0 invalid 0
+[11:55:27] koru rep 3: messages_page c=1 14273.4 rps p50 0.063 p99 0.121 {'200': 114192} err 0 invalid 0
+[11:55:35] koru rep 3: messages_page c=16 78741.3 rps p50 0.195 p99 0.359 {'200': 630077} err 0 invalid 0
+[11:55:43] koru rep 3: messages_page c=64 92841.3 rps p50 0.661 p99 1.285 {'200': 743633} err 0 invalid 0
+[11:55:53] koru rep 3: sidebar c=1 16193.7 rps p50 0.057 p99 0.107 {'200': 129553} err 0 invalid 0
+[11:56:01] koru rep 3: sidebar c=16 108519.9 rps p50 0.141 p99 0.266 {'200': 868267} err 0 invalid 0
+[11:56:09] koru rep 3: sidebar c=64 93757.9 rps p50 0.664 p99 1.272 {'200': 750458} err 0 invalid 0
+[11:56:20] koru rep 3: search c=1 14773.2 rps p50 0.062 p99 0.116 {'200': 118189} err 0 invalid 0
+[11:56:28] koru rep 3: search c=16 98496.7 rps p50 0.155 p99 0.299 {'200': 788123} err 0 invalid 0
+[11:56:36] koru rep 3: search c=64 98731.4 rps p50 0.628 p99 1.213 {'200': 790634} err 0 invalid 0
+[11:56:46] koru rep 3: avatar c=1 10048.4 rps p50 0.091 p99 0.172 {'200': 80389} err 0 invalid 0
+[11:56:54] koru rep 3: avatar c=16 73259.0 rps p50 0.189 p99 0.556 {'200': 586155} err 0 invalid 0
+[11:57:02] koru rep 3: avatar c=64 75370.8 rps p50 0.726 p99 2.451 {'200': 603390} err 0 invalid 0
+[11:57:12] koru rep 3: static_css c=1 15272.8 rps p50 0.059 p99 0.127 {'200': 122186} err 0 invalid 0
+[11:57:20] koru rep 3: static_css c=16 99529.4 rps p50 0.154 p99 0.291 {'200': 796349} err 0 invalid 0
+[11:57:28] koru rep 3: static_css c=64 106740.0 rps p50 0.585 p99 1.112 {'200': 854447} err 0 invalid 0
+[11:57:38] koru rep 3: up c=1 16885.2 rps p50 0.054 p99 0.104 {'200': 135085} err 0 invalid 0
+[11:57:46] koru rep 3: up c=16 107551.2 rps p50 0.142 p99 0.27 {'200': 860514} err 0 invalid 0
+[11:57:54] koru rep 3: up c=64 114720.2 rps p50 0.544 p99 1.034 {'200': 918265} err 0 invalid 0
+[11:58:05] koru rep 3: post_message c=1 1351.3 rps p50 0.644 p99 1.028 {'200': 10812} err 0 invalid 0
+[11:58:13] koru rep 3: post_message c=16 3699.7 rps p50 3.701 p99 11.383 {'200': 29627} err 0 invalid 0
+[11:58:21] koru rep 3: post_message c=64 3621.1 rps p50 15.079 p99 50.047 {'200': 29080} err 0 invalid 0
+[11:58:27] koru rep 3: done -> /root/ship/results-run1/koru-3.json
+[11:59:27] load before run: 1.42 2.94 2.58 (waited 60s)
+[11:59:27] rust rep 3: starting (load: 1.42 2.94 2.58)
+[11:59:38] rust rep 3: cold start 185ms, idle 55MB RSS (contract attempts: 1)
+[11:59:48] rust rep 3: room_show c=1 3330.5 rps p50 0.289 p99 0.467 {'200': 26645} err 0 invalid 0
+[11:59:56] rust rep 3: room_show c=16 15036.3 rps p50 1.013 p99 2.095 {'200': 120315} err 0 invalid 0
+[12:00:04] rust rep 3: room_show c=64 12541.3 rps p50 4.695 p99 11.847 {'200': 100456} err 0 invalid 0
+[12:00:15] rust rep 3: messages_page c=1 2618.7 rps p50 0.366 p99 0.633 {'200': 20951} err 0 invalid 0
+[12:00:23] rust rep 3: messages_page c=16 12483.6 rps p50 1.213 p99 2.571 {'200': 99899} err 0 invalid 0
+[12:00:31] rust rep 3: messages_page c=64 13161.9 rps p50 4.599 p99 9.591 {'200': 105419} err 0 invalid 0
+[12:00:41] rust rep 3: sidebar c=1 3309.7 rps p50 0.291 p99 0.473 {'200': 26479} err 0 invalid 0
+[12:00:49] rust rep 3: sidebar c=16 14641.8 rps p50 1.014 p99 2.367 {'200': 117151} err 0 invalid 0
+[12:00:57] rust rep 3: sidebar c=64 15226.6 rps p50 3.963 p99 9.023 {'200': 121876} err 0 invalid 0
+[12:01:07] rust rep 3: search c=1 3224.4 rps p50 0.3 p99 0.494 {'200': 25796} err 0 invalid 0
+[12:01:15] rust rep 3: search c=16 16021.9 rps p50 0.925 p99 2.159 {'200': 128204} err 0 invalid 0
+[12:01:23] rust rep 3: search c=64 17643.7 rps p50 3.429 p99 7.663 {'200': 141255} err 0 invalid 0
+[12:01:33] rust rep 3: avatar c=1 9973.2 rps p50 0.091 p99 0.185 {'200': 79788} err 0 invalid 0
+[12:01:41] rust rep 3: avatar c=16 68623.5 rps p50 0.221 p99 0.455 {'200': 549061} err 0 invalid 0
+[12:01:49] rust rep 3: avatar c=64 73236.4 rps p50 0.834 p99 1.883 {'200': 586218} err 0 invalid 0
+[12:02:00] rust rep 3: static_css c=1 11469.7 rps p50 0.08 p99 0.159 {'200': 91760} err 0 invalid 0
+[12:02:08] rust rep 3: static_css c=16 69658.2 rps p50 0.218 p99 0.477 {'200': 557340} err 0 invalid 0
+[12:02:16] rust rep 3: static_css c=64 78702.0 rps p50 0.782 p99 1.682 {'200': 629919} err 0 invalid 0
+[12:02:26] rust rep 3: up c=1 5222.5 rps p50 0.18 p99 0.317 {'200': 41782} err 0 invalid 0
+[12:02:34] rust rep 3: up c=16 28280.1 rps p50 0.559 p99 1.04 {'200': 226273} err 0 invalid 0
+[12:02:42] rust rep 3: up c=64 30216.0 rps p50 2.055 p99 4.359 {'200': 241831} err 0 invalid 0
+[12:02:52] rust rep 3: post_message c=1 625.1 rps p50 1.391 p99 2.369 {'200': 5002} err 0 invalid 0
+[12:03:00] rust rep 3: post_message c=16 1781.2 rps p50 8.215 p99 28.303 {'200': 14261} err 0 invalid 0
+[12:03:09] rust rep 3: post_message c=64 1769.3 rps p50 33.919 p99 73.343 {'200': 14209} err 0 invalid 0
+[12:03:11] rust rep 3: done -> /root/ship/results-run1/rust-3.json
+results: /root/ship/results-run1
