@@ -1,0 +1,134 @@
+koru round 1: room_show 16 clients 91076.8 req/s
+koru round 1: messages_page 16 clients 74860.6 req/s
+koru round 1: sidebar 16 clients 91235.6 req/s
+koru round 1: search 16 clients 83122.7 req/s
+koru round 1: avatar 16 clients 59983.0 req/s
+koru round 1: static_css 16 clients 86231.7 req/s
+koru round 1: up 16 clients 91356.1 req/s
+koru round 1: post_message 16 clients 3093.7 req/s
+rust round 1: room_show 16 clients 12174.0 req/s
+rust round 1: messages_page 16 clients 11661.1 req/s
+rust round 1: sidebar 16 clients 13122.7 req/s
+rust round 1: search 16 clients 13224.0 req/s
+rust round 1: avatar 16 clients 39090.9 req/s
+rust round 1: static_css 16 clients 43708.7 req/s
+rust round 1: up 16 clients 23079.4 req/s
+rust round 1: post_message 16 clients 1685.9 req/s
+rust round 2: room_show 16 clients 12390.4 req/s
+rust round 2: messages_page 16 clients 10601.8 req/s
+rust round 2: sidebar 16 clients 10456.7 req/s
+rust round 2: search 16 clients 11335.4 req/s
+rust round 2: avatar 16 clients 33916.6 req/s
+rust round 2: static_css 16 clients 36988.3 req/s
+rust round 2: up 16 clients 18123.6 req/s
+rust round 2: post_message 16 clients 1442.5 req/s
+koru round 2: room_show 16 clients 80633.2 req/s
+koru round 2: messages_page 16 clients 83222.0 req/s
+koru round 2: sidebar 16 clients 95830.3 req/s
+koru round 2: search 16 clients 79725.5 req/s
+koru round 2: avatar 16 clients 59500.4 req/s
+koru round 2: static_css 16 clients 79976.6 req/s
+koru round 2: up 16 clients 93365.5 req/s
+koru round 2: post_message 16 clients 3489.1 req/s
+koru round 3: room_show 16 clients 79573.9 req/s
+koru round 3: messages_page 16 clients 77227.5 req/s
+koru round 3: sidebar 16 clients 80501.2 req/s
+koru round 3: search 16 clients 79916.9 req/s
+koru round 3: avatar 16 clients 60540.3 req/s
+koru round 3: static_css 16 clients 78726.8 req/s
+koru round 3: up 16 clients 89890.5 req/s
+koru round 3: post_message 16 clients 3266.4 req/s
+rust round 3: room_show 16 clients 11270.9 req/s
+rust round 3: messages_page 16 clients 11449.1 req/s
+rust round 3: sidebar 16 clients 12751.8 req/s
+rust round 3: search 16 clients 13034.6 req/s
+rust round 3: avatar 16 clients 38622.6 req/s
+rust round 3: static_css 16 clients 39951.0 req/s
+rust round 3: up 16 clients 18053.7 req/s
+rust round 3: post_message 16 clients 1408.8 req/s
+{
+  "koru": {
+    "room_show": {
+      "median_rps": 80633.2,
+      "runs": [
+        91076.8,
+        80633.2,
+        79573.9
+      ]
+    },
+    "messages_page": {
+      "median_rps": 77227.5,
+      "runs": [
+        74860.6,
+        83222.0,
+        77227.5
+      ]
+    },
+    "sidebar": {
+      "median_rps": 91235.6,
+      "runs": [
+        91235.6,
+        95830.3,
+        80501.2
+      ]
+    },
+    "search": {
+      "median_rps": 79916.9,
+      "runs": [
+        83122.7,
+        79725.5,
+        79916.9
+      ]
+    },
+    "post_message": {
+      "median_rps": 3266.4,
+      "runs": [
+        3093.7,
+        3489.1,
+        3266.4
+      ]
+    }
+  },
+  "rust": {
+    "room_show": {
+      "median_rps": 12174.0,
+      "runs": [
+        12174.0,
+        12390.4,
+        11270.9
+      ]
+    },
+    "messages_page": {
+      "median_rps": 11449.1,
+      "runs": [
+        11661.1,
+        10601.8,
+        11449.1
+      ]
+    },
+    "sidebar": {
+      "median_rps": 12751.8,
+      "runs": [
+        13122.7,
+        10456.7,
+        12751.8
+      ]
+    },
+    "search": {
+      "median_rps": 13034.6,
+      "runs": [
+        13224.0,
+        11335.4,
+        13034.6
+      ]
+    },
+    "post_message": {
+      "median_rps": 1442.5,
+      "runs": [
+        1685.9,
+        1442.5,
+        1408.8
+      ]
+    }
+  }
+}

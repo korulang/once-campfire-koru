@@ -1,0 +1,154 @@
+{
+  "metadata": {
+    "verification_revision": "62cb5b2d82b2cd0f06d008b3e7e3d9a5907cb08e",
+    "response_validation": "route-contract-v1",
+    "started_at": "2026-10-13T14:26:44Z",
+    "seed_sha256": "18d01f6d109697680a283bd1c61040d0bfdd6d2c02609881bb2e3c5992a19881",
+    "server_cpus": "0-3",
+    "client_cpus": "4-7",
+    "network": "host",
+    "gzip": true,
+    "duration": 8,
+    "concurrencies": "16",
+    "rounds": 3,
+    "loadgen_sha256": "c92ebee657e9229768b69099dca6ab6c6f04cedb095ad0d1c66af0d2f88b8ba5",
+    "routes": "room_show,messages_page,sidebar,search,avatar,static_css,up,post_message",
+    "profile": "read-and-post-v1",
+    "mixed_writer": null,
+    "images": {
+      "koru": "sha256:615a511ec97f60501600dca0b0257eae5745d8cf4cab874e1ec0d9e77fd9e9ef",
+      "rust": "sha256:f4f846432a9dc335c15e7a516c2b091508e2876e3a05cdf2c08593e41fb8e64a"
+    },
+    "image_labels": {
+      "koru": {
+        "org.opencontainers.image.description": "",
+        "org.opencontainers.image.licenses": "MIT",
+        "org.opencontainers.image.source": ""
+      },
+      "rust": {
+        "org.opencontainers.image.description": "",
+        "org.opencontainers.image.licenses": "MIT",
+        "org.opencontainers.image.source": ""
+      }
+    },
+    "source_revisions": {
+      "koru": {
+        "head": "12c4bc833245c2a3bd8d1a04f070f13232c2efab",
+        "dirty": true
+      },
+      "rust": {
+        "head": "cf11e8129aedf767a1ad529de348d7a510a40150",
+        "dirty": false
+      }
+    },
+    "preflight_only": false,
+    "topology": {
+      "koru": {
+        "processes": 1,
+        "runtime": "Koru/Orisha epoll pump",
+        "cable": "native websocket (wsq)",
+        "jobs": "in-process",
+        "page_cache": "generation-keyed whole-response"
+      },
+      "rust": {
+        "processes": 1,
+        "readers": "5",
+        "job_workers": "3",
+        "cable": "native tokio",
+        "jobs": "in-process",
+        "response_cache_mb": "64"
+      }
+    },
+    "runtimes": {
+      "koru": "koru",
+      "rust": "rust"
+    },
+    "complete": true
+  },
+  "results": {
+    "koru": {
+      "room_show": {
+        "median_rps": 80633.2,
+        "runs": [
+          91076.8,
+          80633.2,
+          79573.9
+        ]
+      },
+      "messages_page": {
+        "median_rps": 77227.5,
+        "runs": [
+          74860.6,
+          83222.0,
+          77227.5
+        ]
+      },
+      "sidebar": {
+        "median_rps": 91235.6,
+        "runs": [
+          91235.6,
+          95830.3,
+          80501.2
+        ]
+      },
+      "search": {
+        "median_rps": 79916.9,
+        "runs": [
+          83122.7,
+          79725.5,
+          79916.9
+        ]
+      },
+      "post_message": {
+        "median_rps": 3266.4,
+        "runs": [
+          3093.7,
+          3489.1,
+          3266.4
+        ]
+      }
+    },
+    "rust": {
+      "room_show": {
+        "median_rps": 12174.0,
+        "runs": [
+          12174.0,
+          12390.4,
+          11270.9
+        ]
+      },
+      "messages_page": {
+        "median_rps": 11449.1,
+        "runs": [
+          11661.1,
+          10601.8,
+          11449.1
+        ]
+      },
+      "sidebar": {
+        "median_rps": 12751.8,
+        "runs": [
+          13122.7,
+          10456.7,
+          12751.8
+        ]
+      },
+      "search": {
+        "median_rps": 13034.6,
+        "runs": [
+          13224.0,
+          11335.4,
+          13034.6
+        ]
+      },
+      "post_message": {
+        "median_rps": 1442.5,
+        "runs": [
+          1685.9,
+          1442.5,
+          1408.8
+        ]
+      }
+    }
+  }
+}
