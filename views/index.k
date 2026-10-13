@@ -104,7 +104,7 @@ koru/dom:component(Msg) {
     <button class="btn message__action-btn center full-width" data-action="reply#reply" title="Reply" aria-label="Reply">
     <img class="colorize--black" aria-hidden="true" src="/assets/reply-edb77e33.svg" width="20" height="20" />
     </button>
-    <button class="btn message__action-btn center full-width" title="Copy link" aria-label="Copy link" data-controller="copy-to-clipboard" data-action="copy-to-clipboard#copy" data-copy-to-clipboard-success-class="btn--success" data-copy-to-clipboard-url-value="/rooms/{{ rid:s }}/@{{ mid:d }}">
+    <button class="btn message__action-btn center full-width" title="Copy link" aria-label="Copy link" data-controller="copy-to-clipboard" data-action="copy-to-clipboard#copy" data-copy-to-clipboard-success-class="btn--success" data-copy-to-clipboard-content-value="{{ host:s }}/rooms/{{ rid:s }}/@{{ mid:d }}">
     <img class="colorize--black" aria-hidden="true" src="/assets/link-e546a5df.svg" width="20" height="20" />
     </button>
     <a class="btn message__action-btn center full-width message__edit-btn" data-turbo-frame="edit_message_{{ cmid:s }}" title="Edit" aria-label="Edit" href="/rooms/{{ rid:s }}/messages/{{ mid:d }}/edit">
@@ -135,250 +135,499 @@ koru/dom:component(Msg) {
     </div>
 }
 
+// messages/edit.html — the editing frame loaded into edit_message_<cmid>.
+// The lexxy editor carries the current body in its `value` attribute
+// (attr-escaped :s); the delete form posts the same path with
+// _method=delete.
+koru/dom:component(EditMsg) {
+    <turbo-frame id="edit_message_{{ cmid:s }}">
+    <div class="message__body position-relative" data-controller="scroll-into-view">
+    <div class="message__body-content message__body-content--editing gap">
+    <div class="composer--edit composer--rich-text">
+    <form id="form_message_{{ cmid:s }}" data-controller="form" data-action="lexxy:file-accept->form#preventAttachment keydown.esc->form#cancel keydown.ctrl+enter->form#submit:prevent keydown.meta+enter->form#submit:prevent" action="/rooms/{{ rid:s }}/messages/{{ mid:d }}" accept-charset="UTF-8" method="post">
+    <input type="hidden" name="_method" value="patch" />
+    <div class="full-width input input--actor min-width fill-white">
+    <lexxy-editor rows="1" class="input lexxy-content" aria-multiline="true" aria-label="Edit message" autofocus="autofocus" permitted-attachment-types="application/vnd.campfire.mention application/vnd.actiontext.opengraph-embed" data-action="lexxy:change->typing-notifications#start keydown->composer#submitByKeyboard:capture" data-direct-upload-url="{{ host:s }}/rails/active_storage/direct_uploads" data-blob-url-template="{{ host:s }}/rails/active_storage/blobs/redirect/:signed_id/:filename" id="message_body" input="message_body_trix_input_message_{{ cmid:s }}" name="message[body]" value="{{ body:s }}">
+    <lexxy-prompt trigger="@" name="mention" src="/autocompletable/users?room_id={{ rid:s }}" remote-filtering="true" empty-results="No matches">
+    </lexxy-prompt>
+    </lexxy-editor>
+    </div>
+    <a data-form-target="cancel" hidden="hidden" href="/rooms/{{ rid:s }}/messages/{{ mid:d }}">Close editor and discard changes</a>
+    <div class="message__edit-btns flex align-center justify-space-between gap full-width pad-block-start-half">
+    <button name="button" type="submit" class="btn btn--reversed">
+    <img aria-hidden="true" src="/assets/check-7897ff7e.svg" />
+    <span class="for-screen-reader">Save changes</span>
+    </button>
+    <button name="button" type="submit" class="btn btn--negative" form="delete_form_message_{{ cmid:s }}" data-turbo-confirm="Are you sure you want to delete this message?">
+    <img aria-hidden="true" src="/assets/trash-708c7eb2.svg" />
+    <span class="for-screen-reader">Delete message</span>
+    </button>
+    </div>
+    </form>
+    </div>
+    </div>
+    <div class="message__actions flex flex-wrap">
+    <a class="message__action-btn message__edit-close-btn txt-small btn btn--borderless" href="/rooms/{{ rid:s }}/messages/{{ mid:d }}">
+    <img class="colorize--black" aria-hidden="true" src="/assets/remove-0e7a045d.svg" />
+    <span class="for-screen-reader">Close editor and discard changes</span>
+    </a>
+    </div>
+    <form id="delete_form_message_{{ cmid:s }}" data-turbo-frame="edit_message_{{ cmid:s }}" action="/rooms/{{ rid:s }}/messages/{{ mid:d }}" accept-charset="UTF-8" method="post">
+    <input type="hidden" name="_method" value="delete" />
+    </form>
+    </div>
+    </turbo-frame>
+}
+
 // The whole page — layouts/application.html + rooms/show.html flattened.
 // The body holds the rendered rows verbatim ({{ rows:h }}); <!DOCTYPE is
 // outside the dialect, the caller writes it. The messages/_template script
 // block lives inside message-area, first child, as on the wire.
+// ── Application pages ────────────────────────────────────────────────────────
+// Head + the page components every non-room route renders. Head carries the
+// whole <head> (stylesheets, custom_styles slot, importmap, modulepreloads)
+// once so each page component only supplies its <body>. `metas` is the
+// current-user-id/name pair (empty for the unauthenticated transfer and join
+// pages); `styles` is the account custom_styles <style> tag or "".
+
+
+// Users::ProfilesController#show — the identity form plus the session-
+// transfer fieldset (#session_transfer_url is the browser contract's
+// anchor). Avatar upload/delete and the push-subscriptions dev section are
+// omitted: no Active Storage write path exists yet.
+koru/dom:component(ProfilePage) {
+    <body class="admin" data-controller="local-time lightbox">
+    <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
+    <nav id="nav">
+    <div class="flex-item-justify-start">
+    <a class="btn" href="/">
+    <img aria-hidden="true" src="/assets/arrow-left-abe40556.svg" width="20" height="20" />
+    <span class="for-screen-reader">Go Back</span>
+    </a>
+    </div>
+    <div class="flex-item-justify-end">
+    <form method="post" action="/session" data-controller="sessions">
+    <input type="hidden" name="_method" value="delete" />
+    <button class="btn" data-action="sessions#logout:prevent">
+    <img aria-hidden="true" src="/assets/logout-a6131db1.svg" width="20" height="20" />
+    <span class="for-screen-reader">Log out</span>
+    </button>
+    </form>
+    </div>
+    </nav>
+    <main id="main-content">
+    <section class="panel flex flex-column gap center-block" style="view-transition-name: avatar-{{ uid:d }}">
+    <form class="txt-medium" data-controller="form" action="/users/me/profile" accept-charset="UTF-8" method="post">
+    <input type="hidden" name="_method" value="patch" />
+    <div class="flex flex-column gap">
+    <div class="flex align-center gap">
+    <label class="flex align-center gap flex-item-grow input input--actor">
+    <input class="input txt-large" autocomplete="name" placeholder="Enter your name" autofocus="autofocus" required="required" data-1p-ignore="true" type="text" value="{{ name:s }}" name="user[name]" id="user_name" />
+    <img aria-hidden="true" class="colorize--black" src="/assets/person-da193438.svg" width="24" height="24" />
+    </label>
+    </div>
+    <div class="flex align-center gap">
+    <label class="flex align-center gap flex-item-grow input input--actor">
+    <input class="input txt-large" value="{{ email:s }}" autocomplete="username" placeholder="Enter your email address" type="email" name="user[email_address]" id="user_email_address" />
+    <img aria-hidden="true" class="colorize--black" src="/assets/email-6c595bc5.svg" width="24" height="24" />
+    </label>
+    </div>
+    <div class="flex align-center gap">
+    <label class="flex align-center gap flex-item-grow input input--actor">
+    <input class="input txt-large" autocomplete="new-password" placeholder="Change password" type="password" maxlength="72" name="user[password]" id="user_password" />
+    <img aria-hidden="true" class="colorize--black" src="/assets/password-0896da4e.svg" width="24" height="24" />
+    </label>
+    </div>
+    <div class="flex align-start gap">
+    <label class="flex align-center gap flex-item-grow input input--actor">
+    <textarea class="input txt-large" placeholder="A few words about yourself…" maxlength="200" rows="3" name="user[bio]" id="user_bio">{{ bio:s }}</textarea>
+    <img aria-hidden="true" class="colorize--black" src="/assets/bio-567a6005.svg" width="24" height="24" />
+    </label>
+    </div>
+    <button class="btn btn--reversed center txt-large" type="submit">
+    <img aria-hidden="true" src="/assets/check-7897ff7e.svg" width="20" height="20" />
+    <span class="for-screen-reader">Save changes</span>
+    </button>
+    </div>
+    </form>
+    <div class="margin-block pad-inline pad-block fill-shade border-radius">
+    <menu class="flex flex-column gap margin-none pad">
+    {{ memberships:h }}
+    </menu>
+    </div>
+    <fieldset>
+    <legend class="gap">
+    <img aria-hidden="true" class="colorize--black" src="/assets/laptop-cf35e6d4.svg" width="36" height="36" />
+    <img aria-hidden="true" class="colorize--black" src="/assets/transfer-3ec4f61b.svg" width="36" height="36" />
+    <img aria-hidden="true" class="colorize--black" src="/assets/mobile-phone-d0d2301d.svg" width="36" height="36" />
+    </legend>
+    <div class="flex flex-column gap">
+    <label for="session_transfer_url" class="for-screen-reader">Use this link to login automatically on another device</label>
+    <input type="text" class="input" value="{{ turl:s }}" id="session_transfer_url" readonly>
+    <div class="flex align-center center gap">
+    <a class="btn" data-lightbox-target="image" data-action="lightbox#open" data-lightbox-url-value="{{ qrpath:s }}" href="{{ qrpath:s }}">
+    <span class="for-screen-reader">Show auto-login QR code</span>
+    <img aria-hidden="true" class="colorize--black" src="/assets/qr-code-dac3b273.svg" width="20" height="20" />
+    </a>
+    <button class="btn" data-controller="copy-to-clipboard" data-action="copy-to-clipboard#copy" data-copy-to-clipboard-success-class="btn--success" data-copy-to-clipboard-content-value="{{ turl:s }}">
+    <span class="for-screen-reader">Copy auto-login link</span>
+    <img aria-hidden="true" class="flex-item-no-shrink colorize--black" src="/assets/copy-paste-4c379063.svg" width="20" height="20" />
+    </button>
+    </div>
+    </div>
+    </fieldset>
+    </section>
+    </main>
+    <aside id="sidebar" data-controller="toggle-class" data-toggle-class-toggle-class="open">
+    </aside>
+    </body>
+}
+
+// AccountsController#edit — administrators get the bots/custom-styles nav
+// links, the account-name form, and the creation-restriction switch; members
+// see the account name plus the shared invite block. `admin`/`member` are
+// the exclusive slot pair the flow fills from users.role.
+koru/dom:component(AccountPage) {
+    <body class="admin" data-controller="local-time lightbox">
+    <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
+    <nav id="nav">
+    <div class="flex-item-justify-start">
+    <a class="btn" href="/">
+    <img aria-hidden="true" src="/assets/arrow-left-abe40556.svg" width="20" height="20" />
+    <span class="for-screen-reader">Go Back</span>
+    </a>
+    </div>
+    <div>{{ navadmin:h }}</div>
+    </nav>
+    <main id="main-content">
+    <section class="panel txt-align-center flex flex-column gap" style="view-transition-name: account-settings">
+    <div>{{ admin:h }}</div>
+    <div>{{ member:h }}</div>
+    <div class="margin-block pad-inline pad-block-start fill-shade border-radius">
+    <div class="flex flex-column align-center gap">
+    <label class="flex flex-column gap full-width" style="--row-gap: 0.5em">
+    <strong id="invite_label" class="invite-label">Share to invite more people</strong>
+    <span class="flex align-center gap input input--actor fill-white">
+    <img aria-hidden="true" class="colorize--black" src="/assets/person-add-1432b76b.svg" width="20" height="20" />
+    <input type="text" class="input" id="invite_url" value="{{ inviteurl:s }}" aria-labelledby="invite_label" readonly>
+    </span>
+    </label>
+    <div class="flex align-center gap">
+    <a class="btn" data-lightbox-target="image" data-action="lightbox#open" data-lightbox-url-value="{{ qrpath:s }}" href="{{ qrpath:s }}">
+    <span class="for-screen-reader">Show join link QR code</span>
+    <img aria-hidden="true" class="colorize--black" src="/assets/qr-code-dac3b273.svg" width="20" height="20" />
+    </a>
+    <button class="btn" data-controller="copy-to-clipboard" data-action="copy-to-clipboard#copy" data-copy-to-clipboard-success-class="btn--success" data-copy-to-clipboard-content-value="{{ inviteurl:s }}">
+    <span class="for-screen-reader">Copy join link</span>
+    <img aria-hidden="true" class="colorize--black" src="/assets/copy-paste-4c379063.svg" width="20" height="20" />
+    </button>
+    <div>{{ regen:h }}</div>
+    </div>
+    </div>
+    <hr class="margin-block separator full-width" style="--border-style: solid">
+    <menu class="flex flex-column gap margin-none pad">
+    <turbo-frame id="account_users">
+    {{ users:h }}
+    </turbo-frame>
+    </menu>
+    </div>
+    </section>
+    </main>
+    <aside id="sidebar" data-controller="toggle-class" data-toggle-class-toggle-class="open">
+    </aside>
+    </body>
+}
+
+// Rooms::OpensController#new + #edit — one form component parameterized by
+// action + method override. The access menu renders the "Everyone" toggle
+// row and the active-user list the reference shows for context; only
+// room[name] is a permitted parameter.
+koru/dom:component(RoomFormPage) {
+    <body class="admin" data-controller="local-time lightbox">
+    <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
+    <nav id="nav">
+    <div class="flex-item-justify-start">
+    <a class="btn" href="/">
+    <img aria-hidden="true" src="/assets/arrow-left-abe40556.svg" width="20" height="20" />
+    <span class="for-screen-reader">Go Back</span>
+    </a>
+    </div>
+    </nav>
+    <main id="main-content">
+    <section class="panel flex flex-column gap center-block">
+    <form action="{{ action:s }}" accept-charset="UTF-8" method="post">
+    <input type="hidden" name="_method" value="{{ method:s }}" />
+    <div class="flex align-center gap">
+    <label class="flex-item-grow txt-large">
+    <input name="room[name]" id="room_name" class="input full-width" required="required" autofocus="autofocus" placeholder="Name the room" data-turbo-permanent="true" data-action="keydown.enter-&gt;form#submit:prevent" type="text" value="{{ name:s }}">
+    <span class="for-screen-reader">Name this room</span>
+    </label>
+    </div>
+    <hr class="margin-block borderless">
+    <section class="room-access margin-block pad-inline fill-shade border-radius">
+    <menu class="flex flex-column gap margin-none pad overflow-y constrain-height" data-controller="filter" data-filter-active-class="filter--active" data-filter-selected-class="selected">
+    <li class="flex align-center gap margin-none">
+    <figure class="avatar flex-item-no-shrink" style="--avatar-border-radius: 0; --avatar-size: 4ch;">
+    <img aria-hidden="true" class="colorize--black" style="background-color: transparent" src="/assets/everyone-4ca1d460.svg" width="20" height="20">
+    <span class="for-screen-reader">Everyone</span>
+    </figure>
+    <div class="min-width">
+    <div class="overflow-ellipsis fill-shade"><strong>Everyone</strong></div>
+    </div>
+    <hr class="separator" aria-hidden="true">
+    <label for="room_type" class="switch">
+    <input type="checkbox" id="room_type" class="switch__input" checked="checked" disabled="disabled">
+    <span class="switch__btn round"></span>
+    <span class="for-screen-reader">Give only some access to this room</span>
+    </label>
+    </li>
+    <hr class="separator full-width" style="--border-style: solid">
+    <div data-filter-target="list" contents="">
+    {{ users:h }}
+    </div>
+    </menu>
+    </section>
+    <button name="button" type="submit" class="btn btn--reversed txt-large center">
+    <img aria-hidden="true" src="/assets/check-7897ff7e.svg" width="20" height="20">
+    <span class="for-screen-reader">Save</span>
+    </button>
+    </form>
+    </section>
+    </main>
+    <aside id="sidebar" data-controller="toggle-class" data-toggle-class-toggle-class="open">
+    </aside>
+    </body>
+}
+
+// Accounts::BotsController#index — one <li> per bot (built by bot-row in
+// views/index.kz, one access fieldset per non-direct membership).
+koru/dom:component(BotsPage) {
+    <body class="admin" data-controller="local-time lightbox">
+    <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
+    <nav id="nav">
+    <div class="flex-item-justify-start">
+    <a class="btn" href="/account/edit">
+    <img aria-hidden="true" src="/assets/arrow-left-abe40556.svg" width="20" height="20" />
+    <span class="for-screen-reader">Go Back</span>
+    </a>
+    </div>
+    </nav>
+    <main id="main-content">
+    <section class="panel panel--wide txt-align-center flex flex-column position-relative" style="view-transition-name: chat-bots">
+    <div class="pad-inline-double center">
+    <h1 class="margin-none">Chat bots</h1>
+    <p class="margin-none-block-start">With Chat bots, other sites and services can post updates directly to Campfire.</p>
+    <a href="/account/bots/new" class="btn btn--reversed txt-large" aria-label="Add a chat bot">
+    <img aria-hidden="true" src="/assets/bot-8a69692e.svg" width="20" height="20" />
+    <img aria-hidden="true" src="/assets/add-f232d8a6.svg" width="20" height="20" />
+    </a>
+    </div>
+    <div class="pad-inline pad-block-start">
+    <menu class="flex flex-column gap margin-none pad">
+    {{ bots:h }}
+    </menu>
+    </div>
+    </section>
+    </main>
+    </body>
+}
+
+// Accounts::BotsController#new + #edit — user[name] + user[webhook_url].
+koru/dom:component(BotFormPage) {
+    <body class="admin" data-controller="local-time lightbox">
+    <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
+    <nav id="nav">
+    <div class="flex-item-justify-start">
+    <a class="btn" href="/account/bots">
+    <img aria-hidden="true" src="/assets/arrow-left-abe40556.svg" width="20" height="20" />
+    <span class="for-screen-reader">Go Back</span>
+    </a>
+    </div>
+    </nav>
+    <main id="main-content">
+    <section class="panel panel--wide txt-align-center flex flex-column position-relative">
+    <h1 class="for-screen-reader">Chat Bot Setup</h1>
+    <form class="flex flex-column gap" action="{{ action:s }}" accept-charset="UTF-8" method="post">
+    <input type="hidden" name="_method" value="{{ method:s }}" />
+    <div class="flex align-center gap">
+    <label class="flex align-center gap flex-item-grow txt-large input input--actor">
+    <input class="input" autocomplete="name" placeholder="Name the bot" autofocus="autofocus" required="required" data-1p-ignore="true" type="text" name="user[name]" id="user_name" value="{{ name:s }}" />
+    <img aria-hidden="true" class="colorize--black" src="/assets/bot-8a69692e.svg" width="24" height="24" />
+    </label>
+    </div>
+    <div class="flex align-center gap">
+    <label class="flex align-center gap flex-item-grow txt-large input input--actor">
+    <input class="input" placeholder="Webhook URL" type="url" name="user[webhook_url]" id="user_webhook_url" value="{{ webhook:s }}" />
+    <img aria-hidden="true" class="colorize--black" src="/assets/external/web-24ffe636.svg" width="24" height="24" />
+    </label>
+    </div>
+    <button class="btn btn--reversed center txt-large" type="submit">
+    <img aria-hidden="true" src="/assets/check-7897ff7e.svg" width="20" height="20" />
+    <span class="for-screen-reader">Save changes</span>
+    </button>
+    </form>
+    </section>
+    </main>
+    </body>
+}
+
+// Accounts::CustomStylesController#edit — account[custom_styles] textarea.
+koru/dom:component(StylesPage) {
+    <body class="admin" data-controller="local-time lightbox">
+    <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
+    <nav id="nav">
+    <div class="flex-item-justify-start">
+    <a class="btn" href="/account/edit">
+    <img aria-hidden="true" src="/assets/arrow-left-abe40556.svg" width="20" height="20" />
+    <span class="for-screen-reader">Go Back</span>
+    </a>
+    </div>
+    </nav>
+    <main id="main-content">
+    <section class="panel panel--wide txt-align-center flex flex-column position-relative" style="view-transition-name: custom-styles">
+    <form class="flex flex-column gap" action="/account/custom_styles" accept-charset="UTF-8" method="post" data-controller="form" data-action="keydown.ctrl+enter-&gt;form#submit keydown.meta+enter-&gt;form#submit">
+    <div class="pad-inline-double margin-inline">
+    <h1 class="margin-none">Custom CSS</h1>
+    <p class="flex flex-wrap align-center justify-center gap margin-none-block-start" style="--column-gap: 0.5ch; --row-gap: 0">
+    <span>Add custom CSS styles.</span>
+    <img aria-hidden="true" class="flex-inline colorize--black" src="/assets/alert-b937985b.svg" width="16" height="16" />
+    <span>Use Caution: you could break things.</span>
+    </p>
+    </div>
+    <label class="flex align-start gap flex-item-grow">
+    <textarea class="input input--code txt--small" placeholder="Add CSS styles…" autocomplete="off" spellcheck="false" autocorrect="off" autocapitalize="off" rows="16" name="account[custom_styles]" id="account_custom_styles">{{ css:s }}</textarea>
+    </label>
+    <button class="btn btn--reversed center txt-large" type="submit">
+    <img aria-hidden="true" src="/assets/check-7897ff7e.svg" width="20" height="20" />
+    <span class="for-screen-reader">Save changes</span>
+    </button>
+    </form>
+    </section>
+    </main>
+    </body>
+}
+
+// Sessions::TransfersController#show — auto_submit_form_with method: :put.
+// The auto-submit controller requestSubmits on connect; without JS the form
+// is still a complete, honest post to the same URL.
+koru/dom:component(TransferPage) {
+    <body class="admin" data-controller="local-time lightbox">
+    <main id="main-content">
+    <form data-controller="auto-submit" action="{{ action:s }}" accept-charset="UTF-8" method="post">
+    <input type="hidden" name="_method" value="put" />
+    </form>
+    </main>
+    </body>
+}
+
+// UsersController#new — the join form. Posts to /join/:join_code; the
+// code is verified server-side (mismatch is a 404).
+koru/dom:component(JoinPage) {
+    <body class="signup" data-controller="local-time lightbox">
+    <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
+    <nav id="nav">
+    <div class="flex-item-justify-end">
+    <a href="/session/new" class="btn flex-item-justify-end">
+    <img aria-hidden="true" src="/assets/login-keys-df926967.svg" width="20" height="20" />
+    <span class="for-screen-reader">Sign in</span>
+    </a>
+    </div>
+    </nav>
+    <main id="main-content">
+    <form class="center" action="{{ action:s }}" accept-charset="UTF-8" method="post">
+    <section class="nametag u-relative">
+    <div class="nametag__inner flex flex-column gap">
+    <fieldset class="flex flex-column center-block">
+    <legend class="txt-align-center flex gap">
+    <strong class="txt-large">{{ acctname:s }}</strong>
+    </legend>
+    </fieldset>
+    <div class="flex align-center gap">
+    <label class="flex align-center gap flex-item-grow txt-large input input--actor">
+    <input class="input" autocomplete="name" placeholder="Name" autofocus="autofocus" required="required" data-1p-ignore="true" type="text" name="user[name]" id="user_name" />
+    <img aria-hidden="true" class="colorize--black" src="/assets/person-da193438.svg" width="24" height="24" />
+    </label>
+    </div>
+    <div class="flex align-center gap">
+    <label class="flex align-center gap flex-item-grow txt-large input input--actor">
+    <input class="input" autocomplete="username" placeholder="Email address" required="required" type="email" name="user[email_address]" id="user_email_address" />
+    <img aria-hidden="true" class="colorize--black" src="/assets/email-6c595bc5.svg" width="24" height="24" />
+    </label>
+    </div>
+    <div class="flex align-center gap">
+    <label class="flex align-center gap flex-item-grow txt-large input input--actor">
+    <input class="input" autocomplete="new-password" placeholder="Password" required="required" maxlength="72" type="password" name="user[password]" id="user_password" />
+    <img aria-hidden="true" class="colorize--black" src="/assets/password-0896da4e.svg" width="24" height="24" />
+    </label>
+    </div>
+    <button class="btn btn--reversed center txt-large" type="submit">
+    <img aria-hidden="true" src="/assets/check-7897ff7e.svg" width="20" height="20" />
+    <span class="for-screen-reader">Save</span>
+    </button>
+    </div>
+    </section>
+    </form>
+    </main>
+    </body>
+}
+
+// Rooms::DirectsController#new — the ping composer. Rendered as a full page
+// whose <turbo-frame id="direct_rooms_control"> replaces the sidebar's
+// control frame when the "New Ping" link navigates it (_self).
+koru/dom:component(DirectsPage) {
+    <body class="admin" data-controller="local-time lightbox">
+    <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
+    <nav id="nav">
+    </nav>
+    <main id="main-content">
+    <turbo-frame id="direct_rooms_control" target="_top">
+    <div class="directs directs--new flex flex-column gap">
+    <form class="flex gap flex-item-grow" data-controller="form" data-action="keydown.esc-&gt;form#cancel" action="/rooms/directs" accept-charset="UTF-8" method="post">
+    <a class="btn flex-item-no-shrink" data-turbo-frame="user_sidebar" data-form-target="cancel" href="/users/me/sidebar">
+    <img aria-hidden="true" src="/assets/arrow-left-abe40556.svg" width="20" height="20" />
+    <span class="for-screen-reader">Cancel changes</span>
+    </a>
+    <section class="autocomplete__container unpad input input--actor">
+    <div class="autocomplete__input input flex flex-wrap position-relative flex-item-grow" data-controller="autocomplete" data-autocomplete-url-value="/autocompletable/users">
+    <select name="user_ids[]" data-autocomplete-target="select" data-template-id="autocompletable-user" multiple="true" hidden="" required="">
+    </select>
+    <template id="autocompletable-user">
+    <div class="autocomplete__pill max-width" data-value="" tabindex="0">
+    <img class="avatar flex-item-no-shrink" data-content="avatar" src="">
+    <span class="autocomplete-field__selected-value-text overflow-ellipsis flex-item-grow" data-content="label">
+    </span>
+    <button type="button" data-action="autocomplete#remove:prevent" data-value="" tabindex="-1" class="btn btn--plain txt-small translucent flex-item-no-shrink">
+    <img aria-hidden="true" class="colorize--black" src="/assets/remove-circle-384c618c.svg" width="20" height="20" />
+    <span class="for-screen-reader">Remove <span data-content="screenReaderLabel"></span></span>
+    </button>
+    </div>
+    </template>
+    <input autocomplete="off" autocorrect="off" data-1p-ignore="true" class="autocomplete__input input flex flex-wrap position-relative" data-autocomplete-target="input" data-action="input-&gt;autocomplete#search keydown-&gt;autocomplete#didPressKey" type="text" name="rooms_direct[user_ids_input]" id="rooms_direct_user_ids_input">
+    </div>
+    </section>
+    <button name="button" type="submit" class="btn btn--reversed flex-item-no-shrink">
+    <img aria-hidden="true" src="/assets/check-7897ff7e.svg" width="20" height="20" />
+    <span class="for-screen-reader">Start Ping</span>
+    </button>
+    </form>
+    <span class="txt-small translucent pad-inline-half center">Type names to ping someone…</span>
+    </div>
+    </turbo-frame>
+    </main>
+    <aside id="sidebar" data-controller="toggle-class" data-toggle-class-toggle-class="open">
+    </aside>
+    </body>
+}
+
 koru/dom:component(RoomPage) {
-    <html><head><title>{{ title:s }}</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, interactive-widget=resizes-content">
-    <meta name="view-transition" content="same-origin">
-    <meta name="color-scheme" content="light dark">
-    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
-    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="current-user-id" content="{{ uid:d }}" />
-    <meta name="current-user-name" content="{{ uname:s }}" />
-    <meta name="action-cable-url" content="/cable">
-    <meta name="vapid-public-key">
-    <meta name="turbo-prefetch" content="true">
-    <link rel="manifest" href="/webmanifest.json">
-    <link rel="icon" href="/account/logo?v={{ logo:s }}" type="image/png">
-    <link rel="apple-touch-icon" href="/account/logo?v={{ logo:s }}">
-    <link rel="stylesheet" href="/assets/_reset-9c3efd7b.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/actiontext-7b8d51ea.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/animation-bcdb4bab.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/autocomplete-9de8c93f.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/avatars-279376ab.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/base-637a0ec8.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/boosts-da4032a8.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/buttons-c7d39fd4.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/code-333ae548.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/colorize-eb391ca0.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/colors-aee62523.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/composer-e490638a.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/embeds-c20d0a3a.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/filters-8a4d63ed.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/flash-a561c1e5.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/inputs-9e58a07c.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/layout-ff6ddfc6.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/lexxy-content-0ff2f961.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/lexxy-editor-2d5c7ebe.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/lexxy-variables-3fef4323.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/lexxy-2876c58e.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/lightbox-af496d39.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/messages-c5485fef.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/nav-05e7183a.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/panels-af44ec6d.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/separators-172b3ab8.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/sidebar-0be58db9.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/signup-6e02d591.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/spinner-5a118f25.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/trix-65afdb1d.css" data-turbo-track="reload" />
-    <link rel="stylesheet" href="/assets/utilities-e2f32466.css" data-turbo-track="reload" />
-    <script type="importmap" data-turbo-track="reload">{
-  "imports": {
-    "application": "/assets/application-a54c74a7.js",
-    "@hotwired/stimulus": "/assets/stimulus.min-4b1e420e.js",
-    "@hotwired/stimulus-loading": "/assets/stimulus-loading-1fc53fe7.js",
-    "@hotwired/turbo-rails": "/assets/turbo-a1e3a50a.js",
-    "@rails/actioncable": "/assets/actioncable.esm-e0ec9819.js",
-    "@rails/request.js": "/assets/@rails--request-3fc8489d.js",
-    "lexxy": "/assets/lexxy-a21f41d4.js",
-    "highlight.js": "/assets/highlight.js/core-4e141f64.js",
-    "initializers/autocomplete": "/assets/initializers/autocomplete-ba9abe45.js",
-    "initializers/current": "/assets/initializers/current-3a3b90da.js",
-    "initializers/highlight": "/assets/initializers/highlight-5bd558f1.js",
-    "initializers": "/assets/initializers/index-d2bbfae4.js",
-    "initializers/rich_text": "/assets/initializers/rich_text-f451a05e.js",
-    "lib/autocomplete/autocomplete_handler": "/assets/lib/autocomplete/autocomplete_handler-becd1e1a.js",
-    "lib/autocomplete/base_autocomplete_handler": "/assets/lib/autocomplete/base_autocomplete_handler-96e7e419.js",
-    "lib/autocomplete/collection": "/assets/lib/autocomplete/collection-3e251a0e.js",
-    "lib/autocomplete/constants": "/assets/lib/autocomplete/constants-17c2858b.js",
-    "lib/autocomplete/custom_elements/suggestion_option": "/assets/lib/autocomplete/custom_elements/suggestion_option-ac7846b3.js",
-    "lib/autocomplete/custom_elements/suggestion_select": "/assets/lib/autocomplete/custom_elements/suggestion_select-f0045305.js",
-    "lib/autocomplete/helpers": "/assets/lib/autocomplete/helpers-651308b9.js",
-    "lib/autocomplete/renderer": "/assets/lib/autocomplete/renderer-5caf6120.js",
-    "lib/autocomplete/selection": "/assets/lib/autocomplete/selection-862705bf.js",
-    "lib/autocomplete/suggestion_context": "/assets/lib/autocomplete/suggestion_context-b265ffb4.js",
-    "lib/autocomplete/suggestion_controller": "/assets/lib/autocomplete/suggestion_controller-10624c40.js",
-    "lib/autocomplete/suggestion_results_controller": "/assets/lib/autocomplete/suggestion_results_controller-91405749.js",
-    "lib/autocomplete/utils": "/assets/lib/autocomplete/utils-296fb278.js",
-    "lib/cookie": "/assets/lib/cookie-76006835.js",
-    "lib/rich_text/campfire_extension": "/assets/lib/rich_text/campfire_extension-f62f017b.js",
-    "lib/rich_text/cite_node": "/assets/lib/rich_text/cite_node-b4d2b89a.js",
-    "controllers/application": "/assets/controllers/application-f004202c.js",
-    "controllers/auto_submit_controller": "/assets/controllers/auto_submit_controller-ee52d396.js",
-    "controllers/autocomplete_controller": "/assets/controllers/autocomplete_controller-eaf5b07d.js",
-    "controllers/badge_dot_controller": "/assets/controllers/badge_dot_controller-e0d733c8.js",
-    "controllers/boost_delete_controller": "/assets/controllers/boost_delete_controller-29fd1686.js",
-    "controllers/composer_controller": "/assets/controllers/composer_controller-73c33f9f.js",
-    "controllers/copy_to_clipboard_controller": "/assets/controllers/copy_to_clipboard_controller-a4928c72.js",
-    "controllers/drop_target_controller": "/assets/controllers/drop_target_controller-3a205782.js",
-    "controllers/element_removal_controller": "/assets/controllers/element_removal_controller-4526910a.js",
-    "controllers/filter_controller": "/assets/controllers/filter_controller-ca9769d5.js",
-    "controllers/form_controller": "/assets/controllers/form_controller-6f3d64db.js",
-    "controllers": "/assets/controllers/index-594ba2fb.js",
-    "controllers/lightbox_controller": "/assets/controllers/lightbox_controller-98fc07ca.js",
-    "controllers/local_time_controller": "/assets/controllers/local_time_controller-7daf3d0c.js",
-    "controllers/maintain_scroll_controller": "/assets/controllers/maintain_scroll_controller-1debbbfb.js",
-    "controllers/messages_controller": "/assets/controllers/messages_controller-3d90944a.js",
-    "controllers/notifications_controller": "/assets/controllers/notifications_controller-746d0662.js",
-    "controllers/popup_controller": "/assets/controllers/popup_controller-9f8ea824.js",
-    "controllers/presence_controller": "/assets/controllers/presence_controller-28f14aad.js",
-    "controllers/pwa_install_controller": "/assets/controllers/pwa_install_controller-3fe3fc5e.js",
-    "controllers/read_rooms_controller": "/assets/controllers/read_rooms_controller-8245522a.js",
-    "controllers/refresh_room_controller": "/assets/controllers/refresh_room_controller-4e4b6014.js",
-    "controllers/reply_controller": "/assets/controllers/reply_controller-278bb9cc.js",
-    "controllers/rooms_list_controller": "/assets/controllers/rooms_list_controller-64840fcd.js",
-    "controllers/scroll_into_view_controller": "/assets/controllers/scroll_into_view_controller-8a0bc733.js",
-    "controllers/search_results_controller": "/assets/controllers/search_results_controller-aab46974.js",
-    "controllers/sessions_controller": "/assets/controllers/sessions_controller-a9fdfe3d.js",
-    "controllers/soft_keyboard_controller": "/assets/controllers/soft_keyboard_controller-be1da837.js",
-    "controllers/sorted_list_controller": "/assets/controllers/sorted_list_controller-9f9ae485.js",
-    "controllers/sound_controller": "/assets/controllers/sound_controller-d3e5656e.js",
-    "controllers/toggle_class_controller": "/assets/controllers/toggle_class_controller-b67fa681.js",
-    "controllers/turbo_frame_controller": "/assets/controllers/turbo_frame_controller-9f4f722f.js",
-    "controllers/turbo_streaming_controller": "/assets/controllers/turbo_streaming_controller-04b85a80.js",
-    "controllers/typing_notifications_controller": "/assets/controllers/typing_notifications_controller-86906ab9.js",
-    "controllers/unfurl_controller": "/assets/controllers/unfurl_controller-4a868f9a.js",
-    "controllers/upload_preview_controller": "/assets/controllers/upload_preview_controller-9b8b26bb.js",
-    "controllers/web_share_controller": "/assets/controllers/web_share_controller-f7236b6f.js",
-    "helpers/dom_helpers": "/assets/helpers/dom_helpers-0f234176.js",
-    "helpers/navigator_helpers": "/assets/helpers/navigator_helpers-3c9f4c31.js",
-    "helpers/string_helpers": "/assets/helpers/string_helpers-40941ba8.js",
-    "helpers/timing_helpers": "/assets/helpers/timing_helpers-94d95529.js",
-    "helpers/turbo_helpers": "/assets/helpers/turbo_helpers-a3c01462.js",
-    "models/client_message": "/assets/models/client_message-de3c07cf.js",
-    "models/file_uploader": "/assets/models/file_uploader-09a18428.js",
-    "models/message_formatter": "/assets/models/message_formatter-f39a0c5d.js",
-    "models/message_paginator": "/assets/models/message_paginator-b79013e3.js",
-    "models/scroll_manager": "/assets/models/scroll_manager-ed559629.js",
-    "models/typing_tracker": "/assets/models/typing_tracker-42a444a5.js",
-    "languages/bash": "/assets/languages/bash-13136668.js",
-    "languages/css": "/assets/languages/css-a7f2e40b.js",
-    "languages/diff": "/assets/languages/diff-94a335fe.js",
-    "languages/go": "/assets/languages/go-10465864.js",
-    "languages/java": "/assets/languages/java-95f3a30f.js",
-    "languages/javascript": "/assets/languages/javascript-18eb0dd8.js",
-    "languages/json": "/assets/languages/json-60184e1b.js",
-    "languages/python": "/assets/languages/python-8f48fd1a.js",
-    "languages/ruby": "/assets/languages/ruby-287ccd0f.js",
-    "languages/rust": "/assets/languages/rust-d48f93d8.js",
-    "languages/sql": "/assets/languages/sql-642be05a.js",
-    "languages/xml": "/assets/languages/xml-fa7f1eda.js"
-    }
-    }</script>
-    <link rel="modulepreload" href="/assets/application-a54c74a7.js">
-    <link rel="modulepreload" href="/assets/stimulus.min-4b1e420e.js">
-    <link rel="modulepreload" href="/assets/stimulus-loading-1fc53fe7.js">
-    <link rel="modulepreload" href="/assets/turbo-a1e3a50a.js">
-    <link rel="modulepreload" href="/assets/actioncable.esm-e0ec9819.js">
-    <link rel="modulepreload" href="/assets/@rails--request-3fc8489d.js">
-    <link rel="modulepreload" href="/assets/lexxy-a21f41d4.js">
-    <link rel="modulepreload" href="/assets/highlight.js/core-4e141f64.js">
-    <link rel="modulepreload" href="/assets/initializers/autocomplete-ba9abe45.js">
-    <link rel="modulepreload" href="/assets/initializers/current-3a3b90da.js">
-    <link rel="modulepreload" href="/assets/initializers/highlight-5bd558f1.js">
-    <link rel="modulepreload" href="/assets/initializers/index-d2bbfae4.js">
-    <link rel="modulepreload" href="/assets/initializers/rich_text-f451a05e.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/autocomplete_handler-becd1e1a.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/base_autocomplete_handler-96e7e419.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/collection-3e251a0e.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/constants-17c2858b.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/custom_elements/suggestion_option-ac7846b3.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/custom_elements/suggestion_select-f0045305.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/helpers-651308b9.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/renderer-5caf6120.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/selection-862705bf.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/suggestion_context-b265ffb4.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/suggestion_controller-10624c40.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/suggestion_results_controller-91405749.js">
-    <link rel="modulepreload" href="/assets/lib/autocomplete/utils-296fb278.js">
-    <link rel="modulepreload" href="/assets/lib/cookie-76006835.js">
-    <link rel="modulepreload" href="/assets/lib/rich_text/campfire_extension-f62f017b.js">
-    <link rel="modulepreload" href="/assets/lib/rich_text/cite_node-b4d2b89a.js">
-    <link rel="modulepreload" href="/assets/controllers/application-f004202c.js">
-    <link rel="modulepreload" href="/assets/controllers/auto_submit_controller-ee52d396.js">
-    <link rel="modulepreload" href="/assets/controllers/autocomplete_controller-eaf5b07d.js">
-    <link rel="modulepreload" href="/assets/controllers/badge_dot_controller-e0d733c8.js">
-    <link rel="modulepreload" href="/assets/controllers/boost_delete_controller-29fd1686.js">
-    <link rel="modulepreload" href="/assets/controllers/composer_controller-73c33f9f.js">
-    <link rel="modulepreload" href="/assets/controllers/copy_to_clipboard_controller-a4928c72.js">
-    <link rel="modulepreload" href="/assets/controllers/drop_target_controller-3a205782.js">
-    <link rel="modulepreload" href="/assets/controllers/element_removal_controller-4526910a.js">
-    <link rel="modulepreload" href="/assets/controllers/filter_controller-ca9769d5.js">
-    <link rel="modulepreload" href="/assets/controllers/form_controller-6f3d64db.js">
-    <link rel="modulepreload" href="/assets/controllers/index-594ba2fb.js">
-    <link rel="modulepreload" href="/assets/controllers/lightbox_controller-98fc07ca.js">
-    <link rel="modulepreload" href="/assets/controllers/local_time_controller-7daf3d0c.js">
-    <link rel="modulepreload" href="/assets/controllers/maintain_scroll_controller-1debbbfb.js">
-    <link rel="modulepreload" href="/assets/controllers/messages_controller-3d90944a.js">
-    <link rel="modulepreload" href="/assets/controllers/notifications_controller-746d0662.js">
-    <link rel="modulepreload" href="/assets/controllers/popup_controller-9f8ea824.js">
-    <link rel="modulepreload" href="/assets/controllers/presence_controller-28f14aad.js">
-    <link rel="modulepreload" href="/assets/controllers/pwa_install_controller-3fe3fc5e.js">
-    <link rel="modulepreload" href="/assets/controllers/read_rooms_controller-8245522a.js">
-    <link rel="modulepreload" href="/assets/controllers/refresh_room_controller-4e4b6014.js">
-    <link rel="modulepreload" href="/assets/controllers/reply_controller-278bb9cc.js">
-    <link rel="modulepreload" href="/assets/controllers/rooms_list_controller-64840fcd.js">
-    <link rel="modulepreload" href="/assets/controllers/scroll_into_view_controller-8a0bc733.js">
-    <link rel="modulepreload" href="/assets/controllers/search_results_controller-aab46974.js">
-    <link rel="modulepreload" href="/assets/controllers/sessions_controller-a9fdfe3d.js">
-    <link rel="modulepreload" href="/assets/controllers/soft_keyboard_controller-be1da837.js">
-    <link rel="modulepreload" href="/assets/controllers/sorted_list_controller-9f9ae485.js">
-    <link rel="modulepreload" href="/assets/controllers/sound_controller-d3e5656e.js">
-    <link rel="modulepreload" href="/assets/controllers/toggle_class_controller-b67fa681.js">
-    <link rel="modulepreload" href="/assets/controllers/turbo_frame_controller-9f4f722f.js">
-    <link rel="modulepreload" href="/assets/controllers/turbo_streaming_controller-04b85a80.js">
-    <link rel="modulepreload" href="/assets/controllers/typing_notifications_controller-86906ab9.js">
-    <link rel="modulepreload" href="/assets/controllers/unfurl_controller-4a868f9a.js">
-    <link rel="modulepreload" href="/assets/controllers/upload_preview_controller-9b8b26bb.js">
-    <link rel="modulepreload" href="/assets/controllers/web_share_controller-f7236b6f.js">
-    <link rel="modulepreload" href="/assets/helpers/dom_helpers-0f234176.js">
-    <link rel="modulepreload" href="/assets/helpers/navigator_helpers-3c9f4c31.js">
-    <link rel="modulepreload" href="/assets/helpers/string_helpers-40941ba8.js">
-    <link rel="modulepreload" href="/assets/helpers/timing_helpers-94d95529.js">
-    <link rel="modulepreload" href="/assets/helpers/turbo_helpers-a3c01462.js">
-    <link rel="modulepreload" href="/assets/models/client_message-de3c07cf.js">
-    <link rel="modulepreload" href="/assets/models/file_uploader-09a18428.js">
-    <link rel="modulepreload" href="/assets/models/message_formatter-f39a0c5d.js">
-    <link rel="modulepreload" href="/assets/models/message_paginator-b79013e3.js">
-    <link rel="modulepreload" href="/assets/models/scroll_manager-ed559629.js">
-    <link rel="modulepreload" href="/assets/models/typing_tracker-42a444a5.js">
-    <link rel="modulepreload" href="/assets/languages/bash-13136668.js">
-    <link rel="modulepreload" href="/assets/languages/css-a7f2e40b.js">
-    <link rel="modulepreload" href="/assets/languages/diff-94a335fe.js">
-    <link rel="modulepreload" href="/assets/languages/go-10465864.js">
-    <link rel="modulepreload" href="/assets/languages/java-95f3a30f.js">
-    <link rel="modulepreload" href="/assets/languages/javascript-18eb0dd8.js">
-    <link rel="modulepreload" href="/assets/languages/json-60184e1b.js">
-    <link rel="modulepreload" href="/assets/languages/python-8f48fd1a.js">
-    <link rel="modulepreload" href="/assets/languages/ruby-287ccd0f.js">
-    <link rel="modulepreload" href="/assets/languages/rust-d48f93d8.js">
-    <link rel="modulepreload" href="/assets/languages/sql-642be05a.js">
-    <link rel="modulepreload" href="/assets/languages/xml-fa7f1eda.js">
-    <script type="module">import "application"</script>
-    <meta name="turbo-cache-control" content="no-preview">
     <meta name="current-room-id" content="{{ rid:s }}">
-    </head>
     <body class="{{ bodyclass:s }}" data-controller="local-time lightbox">
     <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
     <nav id="nav">
-    <span class="btn btn--reversed btn--faux room--current"><h1 class="room__contents txt-medium overflow-ellipsis">{{ title:s }}</h1></span>
+    <span class="btn btn--reversed btn--faux room--current"><h1 class="room__contents txt-medium overflow-ellipsis">{{ navtitle:h }}</h1></span>
     <a class="btn" style="view-transition-name: edit-room-{{ rid:s }}" data-room-id="{{ rid:s }}" href="{{ editpath:s }}">
     <img aria-hidden="true" src="/assets/menu-dots-horizontal-f6a5d793.svg" width="20" height="20" />
-    <span class="for-screen-reader">Settings for this room</span>
+    <span class="for-screen-reader">{{ settingslabel:s }}</span>
     </a>
     <span>
     <span class="button_to_change_notifying" data-controller="notifications" data-notifications-subscriptions-url-value="/users/me/push_subscriptions" data-notifications-attention-class="btn--pulsing">
@@ -404,7 +653,7 @@ koru/dom:component(RoomPage) {
     <strong>Check your Curl settings</strong>
     <img aria-hidden="true" class="disclosure" src="/assets/disclosure-26d63471.svg" width="10" height="10" />
     </summary>
-    <p>Ensure notifications are enabled for <em>https://{{ host:s }}/</em> in your web browser settings.</p>
+    <p>Ensure notifications are enabled for <em>{{ host:s }}/</em> in your web browser settings.</p>
     </details>
     <details class="notifications-help hide-in-browser" data-notifications-target="details">
     <summary class="btn">
@@ -443,7 +692,7 @@ koru/dom:component(RoomPage) {
     </span>
     </nav>
     <main id="main-content">
-    <div id="message-area" class="message-area" contents="true" data-controller="messages presence drop-target" data-action="turbo:before-stream-render@document-&gt;messages#beforeStreamRender keydown.up@document-&gt;messages#editMyLastMessage dragenter-&gt;drop-target#dragenter dragover-&gt;drop-target#dragover drop-&gt;drop-target#drop visibilitychange@document-&gt;presence#visibilityChanged" data-messages-first-of-day-class="message--first-of-day" data-messages-formatted-class="message--formatted" data-messages-me-class="message--me" data-messages-mentioned-class="message--mentioned" data-messages-threaded-class="message--threaded" data-messages-page-url-value="https://{{ host:s }}/rooms/{{ rid:s }}/messages">
+    <div id="message-area" class="message-area" contents="true" data-controller="messages presence drop-target" data-action="turbo:before-stream-render@document-&gt;messages#beforeStreamRender keydown.up@document-&gt;messages#editMyLastMessage dragenter-&gt;drop-target#dragenter dragover-&gt;drop-target#dragover drop-&gt;drop-target#drop visibilitychange@document-&gt;presence#visibilityChanged" data-messages-first-of-day-class="message--first-of-day" data-messages-formatted-class="message--formatted" data-messages-me-class="message--me" data-messages-mentioned-class="message--mentioned" data-messages-threaded-class="message--threaded" data-messages-page-url-value="{{ host:s }}/rooms/{{ rid:s }}/messages">
     <script type="text/template" data-messages-target="template">
     <div class="message message--me $messageClasses$" id="message_$clientMessageId$" data-format-message-target="message" data-user-id="{{ uid:d }}" data-message-timestamp="$messageTimestamp$" data-messages-target="message">
     <div class="message__day-separator"><time class="message__timestamp" datetime="$messageDatetime$" data-local-time-target="date"></time></div>
@@ -471,7 +720,7 @@ koru/dom:component(RoomPage) {
     </div>
     </div>
     </script>
-    <div id="messages_{{ msgdom:s }}" class="messages" data-controller="maintain-scroll refresh-room" data-action="turbo:before-stream-render@document-&gt;maintain-scroll#beforeStreamRender visibilitychange@document-&gt;refresh-room#visibilityChanged online@window-&gt;refresh-room#online" data-messages-target="messages" data-refresh-room-loaded-at-value="{{ loaded:d }}" data-refresh-room-url-value="https://{{ host:s }}/rooms/{{ rid:s }}/refresh">{{ rows:h }}</div>
+    <div id="messages_{{ msgdom:s }}" class="messages" data-controller="maintain-scroll refresh-room" data-action="turbo:before-stream-render@document-&gt;maintain-scroll#beforeStreamRender visibilitychange@document-&gt;refresh-room#visibilityChanged online@window-&gt;refresh-room#online" data-messages-target="messages" data-refresh-room-loaded-at-value="{{ loaded:d }}" data-refresh-room-url-value="{{ host:s }}/rooms/{{ rid:s }}/refresh">{{ rows:h }}</div>
     <turbo-cable-stream-source channel="RoomMessagesChannel" signed-stream-name="{{ stream:s }}"></turbo-cable-stream-source>
     <button class="message-area__return-to-latest btn" data-action="messages#returnToLatest" data-messages-target="latest" hidden="hidden"><img aria-hidden="true" src="/assets/arrow-down-3f174d76.svg" width="20" height="20" /><span class="for-screen-reader">Jump to newest message</span></button>
     </div>
@@ -490,7 +739,7 @@ koru/dom:component(RoomPage) {
     <div class="flex align-end gap full-width">
     <img aria-hidden="true" class="composer__input-hint colorize--black" style="view-transition-name: input-btn;" src="/assets/messages-outlined-87ff0331.svg" width="22" height="22" />
     <div class="flex flex-column flex-item-grow min-width gap">
-    <lexxy-editor rows="1" class="input lexxy-content" style="order: -1" aria-multiline="true" aria-label="Write a message" permitted-attachment-types="application/vnd.campfire.mention application/vnd.actiontext.opengraph-embed" data-controller="unfurl" data-action="lexxy:change-&gt;typing-notifications#start keydown-&gt;composer#submitByKeyboard:capture lexxy:change-&gt;composer#saveDraft lexxy:insert-link-&gt;unfurl#unfurl" data-composer-target="text" data-direct-upload-url="https://{{ host:s }}/rails/active_storage/direct_uploads" data-blob-url-template="https://{{ host:s }}/rails/active_storage/blobs/redirect/:signed_id/:filename" id="message_body" input="message_body_trix_input_message" name="message[body]">
+    <lexxy-editor rows="1" class="input lexxy-content" style="order: -1" aria-multiline="true" aria-label="Write a message" permitted-attachment-types="application/vnd.campfire.mention application/vnd.actiontext.opengraph-embed" data-controller="unfurl" data-action="lexxy:change-&gt;typing-notifications#start keydown-&gt;composer#submitByKeyboard:capture lexxy:change-&gt;composer#saveDraft lexxy:insert-link-&gt;unfurl#unfurl" data-composer-target="text" data-direct-upload-url="{{ host:s }}/rails/active_storage/direct_uploads" data-blob-url-template="{{ host:s }}/rails/active_storage/blobs/redirect/:signed_id/:filename" id="message_body" input="message_body_trix_input_message" name="message[body]">
     <lexxy-prompt trigger="@" name="mention" src="/autocompletable/users?room_id={{ rid:s }}" remote-filtering="true" empty-results="No matches"></lexxy-prompt>
     </lexxy-editor>
     </div>
@@ -534,7 +783,7 @@ koru/dom:component(RoomPage) {
     <a href="https://once.com" id="app-logo" target="_blank" aria-label="Once software from 37signals home page">
     <img alt="Campfire logo" width="256" height="216" src="/assets/campfire-icon-3d9986c5.png" />
     </a>
-    </body></html>
+    </body>
 }
 
 // ── Page flows ──────────────────────────────────────────────────────────────
@@ -557,7 +806,28 @@ pub tor ts-ms { ts: string } -> i64
 pub tor ts-iso { ts: string } -> string
 pub tor ts-ver { ts: string } -> string
 pub tor msgdom { rid: string } -> string
+pub tor mdom { cmid: string } -> string
 pub tor html-esc { text: string } -> string
+pub tor nav-title { rtype: string, name: string } -> string
+pub tor settings-label { rtype: string } -> string
+pub tor user-metas { uid: i64, name: string } -> string
+pub tor style-wrap { css: ?string } -> string
+pub tor css-stash { css: string<*> }
+pub tor css-take {} -> ?string
+pub tor stream-wrap { action: string, target: string, html: string<*> } -> string
+pub tor room-link { rk: string, rid: string, name: string } -> string
+pub tor direct-link { rid: string, name: string, sgid: string, ver: string } -> string
+pub tor memb-link { rid: string, name: string } -> string
+pub tor bot-key { id: i64, token: string } -> string
+pub tor curl-line { host: string, rid: string, key: string } -> string
+pub tor bots-begin {}
+pub tor bot-row { uid: i64, name: string, key: string, rid: i64, rname: string, host: string } -> string
+pub tor bots-take {} -> string
+pub tor acct-user { uid: i64, uname: string, role: i64, sgid: string, ver: string } -> string
+pub tor room-user { uid: i64, uname: string, sgid: string, ver: string } -> string
+pub tor ac-begin {}
+pub tor ac-row { uid: i64, name: string, sgid: string, ver: string } -> string
+pub tor ac-take {} -> string
 pub tor room-edit-path { rid: string } -> string
 pub tor page-reset {}
 pub tor body-class {} -> string
@@ -568,6 +838,50 @@ pub tor user-title { name: string, bio: string } -> string
 pub tor now-ms {} -> i64
 pub tor host-or { h: ?string } -> string
 pub tor boost-stash { mid: i64, html: string<*> }
+pub tor auth-stash { uid: i64, name: string<*>, email: string<*>, bio: string<*>, role: i64, ver: string<*> }
+pub tor user-role {} -> i64
+pub tor new-room-btn { role: i64, restrict: i64 } -> string
+pub tor auth-email {} -> string
+pub tor auth-bio {} -> string
+pub tor acct-stash { name: string<*>, join: string<*>, restrict: i64, ver: string<*> }
+pub tor acct-restrict {} -> i64
+pub tor acct-ver {} -> string
+pub tor acct-name {} -> string
+pub tor acct-join {} -> string
+pub tor ping-btn { uid: i64, name: string, sgid: string, ver: string } -> string
+pub tor itoa { n: i64 } -> string
+pub tor nav-flag { role: i64 } -> string
+pub tor edit-stash { name: string<*>, wh: string<*> }
+pub tor edit-name {} -> string
+pub tor edit-wh {} -> string
+pub tor join-code {} -> string
+pub tor bot-token {} -> string
+pub tor acct-nav-admin { role: i64 } -> string
+pub tor acct-admin-block { name: string, restrict: i64, role: i64 } -> string
+pub tor acct-member-block { name: string, role: i64 } -> string
+pub tor acct-regen { role: i64 } -> string
+pub tor uids-join { ids: string, uid: i64 } -> string
+pub tor uids-count { ids: string } -> i64
+pub tor list-id { rk: string, rid: string } -> string
+pub tor bot-action { bid: i64 } -> string
+pub tor room-form-action { plural: string, rid: i64 } -> string
+pub tor first-name { name: string } -> string
+pub tor transfer-path { host: string, sid: string } -> string
+pub tor invite-path { host: string, code: string } -> string
+pub tor head-build { title: string, metas: string, logo: string, styles: string } -> string
+pub tor profile-render { uid: i64, name: string, email: string, bio: string,
+                         turl: string, qrpath: string, memberships: string } -> string<std/io:allocated!>
+pub tor account-render { navadmin: string, admin: string, member: string,
+                         inviteurl: string, qrpath: string, regen: string, users: string } -> string<std/io:allocated!>
+pub tor roomform-render { action: string, method: string, name: string, users: string } -> string<std/io:allocated!>
+pub tor bots-render { bots: string } -> string<std/io:allocated!>
+pub tor botform-render { action: string, method: string, name: string, webhook: string } -> string<std/io:allocated!>
+pub tor styles-render { css: string } -> string<std/io:allocated!>
+pub tor transfer-action { sid: string } -> string
+pub tor transfer-render { action: string } -> string<std/io:allocated!>
+pub tor join-render { action: string, acctname: string } -> string<std/io:allocated!>
+pub tor directs-render {} -> string<std/io:allocated!>
+
 pub tor boost-rows { mid: i64 } -> string
 
 // The room page. Membership is an EXISTS-shaped join that also yields the
@@ -583,7 +897,11 @@ room-page = pages:page-begin()
     |> page-reset()
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3:default(conn: d) {
-            SELECT r.name, r.type, u.id, u.name, u.role, u.updated_at
+            SELECT COALESCE(r.name,
+                       (SELECT GROUP_CONCAT(u2.name, ', ')
+                        FROM memberships m2 JOIN users u2 ON u2.id = m2.user_id
+                        WHERE m2.room_id = r.id AND m2.user_id != u.id)),
+                   r.type, u.id, u.name, u.role, u.updated_at
             FROM rooms r
             JOIN memberships m ON m.room_id = r.id
             JOIN users u ON u.id = m.user_id
@@ -661,9 +979,11 @@ room-page = pages:page-begin()
                         |> room-name(): rn3
                         |> boost-rows(mid): brow
                         |> signing:user-sgid(id: uid): usg
+                        |> host-or(h: host): rh
                         |> Msg-render(cmid: cid, mid, uid, rid, ms, ums, iso,
                                       author: anm, atitle, uver, usgid: usg,
-                                      roomname: rn3, body, boosts: brow): mt
+                                      roomname: rn3, body, boosts: brow,
+                                      host: rh): mt
                         |> pages:page-write(text: mt)
                         |> std/io:free(content: mt)
                 | done d4 |> room-present(): has
@@ -693,18 +1013,25 @@ page-shell = pages:page-take(): rows
     |> user-ver(): uver
     |> signing:user-sgid(id: uid): usg
     |> room-type(): rt
+    |> nav-title(rtype: rt, name: rn): nt
+    |> settings-label(rtype: rt): sl
     |> signing:messages-stream(rtype: rt, rid): stm
     |> body-class(): bc
     |> now-ms(): lat
-    |> RoomPage-render(title: rn, rid, msgdom: md,
+    |> user-metas(uid, name: unm): hmet
+    |> css-take(): hcss
+    |> style-wrap(css: hcss): hsty
+    |> acct-ver(): hver
+    |> head-build(title: rn, metas: hmet, logo: hver, styles: hsty): hd
+    |> RoomPage-render(navtitle: nt, settingslabel: sl, rid, msgdom: md,
                        uid, uname: unm, uver, usgid: usg,
                        bodyclass: bc, loaded: lat,
                        host: hst, editpath: ep,
-                       logo: "20260101160000",
                        stream: stm, rows): page
     |> pages:page-begin()
-    |> pages:page-write(text: "<!DOCTYPE html>")
+    |> pages:page-write(text: hd)
     |> pages:page-write(text: page)
+    |> pages:page-write(text: "</html>")
     |> std/io:free(content: page)
     |> pages:page-take(): body -> body
 
@@ -716,7 +1043,13 @@ page-shell = pages:page-take(): rows
 pub tor message-render { cmid: string, mid: i64, uid: i64, rid: string,
                          ms: i64, ums: i64, iso: string, author: string,
                          atitle: string, uver: string, usgid: string,
-                         roomname: string, body: string, boosts: string } -> string<std/io:allocated!>
+                         roomname: string, body: string, boosts: string,
+                         host: ?string } -> string<std/io:allocated!>
+
+// The pub face of EditMsg — same allocated! boundary discipline as
+// message-render: the component call happens host-side in index.kz.
+pub tor edit-render { cmid: string, rid: string, mid: i64,
+                      body: string, host: ?string } -> string<std/io:allocated!>
 
 // The impl is a zig proc (index.kz): an `allocated!` value auto-discharges
 // at a chain's end before it can satisfy the flow's return, so the call to

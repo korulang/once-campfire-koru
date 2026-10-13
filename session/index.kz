@@ -39,6 +39,12 @@ threadlocal var auth_uid: i64 = -1;
     return tok;
 }
 
+// Optional payload unwrap for required-param gates — an `!= null` guard
+// doesn't narrow `?string` to `string` for tor params, so the payload
+// crosses through a proc. Missing -> "".
+~pub tor str-or { s: ?string } -> string
+~proc str-or|zig { return s orelse ""; }
+
 // The 302's extra_headers block — Location + Set-Cookie spliced into the
 // response head. Built in a request-local buffer (same scoping argument
 // as the pages buffer) so the produced string carries no <allocated!>

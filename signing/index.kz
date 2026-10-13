@@ -466,6 +466,39 @@ threadlocal var cverify_buf: [1024]u8 = undefined;
 // answers no, never an error. `exp` honored if the envelope carries one.
 ~pub tor sgid-verify { raw: string } -> i64
 ~proc sgid-verify|zig {
+    return signedVerify(raw, "user/avatar");
+}
+
+// `user.transfer_id`: `signed_id(purpose: :transfer, expires_in: 4.hours)` —
+// same active_record/signed_id verifier as the avatar sgid, with an exp the
+// verify half enforces. Signed ids are what the profile page hands out; the
+// transfers controller trades one back for a session.
+threadlocal var transfer_buf: [320]u8 = undefined;
+
+~pub tor transfer-id { id: i64 } -> string
+~proc transfer-id|zig {
+    const key = derivedKey("active_record/signed_id", &sgid_key, &sgid_key_ok) orelse return "";
+    var ebuf: [32]u8 = undefined;
+    const exp = iso8601(&ebuf, std.time.timestamp() + 4 * 3600);
+    var env_buf: [192]u8 = undefined;
+    const envelope = std.fmt.bufPrint(&env_buf,
+        "{{\"_rails\":{{\"data\":{d},\"exp\":\"{s}\",\"pur\":\"user/transfer\"}}}}", .{ id, exp }) catch return "";
+    const enc_len = std.base64.url_safe_no_pad.Encoder.calcSize(envelope.len);
+    const enc = transfer_buf[0..enc_len];
+    _ = std.base64.url_safe_no_pad.Encoder.encode(enc, envelope);
+    const sig = hmacHex(key, enc);
+    transfer_buf[enc_len] = '-';
+    transfer_buf[enc_len + 1] = '-';
+    @memcpy(transfer_buf[enc_len + 2 .. enc_len + 66], &sig);
+    return transfer_buf[0 .. enc_len + 66];
+}
+
+~pub tor transfer-verify { raw: string } -> i64
+~proc transfer-verify|zig {
+    return signedVerify(raw, "user/transfer");
+}
+
+fn signedVerify(raw: []const u8, purpose: []const u8) i64 {
     const key = derivedKey("active_record/signed_id", &sgid_key, &sgid_key_ok) orelse return 0;
     if (raw.len < 67) return 0;
     const idx = raw.len - 66;
@@ -486,7 +519,7 @@ threadlocal var cverify_buf: [1024]u8 = undefined;
     const rails = yyjson.c.yyjson_obj_getn(root, "_rails", 6) orelse return 0;
     const pur = yyjson.c.yyjson_obj_getn(rails, "pur", 3) orelse return 0;
     const ps = yyjson.c.yyjson_get_str(pur) orelse return 0;
-    if (!std.mem.eql(u8, ps[0..yyjson.c.yyjson_get_len(pur)], "user/avatar")) return 0;
+    if (!std.mem.eql(u8, ps[0..yyjson.c.yyjson_get_len(pur)], purpose)) return 0;
     const expv = yyjson.c.yyjson_obj_getn(rails, "exp", 3);
     if (expv != null and !yyjson.c.yyjson_is_null(expv)) {
         const es = yyjson.c.yyjson_get_str(expv) orelse return 0;
@@ -498,4 +531,27 @@ threadlocal var cverify_buf: [1024]u8 = undefined;
     // positive ids parse as yyjson UINT — get_int handles either subtype,
     // get_sint would answer 0 and we'd 404 a perfectly valid token.
     return yyjson.c.yyjson_get_int(data);
+}
+
+// The DECODED "<b64>:rooms" name — what stream-verify hands back when the
+// sidebar's user-rooms source confirms, and therefore the stream key
+// fanout must use when broadcasting a direct-room prepend to one member's
+// sidebar. user-rooms-stream returns the signed form; this is the inner.
+threadlocal var urooms_raw_buf: [512]u8 = undefined;
+
+~pub tor urooms-raw { id: i64 } -> string
+~proc urooms-raw|zig {
+    var gid_buf: [128]u8 = undefined;
+    const gid = std.fmt.bufPrint(&gid_buf, "gid://campfire/User/{d}", .{id}) catch return "";
+    const gp_len = std.base64.url_safe_no_pad.Encoder.calcSize(gid.len);
+    var gp_buf: [128]u8 = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(gp_buf[0..gp_len], gid);
+    return std.fmt.bufPrint(&urooms_raw_buf, "{s}:rooms", .{gp_buf[0..gp_len]}) catch "";
+}
+
+// Logout's Set-Cookie value — empty token + epoch expiry (Rack spells a
+// delete this way). Pair with session:redirect-signed.
+~pub tor cookie-clear {} -> string
+~proc cookie-clear|zig {
+    return "session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax";
 }

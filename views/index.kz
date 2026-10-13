@@ -192,7 +192,12 @@ threadlocal var ver_buf: [16]u8 = undefined;
     return Msg_render_event.handler(.{ .cmid = cmid, .mid = mid, .uid = uid,
         .rid = rid, .ms = ms, .ums = ums, .iso = iso, .author = author,
         .atitle = atitle, .uver = uver, .usgid = usgid, .roomname = roomname,
-        .body = body, .boosts = boosts });
+        .body = body, .boosts = boosts, .host = originFor(host) });
+}
+
+~proc edit-render|zig {
+    return EditMsg_render_event.handler(.{ .cmid = cmid, .rid = rid,
+        .mid = mid, .body = body, .host = originFor(host) });
 }
 
 // "rooms_<key>_<rid>" — the room dom_id body, shared by messages_, edit_,
@@ -201,6 +206,13 @@ threadlocal var msgdom_buf: [320]u8 = undefined;
 
 ~proc msgdom|zig {
     return std.fmt.bufPrint(&msgdom_buf, "{s}_{s}", .{ roomKey(), rid }) catch "";
+}
+
+// dom_id(message) — the refresh stream's replace target ("message_<cmid>").
+threadlocal var mdom_buf: [96]u8 = undefined;
+
+~proc mdom|zig {
+    return std.fmt.bufPrint(&mdom_buf, "message_{s}", .{cmid}) catch "";
 }
 
 // /rooms/<plural>/<rid>/edit — the room edit path is type-pluralized.
@@ -219,9 +231,19 @@ threadlocal var room_edit_buf: [320]u8 = undefined;
 
 // Host header unwrap — HTTP/1.1 requires Host; absent means a malformed
 // request, and an empty value then renders as a visibly broken URL rather
-// than silently wrong content.
+// than silently wrong content. Returns the full origin: `https://h`
+// (Rails' assume_ssl posture) or `http://h` under DISABLE_SSL, so every
+// absolute URL the page emits carries the scheme the client actually used.
+threadlocal var origin_buf: [320]u8 = undefined;
+
+fn originFor(h: ?[]const u8) []const u8 {
+    const host = h orelse return "";
+    const proto: []const u8 = if (std.posix.getenv("DISABLE_SSL") != null) "http" else "https";
+    return std.fmt.bufPrint(&origin_buf, "{s}://{s}", .{ proto, host }) catch "";
+}
+
 ~proc host-or|zig {
-    return h orelse "";
+    return originFor(h);
 }
 
 // ── Boost arena ─────────────────────────────────────────────────────────────
@@ -260,4 +282,967 @@ threadlocal var boost_ret: std.ArrayList(u8) = .empty;
     room_seen = false;
     boost_n = 0;
     boost_arena.clearRetainingCapacity();
+}
+
+// ── Application-page helpers ────────────────────────────────────────────────
+// Small render helpers the page flows share. All threadlocal, same
+// request-scoped argument as the stashes above.
+
+fn escInto(out: []u8, n: *usize, s: []const u8) void {
+    for (s) |c| {
+        const rep: []const u8 = switch (c) {
+            '&' => "&amp;", '<' => "&lt;", '>' => "&gt;",
+            '"' => "&quot;", '\'' => "&#39;",
+            else => "",
+        };
+        if (rep.len == 0) {
+            if (n.* >= out.len) return;
+            out[n.*] = c;
+            n.* += 1;
+        } else {
+            if (n.* + rep.len > out.len) return;
+            @memcpy(out[n.* .. n.* + rep.len], rep);
+            n.* += rep.len;
+        }
+    }
+}
+
+fn appendInto(out: []u8, n: *usize, s: []const u8) void {
+    if (n.* + s.len > out.len) return;
+    @memcpy(out[n.* .. n.* + s.len], s);
+    n.* += s.len;
+}
+
+// The h1 interior: directs get the "Ping with" screen-reader prefix, every
+// other room its escaped name.
+threadlocal var navtitle_buf: [512]u8 = undefined;
+
+~proc nav-title|zig {
+    var n: usize = 0;
+    if (std.mem.eql(u8, rtype, "Rooms::Direct"))
+        appendInto(&navtitle_buf, &n, "<span class=\"for-screen-reader\">Ping with</span>");
+    escInto(&navtitle_buf, &n, name);
+    return navtitle_buf[0..n];
+}
+
+~proc settings-label|zig {
+    return if (std.mem.eql(u8, rtype, "Rooms::Direct")) "Settings for this Ping" else "Settings for this room";
+}
+
+// current_user_meta_tags — present on every authenticated page, absent on
+// the public transfer/join pages (uid <= 0).
+threadlocal var metas_buf: [512]u8 = undefined;
+
+~proc user-metas|zig {
+    if (uid <= 0) return "";
+    var n: usize = 0;
+    const pre = "<meta name=\"current-user-id\" content=\"";
+    appendInto(&metas_buf, &n, pre);
+    const num = std.fmt.bufPrint(metas_buf[n..], "{d}", .{uid}) catch return "";
+    n += num.len;
+    appendInto(&metas_buf, &n, "\" /><meta name=\"current-user-name\" content=\"");
+    escInto(&metas_buf, &n, name);
+    appendInto(&metas_buf, &n, "\" />");
+    return metas_buf[0..n];
+}
+
+// custom_styles_tag — `tag.style(css.html_safe, data-turbo-track: reload)`.
+// Raw CSS verbatim (the reference marks it html_safe); empty/nil emits
+// nothing so pages don't ship a dead <style>.
+threadlocal var style_buf: [8192]u8 = undefined;
+
+~proc style-wrap|zig {
+    const c = css orelse return "";
+    if (c.len == 0) return "";
+    var n: usize = 0;
+    appendInto(&style_buf, &n, "<style data-turbo-track=\"reload\">");
+    appendInto(&style_buf, &n, c);
+    appendInto(&style_buf, &n, "</style>");
+    return style_buf[0..n];
+}
+
+// The css query's row arm borrows die with the row — same stash shape as
+// session:stash-text, kept local so views needs no cross-module cell.
+threadlocal var css_buf: [8192]u8 = undefined;
+threadlocal var css_len: usize = 0;
+
+~proc css-stash|zig {
+    css_len = @min(css.len, css_buf.len);
+    @memcpy(css_buf[0..css_len], css[0..css_len]);
+}
+
+~proc css-take|zig {
+    if (css_len == 0) return null;
+    return css_buf[0..css_len];
+}
+
+// Turbo stream envelope for the sidebar broadcasts — prepend for a new
+// room, replace for a rename. Same wrapper shape as messages'
+// turbo-wrap, parameterized.
+threadlocal var sw_buf: [65536]u8 = undefined;
+
+~proc stream-wrap|zig {
+    var n: usize = 0;
+    appendInto(&sw_buf, &n, "<turbo-stream action=\"");
+    appendInto(&sw_buf, &n, action);
+    appendInto(&sw_buf, &n, "\" target=\"");
+    appendInto(&sw_buf, &n, target);
+    appendInto(&sw_buf, &n, "\"><template>");
+    appendInto(&sw_buf, &n, html);
+    appendInto(&sw_buf, &n, "</template></turbo-stream>");
+    return sw_buf[0..n];
+}
+
+// The shared-room sidebar anchor — users/sidebars/rooms/_shared verbatim
+// minus unread class + fresh flag (a broadcast row arrives without an
+// unread computation; the rooms-list controller's unread class lands on
+// the next ping if it applies).
+threadlocal var rlink_buf: [2048]u8 = undefined;
+
+~proc room-link|zig {
+    var n: usize = 0;
+    appendInto(&rlink_buf, &n, "<a id=\"list_");
+    appendInto(&rlink_buf, &n, rk);
+    appendInto(&rlink_buf, &n, "_");
+    appendInto(&rlink_buf, &n, rid);
+    appendInto(&rlink_buf, &n, "\" data-rooms-list-target=\"room\" data-room-id=\"");
+    appendInto(&rlink_buf, &n, rid);
+    appendInto(&rlink_buf, &n, "\" data-badge-dot-target=\"unread\" data-sorted-list-target=\"item\" data-sorted-list-name=\"");
+    escInto(&rlink_buf, &n, name);
+    appendInto(&rlink_buf, &n, "\" class=\"align-center gap room btn txt-nowrap\" href=\"/rooms/");
+    appendInto(&rlink_buf, &n, rid);
+    appendInto(&rlink_buf, &n, "\"><span class=\"overflow-ellipsis\">");
+    escInto(&rlink_buf, &n, name);
+    appendInto(&rlink_buf, &n, "</span></a>");
+    return rlink_buf[0..n];
+}
+
+// The direct-room sidebar anchor — _direct partial: avatar, "Ping with"
+// sr prefix, other member's name. Broadcast target #direct_rooms on the
+// member's user_<id>_rooms stream.
+threadlocal var dlink_buf: [2048]u8 = undefined;
+
+~proc direct-link|zig {
+    var n: usize = 0;
+    appendInto(&dlink_buf, &n, "<a class=\"direct\" id=\"list_rooms_direct_");
+    appendInto(&dlink_buf, &n, rid);
+    appendInto(&dlink_buf, &n, "\" data-rooms-list-target=\"room\" data-room-id=\"");
+    appendInto(&dlink_buf, &n, rid);
+    appendInto(&dlink_buf, &n, "\" data-badge-dot-target=\"unread\" data-sorted-list-target=\"item\" href=\"/rooms/");
+    appendInto(&dlink_buf, &n, rid);
+    appendInto(&dlink_buf, &n, "\"><span class=\"avatar\"><img aria-hidden=\"true\" src=\"/users/");
+    appendInto(&dlink_buf, &n, sgid);
+    appendInto(&dlink_buf, &n, "/avatar?v=");
+    appendInto(&dlink_buf, &n, ver);
+    appendInto(&dlink_buf, &n, "\" width=\"48\" height=\"48\" /></span><span class=\"direct__author flex align-center gap max-width min-width border-radius txt-small\"><span class=\"txt-nowrap overflow-ellipsis\"><span class=\"for-screen-reader\">Ping with</span>");
+    escInto(&dlink_buf, &n, name);
+    appendInto(&dlink_buf, &n, "</span></span></a>");
+    return dlink_buf[0..n];
+}
+
+// Profile memberships menu row — _membership partial trimmed to the link
+// itself (the partial's role crown and avatar ride the same anchors).
+threadlocal var mlink_buf: [1024]u8 = undefined;
+
+~proc memb-link|zig {
+    var n: usize = 0;
+    appendInto(&mlink_buf, &n, "<li class=\"flex align-center gap margin-none\"><a class=\"btn flex-item-grow txt-align-start overflow-ellipsis\" href=\"/rooms/");
+    appendInto(&mlink_buf, &n, rid);
+    appendInto(&mlink_buf, &n, "\">");
+    escInto(&mlink_buf, &n, name);
+    appendInto(&mlink_buf, &n, "</a></li>");
+    return mlink_buf[0..n];
+}
+
+// "id-token" — User::Bot#bot_key, the credential embedded in bot message
+// URLs.
+threadlocal var bkey_buf: [128]u8 = undefined;
+
+~proc bot-key|zig {
+    return std.fmt.bufPrint(&bkey_buf, "{d}-{s}", .{ id, token }) catch "";
+}
+
+// `curl -d 'Hello!' <origin>/rooms/<rid>/<bot_key>/messages` — the index's
+// copy-paste command line.
+threadlocal var curl_buf: [1024]u8 = undefined;
+
+~proc curl-line|zig {
+    return std.fmt.bufPrint(&curl_buf, "curl -d 'Hello!' {s}/rooms/{s}/{s}/messages", .{ host, rid, key }) catch "";
+}
+
+// Bot rows accumulate across the flat bots×rooms join: a new uid opens a
+// new <li>, each room appends its access fieldset. bots-take closes the
+// open <li> and answers the whole <menu> interior.
+threadlocal var brows: std.ArrayList(u8) = .empty;
+threadlocal var brows_last: i64 = -1;
+
+~proc bots-begin|zig {
+    brows.clearRetainingCapacity();
+    brows_last = -1;
+}
+
+fn browsAppend(s: []const u8) void {
+    brows.appendSlice(std.heap.page_allocator, s) catch {};
+}
+
+threadlocal var btmp: [1024]u8 = undefined;
+
+~proc bot-row|zig {
+    if (uid != brows_last) {
+        if (brows_last >= 0) browsAppend("</li>");
+        brows_last = uid;
+        browsAppend("<li class=\"flex flex-column gap flush fill-shade border-radius pad-block pad-inline-double\"><div class=\"flex align-center gap\"><div class=\"min-width\"><div class=\"overflow-ellipsis txt-large\"><strong>");
+        const e = escHtmlSlice(name);
+        browsAppend(e);
+        browsAppend("</strong></div></div>");
+        const ep = std.fmt.bufPrint(&btmp, "<a class=\"btn flex-item-justify-end\" href=\"/account/bots/{d}/edit\"><img aria-hidden=\"true\" src=\"/assets/pencil-cf9d28aa.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Edit ", .{uid}) catch "";
+        browsAppend(ep);
+        browsAppend(e);
+        browsAppend("</span></a></div>");
+    }
+    if (rid > 0) {
+        const line = std.fmt.bufPrint(&btmp, "curl -d 'Hello!' {s}/rooms/{d}/{s}/messages", .{ host, rid, key }) catch "";
+        browsAppend("<fieldset class=\"gap max-width pad border border-radius\"><legend class=\"min-width txt-align-start pad-inline\"><strong class=\"overflow-ellipsis\">");
+        browsAppend(escHtmlSlice(rname));
+        browsAppend("</strong></legend><div class=\"flex align-center gap\"><div class=\"flex-item-grow\"><input type=\"text\" class=\"input full-width fill-white\" value=\"");
+        browsAppend(escHtmlSlice(line));
+        browsAppend("\" aria-label=\"curl command for posting messages\" readonly></div></div></fieldset>");
+    }
+    return "";
+}
+
+threadlocal var esc2_buf: [512]u8 = undefined;
+
+fn escHtmlSlice(s: []const u8) []const u8 {
+    var n: usize = 0;
+    escInto(&esc2_buf, &n, s);
+    return esc2_buf[0..n];
+}
+
+~proc bots-take|zig {
+    if (brows_last >= 0) browsAppend("</li>");
+    return brows.items;
+}
+
+// accounts/_users row — avatar, name, and the admin crown only.
+threadlocal var auser_buf: [2048]u8 = undefined;
+
+~proc acct-user|zig {
+    var n: usize = 0;
+    appendInto(&auser_buf, &n, "<li class=\"flex align-center gap margin-none\"><a title=\"");
+    escInto(&auser_buf, &n, uname);
+    appendInto(&auser_buf, &n, "\" class=\"btn avatar\" href=\"/users/");
+    const unum = std.fmt.bufPrint(auser_buf[n..], "{d}", .{uid}) catch "";
+    n += unum.len;
+    appendInto(&auser_buf, &n, "\"><img aria-hidden=\"true\" src=\"/users/");
+    appendInto(&auser_buf, &n, sgid);
+    appendInto(&auser_buf, &n, "/avatar?v=");
+    appendInto(&auser_buf, &n, ver);
+    appendInto(&auser_buf, &n, "\" width=\"48\" height=\"48\" /></a><div class=\"min-width\"><div class=\"overflow-ellipsis\"><strong>");
+    escInto(&auser_buf, &n, uname);
+    appendInto(&auser_buf, &n, "</strong>");
+    if (role == 1) appendInto(&auser_buf, &n, " <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/crown-00d190cb.svg\" width=\"14\" height=\"14\" />");
+    appendInto(&auser_buf, &n, "</div></div></li>");
+    return auser_buf[0..n];
+}
+
+// The room form's member-preview row — who has access, display only.
+threadlocal var ruser_buf: [2048]u8 = undefined;
+
+~proc room-user|zig {
+    var n: usize = 0;
+    appendInto(&ruser_buf, &n, "<li class=\"flex align-center gap margin-none\" data-value=\"");
+    escInto(&ruser_buf, &n, uname);
+    appendInto(&ruser_buf, &n, "\"><figure class=\"avatar flex-item-no-shrink\" style=\"--avatar-size: 4ch;\"><img aria-hidden=\"true\" src=\"/users/");
+    appendInto(&ruser_buf, &n, sgid);
+    appendInto(&ruser_buf, &n, "/avatar?v=");
+    appendInto(&ruser_buf, &n, ver);
+    appendInto(&ruser_buf, &n, "\" width=\"48\" height=\"48\" /></figure><div class=\"min-width\"><div class=\"overflow-ellipsis\"><strong>");
+    escInto(&ruser_buf, &n, uname);
+    appendInto(&ruser_buf, &n, "</strong></div></div></li>");
+    return ruser_buf[0..n];
+}
+
+// ── Autocomplete JSON ───────────────────────────────────────────────────────
+// /autocompletable/users answers the suggestion controller's JSON shape:
+// [{name, value, avatar_url, sgid}]. Accumulated across rows; jsonEsc is
+// the JSON-string codec (\" \\ control, and \uXXXX below 0x20).
+threadlocal var ac_buf: std.ArrayList(u8) = .empty;
+threadlocal var ac_n: usize = 0;
+threadlocal var ac_tmp: [512]u8 = undefined;
+
+fn jsonEsc(out: []u8, n: *usize, s: []const u8) void {
+    for (s) |c| {
+        switch (c) {
+            '"' => appendInto(out, n, "\\\""),
+            '\\' => appendInto(out, n, "\\\\"),
+            else => {
+                if (c < 0x20) {
+                    const esc = std.fmt.bufPrint(out[n.*..], "\\u{x:0>4}", .{c}) catch return;
+                    n.* += esc.len;
+                } else {
+                    if (n.* >= out.len) return;
+                    out[n.*] = c;
+                    n.* += 1;
+                }
+            },
+        }
+    }
+}
+
+~proc ac-begin|zig {
+    ac_buf.clearRetainingCapacity();
+    ac_buf.appendSlice(std.heap.page_allocator, "[") catch {};
+    ac_n = 0;
+}
+
+~proc ac-row|zig {
+    if (ac_n > 0) ac_buf.appendSlice(std.heap.page_allocator, ",") catch {};
+    ac_n += 1;
+    var n: usize = 0;
+    appendInto(&ac_tmp, &n, "{\"name\":\"");
+    jsonEsc(&ac_tmp, &n, name);
+    appendInto(&ac_tmp, &n, "\",\"value\":");
+    const unum = std.fmt.bufPrint(ac_tmp[n..], "{d}", .{uid}) catch return "";
+    n += unum.len;
+    appendInto(&ac_tmp, &n, ",\"avatar_url\":\"/users/");
+    appendInto(&ac_tmp, &n, sgid);
+    appendInto(&ac_tmp, &n, "/avatar?v=");
+    appendInto(&ac_tmp, &n, ver);
+    appendInto(&ac_tmp, &n, "\",\"sgid\":\"");
+    appendInto(&ac_tmp, &n, sgid);
+    appendInto(&ac_tmp, &n, "\"}");
+    ac_buf.appendSlice(std.heap.page_allocator, ac_tmp[0..n]) catch {};
+    return "";
+}
+
+~proc ac-take|zig {
+    ac_buf.appendSlice(std.heap.page_allocator, "]") catch {};
+    return ac_buf.items;
+}
+
+// ── Auth + account stashes ──────────────────────────────────────────────────
+// auth-stash fills the same user cells stash-user does (so user-id/-name/
+// -ver/body-class keep working on app pages) plus email/bio, which the
+// profile form needs. acct-stash carries the singleton account's name and
+// join_code across the done boundary.
+threadlocal var auth_email_buf: [320]u8 = undefined;
+threadlocal var auth_email_len: usize = 0;
+threadlocal var auth_bio_buf: [512]u8 = undefined;
+threadlocal var auth_bio_len: usize = 0;
+
+~proc auth-stash|zig {
+    user_id_v = uid;
+    user_role_v = role;
+    const n = @min(name.len, user_name_buf.len);
+    @memcpy(user_name_buf[0..n], name[0..n]);
+    user_name_len = n;
+    const v = @min(ver.len, user_ver_buf.len);
+    @memcpy(user_ver_buf[0..v], ver[0..v]);
+    user_ver_len = v;
+    const e = @min(email.len, auth_email_buf.len);
+    @memcpy(auth_email_buf[0..e], email[0..e]);
+    auth_email_len = e;
+    const b = @min(bio.len, auth_bio_buf.len);
+    @memcpy(auth_bio_buf[0..b], bio[0..b]);
+    auth_bio_len = b;
+}
+
+~proc user-role|zig {
+    return user_role_v;
+}
+
+~proc auth-email|zig {
+    return auth_email_buf[0..auth_email_len];
+}
+
+~proc auth-bio|zig {
+    return auth_bio_buf[0..auth_bio_len];
+}
+
+threadlocal var acct_name_buf: [256]u8 = undefined;
+threadlocal var acct_name_len: usize = 0;
+threadlocal var acct_join_buf: [64]u8 = undefined;
+threadlocal var acct_join_len: usize = 0;
+threadlocal var acct_restrict_v: i64 = 0;
+threadlocal var acct_ver_buf: [16]u8 = undefined;
+threadlocal var acct_ver_len: usize = 0;
+
+~proc acct-stash|zig {
+    const n = @min(name.len, acct_name_buf.len);
+    @memcpy(acct_name_buf[0..n], name[0..n]);
+    acct_name_len = n;
+    const j = @min(join.len, acct_join_buf.len);
+    @memcpy(acct_join_buf[0..j], join[0..j]);
+    acct_join_len = j;
+    acct_restrict_v = restrict;
+    const v = @min(ver.len, acct_ver_buf.len);
+    @memcpy(acct_ver_buf[0..v], ver[0..v]);
+    acct_ver_len = v;
+}
+
+~proc acct-name|zig {
+    return acct_name_buf[0..acct_name_len];
+}
+
+~proc acct-join|zig {
+    return acct_join_buf[0..acct_join_len];
+}
+
+// ── Absolute-URL builders ───────────────────────────────────────────────────
+threadlocal var tpath_buf: [1024]u8 = undefined;
+
+~proc transfer-path|zig {
+    return std.fmt.bufPrint(&tpath_buf, "{s}/session/transfers/{s}", .{ host, sid }) catch "";
+}
+
+// Separate buffer — a flow may hold a transfer URL and an invite URL at
+// once; sharing one TLS cell would clobber the first on the second call.
+threadlocal var ipath_buf: [1024]u8 = undefined;
+
+~proc invite-path|zig {
+    return std.fmt.bufPrint(&ipath_buf, "{s}/join/{s}", .{ host, code }) catch "";
+}
+
+~proc acct-restrict|zig {
+    return acct_restrict_v;
+}
+
+// The direct-placeholder button — sidebars/rooms/_direct_placeholder's
+// button_to POST /rooms/directs?user_ids[]=<uid>: a one-click ping that
+// the same create flow serves.
+threadlocal var pbtn_buf: [2048]u8 = undefined;
+
+~proc ping-btn|zig {
+    var n: usize = 0;
+    appendInto(&pbtn_buf, &n, "<form class=\"button_to\" method=\"post\" action=\"/rooms/directs?user_ids%5B%5D=");
+    const unum = std.fmt.bufPrint(pbtn_buf[n..], "{d}", .{uid}) catch return "";
+    n += unum.len;
+    appendInto(&pbtn_buf, &n, "\"><button class=\"direct borderless fill-transparent unpad\" type=\"submit\"><span class=\"avatar\"><img aria-hidden=\"true\" src=\"/users/");
+    appendInto(&pbtn_buf, &n, sgid);
+    appendInto(&pbtn_buf, &n, "/avatar?v=");
+    appendInto(&pbtn_buf, &n, ver);
+    appendInto(&pbtn_buf, &n, "\" /></span><span class=\"direct__author flex align-center gap max-width min-width border-radius txt-small\"><span class=\"txt-nowrap overflow-ellipsis\"><span class=\"for-screen-reader\">Ping with</span>");
+    escInto(&pbtn_buf, &n, name);
+    appendInto(&pbtn_buf, &n, "</span></span></button></form>");
+    return pbtn_buf[0..n];
+}
+
+// i64 -> decimal text, for building markup by hand where a component's :d
+// slot isn't in play.
+threadlocal var itoa_buf: [24]u8 = undefined;
+
+~proc itoa|zig {
+    return std.fmt.bufPrint(&itoa_buf, "{d}", .{n}) catch "0";
+}
+
+// members.first.name.split(' ')[0] — the direct list shows the other
+// member's first token.
+~proc first-name|zig {
+    const cut = std.mem.indexOfScalar(u8, name, ' ') orelse name.len;
+    return name[0..cut];
+}
+
+~proc acct-ver|zig {
+    return acct_ver_buf[0..acct_ver_len];
+}
+
+// ── Small form helpers ──────────────────────────────────────────────────────
+// nav-flag drives the admin-only "New room"/gear affordances: "1" when the
+// stashed user can administer, "" otherwise (component renders the slot
+// conditionally on emptiness).
+~proc nav-flag|zig {
+    return if (role == 1) "1" else "";
+}
+
+// edit-stash carries one or two row fields (name + optional webhook) across
+// the done boundary so a form can pre-fill. Distinct buffers from every
+// other stash — a profile page can hold an account name and a bot edit at
+// the same time.
+threadlocal var edit_name_buf: [256]u8 = undefined;
+threadlocal var edit_name_len: usize = 0;
+threadlocal var edit_wh_buf: [512]u8 = undefined;
+threadlocal var edit_wh_len: usize = 0;
+
+~proc edit-stash|zig {
+    const n = @min(name.len, edit_name_buf.len);
+    @memcpy(edit_name_buf[0..n], name[0..n]);
+    edit_name_len = n;
+    const w = @min(wh.len, edit_wh_buf.len);
+    @memcpy(edit_wh_buf[0..w], wh[0..w]);
+    edit_wh_len = w;
+}
+
+~proc edit-name|zig {
+    return edit_name_buf[0..edit_name_len];
+}
+
+~proc edit-wh|zig {
+    return edit_wh_buf[0..edit_wh_len];
+}
+
+// ── Tokens + account-page blocks ────────────────────────────────────────────
+// SecureRandom.alphanumeric(12) — [0-9A-Za-z] — used for bot_token and the
+// join code's 12 characters (grouped 4-4-4 with dashes, the stored form).
+const ALNUM = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+fn randAlnum(out: []u8) void {
+    var bytes: [64]u8 = undefined;
+    std.crypto.random.bytes(bytes[0..out.len]);
+    for (out, 0..) |*c, i| c.* = ALNUM[bytes[i] % ALNUM.len];
+}
+
+threadlocal var jcode_buf: [24]u8 = undefined;
+
+~proc join-code|zig {
+    var raw: [12]u8 = undefined;
+    randAlnum(&raw);
+    var n: usize = 0;
+    for (raw, 0..) |c, i| {
+        if (i == 4 or i == 8) {
+            jcode_buf[n] = '-';
+            n += 1;
+        }
+        jcode_buf[n] = c;
+        n += 1;
+    }
+    return jcode_buf[0..n];
+}
+
+threadlocal var btok_buf: [16]u8 = undefined;
+
+~proc bot-token|zig {
+    var raw: [12]u8 = undefined;
+    randAlnum(&raw);
+    @memcpy(btok_buf[0..12], &raw);
+    return btok_buf[0..12];
+}
+
+// accounts/edit nav — administrators get the bots and custom-styles links;
+// members get nothing (the smoke checks "Set up chat bots" is absent).
+~proc acct-nav-admin|zig {
+    if (role != 1) return "";
+    return "<div class=\"flex align-center gap flex-item-justify-end\"><a href=\"/account/bots\" class=\"btn\" style=\"view-transition-name: chat-bots\"><img aria-hidden=\"true\" src=\"/assets/bot-8a69692e.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Set up chat bots</span></a><a href=\"/account/custom_styles/edit\" class=\"btn\" style=\"view-transition-name: custom-styles\"><img aria-hidden=\"true\" src=\"/assets/art-ed709d32.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Custom styles</span></a></div>";
+}
+
+// The account-name form + creation-restriction switch. The switch posts a
+// put with the TOGGLED value, mirroring the reference hidden field.
+threadlocal var ablock_buf: [6144]u8 = undefined;
+
+~proc acct-admin-block|zig {
+    if (role != 1) return "";
+    var n: usize = 0;
+    appendInto(&ablock_buf, &n, "<form class=\"flex flex-column gap\" action=\"/account\" accept-charset=\"UTF-8\" method=\"post\" data-controller=\"form\"><input type=\"hidden\" name=\"_method\" value=\"patch\" /><div class=\"flex align-center gap\"><label class=\"flex align-center gap flex-item-grow\"><input type=\"text\" name=\"account[name]\" id=\"account_name\" value=\"");
+    escInto(&ablock_buf, &n, name);
+    appendInto(&ablock_buf, &n, "\" autocomplete=\"off\" placeholder=\"Name this account\" autofocus=\"autofocus\" data-action=\"keydown.enter-&gt;form#submit\" class=\"input txt-large\" /></label><button class=\"btn btn--reversed center\" type=\"submit\"><img aria-hidden=\"true\" src=\"/assets/check-7897ff7e.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Save changes</span></button></div></form><div class=\"margin-block-start pad-block pad-inline-double fill-shade border-radius\"><form class=\"flex align-center gap center\" action=\"/account\" accept-charset=\"UTF-8\" method=\"post\" data-controller=\"form\"><input type=\"hidden\" name=\"_method\" value=\"put\" /><div class=\"flex-item-grow flex align-center gap txt-align-start\"><img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/crown-00d190cb.svg\" width=\"18\" height=\"18\" /> Must be admin to create new rooms</div><input type=\"hidden\" name=\"account[settings_attributes][restrict_room_creation_to_administrators]\" value=\"");
+    appendInto(&ablock_buf, &n, if (restrict == 0) "true" else "false");
+    appendInto(&ablock_buf, &n, "\" /><label class=\"switch\"><input type=\"checkbox\" class=\"switch__input\" ");
+    if (restrict != 0) appendInto(&ablock_buf, &n, "checked=\"checked\" ");
+    appendInto(&ablock_buf, &n, "data-action=\"change-&gt;form#submit\" /><span class=\"switch__btn round\"></span><span class=\"for-screen-reader\">Must be admin to create new rooms</span></label></form></div>");
+    return ablock_buf[0..n];
+}
+
+threadlocal var mblock_buf: [1024]u8 = undefined;
+
+~proc acct-member-block|zig {
+    if (role == 1) return "";
+    var n: usize = 0;
+    appendInto(&mblock_buf, &n, "<h1 class=\"flex-item-grow txt-x-large\">");
+    escInto(&mblock_buf, &n, name);
+    appendInto(&mblock_buf, &n, "</h1>");
+    return mblock_buf[0..n];
+}
+
+~proc acct-regen|zig {
+    if (role != 1) return "";
+    return "<form class=\"button_to\" method=\"post\" action=\"/account/join_code\"><button class=\"btn btn--regenerate\" type=\"submit\"><img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/refresh-249f0509.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Regenerate join link</span></button></form>";
+}
+
+// ── Direct-room user_ids plumbing ───────────────────────────────────────────
+// form-ids yields "a,b"; the current user joins the set — appended only when
+// absent (the select may already carry them). uids-count answers the member
+// total for the find-for exact-match query.
+threadlocal var uj_buf: [512]u8 = undefined;
+
+// Emits a JSON array ("[3,1]") so call sites can splice it through a bound
+// parameter: `u.id IN (SELECT value FROM json_each({{allids}}))`. A bare
+// "3,1" would bind as a single string literal and match nothing.
+~proc uids-join|zig {
+    var n: usize = 0;
+    var have = false;
+    var want_buf: [24]u8 = undefined;
+    const want = std.fmt.bufPrint(&want_buf, "{d}", .{uid}) catch return "";
+    uj_buf[n] = '[';
+    n += 1;
+    var it = std.mem.splitScalar(u8, ids, ',');
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        if (std.mem.eql(u8, part, want)) have = true;
+        if (n > 1) {
+            uj_buf[n] = ',';
+            n += 1;
+        }
+        appendInto(&uj_buf, &n, part);
+    }
+    if (!have) {
+        if (n > 1) {
+            uj_buf[n] = ',';
+            n += 1;
+        }
+        appendInto(&uj_buf, &n, want);
+    }
+    uj_buf[n] = ']';
+    n += 1;
+    return uj_buf[0..n];
+}
+
+~proc uids-count|zig {
+    if (ids.len == 0) return 0;
+    var c: i64 = 1;
+    for (ids) |ch| {
+        if (ch == ',') c += 1;
+    }
+    return c;
+}
+
+// dom_id(room, :list) — the sidebar anchor id that broadcast_replace_to
+// targets on rename: "list_rooms_open_<id>" / "list_rooms_closed_<id>" /
+// "list_rooms_direct_<id>". rk arrives as "rooms_open" etc.
+threadlocal var lid_buf: [96]u8 = undefined;
+
+~proc list-id|zig {
+    return std.fmt.bufPrint(&lid_buf, "list_{s}_{s}", .{ rk, rid }) catch "";
+}
+
+// "/account/bots/<id>" / "/rooms/<plural>/<rid>" — form action paths, own
+// buffers (a flow may hold both at once).
+threadlocal var bact_buf: [96]u8 = undefined;
+
+~proc bot-action|zig {
+    return std.fmt.bufPrint(&bact_buf, "/account/bots/{d}", .{bid}) catch "";
+}
+
+threadlocal var ract_buf: [96]u8 = undefined;
+
+~proc room-form-action|zig {
+    return std.fmt.bufPrint(&ract_buf, "/rooms/{s}/{d}", .{ plural, rid }) catch "";
+}
+
+// ── Composed document head ────────────────────────────────────────────────
+// layouts/application.html.erb — the shared <head>: title, user metas,
+// favicon version, the stylesheet link block, custom styles, importmap,
+// modulepreloads, and the application import. Dom components cannot splice
+// markup inside an element that has element children, so the head is a
+// plain string built here and page components emit <body> fragments.
+threadlocal var head_buf: [128 * 1024]u8 = undefined;
+
+const head_a =
+    \\    <html><head><title>
+    ;
+const head_b =
+    \\</title>
+    \\    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, interactive-widget=resizes-content">
+    \\    <meta name="view-transition" content="same-origin">
+    \\    <meta name="color-scheme" content="light dark">
+    \\    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+    \\    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+    \\    <meta name="apple-mobile-web-app-capable" content="yes">
+    ;
+const head_c =
+    \\
+    \\    <meta name="action-cable-url" content="/cable">
+    \\    <meta name="vapid-public-key">
+    \\    <meta name="turbo-prefetch" content="true">
+    \\    <link rel="manifest" href="/webmanifest.json">
+    \\    <link rel="icon" href="/account/logo?v=
+    ;
+const head_d =
+    \\" type="image/png">
+    \\    <link rel="apple-touch-icon" href="/account/logo?v=
+    ;
+const head_e =
+    \\">
+    \\    <link rel="stylesheet" href="/assets/_reset-9c3efd7b.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/actiontext-7b8d51ea.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/animation-bcdb4bab.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/autocomplete-9de8c93f.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/avatars-279376ab.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/base-637a0ec8.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/boosts-da4032a8.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/buttons-c7d39fd4.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/code-333ae548.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/colorize-eb391ca0.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/colors-aee62523.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/composer-e490638a.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/embeds-c20d0a3a.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/filters-8a4d63ed.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/flash-a561c1e5.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/inputs-9e58a07c.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/layout-ff6ddfc6.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/lexxy-content-0ff2f961.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/lexxy-editor-2d5c7ebe.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/lexxy-variables-3fef4323.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/lexxy-2876c58e.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/lightbox-af496d39.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/messages-c5485fef.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/nav-05e7183a.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/panels-af44ec6d.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/separators-172b3ab8.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/sidebar-0be58db9.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/signup-6e02d591.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/spinner-5a118f25.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/trix-65afdb1d.css" data-turbo-track="reload" />
+    \\    <link rel="stylesheet" href="/assets/utilities-e2f32466.css" data-turbo-track="reload" />
+    ;
+const head_f =
+    \\
+    \\    <script type="importmap" data-turbo-track="reload">{
+    \\  "imports": {
+    \\    "application": "/assets/application-a54c74a7.js",
+    \\    "@hotwired/stimulus": "/assets/stimulus.min-4b1e420e.js",
+    \\    "@hotwired/stimulus-loading": "/assets/stimulus-loading-1fc53fe7.js",
+    \\    "@hotwired/turbo-rails": "/assets/turbo-a1e3a50a.js",
+    \\    "@rails/actioncable": "/assets/actioncable.esm-e0ec9819.js",
+    \\    "@rails/request.js": "/assets/@rails--request-3fc8489d.js",
+    \\    "lexxy": "/assets/lexxy-a21f41d4.js",
+    \\    "highlight.js": "/assets/highlight.js/core-4e141f64.js",
+    \\    "initializers/autocomplete": "/assets/initializers/autocomplete-ba9abe45.js",
+    \\    "initializers/current": "/assets/initializers/current-3a3b90da.js",
+    \\    "initializers/highlight": "/assets/initializers/highlight-5bd558f1.js",
+    \\    "initializers": "/assets/initializers/index-d2bbfae4.js",
+    \\    "initializers/rich_text": "/assets/initializers/rich_text-f451a05e.js",
+    \\    "lib/autocomplete/autocomplete_handler": "/assets/lib/autocomplete/autocomplete_handler-becd1e1a.js",
+    \\    "lib/autocomplete/base_autocomplete_handler": "/assets/lib/autocomplete/base_autocomplete_handler-e29a896e.js",
+    \\    "lib/autocomplete/collection": "/assets/lib/autocomplete/collection-3e251a0e.js",
+    \\    "lib/autocomplete/constants": "/assets/lib/autocomplete/constants-17c2858b.js",
+    \\    "lib/autocomplete/custom_elements/suggestion_option": "/assets/lib/autocomplete/custom_elements/suggestion_option-ac7846b3.js",
+    \\    "lib/autocomplete/custom_elements/suggestion_select": "/assets/lib/autocomplete/custom_elements/suggestion_select-f0045305.js",
+    \\    "lib/autocomplete/helpers": "/assets/lib/autocomplete/helpers-651308b9.js",
+    \\    "lib/autocomplete/renderer": "/assets/lib/autocomplete/renderer-5caf6120.js",
+    \\    "lib/autocomplete/selection": "/assets/lib/autocomplete/selection-862705bf.js",
+    \\    "lib/autocomplete/suggestion_context": "/assets/lib/autocomplete/suggestion_context-b265ffb4.js",
+    \\    "lib/autocomplete/suggestion_controller": "/assets/lib/autocomplete/suggestion_controller-10624c40.js",
+    \\    "lib/autocomplete/suggestion_results_controller": "/assets/lib/autocomplete/suggestion_results_controller-91405749.js",
+    \\    "lib/autocomplete/utils": "/assets/lib/autocomplete/utils-296fb278.js",
+    \\    "lib/cookie": "/assets/lib/cookie-76006835.js",
+    \\    "lib/rich_text/campfire_extension": "/assets/lib/rich_text/campfire_extension-f62f017b.js",
+    \\    "lib/rich_text/cite_node": "/assets/lib/rich_text/cite_node-b4d2b89a.js",
+    \\    "controllers/application": "/assets/controllers/application-f004202c.js",
+    \\    "controllers/auto_submit_controller": "/assets/controllers/auto_submit_controller-ee52d396.js",
+    \\    "controllers/autocomplete_controller": "/assets/controllers/autocomplete_controller-eaf5b07d.js",
+    \\    "controllers/badge_dot_controller": "/assets/controllers/badge_dot_controller-e0d733c8.js",
+    \\    "controllers/boost_delete_controller": "/assets/controllers/boost_delete_controller-29fd1686.js",
+    \\    "controllers/composer_controller": "/assets/controllers/composer_controller-73c33f9f.js",
+    \\    "controllers/copy_to_clipboard_controller": "/assets/controllers/copy_to_clipboard_controller-07e32f4d.js",
+    \\    "controllers/drop_target_controller": "/assets/controllers/drop_target_controller-3a205782.js",
+    \\    "controllers/element_removal_controller": "/assets/controllers/element_removal_controller-4526910a.js",
+    \\    "controllers/filter_controller": "/assets/controllers/filter_controller-ca9769d5.js",
+    \\    "controllers/form_controller": "/assets/controllers/form_controller-6f3d64db.js",
+    \\    "controllers": "/assets/controllers/index-594ba2fb.js",
+    \\    "controllers/lightbox_controller": "/assets/controllers/lightbox_controller-98fc07ca.js",
+    \\    "controllers/local_time_controller": "/assets/controllers/local_time_controller-7daf3d0c.js",
+    \\    "controllers/maintain_scroll_controller": "/assets/controllers/maintain_scroll_controller-1debbbfb.js",
+    \\    "controllers/messages_controller": "/assets/controllers/messages_controller-3d90944a.js",
+    \\    "controllers/notifications_controller": "/assets/controllers/notifications_controller-746d0662.js",
+    \\    "controllers/popup_controller": "/assets/controllers/popup_controller-9f8ea824.js",
+    \\    "controllers/presence_controller": "/assets/controllers/presence_controller-28f14aad.js",
+    \\    "controllers/pwa_install_controller": "/assets/controllers/pwa_install_controller-3fe3fc5e.js",
+    \\    "controllers/read_rooms_controller": "/assets/controllers/read_rooms_controller-8245522a.js",
+    \\    "controllers/refresh_room_controller": "/assets/controllers/refresh_room_controller-4e4b6014.js",
+    \\    "controllers/reply_controller": "/assets/controllers/reply_controller-278bb9cc.js",
+    \\    "controllers/rooms_list_controller": "/assets/controllers/rooms_list_controller-64840fcd.js",
+    \\    "controllers/scroll_into_view_controller": "/assets/controllers/scroll_into_view_controller-8a0bc733.js",
+    \\    "controllers/search_results_controller": "/assets/controllers/search_results_controller-aab46974.js",
+    \\    "controllers/sessions_controller": "/assets/controllers/sessions_controller-a9fdfe3d.js",
+    \\    "controllers/soft_keyboard_controller": "/assets/controllers/soft_keyboard_controller-be1da837.js",
+    \\    "controllers/sorted_list_controller": "/assets/controllers/sorted_list_controller-9f9ae485.js",
+    \\    "controllers/sound_controller": "/assets/controllers/sound_controller-d3e5656e.js",
+    \\    "controllers/toggle_class_controller": "/assets/controllers/toggle_class_controller-b67fa681.js",
+    \\    "controllers/turbo_frame_controller": "/assets/controllers/turbo_frame_controller-9f4f722f.js",
+    \\    "controllers/turbo_streaming_controller": "/assets/controllers/turbo_streaming_controller-04b85a80.js",
+    \\    "controllers/typing_notifications_controller": "/assets/controllers/typing_notifications_controller-86906ab9.js",
+    \\    "controllers/unfurl_controller": "/assets/controllers/unfurl_controller-4a868f9a.js",
+    \\    "controllers/upload_preview_controller": "/assets/controllers/upload_preview_controller-9b8b26bb.js",
+    \\    "controllers/web_share_controller": "/assets/controllers/web_share_controller-f7236b6f.js",
+    \\    "helpers/dom_helpers": "/assets/helpers/dom_helpers-0f234176.js",
+    \\    "helpers/navigator_helpers": "/assets/helpers/navigator_helpers-3c9f4c31.js",
+    \\    "helpers/string_helpers": "/assets/helpers/string_helpers-40941ba8.js",
+    \\    "helpers/timing_helpers": "/assets/helpers/timing_helpers-94d95529.js",
+    \\    "helpers/turbo_helpers": "/assets/helpers/turbo_helpers-a3c01462.js",
+    \\    "models/client_message": "/assets/models/client_message-de3c07cf.js",
+    \\    "models/file_uploader": "/assets/models/file_uploader-d3a5c44b.js",
+    \\    "models/message_formatter": "/assets/models/message_formatter-f39a0c5d.js",
+    \\    "models/message_paginator": "/assets/models/message_paginator-b79013e3.js",
+    \\    "models/scroll_manager": "/assets/models/scroll_manager-ed559629.js",
+    \\    "models/typing_tracker": "/assets/models/typing_tracker-42a444a5.js",
+    \\    "languages/bash": "/assets/languages/bash-13136668.js",
+    \\    "languages/css": "/assets/languages/css-a7f2e40b.js",
+    \\    "languages/diff": "/assets/languages/diff-94a335fe.js",
+    \\    "languages/go": "/assets/languages/go-10465864.js",
+    \\    "languages/java": "/assets/languages/java-95f3a30f.js",
+    \\    "languages/javascript": "/assets/languages/javascript-18eb0dd8.js",
+    \\    "languages/json": "/assets/languages/json-60184e1b.js",
+    \\    "languages/python": "/assets/languages/python-8f48fd1a.js",
+    \\    "languages/ruby": "/assets/languages/ruby-287ccd0f.js",
+    \\    "languages/rust": "/assets/languages/rust-d48f93d8.js",
+    \\    "languages/sql": "/assets/languages/sql-642be05a.js",
+    \\    "languages/xml": "/assets/languages/xml-fa7f1eda.js"
+    \\    }
+    \\    }</script>
+    \\    <link rel="modulepreload" href="/assets/application-a54c74a7.js">
+    \\    <link rel="modulepreload" href="/assets/stimulus.min-4b1e420e.js">
+    \\    <link rel="modulepreload" href="/assets/stimulus-loading-1fc53fe7.js">
+    \\    <link rel="modulepreload" href="/assets/turbo-a1e3a50a.js">
+    \\    <link rel="modulepreload" href="/assets/actioncable.esm-e0ec9819.js">
+    \\    <link rel="modulepreload" href="/assets/@rails--request-3fc8489d.js">
+    \\    <link rel="modulepreload" href="/assets/lexxy-a21f41d4.js">
+    \\    <link rel="modulepreload" href="/assets/highlight.js/core-4e141f64.js">
+    \\    <link rel="modulepreload" href="/assets/initializers/autocomplete-ba9abe45.js">
+    \\    <link rel="modulepreload" href="/assets/initializers/current-3a3b90da.js">
+    \\    <link rel="modulepreload" href="/assets/initializers/highlight-5bd558f1.js">
+    \\    <link rel="modulepreload" href="/assets/initializers/index-d2bbfae4.js">
+    \\    <link rel="modulepreload" href="/assets/initializers/rich_text-f451a05e.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/autocomplete_handler-becd1e1a.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/base_autocomplete_handler-e29a896e.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/collection-3e251a0e.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/constants-17c2858b.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/custom_elements/suggestion_option-ac7846b3.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/custom_elements/suggestion_select-f0045305.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/helpers-651308b9.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/renderer-5caf6120.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/selection-862705bf.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/suggestion_context-b265ffb4.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/suggestion_controller-10624c40.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/suggestion_results_controller-91405749.js">
+    \\    <link rel="modulepreload" href="/assets/lib/autocomplete/utils-296fb278.js">
+    \\    <link rel="modulepreload" href="/assets/lib/cookie-76006835.js">
+    \\    <link rel="modulepreload" href="/assets/lib/rich_text/campfire_extension-f62f017b.js">
+    \\    <link rel="modulepreload" href="/assets/lib/rich_text/cite_node-b4d2b89a.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/application-f004202c.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/auto_submit_controller-ee52d396.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/autocomplete_controller-eaf5b07d.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/badge_dot_controller-e0d733c8.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/boost_delete_controller-29fd1686.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/composer_controller-73c33f9f.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/copy_to_clipboard_controller-07e32f4d.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/drop_target_controller-3a205782.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/element_removal_controller-4526910a.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/filter_controller-ca9769d5.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/form_controller-6f3d64db.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/index-594ba2fb.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/lightbox_controller-98fc07ca.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/local_time_controller-7daf3d0c.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/maintain_scroll_controller-1debbbfb.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/messages_controller-3d90944a.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/notifications_controller-746d0662.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/popup_controller-9f8ea824.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/presence_controller-28f14aad.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/pwa_install_controller-3fe3fc5e.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/read_rooms_controller-8245522a.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/refresh_room_controller-4e4b6014.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/reply_controller-278bb9cc.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/rooms_list_controller-64840fcd.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/scroll_into_view_controller-8a0bc733.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/search_results_controller-aab46974.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/sessions_controller-a9fdfe3d.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/soft_keyboard_controller-be1da837.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/sorted_list_controller-9f9ae485.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/sound_controller-d3e5656e.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/toggle_class_controller-b67fa681.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/turbo_frame_controller-9f4f722f.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/turbo_streaming_controller-04b85a80.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/typing_notifications_controller-86906ab9.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/unfurl_controller-4a868f9a.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/upload_preview_controller-9b8b26bb.js">
+    \\    <link rel="modulepreload" href="/assets/controllers/web_share_controller-f7236b6f.js">
+    \\    <link rel="modulepreload" href="/assets/helpers/dom_helpers-0f234176.js">
+    \\    <link rel="modulepreload" href="/assets/helpers/navigator_helpers-3c9f4c31.js">
+    \\    <link rel="modulepreload" href="/assets/helpers/string_helpers-40941ba8.js">
+    \\    <link rel="modulepreload" href="/assets/helpers/timing_helpers-94d95529.js">
+    \\    <link rel="modulepreload" href="/assets/helpers/turbo_helpers-a3c01462.js">
+    \\    <link rel="modulepreload" href="/assets/models/client_message-de3c07cf.js">
+    \\    <link rel="modulepreload" href="/assets/models/file_uploader-d3a5c44b.js">
+    \\    <link rel="modulepreload" href="/assets/models/message_formatter-f39a0c5d.js">
+    \\    <link rel="modulepreload" href="/assets/models/message_paginator-b79013e3.js">
+    \\    <link rel="modulepreload" href="/assets/models/scroll_manager-ed559629.js">
+    \\    <link rel="modulepreload" href="/assets/models/typing_tracker-42a444a5.js">
+    \\    <link rel="modulepreload" href="/assets/languages/bash-13136668.js">
+    \\    <link rel="modulepreload" href="/assets/languages/css-a7f2e40b.js">
+    \\    <link rel="modulepreload" href="/assets/languages/diff-94a335fe.js">
+    \\    <link rel="modulepreload" href="/assets/languages/go-10465864.js">
+    \\    <link rel="modulepreload" href="/assets/languages/java-95f3a30f.js">
+    \\    <link rel="modulepreload" href="/assets/languages/javascript-18eb0dd8.js">
+    \\    <link rel="modulepreload" href="/assets/languages/json-60184e1b.js">
+    \\    <link rel="modulepreload" href="/assets/languages/python-8f48fd1a.js">
+    \\    <link rel="modulepreload" href="/assets/languages/ruby-287ccd0f.js">
+    \\    <link rel="modulepreload" href="/assets/languages/rust-d48f93d8.js">
+    \\    <link rel="modulepreload" href="/assets/languages/sql-642be05a.js">
+    \\    <link rel="modulepreload" href="/assets/languages/xml-fa7f1eda.js">
+    \\    <script type="module">import "application"</script>
+    \\    <meta name="turbo-cache-control" content="no-preview">
+    \\    </head>
+    ;
+
+~proc head-build|zig {
+    var n: usize = 0;
+    appendInto(&head_buf, &n, "<!DOCTYPE html>");
+    appendInto(&head_buf, &n, head_a);
+    escInto(&head_buf, &n, title);
+    appendInto(&head_buf, &n, head_b);
+    appendInto(&head_buf, &n, metas);
+    appendInto(&head_buf, &n, head_c);
+    appendInto(&head_buf, &n, logo);
+    appendInto(&head_buf, &n, head_d);
+    appendInto(&head_buf, &n, logo);
+    appendInto(&head_buf, &n, head_e);
+    appendInto(&head_buf, &n, styles);
+    appendInto(&head_buf, &n, head_f);
+    return head_buf[0..n];
+}
+
+// "New Chat Room" nav button — admins always, members only when the account
+// doesn't restrict creation (accounts.settings.restrict_room_creation_to_administrators).
+threadlocal var nrb_buf: [1024]u8 = undefined;
+
+~proc new-room-btn|zig {
+    if (role != 1 and restrict != 0) return "";
+    const s = "<a href=\"/rooms/opens/new\" class=\"rooms__new-btn btn room align-center gap txt-reversed\" aria-label=\"New Chat Room\"><img aria-hidden=\"true\" src=\"/assets/add-f232d8a6.svg\" width=\"20\" height=\"20\" style=\"view-transition-name: new-room\" /></a>";
+    const n = @min(s.len, nrb_buf.len);
+    @memcpy(nrb_buf[0..n], s[0..n]);
+    return nrb_buf[0..n];
+}
+
+~proc profile-render|zig {
+    return ProfilePage_render_event.handler(.{ .uid = uid, .name = name, .email = email, .bio = bio, .turl = turl, .qrpath = qrpath, .memberships = memberships });
+}
+~proc account-render|zig {
+    return AccountPage_render_event.handler(.{ .navadmin = navadmin, .admin = admin, .member = member, .inviteurl = inviteurl, .qrpath = qrpath, .regen = regen, .users = users });
+}
+~proc roomform-render|zig {
+    return RoomFormPage_render_event.handler(.{ .action = action, .method = method, .name = name, .users = users });
+}
+~proc bots-render|zig {
+    return BotsPage_render_event.handler(.{ .bots = bots });
+}
+~proc botform-render|zig {
+    return BotFormPage_render_event.handler(.{ .action = action, .method = method, .name = name, .webhook = webhook });
+}
+~proc styles-render|zig {
+    return StylesPage_render_event.handler(.{ .css = css });
+}
+// The auto-submit form's action — session_transfer_path, the page's own URL.
+threadlocal var tact_buf: [1024]u8 = undefined;
+
+~proc transfer-action|zig {
+    return std.fmt.bufPrint(&tact_buf, "/session/transfers/{s}", .{sid}) catch "";
+}
+
+~proc transfer-render|zig {
+    return TransferPage_render_event.handler(.{ .action = action });
+}
+~proc join-render|zig {
+    return JoinPage_render_event.handler(.{ .action = action, .acctname = acctname });
+}
+~proc directs-render|zig {
+    return DirectsPage_render_event.handler(.{});
 }

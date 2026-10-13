@@ -9,9 +9,16 @@ const std = @import("std");
 
 threadlocal var buf: std.ArrayList(u8) = .empty;
 
+// Fragments (row loops whose output lands inside a component) need their own
+// accumulator: page-take returns a live slice of `buf`, so folding rows into
+// `buf` then continuing to page-write would dangle the fragment — and double
+// its bytes, once raw, once inside the component. page-begin clears both.
+threadlocal var frag_buf: std.ArrayList(u8) = .empty;
+
 ~pub tor page-begin {}
 ~proc page-begin|zig {
     buf.clearRetainingCapacity();
+    frag_buf.clearRetainingCapacity();
 }
 
 ~pub tor page-write { text: string<*> }
@@ -22,6 +29,16 @@ threadlocal var buf: std.ArrayList(u8) = .empty;
 ~pub tor page-take {} -> string
 ~proc page-take|zig {
     return buf.items;
+}
+
+~pub tor frag-write { text: string<*> }
+~proc frag-write|zig {
+    frag_buf.appendSlice(std.heap.page_allocator, text) catch unreachable;
+}
+
+~pub tor frag-take {} -> string
+~proc frag-take|zig {
+    return frag_buf.items;
 }
 
 ~pub tor page-has-content {} -> bool

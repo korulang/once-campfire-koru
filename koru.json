@@ -11,6 +11,7 @@
     "config": "./config",
     "messages": "./messages",
     "pages": "./pages",
+    "qr": "./qr",
     "session": "./session",
     "signing": "./signing",
     "views": "./views"

@@ -7,8 +7,12 @@ export default class extends Controller {
   static classes = [ "unread" ]
 
   #disconnected = true
+  #connection = 0
+  #discardDirectEditor = false
 
   async connect() {
+    this.element.addEventListener("turbo:click", this.#directNavigation)
+    this.element.addEventListener("turbo:before-frame-render", this.#preserveDirectEditor)
     this.channel ??= await cable.subscribeTo({ channel: "UnreadRoomsChannel" }, {
       connected: this.#channelConnected.bind(this),
       disconnected: this.#channelDisconnected.bind(this),
@@ -17,7 +21,11 @@ export default class extends Controller {
   }
 
   disconnect() {
+    this.element.removeEventListener("turbo:click", this.#directNavigation)
+    this.element.removeEventListener("turbo:before-frame-render", this.#preserveDirectEditor)
+    this.#discardDirectEditor = false
     ignoringBriefDisconnects(this.element, () => {
+      this.#channelDisconnected()
       this.channel?.unsubscribe()
       this.channel = null
     })
@@ -36,10 +44,45 @@ export default class extends Controller {
     }
   }
 
-  #channelConnected() {
+  // Preserve the live picker through background refreshes, but allow deliberate navigation.
+  #directNavigation = event => {
+    if (event.target.closest("a")?.dataset.turboFrame === this.element.id) {
+      this.#discardDirectEditor = true
+    }
+  }
+
+  #preserveDirectEditor = event => {
+    if (event.target !== this.element) return
+    const discard = this.#discardDirectEditor
+    this.#discardDirectEditor = false
+    if (discard) return
+
+    const current = this.element.querySelector("#direct_rooms_control")
+    const incoming = event.detail.newFrame.querySelector("#direct_rooms_control")
+    if (!current?.querySelector('[data-autocomplete-target="input"]') || !incoming) return
+
+    // Turbo's Bardo moves the actual element, keeping input, selections and controllers.
+    const controls = [ current, incoming ].map(element => [ element, element.hasAttribute("data-turbo-permanent") ])
+    for (const [ element ] of controls) element.setAttribute("data-turbo-permanent", "")
+    const render = event.detail.render
+    event.detail.render = (...args) => {
+      try {
+        return render(...args)
+      } finally {
+        for (const [ element, permanent ] of controls) element.toggleAttribute("data-turbo-permanent", permanent)
+      }
+    }
+  }
+
+  async #channelConnected() {
     if (this.#disconnected) {
       this.#disconnected = false
-      this.element.reload()
+      const connection = ++this.#connection
+      // Reloading an unfinished frame aborts its response body reader.
+      await this.element.loaded
+      if (this.element.isConnected && !this.#disconnected && connection === this.#connection) {
+        this.element.reload()
+      }
     }
   }
 

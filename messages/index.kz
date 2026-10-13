@@ -32,6 +32,7 @@ threadlocal var cr_ver_len: usize = 0;
     cr_name_len = 0;
     cr_bio_len = 0;
     cr_ver_len = 0;
+    cmid_len = 0;
 }
 
 fn stashStr(buf: []u8, len: *usize, s: []const u8) void {
@@ -285,6 +286,38 @@ fn reqScratch() std.mem.Allocator {
     bufAppend(&wrap_buf, &n, html);
     bufAppend(&wrap_buf, &n, "</template></turbo-stream>");
     return wrap_buf[0..n];
+}
+
+// `turbo_stream.replace` on the presentation dom_id with maintain_scroll —
+// broadcast_replace_to @room, :messages, target: [@message, :presentation],
+// attributes: { maintain_scroll: true }. The template is the
+// messages/_presentation partial verbatim.
+threadlocal var pwrap_buf: [262144]u8 = undefined;
+
+~proc present-wrap|zig {
+    var n: usize = 0;
+    bufAppend(&pwrap_buf, &n, "<turbo-stream action=\"replace\" target=\"presentation_message_");
+    bufAppend(&pwrap_buf, &n, cmid);
+    bufAppend(&pwrap_buf, &n, "\" maintain_scroll=\"true\"><template><div id=\"presentation_message_");
+    bufAppend(&pwrap_buf, &n, cmid);
+    bufAppend(&pwrap_buf, &n, "\" dir=\"auto\" data-reply-target=\"body\" data-messages-target=\"body\"><div class=\"lexxy-content\">");
+    bufAppend(&pwrap_buf, &n, body);
+    bufAppend(&pwrap_buf, &n, "</div></div></template></turbo-stream>");
+    return pwrap_buf[0..n];
+}
+
+// The update path's stash: the permissioned row's client_message_id (the
+// broadcast target) survives the | done boundary.
+threadlocal var cmid_buf: [96]u8 = undefined;
+threadlocal var cmid_len: usize = 0;
+
+~proc stash-cmid|zig { stashStr(&cmid_buf, &cmid_len, s); }
+~proc msg-cmid|zig { return cmid_buf[0..cmid_len]; }
+
+threadlocal var path_buf: [160]u8 = undefined;
+
+~proc msg-path|zig {
+    return std.fmt.bufPrint(&path_buf, "/rooms/{s}/messages/{s}", .{ rid, mid }) catch "";
 }
 
 // ── Dedicated message writer ────────────────────────────────────────────────
@@ -621,4 +654,32 @@ threadlocal var bs_payload_len: usize = 0;
 
 ~proc render-payload|zig {
     return bs_payload_buf[0..bs_payload_len];
+}
+
+// 201 Created + `Location: /messages/<mid>` — by_bots #create's
+// head_with_location. Threadlocal buffer, request-scoped like the rest.
+threadlocal var bloc_buf: [128]u8 = undefined;
+
+~proc bot-location|zig {
+    return std.fmt.bufPrint(&bloc_buf, "Location: /messages/{d}\r\n", .{mid}) catch "";
+}
+
+// 201 + Location — head :created, location: message_url(@message).
+~proc respond-located|zig {
+    return .{ .status = 201, .body = "", .content_type = "text/plain", .extra_headers = loc };
+}
+
+// form-ids answers "0" on no match (its SQL-guard contract); a route that
+// also honors ?user_ids[]= picks the query value in that case. Query "" and
+// form "0" both yield "0" — an empty IN () set, which is correct for a
+// recipient-less ping (self-room never matches: current uid joins later).
+threadlocal var idsor_buf: [512]u8 = undefined;
+
+~proc ids-or|zig {
+    if (form.len > 0 and !(form.len == 1 and form[0] == '0')) {
+        @memcpy(idsor_buf[0..form.len], form);
+        return idsor_buf[0..form.len];
+    }
+    @memcpy(idsor_buf[0..query.len], query);
+    return idsor_buf[0..query.len];
 }
