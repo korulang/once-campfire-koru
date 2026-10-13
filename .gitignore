@@ -13,3 +13,7 @@ seed/*-shm
 seed/*-wal
 campfire
 *.sqlite3
+
+# vendor/ ships third-party snapshots verbatim — the generated-artifact
+# patterns above must not eat their build files
+!vendor/**

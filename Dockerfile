@@ -23,13 +23,12 @@ ARG ZIG_VERSION=0.15.2
 # --- toolchain: zig + the compiler -----------------------------------------
 FROM docker.io/library/debian:${DEBIAN_RELEASE} AS toolchain
 ARG ZIG_VERSION
-ARG TARGETARCH
 RUN apt-get update -qq && \
     apt-get install --no-install-recommends -y \
       curl xz-utils ca-certificates \
       zlib1g-dev libsqlite3-dev libssl-dev libyyjson-dev && \
     rm -rf /var/lib/apt/lists /var/cache/apt/archives
-RUN arch=$(case "$TARGETARCH" in arm64) echo aarch64;; amd64) echo x86_64;; *) echo "$TARGETARCH";; esac) && \
+RUN arch=$(uname -m) && \
     curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" \
       | tar -xJ -C /opt && \
     ln -s "/opt/zig-${arch}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
