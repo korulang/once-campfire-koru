@@ -1,0 +1,179 @@
+// Koru Standard Library: the `fpgaemit` part of kernel.kz — `self|fpga`
+// module emission. Joined via `~part fpgaemit` in kernel.kz; merged into
+// the kernel module. kernel.fpga.kz owns the facet read (ports, sat
+// claims); this file turns it into `<sym>.fpga.sv` — one pipeline stage:
+// the mapped field combinational, every other field passed through, one
+// register. kernel.fpgatb.kz emits the bench that gates it; Stage D's
+// emitted build globs `*.fpga.sv`, runs iverilog + vvp + yosys check.
+//
+// Signed ports (`logic signed [W-1:0]`) come from met ranges admitting
+// negatives; the wide/sat map sign-extends them, zero-extends unsigned
+// ones — a wrong extension is a wrong circuit, not a detail.
+
+// Emit `<sym>.fpga.sv` into the build root, then delegate the testbench
+// (kernel.fpgatb.kz). The body is already parsed by the caller into
+// (field, op, lit); every other shape field passes the stage through.
+fn emitFpgaSelf(
+    alloc: std.mem.Allocator,
+    prog: *const kast.Program,
+    home: []const u8,
+    type_name: []const u8,
+    binding: []const u8,
+    body_text: []const u8,
+    shape_fields: []const kast.Field,
+    dataset: []const u8,
+    sym: []const u8,
+) void {
+    // ---- body: `k.<field> <op>= <int>` — same narrow contract as |mlir ----
+    const bt = std.mem.trim(u8, body_text, " \t\n\r;");
+    if (!std.mem.startsWith(u8, bt, binding) or bt.len <= binding.len or bt[binding.len] != '.') {
+        std.debug.print("error[KORU123]: `self|fpga` currently generates SystemVerilog only for `{s}.<field> <op>= <int>` (op: * + - /) — got `{s}`\n", .{ binding, bt });
+        std.process.exit(1);
+    }
+    var rest = bt[binding.len + 1 ..];
+    var fld_end: usize = 0;
+    while (fld_end < rest.len and (std.ascii.isAlphanumeric(rest[fld_end]) or rest[fld_end] == '_')) fld_end += 1;
+    const map_field = rest[0..fld_end];
+    rest = std.mem.trimLeft(u8, rest[fld_end..], " \t");
+    if (rest.len < 3 or rest[1] != '=') {
+        std.debug.print("error[KORU123]: `self|fpga` currently generates SystemVerilog only for `{s}.<field> <op>= <int>` (op: * + - /) — got `{s}`\n", .{ binding, bt });
+        std.process.exit(1);
+    }
+    const sv_op: u8 = switch (rest[0]) {
+        '*', '+', '-', '/' => rest[0],
+        else => {
+            std.debug.print("error[KORU123]: `self|fpga` supports ops * + - / — got `{c}=` in `{s}`\n", .{ rest[0], bt });
+            std.process.exit(1);
+        },
+    };
+    const lit_raw = std.mem.trim(u8, rest[2..], " \t");
+    const lit = std.fmt.parseInt(i64, lit_raw, 10) catch {
+        std.debug.print("error[KORU123]: `self|fpga` needs an integer literal operand — got `{s}`\n", .{bt});
+        std.process.exit(1);
+    };
+
+    var map_idx: ?usize = null;
+    for (shape_fields, 0..) |sf, sfi| {
+        if (std.mem.eql(u8, sf.name, map_field)) map_idx = sfi;
+        if (!std.mem.eql(u8, sf.type, "i64")) {
+            std.debug.print("error[KORU123]: `self|fpga` emits i64 shape fields only this rung — `{s}` is {s} (a fabric port needs a bit width; float semantics are a later rung)\n", .{ sf.name, sf.type });
+            std.process.exit(1);
+        }
+    }
+    const mapped = map_idx orelse {
+        std.debug.print("error[KORU123]: `self|fpga` body names `{s}` — not a field of {s} (shape declares {d} field(s))\n", .{ map_field, type_name, shape_fields.len });
+        std.process.exit(1);
+    };
+
+    // ---- ports: the |fpga facet's meet, refine's own fold. `sat` is the
+    // mapped field's clamp claim — the effective [lo,hi] it saturates to.
+    const proto_home = fpgaProtoHome(prog.items, prog.main_module_name, type_name) orelse home;
+    var ports = alloc.alloc(FpgaPort, shape_fields.len) catch unreachable;
+    for (shape_fields, 0..) |_, wi| ports[wi] = .{ .bits = 64, .sign = true };
+    var sat: ?[2]i64 = null;
+    if (@hasDecl(koru_std, "koru_refine")) {
+        const met = koru_std.koru_refine.metFields(alloc, prog, proto_home, type_name, "fpga");
+        for (met) |*mf| {
+            for (shape_fields, 0..) |sf, sfi| {
+                if (!std.mem.eql(u8, mf.name, sf.name)) continue;
+                const lo_v: ?i64 = if (mf.lo) |b| b.value else null;
+                const hi_v: ?i64 = if (mf.hi) |b| b.value else null;
+                const eq_v: ?i64 = if (mf.eq) |b| b.value else null;
+                const cl: ?[2]i64 = if (mf.clamp) |c| .{ c.lo, c.hi } else null;
+                ports[sfi] = fpgaFieldPort(lo_v, if (mf.lo) |b| b.exclusive else false, hi_v, if (mf.hi) |b| b.exclusive else false, eq_v, cl);
+                if (sfi == mapped and mf.clamp != null) sat = fpgaEffBounds(lo_v, if (mf.lo) |b| b.exclusive else false, hi_v, if (mf.hi) |b| b.exclusive else false, cl);
+            }
+        }
+    }
+
+    // ---- dataset: the testbench's stimulus, checked against the ports ----
+    const elems = fpgaParseDataset(alloc, dataset, shape_fields, type_name);
+    for (elems, 0..) |ev, ei| {
+        for (shape_fields, 0..) |sf, sfi| {
+            const p = ports[sfi];
+            const over = if (p.bits >= 64)
+                !p.sign and ev[sfi] < 0
+            else if (p.sign)
+                ev[sfi] < -(@as(i64, 1) << @intCast(p.bits - 1)) or ev[sfi] > (@as(i64, 1) << @intCast(p.bits - 1)) - 1
+            else
+                ev[sfi] < 0 or ev[sfi] > (@as(i64, 1) << @intCast(p.bits)) - 1;
+            if (over) {
+                std.debug.print("error[KORU123]: `self|fpga` init element {d} has `{s}` = {d} — the |fpga facet met that port to {d}{s} bits, which cannot carry it (the facet is enforced at the artifact's boundary too)\n", .{ ei, sf.name, ev[sfi], p.bits, if (p.sign) " signed" else "" });
+                std.process.exit(1);
+            }
+        }
+    }
+
+    // ---- the module ----
+    var sv = std.ArrayList(u8).initCapacity(alloc, 2048) catch unreachable;
+    const w = struct {
+        fn p(buf: *std.ArrayList(u8), a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+            buf.appendSlice(a, std.fmt.allocPrint(a, fmt, args) catch unreachable) catch unreachable;
+        }
+    }.p;
+
+    w(&sv, alloc, "// Generated by std/kernel:self|fpga — one kernel self op, one pipeline\n", .{});
+    w(&sv, alloc, "// stage. Host lowering is the ordinary Zig loop; this artifact is gated\n", .{});
+    w(&sv, alloc, "// by iverilog + the generated testbench + yosys check, all run by the build.\n", .{});
+    w(&sv, alloc, "module {s} (\n    input  logic        clk,\n    input  logic        rst_n,\n    input  logic        in_valid,\n", .{sym});
+    for (shape_fields, 0..) |sf, sfi| {
+        w(&sv, alloc, "    input  logic {s}[{d}:0] in_{s},\n", .{ if (ports[sfi].sign) "signed " else "", ports[sfi].bits - 1, sf.name });
+    }
+    w(&sv, alloc, "    output logic        out_valid,\n", .{});
+    for (shape_fields, 0..) |sf, sfi| {
+        w(&sv, alloc, "    output logic {s}[{d}:0] out_{s}{s}\n", .{ if (ports[sfi].sign) "signed " else "", ports[sfi].bits - 1, sf.name, if (sfi + 1 < shape_fields.len) "," else "" });
+    }
+    w(&sv, alloc, ");\n", .{});
+    // The mapped field is combinational; the stage register is the beat.
+    // A clamp claim saturates: the map is computed signed-wide (the input
+    // sign-extended if its port is signed, zero-extended if not), then
+    // held inside the effective [lo,hi] before it reaches the port.
+    {
+        const sf = shape_fields[mapped];
+        const mp = ports[mapped];
+        w(&sv, alloc, "    logic {s}[{d}:0] mapped_{s};\n", .{ if (mp.sign) "signed " else "", mp.bits - 1, sf.name });
+        const mlit = fpgaPortLit(lit, mp);
+        if (sat) |sc| {
+            w(&sv, alloc, "    logic signed [63:0] wide_{s};\n", .{sf.name});
+            if (mp.sign) {
+                w(&sv, alloc, "    assign wide_{s} = $signed(in_{s}) {c} {s}64'sd{d};\n", .{ sf.name, sf.name, sv_op, if (lit < 0) "-" else "", @abs(lit) });
+            } else {
+                w(&sv, alloc, "    assign wide_{s} = $signed({{1'b0, in_{s}}}) {c} {s}64'sd{d};\n", .{ sf.name, sf.name, sv_op, if (lit < 0) "-" else "", @abs(lit) });
+            }
+            const hi_lit = fpgaPortLit(sc[1], mp);
+            const lo_lit = fpgaPortLit(sc[0], mp);
+            w(&sv, alloc, "    assign mapped_{s} = (wide_{s} > {s}64'sd{d}) ? {s}{d}'{s}d{d} : (wide_{s} < {s}64'sd{d}) ? {s}{d}'{s}d{d} : wide_{s}[{d}:0];\n", .{
+                sf.name, sf.name, if (sc[1] < 0) "-" else "", @abs(sc[1]), hi_lit.neg, hi_lit.bits, hi_lit.s, hi_lit.mag,
+                sf.name, if (sc[0] < 0) "-" else "", @abs(sc[0]), lo_lit.neg, lo_lit.bits, lo_lit.s, lo_lit.mag, sf.name, mp.bits - 1,
+            });
+        } else {
+            w(&sv, alloc, "    assign mapped_{s} = in_{s} {c} {s}{d}'{s}d{d};\n", .{ sf.name, sf.name, sv_op, mlit.neg, mlit.bits, mlit.s, mlit.mag });
+        }
+    }
+    w(&sv, alloc, "\n    always_ff @(posedge clk or negedge rst_n) begin\n        if (!rst_n) begin\n            out_valid <= 1'b0;\n", .{});
+    for (shape_fields, 0..) |sf, sfi| {
+        w(&sv, alloc, "            out_{s} <= {d}'d0;\n", .{ sf.name, ports[sfi].bits });
+    }
+    w(&sv, alloc, "        end else begin\n            out_valid <= in_valid;\n", .{});
+    for (shape_fields, 0..) |sf, sfi| {
+        if (sfi == mapped) {
+            w(&sv, alloc, "            out_{s} <= mapped_{s};\n", .{ sf.name, sf.name });
+        } else {
+            w(&sv, alloc, "            out_{s} <= in_{s};\n", .{ sf.name, sf.name });
+        }
+    }
+    w(&sv, alloc, "        end\n    end\nendmodule\n", .{});
+
+    {
+        const fname = std.fmt.allocPrint(alloc, "{s}.fpga.sv", .{sym}) catch unreachable;
+        const mf = std.fs.cwd().createFile(fname, .{}) catch |e| {
+            std.debug.print("error: `self|fpga` cannot write {s}: {s}\n", .{ fname, @errorName(e) });
+            std.process.exit(1);
+        };
+        defer mf.close();
+        mf.writeAll(sv.items) catch unreachable;
+    }
+    // ---- the testbench lives in the fpgatb part — it must mirror the
+    // module's port semantics (width, signedness, truncate vs saturate) ----
+    emitFpgaTb(alloc, sym, shape_fields, ports, elems, mapped, sv_op, lit, sat);
+}

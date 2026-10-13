@@ -1,0 +1,39 @@
+// Koru Standard Library: String Formatting — JS placeholder emission.
+// Joined via `~part jsprec` in fmt.kz; merged into the fmt module at load.
+
+/// Emit one `{{ ... }}` placeholder's value expression for the JS concat the
+/// `ln|js` transform is building — bare `name` normally,
+/// `Number(name).toFixed(N)` when the spec carries a `:.N` precision tail
+/// (`d:.4`, `f:.2`, `:.4`). JS `+` already stringifies every other spec, so
+/// they still collapse to the bare name — `s`/`S`/`d`/`f`/`any` unchanged.
+///
+/// A dotted path (`req.text`) is a JS member read verbatim, and a segment
+/// that collides with a JS keyword is still a legal property name — so
+/// unlike |zig there is nothing to escape here.
+fn jsPlaceholder(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, placeholder: []const u8) void {
+    var var_name: []const u8 = placeholder;
+    var precision: ?[]const u8 = null;
+    if (std.mem.indexOf(u8, placeholder, ":")) |colon_pos| {
+        var_name = placeholder[0..colon_pos];
+        const spec = placeholder[colon_pos + 1 ..];
+        if (std.mem.indexOf(u8, spec, ":")) |p2| {
+            // `:.N` — the dot is the precision marker, digits after it are N.
+            const rest = spec[p2 + 1 ..];
+            if (rest.len > 1 and rest[0] == '.') {
+                const d = rest[1..];
+                var digits = true;
+                for (d) |c| digits = digits and c >= '0' and c <= '9';
+                if (digits) precision = d;
+            }
+        }
+    }
+    if (precision) |d| {
+        buf.appendSlice(allocator, "Number(") catch unreachable;
+        buf.appendSlice(allocator, var_name) catch unreachable;
+        buf.appendSlice(allocator, ").toFixed(") catch unreachable;
+        buf.appendSlice(allocator, d) catch unreachable;
+        buf.append(allocator, ')') catch unreachable;
+    } else {
+        buf.appendSlice(allocator, var_name) catch unreachable;
+    }
+}

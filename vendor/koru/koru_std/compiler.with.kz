@@ -1,0 +1,313 @@
+// Koru Standard Library: the `with` part of compiler.kz.
+// Joined via `~part with` in compiler.kz; merged into the compiler
+// module at load.
+//
+// resolve-with-scopes: the [with] vocabulary pass and its helpers.
+
+// [with] scoped-vocabulary resolution (641_010; concept
+// frag-with-declares-the-flows-vocabulary). Stage-A canonicalize stamps the
+// MAIN module onto every bare name with no import lookup, so a bare `match`
+// inside a grammar region arrives here as `<main>:match` and would die as an
+// unknown tor. `[with]` colors its whole flow — position is meaningless, the
+// gather runs over the entire subtree before any restamp — and the open set
+// is the union of every opener it finds: bare `[with]` derives the annotated
+// invocation's own module, `[with(a, b)]` names modules explicitly
+// (import-spelled, and each must be imported — KORU142). A bare name stamped
+// to its flow's home module that is NOT a real tor there but IS a real tor of
+// an opened module is re-qualified to it; matching is on the full dotted
+// event name, so `say.hi` and `log.hi` never collide on `hi`. Unresolved-only
+// — a name that genuinely resolves at home is never shadowed. Runs BEFORE
+// run-pre-transforms so the grammar transform (parser.kz `isVerb` keys off
+// the qualifier being present) sees the resolved `std.parser:match`. Mirrors
+// canonicalize_names' own flow/continuation/node recursion, so it visits
+// exactly the paths it does.
+~pub tor resolve-with-scopes { ctx: CompilerContext } -> CompilerContext
+
+~proc resolve-with-scopes|zig {
+    const ast_mod = @import("ast");
+    const main_mod = ctx.ast.main_module_name;
+    const alloc = ctx.allocator;
+
+    var updated_ctx = ctx;
+
+    const S = struct {
+        // Build a set of "module\x00event" keys from every event_decl (recursing
+        // module_decls). Collected from original_ast — the unfiltered AST — so the
+        // membership check is complete regardless of emit-mode filtering.
+        fn collect(items: []const ast_mod.Item, set: *std.StringHashMap(void), a: std.mem.Allocator) void {
+            for (items) |*item| {
+                switch (item.*) {
+                    .event_decl => |*e| {
+                        if (e.path.segments.len == 0) continue;
+                        const mq = e.path.module_qualifier orelse continue;
+                        const name = std.mem.join(a, ".", e.path.segments) catch continue;
+                        const key = std.fmt.allocPrint(a, "{s}\x00{s}", .{ mq, name }) catch continue;
+                        set.put(key, {}) catch {};
+                    },
+                    .module_decl => |*m| collect(m.items, set, a),
+                    else => {},
+                }
+            }
+        }
+
+        // The set of module names this program actually imported — what a
+        // `with(...)` argument is allowed to name (KORU142).
+        fn collectModules(items: []const ast_mod.Item, set: *std.StringHashMap(void), a: std.mem.Allocator) void {
+            for (items) |*item| {
+                switch (item.*) {
+                    .module_decl => |*m| {
+                        set.put(m.logical_name, {}) catch {};
+                        collectModules(m.items, set, a);
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        fn has(set: *std.StringHashMap(void), mod: []const u8, seg: []const u8, a: std.mem.Allocator) bool {
+            const key = std.fmt.allocPrint(a, "{s}\x00{s}", .{ mod, seg }) catch return false;
+            defer a.free(key);
+            return set.contains(key);
+        }
+
+        const WithKind = union(enum) {
+            none,
+            derive, // bare `[with]` — the vocabulary is the annotated call's module
+            explicit: []const u8, // `[with(a, b)]` — the arg list IS the open set
+        };
+
+        // `with` alone derives; `with(a, b)` declares. Args are module paths
+        // spelled exactly as `import` writes them, comma-separated like any
+        // argument list — `|` separates annotations, never arguments.
+        fn withKind(ann: []const u8) WithKind {
+            if (std.mem.eql(u8, ann, "with")) return .derive;
+            if (ann.len > 6 and std.mem.startsWith(u8, ann, "with(") and ann[ann.len - 1] == ')')
+                return .{ .explicit = ann[5 .. ann.len - 1] };
+            return .none;
+        }
+
+        // A `with(...)` argument names a module this file imported — the
+        // annotation abbreviates a declared dependency, it never creates one.
+        // An arg matching no module_decl in the program is KORU142.
+        fn addExplicit(args: []const u8, targets: *std.ArrayList([]const u8), seen: *std.StringHashMap(void), mods: *std.StringHashMap(void), a: std.mem.Allocator, errs: anytype, loc: anytype) void {
+            var it = std.mem.splitScalar(u8, args, ',');
+            while (it.next()) |raw| {
+                const spelled = std.mem.trim(u8, raw, " \t");
+                if (spelled.len == 0) continue;
+                const dotted = std.mem.replaceOwned(u8, a, spelled, "/", ".") catch continue;
+                if (!mods.contains(dotted)) {
+                    const msg = std.fmt.allocPrint(a, "error[KORU142]: [with] module '{s}' is not imported — the annotation abbreviates a dependency this file declares; write 'import {s}' to declare it", .{ spelled, spelled }) catch continue;
+                    errs.append(a, .{ .message = msg, .location = .{
+                        .file = loc.file,
+                        .line = @intCast(loc.line),
+                        .column = @intCast(loc.column),
+                    } }) catch {};
+                    continue;
+                }
+                addTarget(dotted, targets, seen, a);
+            }
+        }
+
+        fn applyAnnotations(anns: []const []const u8, derived: ?[]const u8, targets: *std.ArrayList([]const u8), seen: *std.StringHashMap(void), mods: *std.StringHashMap(void), a: std.mem.Allocator, errs: anytype, loc: anytype) void {
+            for (anns) |ann| {
+                switch (withKind(ann)) {
+                    .none => {},
+                    .derive => addTarget(derived, targets, seen, a),
+                    .explicit => |args| addExplicit(args, targets, seen, mods, a, errs, loc),
+                }
+            }
+        }
+
+        fn addTarget(mq: ?[]const u8, targets: *std.ArrayList([]const u8), seen: *std.StringHashMap(void), a: std.mem.Allocator) void {
+            const m = mq orelse return;
+            if (seen.contains(m)) return;
+            seen.put(m, {}) catch {};
+            targets.append(a, m) catch {};
+        }
+
+        // Gather every `[with]` target opened anywhere in a flow subtree — the head
+        // AND every mid-chain step, now that the parser hangs the annotation on the
+        // step's Invocation. Distinct by module.
+        fn gatherNode(node: *const ast_mod.Node, targets: *std.ArrayList([]const u8), seen: *std.StringHashMap(void), mods: *std.StringHashMap(void), a: std.mem.Allocator, errs: anytype, loc: anytype) void {
+            switch (node.*) {
+                .invocation => |*inv| {
+                    applyAnnotations(inv.annotations, inv.path.module_qualifier, targets, seen, mods, a, errs, loc);
+                },
+                .label_with_invocation => |*lwi| {
+                    applyAnnotations(lwi.invocation.annotations, lwi.invocation.path.module_qualifier, targets, seen, mods, a, errs, loc);
+                },
+                .conditional_block => |*cb| for (cb.nodes) |*n| gatherNode(n, targets, seen, mods, a, errs, loc),
+                .foreach => |*fe| for (fe.branches) |*b| for (b.body) |*c| gatherCont(c, targets, seen, mods, a, errs, loc),
+                .conditional => |*cond| for (cond.branches) |*b| for (b.body) |*c| gatherCont(c, targets, seen, mods, a, errs, loc),
+                .switch_result => |*sr| for (sr.branches) |*b| for (b.body) |*c| gatherCont(c, targets, seen, mods, a, errs, loc),
+                else => {},
+            }
+        }
+
+        fn gatherCont(cont: *const ast_mod.Continuation, targets: *std.ArrayList([]const u8), seen: *std.StringHashMap(void), mods: *std.StringHashMap(void), a: std.mem.Allocator, errs: anytype, loc: anytype) void {
+            if (cont.node) |*n| gatherNode(n, targets, seen, mods, a, errs, loc);
+            for (cont.continuations) |*nested| gatherCont(nested, targets, seen, mods, a, errs, loc);
+        }
+
+        // Resolve one bare name against the active `[with]` targets.
+        //   .local     — resolves in the main module; never shadowed
+        //   .unknown   — no active target owns it; leave for the downstream KORU040
+        //   .resolved  — exactly one target owns it; restamped in place here
+        //   .ambiguous — two or more own it; caller raises the KORU140 pick-wall
+        //
+        // `.ambiguous` carries EVERY owner, not a pair. A pick-wall exists to
+        // hand the author the whole set to choose from; naming a subset means
+        // you qualify to escape the reported collision and the owner it never
+        // mentioned ambushes you on the next build (641_014).
+        const Outcome = union(enum) {
+            local,
+            unknown,
+            resolved,
+            ambiguous: []const []const u8,
+        };
+
+        // An invocation's full dotted name (`say.hi`), not its last segment —
+        // two events sharing a tail (`say.hi`, `log.hi`) are different names.
+        fn fullName(inv: *const ast_mod.Invocation, a: std.mem.Allocator) ?[]const u8 {
+            if (inv.path.segments.len == 0) return null;
+            return std.mem.join(a, ".", inv.path.segments) catch null;
+        }
+
+        fn restamp(inv: *ast_mod.Invocation, targets: []const []const u8, main: []const u8, set: *std.StringHashMap(void), a: std.mem.Allocator) Outcome {
+            const name = fullName(inv, a) orelse return .unknown;
+            const mq = inv.path.module_qualifier orelse return .unknown;
+            if (!std.mem.eql(u8, mq, main)) return .unknown; // already qualified — not ours
+            if (has(set, main, name, a)) return .local; // resolves locally — never shadow
+            var owners = std.ArrayList([]const u8){};
+            for (targets) |t| {
+                if (has(set, t, name, a)) owners.append(a, t) catch return .unknown;
+            }
+            if (owners.items.len == 0) return .unknown; // unknown in every target too
+            if (owners.items.len > 1) return .{ .ambiguous = owners.toOwnedSlice(a) catch return .unknown };
+            const only = owners.items[0];
+            owners.deinit(a);
+            inv.path.module_qualifier = a.dupe(u8, only) catch return .unknown;
+            return .resolved;
+        }
+
+        // Restamp one invocation and, on ambiguity, record the KORU140 pick-wall
+        // into ctx.errors — surfaced (and halted on) at the analysis boundary.
+        fn resolveInv(inv: *ast_mod.Invocation, targets: []const []const u8, main: []const u8, set: *std.StringHashMap(void), a: std.mem.Allocator, errs: anytype, loc: anytype) void {
+            switch (restamp(inv, targets, main, set, a)) {
+                .ambiguous => |owners| {
+                    defer a.free(owners);
+                    const seg = fullName(inv, a) orelse return;
+                    // Name every owner: `'a' and 'b'`, `'a', 'b' and 'c'`, ...
+                    var listing = std.ArrayList(u8){};
+                    defer listing.deinit(a);
+                    for (owners, 0..) |owner, i| {
+                        if (i > 0) listing.appendSlice(a, if (i + 1 == owners.len) " and " else ", ") catch return;
+                        listing.append(a, '\'') catch return;
+                        listing.appendSlice(a, owner) catch return;
+                        listing.append(a, '\'') catch return;
+                    }
+                    const msg = std.fmt.allocPrint(a, "error[KORU140]: bare name '{s}' resolves against more than one opened vocabulary ({s}) — qualify the call explicitly to pick one", .{ seg, listing.items }) catch return;
+                    errs.append(a, .{ .message = msg, .location = .{
+                        .file = loc.file,
+                        .line = @intCast(loc.line),
+                        .column = @intCast(loc.column),
+                    } }) catch {};
+                },
+                else => {},
+            }
+        }
+
+        fn walkNode(node: *ast_mod.Node, targets: []const []const u8, main: []const u8, set: *std.StringHashMap(void), a: std.mem.Allocator, errs: anytype, loc: anytype) void {
+            switch (node.*) {
+                .invocation => |*inv| resolveInv(@constCast(inv), targets, main, set, a, errs, loc),
+                .label_with_invocation => |*lwi| resolveInv(@constCast(&lwi.invocation), targets, main, set, a, errs, loc),
+                .conditional_block => |*cb| {
+                    for (cb.nodes) |*n| walkNode(@constCast(n), targets, main, set, a, errs, loc);
+                },
+                .foreach => |*fe| {
+                    for (fe.branches) |*b| {
+                        for (b.body) |*c| walkCont(@constCast(c), targets, main, set, a, errs, loc);
+                    }
+                },
+                .conditional => |*cond| {
+                    for (cond.branches) |*b| {
+                        for (b.body) |*c| walkCont(@constCast(c), targets, main, set, a, errs, loc);
+                    }
+                },
+                .switch_result => |*sr| {
+                    for (sr.branches) |*b| {
+                        for (b.body) |*c| walkCont(@constCast(c), targets, main, set, a, errs, loc);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        fn walkCont(cont: *ast_mod.Continuation, targets: []const []const u8, main: []const u8, set: *std.StringHashMap(void), a: std.mem.Allocator, errs: anytype, loc: anytype) void {
+            if (cont.node) |*n| walkNode(@constCast(n), targets, main, set, a, errs, loc);
+            for (cont.continuations) |*nested| walkCont(@constCast(nested), targets, main, set, a, errs, loc);
+        }
+    };
+
+    var set = std.StringHashMap(void).init(alloc);
+    S.collect(ctx.original_ast.items, &set, alloc);
+
+    var imported = std.StringHashMap(void).init(alloc);
+    S.collectModules(ctx.original_ast.items, &imported, alloc);
+
+    // Flows live at TWO depths. The entry file's are top-level items; an
+    // imported module's arrive wrapped in a single `.module_decl` carrying its
+    // own items. The flat walk this replaced resolved `[with]` for the entry
+    // file alone, so a vocabulary opened inside a library never restamped and
+    // its bare names kept the library's own qualifier — `std/parser:parse` then
+    // refused the grammar's `match(l)` picker as "not the static shape" while
+    // looking straight at it (115_012).
+    //
+    // The stamp to resolve against is the flow's HOME MODULE, not the program's
+    // main module. Stage-A canonicalize stamps a bare name with the module it
+    // was written in; for a library flow that is the library's logical name, so
+    // passing `main_module_name` down made every restamp bail as "already
+    // qualified — not ours". Home is `main_mod` at top level and the enclosing
+    // `.module_decl`'s logical name below it.
+    const Walk = struct {
+        fn items(
+            its: []const ast_mod.Item,
+            home: []const u8,
+            set2: *std.StringHashMap(void),
+            mods: *std.StringHashMap(void),
+            a: std.mem.Allocator,
+            errs: anytype,
+        ) void {
+            for (its) |*item| {
+                switch (item.*) {
+                    .module_decl => |*m| items(m.items, m.logical_name, set2, mods, a, errs),
+                    .flow => |*flow| {
+                        // Collect the vocabularies this flow opens: a flow-head
+                        // `[with]` (the annotation may live on the flow itself)
+                        // plus every mid-chain opener.
+                        var targets = std.ArrayList([]const u8){};
+                        var seen = std.StringHashMap(void).init(a);
+                        // `flow.inv()` assumes an invocation head — derive the
+                        // flow-level vocabulary only when the head really is one.
+                        const derived: ?[]const u8 = if (flow.body.node) |*n| switch (n.*) {
+                            .invocation => |*i| i.path.module_qualifier,
+                            .label_with_invocation => |*l| l.invocation.path.module_qualifier,
+                            else => null,
+                        } else null;
+                        S.applyAnnotations(flow.annotations, derived, &targets, &seen, mods, a, errs, flow.location);
+                        S.gatherCont(&flow.body, &targets, &seen, mods, a, errs, flow.location);
+                        if (targets.items.len == 0) continue;
+
+                        S.walkCont(@constCast(&flow.body), targets.items, home, set2, a, errs, flow.location);
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+    Walk.items(updated_ctx.ast.items, main_mod, &set, &imported, alloc, &updated_ctx.errors);
+
+    updated_ctx.passes_completed += 1;
+    updated_ctx.current_pass = "resolve_with_scopes";
+    return updated_ctx;
+}

@@ -1,0 +1,525 @@
+// ============================================================
+// GATE — named enforcement profiles over declared rules
+// ============================================================
+// An invariant row (std/invariants) declares a rule in source, next to the
+// code it constrains. A gate PROFILE names when and how a set of those
+// rules is enforced — and the same program answers differently under
+// different profiles, because the profile is a selection over the declared
+// surface, not a property of it. `dev` for a workstation commit, `aerospace`
+// for a sanctioned pipeline: the rules do not change; the profile chooses
+// which of them are asked and how hard a "no" lands.
+//
+// SURFACE:
+//
+//   std/gate:profile(dev) {
+//     "block": true,
+//     "description": "the local commit gate",
+//     "judge": "invariants/gate",        // optional — verdict delegator
+//     "judge_src": "invariants/gate.k"   // optional — staleness oracle
+//   }
+//
+// The name is positional — `expr` is made for this: a profile's whole job is
+// being a name, so the name rides the call and the block carries only the
+// policy fields (`block`, `description`, `judge`, `judge_src`). A `"name"`
+// key in the block is a refusal — it would let the name and the field
+// disagree.
+//
+// A rule joins a profile by tag: `tags: ["dev"]` on the invariant row makes
+// it a member of `gate dev`. `"dev-local"` marks the row file-scoped — it
+// fires only when its own declaring file is in the staged diff. `odds-N` is
+// a deterministic alarm: the row fires when sha256(name ++ "\0" ++ staged
+// diff) mod 100 lands below N — same staged state, same roll, so re-running
+// the gate answers identically and the alarm is driven by commit activity,
+// not a schedule. `repo-X` scopes a check: row to a consumer repo (matched
+// on the repo directory's basename).
+//
+//   koruc <file> gate            — list the profiles this program declares
+//   koruc <file> gate dev        — run the `dev` profile
+//   koruc <file> gate dev json   — machine-readable verdicts
+//   koruc <file> gate dev --advisory   — soften a blocking profile locally
+//   koruc <file> gate dev --checks-only  — instruments only, no judged rows
+//   koruc <file> gate dev --judge-only   — judged rows only, no instruments
+//   koruc <file> gate dev --repo PATH  — gate another repo's staged diff
+//
+// EXECUTION. The row's `check:` field decides its strategy, as it always
+// has: a `check:` command is a deterministic instrument — exec'd in the
+// directory of the file that declared the profile, non-zero is a
+// VIOLATION. A row without `check:` is judgment-class: the profile's
+// `judge` names the binary the verdict delegates to (argv: rule, staged
+// state; first stdout line is the verdict — VIOLATION / CLEAN / anything
+// else reads UNJUDGED). A stale or missing binary rebuilds through
+// `koruc build <judge_src>` when the profile names one. Judgment has a
+// measured input window (~96KB of staged state — gate.py's bound, kept);
+// beyond it the row is UNJUDGED, and a profile with no `judge` UNJUDGEs
+// every judged row with the cause named. Deterministic check failures
+// always block; judgment verdicts block only when the profile's `block`
+// stands — the profile declares the default and `--advisory` is the only
+// tightening direction.
+//
+// Two honesty rules ported from gate.py: a profile name that matches no
+// declaration is a refusal, not an empty run — `gate typoname` exits 1 and
+// names the declared set. And UNJUDGED is never a silent pass.
+//
+// [norun] for the same reason as flag.declare: the profile declaration is
+// data in the AST, harvested after the parse — a consumer discovers gates
+// by parsing the program, never from a hardcoded list.
+
+~[comptime|norun]pub tor profile { expr: Expression, source: Source }
+
+~import std/compiler
+
+// ============================================================
+// GATE COMMAND — enumerate profiles and run them
+// ============================================================
+
+~std/compiler:command.declare {
+    "name": "gate",
+    "description": "Run a named gate profile over the program's declared rules"
+}
+
+~[comptime|command]pub tor gate {
+    program: *const std/compiler:Program,
+    allocator: __koru_std.mem.Allocator,
+    argv: []string,
+}
+
+~proc gate|zig {
+    const ast_inv = @import("ast");
+    const cenv = @import("compiler_env");
+
+    // The command owns an arena — the explain convention: every internal
+    // allocation (row lists, git output, split argv, verdict strings) frees
+    // in one deinit when the command frame returns.
+    var cmd_arena = std.heap.ArenaAllocator.init(allocator);
+    defer cmd_arena.deinit();
+    const alloc = cmd_arena.allocator();
+
+    const helpers = gate_helpers;
+
+    const Profile = struct {
+        name: []const u8,
+        description: []const u8,
+        block: bool,
+        dir: []const u8, // declaring file's directory — the exec anchor
+        judge: []const u8, // judge binary, relative to `dir` unless absolute
+        judge_src: []const u8, // optional source — staleness rebuild oracle
+    };
+    const Row = struct {
+        name: []const u8,
+        kind: []const u8, // inferred | aspirational
+        tags: []const u8,
+        rule: []const u8,
+        check: []const u8,
+        file: []const u8,
+    };
+
+    const all_flows = ast_inv.allFlows(alloc, program);
+
+    var profiles = std.ArrayList(Profile){};
+    var rows = std.ArrayList(Row){};
+
+    for (all_flows) |flow| {
+        const mq = flow.inv().path.module_qualifier orelse continue;
+        if (flow.inv().path.segments.len != 1) continue;
+        const seg = flow.inv().path.segments[0];
+        const is_profile = std.mem.eql(u8, mq, "std.gate") and std.mem.eql(u8, seg, "profile");
+        const is_row = std.mem.eql(u8, mq, "std.invariants") and
+            (std.mem.eql(u8, seg, "inferred") or std.mem.eql(u8, seg, "aspirational"));
+        if (!is_profile and !is_row) continue;
+
+        var expr_text: []const u8 = "";
+        var block_src: []const u8 = "";
+        for (flow.inv().args) |arg| {
+            if (std.mem.eql(u8, arg.name, "expr")) expr_text = arg.value;
+            if (std.mem.eql(u8, arg.name, "source")) block_src = arg.value;
+        }
+        // location.file is absolute for module-resolved files; the entry file
+        // arrives as spelled on the command line — relative to the cwd the
+        // compiler was invoked in, NOT the backend's (the backend runs inside
+        // entry_dir). Normalize or every cwd/dirname derived downstream
+        // resolves one directory too deep.
+        const loc_file = if (std.fs.path.isAbsolute(flow.location.file))
+            flow.location.file
+        else
+            cenv.CompilerEnv.entry_file;
+        if (is_profile) {
+            var pname = std.mem.trim(u8, expr_text, " \t");
+            if (pname.len >= 2 and pname[0] == '"' and pname[pname.len - 1] == '"') {
+                pname = pname[1 .. pname.len - 1];
+            }
+            if (helpers.jsonField(block_src, "name").len > 0) {
+                std.debug.print("gate: profile '{s}' also carries a \"name\" field — the name is positional: `std/gate:profile(<name>) {{ ... }}`\n", .{pname});
+                std.process.exit(1);
+            }
+            profiles.append(alloc, .{
+                .name = pname,
+                .description = helpers.jsonField(block_src, "description"),
+                .block = std.mem.eql(u8, helpers.jsonField(block_src, "block"), "true"),
+                .dir = std.fs.path.dirname(loc_file) orelse ".",
+                .judge = helpers.jsonField(block_src, "judge"),
+                .judge_src = helpers.jsonField(block_src, "judge_src"),
+            }) catch {};
+        } else {
+            const src = block_src;
+            rows.append(alloc, .{
+                .name = helpers.jsonField(src, "name"),
+                .kind = seg,
+                .tags = helpers.jsonField(src, "tags"),
+                .rule = helpers.jsonField(src, "rule"),
+                .check = helpers.jsonField(src, "check"),
+                .file = loc_file,
+            }) catch {};
+        }
+    }
+
+    // `gate` with no profile lists what this program declares.
+    if (argv.len == 0) {
+        if (profiles.items.len == 0) {
+            std.debug.print("\ngate — none declared (a profile is a `std/gate:profile(<name>) {{ ... }}` block)\n", .{});
+            return;
+        }
+        var namew: usize = 0;
+        for (profiles.items) |p| namew = @max(namew, p.name.len);
+        std.debug.print("\ngate — {d} profile{s} declared\n\n", .{ profiles.items.len, if (profiles.items.len == 1) "" else "s" });
+        for (profiles.items) |p| {
+            var local_buf: [128]u8 = undefined;
+            const local_tag = std.fmt.bufPrint(&local_buf, "{s}-local", .{p.name}) catch p.name;
+            var members: usize = 0;
+            for (rows.items) |r| {
+                if (helpers.tagged(r.tags, p.name) or helpers.tagged(r.tags, local_tag)) members += 1;
+            }
+            std.debug.print("  {s}", .{p.name});
+            var i: usize = p.name.len;
+            while (i < namew) : (i += 1) std.debug.print(" ", .{});
+            const count = std.fmt.allocPrint(alloc, "{d} row{s}", .{ members, if (members == 1) "" else "s" }) catch "?";
+            std.debug.print("  {s}  {s}", .{ if (p.block) "blocking" else "advisory", count });
+            var j: usize = count.len;
+            while (j < 7) : (j += 1) std.debug.print(" ", .{});
+            if (p.description.len > 0) std.debug.print(" {s}", .{p.description});
+            std.debug.print("\n", .{});
+        }
+        return;
+    }
+
+    // `gate <name>` — run the named profile.
+    const want_name = argv[0];
+    var want_json = false;
+    var advisory = false;
+    var checks_only = false;
+    var judge_only = false;
+    var repo_arg: ?[]const u8 = null;
+    var ai: usize = 1;
+    while (ai < argv.len) : (ai += 1) {
+        const a = argv[ai];
+        if (std.mem.eql(u8, a, "json")) {
+            want_json = true;
+        } else if (std.mem.eql(u8, a, "--advisory")) {
+            advisory = true;
+        } else if (std.mem.eql(u8, a, "--checks-only")) {
+            checks_only = true;
+        } else if (std.mem.eql(u8, a, "--judge-only")) {
+            judge_only = true;
+        } else if (std.mem.eql(u8, a, "--repo")) {
+            ai += 1;
+            if (ai >= argv.len) {
+                std.debug.print("gate: --repo takes a path\n", .{});
+                std.process.exit(1);
+            }
+            repo_arg = argv[ai];
+        } else {
+            std.debug.print("gate: unknown argument '{s}' — usage: gate <profile> [json] [--advisory] [--checks-only] [--judge-only] [--repo PATH]\n", .{a});
+            std.process.exit(1);
+        }
+    }
+
+    var found: ?Profile = null;
+    for (profiles.items) |p| {
+        if (std.mem.eql(u8, p.name, want_name)) found = p;
+    }
+    const prof = found orelse {
+        std.debug.print("gate: no profile named '{s}'", .{want_name});
+        if (profiles.items.len > 0) {
+            std.debug.print(" — declared:", .{});
+            for (profiles.items) |p| std.debug.print(" {s}", .{p.name});
+        }
+        std.debug.print("\n", .{});
+        std.process.exit(1);
+        unreachable;
+    };
+
+    var local_buf: [128]u8 = undefined;
+    const local_tag = std.fmt.bufPrint(&local_buf, "{s}-local", .{prof.name}) catch unreachable;
+    var members = std.ArrayList(Row){};
+    for (rows.items) |r| {
+        if (helpers.tagged(r.tags, prof.name) or helpers.tagged(r.tags, local_tag)) {
+            members.append(alloc, r) catch {};
+        }
+    }
+    if (members.items.len == 0) {
+        std.debug.print("gate: profile '{s}' selects no rows (a row joins by tagging \"{s}\" or \"{s}\")\n", .{ prof.name, prof.name, local_tag });
+        return;
+    }
+
+    const block = prof.block and !advisory;
+
+    // The gated repo: --repo names it; otherwise the profile's own
+    // repository (the git toplevel over the declaring file's directory).
+    const gated_repo = helpers.gitToplevel(alloc, repo_arg orelse prof.dir) orelse (repo_arg orelse prof.dir);
+    const gated_base = std.fs.path.basename(gated_repo);
+    const prof_repo = helpers.gitToplevel(alloc, prof.dir) orelse prof.dir;
+    const manifest_repo = std.mem.eql(u8, gated_base, std.fs.path.basename(prof_repo));
+
+    // The staged diff is fetched lazily — only an odds roll, a -local row,
+    // or a judged row can need it.
+    var staged: ?[]const u8 = null;
+    var staged_done = false;
+
+    // The judge resolves lazily on the first judgment-class row: the
+    // profile's `judge` field names the binary (relative to the profile's
+    // declaring directory), `judge_src` names the source the binary builds
+    // from — a stale or missing binary is rebuilt via `koruc build`, the
+    // same stale-binary discipline gate.py applies to gate.k. A profile
+    // with no `judge` field cannot judge — every judged row reports
+    // UNJUDGED with that cause.
+    var judge_checked = false;
+    var judge_path: ?[]const u8 = null;
+    var judge_reason: []const u8 = "";
+    var judge_env: ?std.process.EnvMap = null;
+
+    // The judge's input window, measured 2026-09-21 against typesafe/jev-1.13-20260917
+    // via OpenRouter: 100KB fine, 147KB refused max_tokens_exceeded.
+    const JUDGE_STATE_MAX_BYTES: usize = 96_000;
+
+    var n_fail: usize = 0;
+    var n_flag: usize = 0;
+
+    const Verdict = struct { name: []const u8, verdict: []const u8, detail: []const u8 };
+    var verdicts = std.ArrayList(Verdict){};
+
+    // The name column rides the widest member.
+    var namew: usize = 0;
+    for (members.items) |r| namew = @max(namew, r.name.len);
+
+    const plural = if (members.items.len == 1) "row" else "rows";
+    if (!want_json) std.debug.print("gate {s} — {s} · {d} {s} · {s}\n\n", .{ prof.name, if (block) "enforcing" else "advisory", members.items.len, plural, gated_base });
+
+    for (members.items) |r| {
+        // odds-N first: a miss dismisses the row before anything runs; a
+        // fire annotates the row's own line with the roll.
+        var fired: []const u8 = "";
+        if (helpers.oddsN(r.tags)) |n| {
+            if (!staged_done) {
+                staged_done = true;
+                if (helpers.runOut(alloc, &.{ "git", "-C", gated_repo, "diff", "--staged" }, null, null)) |res| {
+                    if (res.code == 0) staged = res.out;
+                }
+            }
+            const diff = staged orelse "";
+            const roll = helpers.oddsRoll(r.name, diff);
+            if (roll >= n) {
+                const det = std.fmt.allocPrint(alloc, "rolled {d}, needed < {d}", .{ roll, n }) catch "rolled away";
+                if (!want_json) helpers.row("–", r.name, namew, det);
+                verdicts.append(alloc, .{ .name = r.name, .verdict = "skip", .detail = "odds miss" }) catch {};
+                continue;
+            }
+            fired = std.fmt.allocPrint(alloc, " · rolled {d} < {d}", .{ roll, n }) catch "";
+        }
+
+        const is_local = helpers.tagged(r.tags, local_tag);
+        var local_state: ?[]const u8 = null;
+        if (is_local) {
+            if (helpers.fileStagedDiff(alloc, r.file)) |fdiff| {
+                local_state = fdiff; // the judged state for a -local row
+            } else {
+                const det = std.fmt.allocPrint(alloc, "{s} not staged", .{std.fs.path.basename(r.file)}) catch "not staged";
+                if (!want_json) helpers.row("–", r.name, namew, det);
+                verdicts.append(alloc, .{ .name = r.name, .verdict = "skip", .detail = "file not staged" }) catch {};
+                continue;
+            }
+        }
+
+        if (r.check.len > 0) {
+            var glyph: []const u8 = "–";
+            var det: []const u8 = "skipped";
+            var vdet: []const u8 = "skipped";
+            var tail: []const u8 = "";
+            var ran = false;
+            if (judge_only) {
+                det = "skipped — --judge-only";
+                vdet = "judge-only";
+            } else if (helpers.repoScope(r.tags)) |scope| {
+                if (std.mem.eql(u8, scope, gated_base)) {
+                    ran = true;
+                } else {
+                    det = std.fmt.allocPrint(alloc, "instruments {s}", .{scope}) catch "other repo";
+                    vdet = "other repo";
+                }
+            } else if (!manifest_repo) {
+                det = "runs on the manifest repo only";
+                vdet = "manifest repo only";
+            } else {
+                ran = true;
+            }
+            if (ran) {
+                const cmd = helpers.splitCmd(alloc, r.check);
+                const res = helpers.runOut(alloc, cmd, prof.dir, null);
+                if (res == null or res.?.code != 0) {
+                    const code: u8 = if (res) |x| x.code else 255;
+                    glyph = "✗";
+                    det = std.fmt.allocPrint(alloc, "check failed (exit {d})", .{code}) catch "check failed";
+                    tail = helpers.tailLines(if (res) |x| std.mem.trim(u8, x.out, " \n\t") else "", 8);
+                    n_fail += 1;
+                    verdicts.append(alloc, .{ .name = r.name, .verdict = "violation", .detail = "check failed" }) catch {};
+                } else {
+                    glyph = "✓";
+                    det = "check ok";
+                    verdicts.append(alloc, .{ .name = r.name, .verdict = "pass", .detail = "check ok" }) catch {};
+                }
+            } else {
+                verdicts.append(alloc, .{ .name = r.name, .verdict = "skip", .detail = vdet }) catch {};
+            }
+            if (!want_json) {
+                const disp = if (fired.len > 0) std.fmt.allocPrint(alloc, "{s}{s}", .{ det, fired }) catch det else det;
+                helpers.row(glyph, r.name, namew, disp);
+                var lit = std.mem.splitScalar(u8, tail, '\n');
+                while (lit.next()) |tl| {
+                    if (tl.len > 0) std.debug.print("      {s}\n", .{tl});
+                }
+            }
+            continue;
+        }
+
+        // Judgment-class row. Deterministic checks run under --checks-only;
+        // judged rows need a staged state to judge at all.
+        if (checks_only) {
+            if (!want_json) helpers.row("–", r.name, namew, "skipped — --checks-only");
+            verdicts.append(alloc, .{ .name = r.name, .verdict = "skip", .detail = "checks-only" }) catch {};
+            continue;
+        }
+        var state: []const u8 = "";
+        if (is_local) {
+            state = gate_diffstate.judgedState(alloc, r.tags, local_state orelse "");
+        } else {
+            if (!staged_done) {
+                staged_done = true;
+                if (helpers.runOut(alloc, &.{ "git", "-C", gated_repo, "diff", "--staged" }, null, null)) |res| {
+                    if (res.code == 0) staged = res.out;
+                }
+            }
+            state = gate_diffstate.judgedState(alloc, r.tags, staged orelse "");
+        }
+        if (!is_local and std.mem.trim(u8, state, " \n\t").len == 0) {
+            if (!want_json) helpers.row("–", r.name, namew, "no staged changes");
+            verdicts.append(alloc, .{ .name = r.name, .verdict = "skip", .detail = "no staged changes" }) catch {};
+            continue;
+        }
+
+        // Resolve the judge once: profile-declared binary, rebuilt through
+        // `koruc build` when judge_src is newer — the stale-binary
+        // discipline gate.py applies to gate.k.
+        if (!judge_checked) {
+            judge_checked = true;
+            if (prof.judge.len == 0) {
+                judge_reason = "the profile declares no \"judge\" binary — add `\"judge\": \"<path>\"` to its block";
+            } else {
+                const jpath = if (std.fs.path.isAbsolute(prof.judge))
+                    prof.judge
+                else
+                    std.fs.path.join(alloc, &.{ prof.dir, prof.judge }) catch prof.judge;
+                var build_ok = true;
+                if (prof.judge_src.len > 0) {
+                    const spath = if (std.fs.path.isAbsolute(prof.judge_src))
+                        prof.judge_src
+                    else
+                        std.fs.path.join(alloc, &.{ prof.dir, prof.judge_src }) catch prof.judge_src;
+                    const bst = std.fs.cwd().statFile(jpath) catch null;
+                    const sst = std.fs.cwd().statFile(spath) catch null;
+                    if (bst == null or (sst != null and sst.?.mtime > bst.?.mtime)) {
+                        const br = helpers.runOut(alloc, &.{ "koruc", "build", prof.judge_src }, prof.dir, null);
+                        if (br == null or br.?.code != 0) {
+                            build_ok = false;
+                            judge_reason = std.fmt.allocPrint(alloc, "judge build failed — `koruc build {s}` from {s}", .{ prof.judge_src, prof.dir }) catch "judge build failed";
+                        }
+                    }
+                }
+                if (build_ok) {
+                    if (std.fs.cwd().statFile(jpath)) |_| {
+                        judge_path = jpath;
+                        if (helpers.provisionKey(alloc)) |m| judge_env = m;
+                    } else |_| {
+                        judge_reason = std.fmt.allocPrint(alloc, "judge binary not found at {s}", .{jpath}) catch "judge binary not found";
+                    }
+                }
+            }
+        }
+
+        var verdict: []const u8 = "";
+        if (judge_path == null) {
+            verdict = std.fmt.allocPrint(alloc, "UNJUDGED {s}", .{judge_reason}) catch "UNJUDGED";
+        } else if (state.len > JUDGE_STATE_MAX_BYTES) {
+            verdict = std.fmt.allocPrint(alloc, "UNJUDGED state {d}B exceeds the judge's context (~{d}B measured — split the commit or scope the row narrower)", .{ state.len, JUDGE_STATE_MAX_BYTES }) catch "UNJUDGED oversized state";
+        } else {
+            const jr = helpers.runOut(alloc, &.{ judge_path.?, r.rule, state }, prof.dir, if (judge_env) |*m| m else null);
+            if (jr) |res| {
+                var it = std.mem.splitScalar(u8, res.out, '\n');
+                verdict = std.mem.trim(u8, it.next() orelse "", " \r\t");
+                if (verdict.len == 0) verdict = "UNJUDGED judge produced no output";
+            } else {
+                verdict = "UNJUDGED judge failed to exec";
+            }
+        }
+
+        var glyph: []const u8 = "";
+        if (std.mem.startsWith(u8, verdict, "VIOLATION")) {
+            if (block) {
+                glyph = "✗";
+                n_fail += 1;
+            } else {
+                glyph = "!";
+                n_flag += 1;
+            }
+            verdicts.append(alloc, .{ .name = r.name, .verdict = "violation", .detail = verdict }) catch {};
+        } else if (std.mem.startsWith(u8, verdict, "CLEAN")) {
+            glyph = "✓";
+            verdicts.append(alloc, .{ .name = r.name, .verdict = "pass", .detail = verdict }) catch {};
+        } else {
+            if (block) {
+                glyph = "✗";
+                n_fail += 1;
+            } else {
+                glyph = "!";
+                n_flag += 1;
+            }
+            verdicts.append(alloc, .{ .name = r.name, .verdict = "unjudged", .detail = verdict }) catch {};
+        }
+        if (!want_json) {
+            const disp = if (fired.len > 0) std.fmt.allocPrint(alloc, "{s}{s}", .{ verdict, fired }) catch verdict else verdict;
+            helpers.row(glyph, r.name, namew, disp);
+        }
+    }
+
+    if (want_json) {
+        std.debug.print("{{\"profile\":\"{s}\",\"mode\":\"{s}\",\"rows\":[", .{ prof.name, if (block) "enforcing" else "advisory" });
+        for (verdicts.items, 0..) |v, vi| {
+            if (vi > 0) std.debug.print(",", .{});
+            std.debug.print("{{\"name\":\"", .{});
+            helpers.jsonEscape(v.name);
+            std.debug.print("\",\"verdict\":\"{s}\",\"detail\":\"", .{v.verdict});
+            helpers.jsonEscape(v.detail);
+            std.debug.print("\"}}", .{});
+        }
+        std.debug.print("],\"failures\":{d}}}\n", .{n_fail});
+    } else {
+        if (n_fail > 0) {
+            std.debug.print("\ngate {s} — {d} blocking violation{s}\n", .{ prof.name, n_fail, if (n_fail == 1) "" else "s" });
+        } else if (n_flag > 0) {
+            std.debug.print("\ngate {s} — clean · {d} flagged\n", .{ prof.name, n_flag });
+        } else {
+            std.debug.print("\ngate {s} — clean\n", .{prof.name});
+        }
+    }
+
+    if (n_fail > 0) std.process.exit(1);
+}
+~part diffstate
+~part helpers

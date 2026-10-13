@@ -1,0 +1,63 @@
+// Koru Standard Library: the `decl` part of supervisor.kz — policy
+// declaration parsing. Joined via `~part decl` in supervisor.kz; merged
+// into the supervisor module at load.
+//
+// Declarations are DATA — they live in the supervised block, not in arm
+// position (`| [key: value]` refuses pointing here). `within: N unit` is
+// the wall-clock min-spacing throttle; `policy: Name` delegates the
+// decision rules to a named same-module tor. `ticks` is pinned vocabulary
+// awaiting its supplier — an enclosing signal model's steppable clock.
+
+const ast = @import("ast");
+const errors = @import("errors");
+
+/// `within` parse result: the emitted spacing expression (nanoseconds)
+/// or a refusal to hand back as the transform's replacement.
+const WithinResult = union(enum) { ok: []const u8, refuse: ast.Item };
+
+/// Parse a `{ within: N unit }` value into the emitted nanosecond
+/// spacing expression. Wall-clock units only — `ticks` refuses naming
+/// the missing signal-model supplier.
+fn parseWithin(
+    allocator: std.mem.Allocator,
+    reporter: anytype,
+    loc: errors.SourceLocation,
+    module: []const u8,
+    raw: []const u8,
+) WithinResult {
+    const refuse = struct {
+        fn at(alloc: std.mem.Allocator, rep: anytype, l: errors.SourceLocation, m: []const u8, comptime fmt: []const u8, args: anytype) WithinResult {
+            return .{ .refuse = ast.refusal(alloc, rep, .KORU161, l, m, fmt, args) };
+        }
+    };
+    const value = std.mem.trim(u8, raw, " ");
+    var toks = std.mem.tokenizeAny(u8, value, " \t");
+    const n_tok = toks.next() orelse "";
+    const unit = toks.next() orelse "";
+    if (n_tok.len == 0 or unit.len == 0 or toks.next() != null) {
+        return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: within wants `N unit` — 'within: {s}'", .{value});
+    }
+    const n = std.fmt.parseInt(i64, n_tok, 10) catch {
+        return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: within wants an integer count — got '{s}'", .{n_tok});
+    };
+    if (n <= 0) {
+        return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: within must be positive — 'within: {s}' throttles nothing", .{value});
+    }
+    if (std.mem.eql(u8, unit, "ticks")) {
+        return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: 'within: {s} ticks' has no tick supplier in scope — tick clocks come from an enclosing signal model. Today the wall clock supplies the spacing: ms|us|ns|s", .{n_tok});
+    }
+    // The spacing lands inside a Koru `when` expression in the generated
+    // step — emit a plain integer nanosecond literal, not Zig text.
+    const mult: i128 = if (std.mem.eql(u8, unit, "ns"))
+        1
+    else if (std.mem.eql(u8, unit, "us"))
+        1_000
+    else if (std.mem.eql(u8, unit, "ms"))
+        1_000_000
+    else if (std.mem.eql(u8, unit, "s"))
+        1_000_000_000
+    else {
+        return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: unknown time unit '{s}' — wall-clock units are ms|us|ns|s", .{unit});
+    };
+    return .{ .ok = std.fmt.allocPrint(allocator, "{d}", .{n * mult}) catch unreachable };
+}

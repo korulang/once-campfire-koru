@@ -1,0 +1,104 @@
+// Koru Standard Library: the `world` part of bridge.kz — the vocabulary
+// persists. Joined via `~part world` in bridge.kz; merged into the bridge
+// module at load.
+//
+// KOPIUM_RUNTIME.md's permanence rung: `create(world: <dir>)` mounts a
+// directory of flow files as the session's STARTING vocabulary, and every
+// define that lands writes `<dir>/<name>.k`, so session N+1 inherits what
+// session N invented. A world file is verbatim definition source — the
+// same `tor` + `name =` text the agent sent — so the directory reads,
+// diffs, and gardens like a program, and restore runs the SAME install
+// path a fresh define takes: same parser, same checks, same table.
+//
+// Vocabulary persists; possession does not. The pool mints empty and live
+// handles still die with the process — a world carries what the agent may
+// SAY, never what it holds.
+//
+// Failure shape: a world that cannot install panics, it does not degrade.
+// `-> *Bridge` is a bare return and a bare return has no tags, so create
+// cannot spell a refusal arm (210_309/210_310 pin that collision's wall);
+// a session whose genome is corrupt panics at mount, naming the file,
+// rather than running on a silently smaller vocabulary — the same
+// severity dischargeAll gives a session that cannot release what it holds.
+
+~pub tor create { id: string, scope: string, introspection: bool = false, world: string = "" } -> *Bridge<session!>
+
+~proc create|zig {
+    const allocator = koru_allocator();
+    const br = allocator.create(Bridge) catch unreachable;
+    br.* = Bridge.init(allocator, id, scope, introspection, world);
+    if (world.len > 0) { loadWorld(br); armCustodyLog(br); }
+    return br;
+}
+
+/// The define path every site shares: install into the session's table,
+/// and when it lands persist the verbatim source to the world — one file
+/// per flow, so restore needs no re-serialization and the directory diffs
+/// like a program. No world, no write: a worldless session is unchanged.
+fn installDefine(br: *Bridge, source: []const u8) Interp.define_event.Output {
+    const out = Interp.define_event.handler(.{ .source = source, .defined = br.defined });
+    switch (out) {
+        .defined => |name| if (br.world) |w| persistDefined(br, w, name, source),
+        else => {},
+    }
+    return out;
+}
+
+/// Mount every `<world>/*.k` through the shared define path, in name order
+/// for determinism. `makePath` first: a world that does not exist yet is
+/// an empty genome, not an error. The first file that fails to install
+/// panics naming it — see the header for why panic is the only refusal
+/// create can spell.
+fn loadWorld(br: *Bridge) void {
+    const a = br.allocator;
+    const dir_path = br.world.?;
+    std.fs.cwd().makePath(dir_path) catch |e|
+        std.debug.panic("std/bridge:create: world '{s}' cannot be created: {s}", .{ dir_path, @errorName(e) });
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |e|
+        std.debug.panic("std/bridge:create: world '{s}' cannot be opened: {s}", .{ dir_path, @errorName(e) });
+    defer dir.close();
+    var names = std.ArrayList([]const u8).initCapacity(a, 8) catch @panic("std/bridge:create: OOM reading world");
+    defer names.deinit(a);
+    var it = dir.iterate();
+    while (it.next() catch |e|
+        std.debug.panic("std/bridge:create: world '{s}' cannot be read: {s}", .{ dir_path, @errorName(e) })
+    ) |ent| {
+        if (ent.kind != .file or !std.mem.endsWith(u8, ent.name, ".k")) continue;
+        names.append(a, a.dupe(u8, ent.name) catch @panic("std/bridge:create: OOM reading world"))
+            catch @panic("std/bridge:create: OOM reading world");
+    }
+    std.mem.sort([]const u8, names.items, {}, lessName);
+    defer for (names.items) |name| a.free(name);
+    for (names.items) |name| {
+        const src = dir.readFileAlloc(a, name, 64 * 1024 * 1024) catch |e|
+            std.debug.panic("std/bridge:create: world file '{s}' cannot be read: {s}", .{ name, @errorName(e) });
+        defer a.free(src);
+        switch (installDefine(br, src)) {
+            .defined => {},
+            .parse_error => |e| std.debug.panic(
+                "std/bridge:create: world file '{s}' failed to install ({s} at {d}:{d}) — fix or remove it; a session will not start on a half-mounted vocabulary",
+                .{ name, e.message, e.line, e.column },
+            ),
+        }
+    }
+}
+
+fn lessName(_: void, x: []const u8, y: []const u8) bool {
+    return std.mem.lessThan(u8, x, y);
+}
+
+/// `<world>/<name>.k` — one file per flow, the verbatim source the agent
+/// sent. Same-name defines overwrite, matching the table's own rule (the
+/// later definition wins).
+fn persistDefined(br: *Bridge, dir_path: []const u8, name: []const u8, source: []const u8) void {
+    const a = br.allocator;
+    const filename = std.fmt.allocPrint(a, "{s}.k", .{name}) catch @panic("std/bridge:define: OOM writing world");
+    defer a.free(filename);
+    const path = std.fs.path.join(a, &.{ dir_path, filename }) catch @panic("std/bridge:define: OOM writing world");
+    defer a.free(path);
+    const file = std.fs.cwd().createFile(path, .{}) catch |e|
+        std.debug.panic("std/bridge:define: cannot write world file '{s}': {s}", .{ path, @errorName(e) });
+    defer file.close();
+    file.writeAll(source) catch |e|
+        std.debug.panic("std/bridge:define: cannot write world file '{s}': {s}", .{ path, @errorName(e) });
+}

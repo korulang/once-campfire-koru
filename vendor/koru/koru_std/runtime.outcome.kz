@@ -1,0 +1,96 @@
+// Koru Standard Library: the `outcome` part of runtime.kz — how the
+// interpreter's result union becomes the `run` / `run-cached` tors' result
+// union, with the shape contract applied on the way. Joined via
+// `~part outcome` in runtime.kz; merged into the runtime module at load.
+
+/// The interpreter's run outcome, relabeled into the `run` tor's result
+/// union. `shape` validates a `.result` against the named tor's branch
+/// contract before it is handed back. `run-cached`'s proc carries its own
+/// copy inline — the cached tor is not `~retain`, so its `run_cached_event`
+/// struct is emitted only when invoked and cannot be named in a signature.
+fn relayRunOutcome(
+    result: @import("root").koru_std.koru_interpreter.run_event.Output,
+    scope: []const u8,
+    shape: ?[]const u8,
+) run_event.Output {
+    switch (result) {
+        .unhandled_branch => |u| return .{ .unhandled_branch = .{ .branch = u.branch, .payload = u.payload, .handles = u.handles } },
+        .result => |r| {
+            // Shape validation: if shape is specified, validate the result
+            if (shape) |shape_event_name| {
+                const shape_branches = lookupEventBranches(scope, shape_event_name);
+                if (shape_branches.len > 0) {
+                    // Check if the result branch matches any of the shape's branches
+                    var branch_valid = false;
+                    var matching_branch: ?BranchSpec = null;
+                    for (shape_branches) |branch_spec| {
+                        if (std.mem.eql(u8, r.value.branch, branch_spec.name)) {
+                            branch_valid = true;
+                            matching_branch = branch_spec;
+                            break;
+                        }
+                    }
+
+                    if (!branch_valid) {
+                        return .{ .shape_error = .{
+                            .branch = r.value.branch,
+                            .field = null,
+                            .message = "unknown branch - not in shape contract",
+                        } };
+                    }
+
+                    // Check required fields if we have a matching branch
+                    if (matching_branch) |mb| {
+                        for (mb.fields) |field_spec| {
+                            if (field_spec.is_optional) continue;
+                            // Check if the required field exists in the result
+                            var field_found = false;
+                            for (r.value.fields) |result_field| {
+                                if (std.mem.eql(u8, result_field.name, field_spec.name)) {
+                                    field_found = true;
+                                    break;
+                                }
+                            }
+                            if (!field_found) {
+                                return .{ .shape_error = .{
+                                    .branch = r.value.branch,
+                                    .field = field_spec.name,
+                                    .message = "missing required field",
+                                } };
+                            }
+                        }
+                    }
+                }
+            }
+
+            return .{ .result = .{
+                .value = r.value,
+                .used = r.used,
+                .handles = r.handles,
+                .bound = r.bound,
+                .trace = r.trace,
+            } };
+        },
+        .exhausted => |e| return .{ .exhausted = .{
+            .used = e.used,
+            .last_event = e.last_event,
+            .handles = e.handles,
+        } },
+        .parse_error => |e| return .{ .parse_error = .{
+            .message = e.message,
+            .line = e.line,
+            .column = e.column,
+        } },
+        .validation_error => |e| return .{ .validation_error = e },
+        .dispatch_error => |e| {
+            if (std.mem.eql(u8, e.message, "EventDenied")) {
+                return .{ .event_denied = e.event_name };
+            }
+            return .{ .dispatch_error = .{
+                .event_name = e.event_name,
+                .message = e.message,
+                .trace = e.trace,
+            } };
+        },
+    }
+}

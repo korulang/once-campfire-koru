@@ -1,0 +1,197 @@
+// Koru Standard Library: the `bulk` part of store.kz.
+// Joined via `~part bulk` in store.kz; merged into the module at load.
+
+// ------------------------------------------------------------------
+// Bulk append — `for(lo..hi) ! each i |> insert(s){fields}` lowered to
+// a hoisted capacity check, per-column writes at `base + j`, and one
+// `len += n`. The per-row path's `len += 1` is a loop-carried store no
+// optimizer can reassociate past the per-row capacity @panic; measured
+// ~294us -> ~89us on the add_remove fill by hand-editing the emitted
+// binary's loop (same checksum, same build — the marshal shape was
+// already free, the serial len was not).
+//
+// Neither end of the pattern can see the other: `std/store:insert`'s
+// transform is site-local, and `std/control:for`'s Liquid template
+// holds its body as an opaque `__koru_inline_scoped_N` marker. `new`'s
+// whole-program scan is the one place both sides are visible, so the
+// recognizer lives here. Zig only — `InlineCode` carries no lane and
+// this text IS Zig, so `proc new|js` gates it off at the call site.
+// Every doubt declines the site; a declined site stays a per-row
+// insert and is correct by construction.
+//
+// Handle-bearing stores keep the tier: the batch mints the same slot
+// sequence the per-row path would — freelist pops in LIFO order
+// (`free[frem-1-j]`), then bump-allocations (`next+k`) — so handle
+// values, freelist order, and generation counters are bit-identical.
+// What a batch cannot reproduce is a reactive enter: a rule or query
+// site fires per insert at sites BELOW its declaration (the emitter's
+// `__site_line > qs.line`), so `match` declines any counted-for whose
+// insert line follows a non-preorder qsite.
+//
+// The text-producing half — token scanners, the insert-field match,
+// the Zig block itself — lives in `store.bulkemit.kz` (`BulkEmit`),
+// split under the line-baseline wall.
+// ------------------------------------------------------------------
+const Bulk = struct {
+    const ast = @import("ast");
+    const ast_functional = @import("ast_functional");
+
+    const Range = struct { lo: []const u8, hi: []const u8 };
+
+
+    /// One continuation: if its node is the counted `for` whose each
+    /// arm is exactly this store's insert, freeze the bulk block into
+    /// the invocation's `inline_body` — the canonical "emit this
+    /// instead" slot the `~for` template itself uses — and mark the
+    /// node `@pass_ran("transform")` so the walker never hands it to
+    /// the for transform. The node stays `.invocation` (`f.inv()`
+    /// asserts that) and the continuations stay put — under an
+    /// inline_body they are metadata, not emission.
+    fn cont(alloc: std.mem.Allocator, prog: *const ast.Program, c: *ast.Continuation, store: []const u8, cap: usize, handles: bool, reactive_min: ?usize, icol: ?[]const u8) usize {
+        var n: usize = 0;
+        if (c.node) |*nd| {
+            if (nd.* == .invocation) {
+                if (match(alloc, prog, &nd.invocation, c, store, cap, handles, reactive_min, icol)) |text| {
+                    nd.invocation.inline_body = text;
+                    BulkEmit.annotate(alloc, &nd.invocation);
+                    n += 1;
+                }
+            }
+        }
+        if (n == 0) {
+            for (c.continuations) |*cc| {
+                n += cont(alloc, prog, @constCast(cc), store, cap, handles, reactive_min, icol);
+            }
+        }
+        return n;
+    }
+
+    /// The pattern match — returns the bulk block's Zig text, or null
+    /// to leave the site a per-row insert. Every check that cannot
+    /// prove the shape declines.
+    fn match(alloc: std.mem.Allocator, prog: *const ast.Program, iv: *const ast.Invocation, c: *ast.Continuation, store: []const u8, cap: usize, handles: bool, reactive_min: ?usize, icol: ?[]const u8) ?[]const u8 {
+        const range = bulkRangeOf(alloc, iv) orelse return null;
+        // The range bounds must not read the store being filled — a
+        // `0..s.len` hoisted check must see the same `hi` the per-row
+        // loop saw.
+        if (BulkEmit.tokenIn(alloc, range.lo, store) or BulkEmit.tokenIn(alloc, range.hi, store)) return null;
+        for ([_][]const u8{ "insert", "take" }) |bad| {
+            if (BulkEmit.tokenIn(alloc, range.lo, bad) or BulkEmit.tokenIn(alloc, range.hi, bad)) return null;
+        }
+        // Arms: exactly `! each`, optionally followed by `| done`. A
+        // done arm with a body runs after the loop — the bulk block
+        // keeps it by emitting `__koru_continue_1` at the end, the same
+        // hand-off marker the template's `{{ continuations["done"].
+        // continue }}` renders to; the splice resolver lowers it to the
+        // arm's body (guarded if the arm has a `when`). An ABSENT done
+        // is fine but must be written in: `for` declares it `| ?done`,
+        // and the obligation pass synthesizes a no-op arm for any
+        // optional branch left unhandled — an arm-list change that
+        // triggers a template RE-RENDER, which would overwrite this
+        // inline_body. Emitting the arm ourselves keeps the list
+        // stable (same shape the synthesizer makes: terminal node).
+        if (c.continuations.len == 1) {
+            // append below, after the site is proven
+        } else if (c.continuations.len == 2) {
+            const d = &c.continuations[1];
+            if (!std.mem.eql(u8, std.mem.trim(u8, d.branch, " "), "done")) return null;
+            if (d.kind != .terminal) return null;
+            if (d.is_catchall or d.destructure.len != 0) return null;
+            if (d.binding) |db| {
+                const bt = std.mem.trim(u8, db, " ");
+                if (bt.len != 0 and !std.mem.eql(u8, bt, "_")) return null;
+            }
+        } else return null;
+        const each: *const ast.Continuation = &c.continuations[0];
+        if (!std.mem.eql(u8, std.mem.trim(u8, each.branch, " "), "each")) return null;
+        if (each.kind != .effect) return null;
+        var bind: ?[]const u8 = null;
+        if (each.binding) |b0| {
+            const b = std.mem.trim(u8, b0, " ");
+            if (b.len == 0) return null;
+            if (!std.mem.eql(u8, b, "_")) {
+                for (b) |ch| {
+                    if (!Gate.isIdentCh(ch)) return null;
+                }
+                if (std.mem.eql(u8, b, store) or std.mem.startsWith(u8, b, "__koru_")) return null;
+                bind = b;
+            }
+        }
+        const flds = BulkEmit.insertFields(alloc, prog, each, store) orelse return null;
+        // Reactive enters fire per row — `if (__site_line > qs.line)`
+        // in the per-row path — and observe intermediate store states
+        // a single batch write cannot reproduce. A counted-for whose
+        // each arm sits BELOW a standing (non-preorder) qsite's declared
+        // line stays per-row. `each.location.line` never precedes the
+        // flow's stamped `__site_line`, so the check is conservative.
+        if (reactive_min) |m| {
+            if (each.location.line > m) return null;
+        }
+        // C#: the emit has its own arm (`BulkEmit.emitCs`) — but the
+        // `std/indexes` join inside the loop is Zig-shaped register
+        // machinery with no cs port, so an indexed store declines the
+        // bulk lowering here and takes the per-row path instead.
+        const host = storeHostTarget();
+        if (host == .cs and icol != null) return null;
+        const text = if (host == .cs)
+            bulkEmitCs(alloc, prog, store, cap, range, bind, flds, handles)
+        else
+            bulkEmit(alloc, prog, store, cap, range, bind, flds, handles, icol);
+        // The bulk block carries the loop — the `each` arm is consumed
+        // DATA now, not a live handler. The flag keeps the emitter's
+        // Handlers-struct bridge from re-emitting the per-row insert
+        // beside the block (emitter_helpers.zig:5560 skips flagged arms).
+        if (c.continuations.len == 1) {
+            const nc = alloc.alloc(ast.Continuation, 2) catch unreachable;
+            nc[0] = c.continuations[0];
+            nc[0].is_transformed_subtree = true;
+            nc[1] = ast.Continuation{
+                .branch = "done",
+                .binding = null,
+                .binding_annotations = &.{},
+                .binding_type = .branch_payload,
+                .is_catchall = false, .catchall_metatype = null,
+                .condition = null, .condition_expr = null,
+                .node = .{ .terminal = {} },
+                .indent = 0, .continuations = &.{},
+                .location = each.location,
+            };
+            c.continuations = nc;
+        } else {
+            @constCast(&c.continuations[0]).is_transformed_subtree = true;
+        }
+        return text;
+    }
+
+    /// The program walk — every flow's continuation tree. Rewrites in
+    /// place (the `@constCast` precedent is the storeRefs walk's). A
+    /// top-level `for` is its flow's OWN head invocation — the emitter
+    /// reads `Flow.inline_body` there — while a nested `for` rides
+    /// `Invocation.inline_body`. The field expressions inside the
+    /// emitted block still read like source (`cfg.entities`); `new`'s
+    /// own end-of-pass Walk lowers store refs in inline bodies, the
+    /// same slot every other text position rides.
+    fn rewrite(alloc: std.mem.Allocator, prog: *const ast.Program, program_items: []const *const ast.Item, store: []const u8, cap: usize, handles: bool, reactive_min: ?usize, icol: ?[]const u8) usize {
+        var n: usize = 0;
+        for (program_items) |pi| {
+            if (pi.* != .flow) continue;
+            const f = @constCast(&pi.flow);
+            var done = false;
+            if (f.body.node) |*nd| {
+                if (nd.* == .invocation) {
+                    if (match(alloc, prog, &nd.invocation, &f.body, store, cap, handles, reactive_min, icol)) |text| {
+                        f.inline_body = text;
+                        BulkEmit.annotate(alloc, &nd.invocation);
+                        done = true;
+                    }
+                }
+            }
+            if (!done) {
+                for (f.body.continuations) |*cc| {
+                    n += cont(alloc, prog, @constCast(cc), store, cap, handles, reactive_min, icol);
+                }
+            } else n += 1;
+        }
+        return n;
+    }
+};

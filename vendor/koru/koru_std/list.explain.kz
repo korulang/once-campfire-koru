@@ -1,0 +1,113 @@
+// Koru Standard Library: the `explain` part of list — joined via
+// `~part explain` in list.kz; members land in koru_list.
+//
+// The consumer's explainer — the enforcement half of the facet story.
+// std/refine reports what was DECLARED on a type; this reports what
+// std/list ENFORCES at its boundary: for every `std/list:new(X)` site,
+// the element's met facet is asked from refine's own fold (`metFields`)
+// — the same producer the transform reads, so the report cannot drift
+// from what push actually guards — plus the branch contract the push
+// signature declares (`| ?ok` / `| ?!violated` / `| ?!oom`).
+
+// One distinct element type and how many `new` sites construct it.
+const Elem = struct { home: []const u8, name: []const u8, sites: usize };
+
+fn isListNew(inv: *const ast_find.Invocation) bool {
+    if (inv.path.segments.len != 1) return false;
+    const mq = inv.path.module_qualifier orelse return false;
+    return std.mem.eql(u8, inv.path.segments[0], "new") and
+        (std.mem.eql(u8, mq, "std.list") or std.mem.eql(u8, mq, "std/list"));
+}
+
+fn collectElems(alloc: std.mem.Allocator, items: []const ast_find.Item, scope_home: []const u8, out: *std.ArrayList(Elem)) void {
+    for (items) |entry| {
+        switch (entry) {
+            .flow => |fl| {
+                if (fl.body.node) |*node| {
+                    if (node.* == .invocation and isListNew(&node.invocation) and node.invocation.args.len > 0) {
+                        const elem = std.mem.trim(u8, node.invocation.args[0].value, " \t");
+                        var home = scope_home;
+                        var name = elem;
+                        if (std.mem.lastIndexOfScalar(u8, elem, ':')) |ci| {
+                            name = elem[ci + 1 ..];
+                            const dotted = alloc.dupe(u8, elem[0..ci]) catch unreachable;
+                            for (dotted) |*c| {
+                                if (c.* == '/') c.* = '.';
+                            }
+                            home = dotted;
+                        }
+                        var seen = false;
+                        for (out.items) |*e| {
+                            if (std.mem.eql(u8, e.home, home) and std.mem.eql(u8, e.name, name)) {
+                                e.sites += 1;
+                                seen = true;
+                                break;
+                            }
+                        }
+                        if (!seen) out.append(alloc, .{ .home = home, .name = name, .sites = 1 }) catch unreachable;
+                    }
+                }
+            },
+            .module_decl => |m| collectElems(alloc, m.items, m.logical_name, out),
+            else => {},
+        }
+    }
+}
+
+// @retain: explain_list_event is referenced from generated code
+// (koruc's koru_explain_gather invokes every discovered [explainer]).
+~[comptime|explainer]pub tor explain-list {
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> ExplainReport
+
+~proc explain-list|zig {
+    const Entry = ast_find.ExplainReport.Entry;
+    const Section = ast_find.ExplainReport.Section;
+
+    var elems = std.ArrayList(Elem).initCapacity(allocator, 8) catch unreachable;
+    collectElems(allocator, program.items, program.main_module_name, &elems);
+
+    if (elems.items.len == 0) {
+        return .{ .title = "std/list", .sections = &.{
+            .{ .heading = "lists", .entries = &.{
+                .{ .note = "no std/list:new sites — no lists declared" },
+            } },
+        } };
+    }
+
+    // The facet fold lives in koru_refine — present only when the program
+    // imports std/refine. @hasDecl keeps the explainer honest either way.
+    const has_refine = @hasDecl(koru_std, "koru_refine");
+
+    var sections = std.ArrayList(Section).initCapacity(allocator, elems.items.len) catch unreachable;
+    for (elems.items) |e| {
+        const heading = std.fmt.allocPrint(allocator, "list({s}:{s})", .{ e.home, e.name }) catch unreachable;
+        var entries = std.ArrayList(Entry).initCapacity(allocator, 12) catch unreachable;
+        entries.append(allocator, .{ .property = .{ .key = "element", .value = .{ .string = std.fmt.allocPrint(allocator, "{s}:{s}", .{ e.home, e.name }) catch unreachable } } }) catch unreachable;
+        entries.append(allocator, .{ .property = .{ .key = "new_sites", .value = .{ .integer = @intCast(e.sites) } } }) catch unreachable;
+        if (!has_refine) {
+            entries.append(allocator, .{ .note = "std/refine not imported — push stores unchecked" }) catch unreachable;
+        } else {
+            const fields = koru_std.koru_refine.metFields(allocator, program, e.home, e.name, null);
+            if (fields.len == 0) {
+                entries.append(allocator, .{ .note = "no refine facets on the element — push stores unchecked" }) catch unreachable;
+            }
+            var guarded: usize = 0;
+            for (fields) |*f| {
+                if (koru_std.koru_refine.carriesTerms(f)) guarded += 1;
+                const effect = koru_std.koru_refine.fieldEffect(f);
+                entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "{s} — push {s}", .{ koru_std.koru_refine.spellField(allocator, f), effect }) catch unreachable }) catch unreachable;
+                entries.append(allocator, .{ .property = .{ .key = std.fmt.allocPrint(allocator, "{s}.enforced", .{f.name}) catch unreachable, .value = .{ .string = effect } } }) catch unreachable;
+            }
+            entries.append(allocator, .{ .property = .{ .key = "facets_enforced", .value = .{ .integer = @intCast(guarded) } } }) catch unreachable;
+            entries.append(allocator, .{ .note = "push declares | ?ok | ?!violated | ?!oom — an unhandled violation panics; | violated f |> handles or forwards" }) catch unreachable;
+        }
+        sections.append(allocator, .{ .heading = heading, .entries = entries.toOwnedSlice(allocator) catch &.{} }) catch unreachable;
+    }
+
+    return .{
+        .title = "std/list",
+        .sections = sections.toOwnedSlice(allocator) catch &.{},
+    };
+}

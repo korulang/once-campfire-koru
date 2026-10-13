@@ -1,0 +1,176 @@
+// Koru Standard Library: the refine transform body — joined via
+// `~part body` in refine.kz; members land in koru_refine. The two
+// `default` impl procs in refine.k dispatch here; `scope` is the facet
+// target the selected impl stamps (null = universal).
+
+// The transform body both `default` impls share — `scope` is the facet's
+// target: null for the universal facet (bare `std/refine(S)`), "fpga" for
+// `std/refine(S)|fpga`. The variant dispatch picked which impl ran; the
+// scope it stamps is what that selection means.
+fn refineDefault(
+    expr: []const u8,
+    source: ast.Source,
+    item: *const ast.Item,
+    program: *const ast.Program,
+    reporter: *koru_std.koru_compiler.ErrorReporter,
+    scope: ?[]const u8,
+) SiteResult {
+    const allocator = koru_allocator();
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // -- the entry name ---------------------------------------------------
+
+    const type_name = bareName(expr);
+    if (type_name.len == 0) {
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU205, flow.location, flow.module, "std/refine: the entry name '{s}' is not usable — a refine name must be a non-empty identifier or a qualified `home:Name`", .{type_name}) };
+    }
+    const want = blk: {
+        if (flow.body.node) |*node| {
+            if (node.* == .invocation) {
+                break :blk invWant(allocator, &node.invocation, scopeOfFlow(program, flow));
+            }
+        }
+        break :blk Want{ .home = scopeOfFlow(program, flow), .name = type_name };
+    };
+
+    // -- pass 1: strict-parse this block ----------------------------------
+
+    var meet = std.ArrayList(Field).initCapacity(allocator, 8) catch unreachable;
+    if (parseInto(allocator, reporter, flow, type_name, source.text, &meet, true)) |r| return r;
+    if (meet.items.len == 0) {
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU205, flow.location, flow.module, "std/refine({s}): an entry with no fields refines nothing — declare at least one `name: type` field", .{type_name}) };
+    }
+
+    // -- pass 2: find the proto anchor ------------------------------------
+
+    var pfields = std.ArrayList(ProtoField).initCapacity(allocator, 8) catch unreachable;
+    var anchor_found = false;
+    walkProto(allocator, program.items, program.main_module_name, want, &pfields, &anchor_found);
+    if (!anchor_found) {
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU205, flow.location, flow.module, "std/refine({s}): no declaration named '{s}' in home '{s}' to refine — refine meets a `std/proto` declaration", .{ type_name, want.name, want.home }) };
+    }
+
+    // -- pass 3: every refined field must exist on the anchor -------------
+
+    for (meet.items) |f| {
+        var pf: ?ProtoField = null;
+        for (pfields.items) |p| {
+            if (std.mem.eql(u8, p.name, f.name)) {
+                pf = p;
+                break;
+            }
+        }
+        const p = pf orelse
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU205, flow.location, flow.module, "std/refine({s}): names no field '{s}' — the declaration has none to refine", .{ type_name, f.name }) };
+        if (!std.mem.eql(u8, p.base, f.base)) {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU205, flow.location, flow.module, "std/refine({s}): field '{s}' declares base '{s}' but the declaration says '{s}' — a meet needs one base, not two", .{ type_name, f.name, f.base, p.base }) };
+        }
+    }
+
+    // -- pass 4: fold every sibling refine declaration onto the meet ------
+
+    const my_inv = blk: {
+        if (flow.body.node) |*node| {
+            if (node.* == .invocation) break :blk &node.invocation;
+        }
+        break :blk undefined;
+    };
+    walkRefine(allocator, reporter, flow, program.items, program.main_module_name, want, scope, &meet, my_inv);
+
+    // -- pass 5: the total meet must be legal and non-empty per field -----
+
+    for (meet.items) |*f| {
+        if (legalBase(allocator, reporter, flow, type_name, program, want.home, f)) |r| return r;
+        if (canonAlts(allocator, f)) |pair| {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU205, flow.location, flow.module, "std/refine({s}): field '{s}' refines to nothing — '{s}' and '{s}' cannot both hold", .{ type_name, f.name, pair[0], pair[1] }) };
+        }
+        if (emptyField(f)) |pair| {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU205, flow.location, flow.module, "std/refine({s}): field '{s}' refines to nothing — '{s}' and '{s}' cannot both hold", .{ type_name, f.name, pair[0], pair[1] }) };
+        }
+    }
+
+    // -- pass 6: canonical marker, dedup against an already-met facet -----
+
+    var out = std.ArrayList(u8).initCapacity(allocator, source.text.len + 32) catch unreachable;
+    out.appendSlice(allocator, "refine ") catch unreachable;
+    out.appendSlice(allocator, want.home) catch unreachable;
+    out.appendSlice(allocator, ":") catch unreachable;
+    out.appendSlice(allocator, want.name) catch unreachable;
+    if (scope) |s| {
+        out.appendSlice(allocator, "|") catch unreachable;
+        out.appendSlice(allocator, s) catch unreachable;
+    }
+    out.appendSlice(allocator, ": ") catch unreachable;
+    for (meet.items, 0..) |f, i| {
+        if (i > 0) out.appendSlice(allocator, ", ") catch unreachable;
+        out.appendSlice(allocator, f.name) catch unreachable;
+        out.appendSlice(allocator, ": ") catch unreachable;
+        out.appendSlice(allocator, f.base) catch unreachable;
+        if (f.eq) |e| {
+            out.appendSlice(allocator, " & ") catch unreachable;
+            out.appendSlice(allocator, e.src) catch unreachable;
+        } else {
+            if (f.lo) |lo| {
+                out.appendSlice(allocator, " & ") catch unreachable;
+                out.appendSlice(allocator, lo.src) catch unreachable;
+            }
+            if (f.hi) |hi| {
+                out.appendSlice(allocator, " & ") catch unreachable;
+                out.appendSlice(allocator, hi.src) catch unreachable;
+            }
+        }
+        if (f.alts) |_| {
+            out.appendSlice(allocator, " & ") catch unreachable;
+            out.appendSlice(allocator, f.alts_src orelse "") catch unreachable;
+        }
+        if (f.clamp) |c| {
+            out.appendSlice(allocator, " & ") catch unreachable;
+            out.appendSlice(allocator, c.src) catch unreachable;
+        }
+    }
+    const body = out.toOwnedSlice(allocator) catch unreachable;
+    std.debug.print("{s}\n", .{body});
+
+    // If a sibling block already left this facet in the tree, this site
+    // dissolves to a tombstone comment — one canonical facet_decl per
+    // (home, name, scope). The comment is write-only debug text; nothing
+    // parses it.
+    if (facetExists(program.items, want.home, want.name, scope)) {
+        const tombstone = if (scope) |s|
+            std.fmt.allocPrint(allocator, "// refine {s}:{s}|{s}: met", .{ want.home, want.name, s }) catch unreachable
+        else
+            std.fmt.allocPrint(allocator, "// refine {s}:{s}: met", .{ want.home, want.name }) catch unreachable;
+        return .{ .replacement = ast.Item{ .inline_code = ast.InlineCode{
+            .code = tombstone,
+            .location = flow.location,
+            .module = flow.module,
+        } } };
+    }
+
+    // The canonical facet goes into the program tree as a typed
+    // FacetDecl — the declaration later transforms read.
+    const ffields = allocator.alloc(ast.FacetField, meet.items.len) catch unreachable;
+    for (meet.items, 0..) |f, i| {
+        ffields[i] = .{
+            .name = allocator.dupe(u8, f.name) catch unreachable,
+            .type = allocator.dupe(u8, f.base) catch unreachable,
+            .lo = if (f.lo) |b| .{ .value = b.value, .exclusive = b.exclusive } else null,
+            .hi = if (f.hi) |b| .{ .value = b.value, .exclusive = b.exclusive } else null,
+            .eq = if (f.eq) |b| .{ .value = b.value, .exclusive = b.exclusive } else null,
+            .clamp = if (f.clamp) |c| .{ .lo = c.lo, .hi = c.hi } else null,
+            .alts = if (f.alts) |set| (allocator.dupe(i64, set) catch unreachable) else null,
+            .alt_default = f.alt_default,
+        };
+    }
+    return .{ .replacement = ast.Item{ .facet_decl = ast.FacetDecl{
+        .name = allocator.dupe(u8, want.name) catch unreachable,
+        .module = allocator.dupe(u8, want.home) catch unreachable,
+        .target = if (scope) |s| allocator.dupe(u8, s) catch unreachable else null,
+        .fields = ffields,
+        .location = flow.location,
+    } } };
+}

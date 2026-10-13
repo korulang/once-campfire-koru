@@ -1,0 +1,63 @@
+// Koru Standard Library: the `guards` part of interpreter.kz — `when`
+// clauses on dispatch arms. Joined via `~part guards` in interpreter.kz;
+// merged into the interpreter module at load.
+//
+// Compiled emission lowers same-branch armed continuations into an
+// if/else-if/else chain: arms try in source order, the first truthy
+// guard wins, an unguarded arm is the else. The interpreter mirrors that
+// — a guard is an expression over the arm's OWN binding, which does not
+// exist until selection, so `armGuardPasses` evaluates against a scratch
+// scope provisionally holding the payload. A false guard moves selection
+// to the next name-matching candidate; it never fires the arm anyway.
+// A guard that cannot be judged (won't parse, names nothing bound) is
+// GuardUnjudgable — surfaced as a dispatch-error, never silently true or
+// silently false. (440_024; kopium bridge-mirror 2026-09-13-arm-when-guards)
+
+fn armGuardPasses(
+    cont: *const ast.Continuation,
+    branch: []const u8,
+    fields: []const NamedField,
+    bindings: *const ExprBindings,
+    allocator: std.mem.Allocator,
+) !bool {
+    const cond_text = cont.condition orelse return true;
+    var scoped_values = try bindings.values.clone();
+    defer scoped_values.deinit();
+    var scoped = ExprBindings{ .values = scoped_values, .allocator = allocator };
+    if (cont.binding) |name| {
+        const bv = Value.fromDispatch(branch, fields);
+        try populateArmExprBindings(&scoped, name, bv, branch, allocator);
+    }
+    var parser = koru_parser.ExpressionParser.init(allocator, cond_text);
+    defer parser.deinit();
+    const parsed = parser.parse() catch return error.GuardUnjudgable;
+    const result = evaluateExpression(parsed, &scoped) catch return error.GuardUnjudgable;
+    return result.isTruthy();
+}
+
+// The expr-binding scope an arm's body (and its guard) sees: the payload
+// binds bare (scalar payload → its value, structured → the branch name),
+// `name.Branch` always names the fired branch, and `name.<field>` names
+// each payload field. Selection populates it on a scratch scope; the
+// fired arm's commit path populates the real one — same shape both ways.
+fn populateArmExprBindings(
+    bindings: *ExprBindings,
+    name: []const u8,
+    bound_value: Value,
+    branch: []const u8,
+    allocator: std.mem.Allocator,
+) !void {
+    const scalar = bound_value.fields.len == 1 and std.mem.eql(u8, bound_value.fields[0].name, "__type_ref");
+    try bindings.set(name, if (scalar)
+        fieldValueToExprValue(bound_value.fields[0].value)
+    else
+        .{ .string_val = branch });
+    var branch_key_buf: [256]u8 = undefined;
+    const branch_key = std.fmt.bufPrint(&branch_key_buf, "{s}.Branch", .{name}) catch "";
+    if (branch_key.len > 0) try bindings.set(try allocator.dupe(u8, branch_key), .{ .string_val = branch });
+    for (bound_value.fields) |fv| {
+        var field_key_buf: [256]u8 = undefined;
+        const field_key = std.fmt.bufPrint(&field_key_buf, "{s}.{s}", .{ name, fv.name }) catch continue;
+        try bindings.set(try allocator.dupe(u8, field_key), fieldValueToExprValue(fv.value));
+    }
+}

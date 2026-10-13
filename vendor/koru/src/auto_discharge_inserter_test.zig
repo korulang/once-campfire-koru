@@ -1,0 +1,331 @@
+const std = @import("std");
+const ast = @import("ast");
+const Parser = @import("parser").Parser;
+const AutoDischargeInserter = @import("auto_discharge_inserter").AutoDischargeInserter;
+const errors = @import("errors");
+
+// =============================================================================
+// CORE TEST: Same phantom state name, different base types
+// =============================================================================
+// This is the fundamental test for phantom type obligation matching.
+//
+// The phantom system tracks obligations by BOTH:
+//   1. The phantom state name (e.g., "active")
+//   2. The base type (e.g., "*Connection" vs "*Transaction")
+//
+// A *Connection<active!> obligation can ONLY be discharged by an event
+// that accepts *Connection<!active>, NOT by one that accepts *Transaction<!active>.
+// =============================================================================
+
+test "findDisposalEvents filters by base type - same phantom state, different types" {
+    // Use arena for parser (it leaks internally), testing allocator for our code
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    const test_alloc = std.testing.allocator;
+
+    // Two different types, both with "active" phantom state
+    // Connection uses close() to discharge
+    // Transaction uses commit() to discharge
+    // All events are in module "test" (from filename)
+    const source =
+        \\~tor connect { }
+        \\| ok: *Connection<active!>
+        \\
+        \\~tor close[!] { conn: *Connection<!active> }
+        \\
+        \\~tor begin { }
+        \\| ok: *Transaction<active!>
+        \\
+        \\~tor commit[!] { tx: *Transaction<!active> }
+    ;
+
+    const empty_flags: []const []const u8 = &.{};
+    var parser = try Parser.init(arena_alloc, source, "test.kz", empty_flags, null);
+    defer parser.deinit();
+
+    var parse_result = try parser.parse();
+    defer parse_result.deinit();
+
+    var reporter = try errors.ErrorReporter.init(test_alloc, "test.kz", source);
+    defer reporter.deinit();
+
+    var inserter = try AutoDischargeInserter.init(test_alloc, &reporter, false, false, false, "zig");
+    defer inserter.deinit();
+
+    // Build event map from parsed AST
+    try inserter.buildEventMap(&parse_result.source_file);
+
+    // Test 1: *Connection<active!> should find ONLY close(), not commit()
+    // The phantom state is "test:active" (module:state)
+    {
+        const disposals = try inserter.findDisposalEvents("test:active!", "*Connection");
+        defer {
+            for (disposals) |d| {
+                test_alloc.free(d.qualified_name);
+                test_alloc.free(d.field_name);
+            }
+            test_alloc.free(disposals);
+        }
+
+        try std.testing.expectEqual(@as(usize, 1), disposals.len);
+        try std.testing.expectEqualStrings("test:close[!]", disposals[0].qualified_name);
+    }
+
+    // Test 2: *Transaction<active!> should find ONLY commit(), not close()
+    {
+        const disposals = try inserter.findDisposalEvents("test:active!", "*Transaction");
+        defer {
+            for (disposals) |d| {
+                test_alloc.free(d.qualified_name);
+                test_alloc.free(d.field_name);
+            }
+            test_alloc.free(disposals);
+        }
+
+        try std.testing.expectEqual(@as(usize, 1), disposals.len);
+        try std.testing.expectEqualStrings("test:commit[!]", disposals[0].qualified_name);
+    }
+
+    // Test 3: Wrong base type should find NO disposals
+    {
+        // Looking for active! disposal but with a type that has no disposal event
+        const disposals = try inserter.findDisposalEvents("test:active!", "*SomeOtherType");
+        defer {
+            for (disposals) |d| {
+                test_alloc.free(d.qualified_name);
+                test_alloc.free(d.field_name);
+            }
+            test_alloc.free(disposals);
+        }
+
+        try std.testing.expectEqual(@as(usize, 0), disposals.len);
+    }
+}
+
+test "findDisposalEvents handles multiple disposal options for same type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    const test_alloc = std.testing.allocator;
+
+    // One type with multiple ways to discharge the same state
+    const source =
+        \\~tor open { path: string }
+        \\| ok: *File<open!>
+        \\
+        \\~tor close[!] { file: *File<!open> }
+        \\
+        \\~tor close-and-delete[!] { file: *File<!open> }
+    ;
+
+    const empty_flags: []const []const u8 = &.{};
+    var parser = try Parser.init(arena_alloc, source, "test.kz", empty_flags, null);
+    defer parser.deinit();
+
+    var parse_result = try parser.parse();
+    defer parse_result.deinit();
+
+    var reporter = try errors.ErrorReporter.init(test_alloc, "test.kz", source);
+    defer reporter.deinit();
+
+    var inserter = try AutoDischargeInserter.init(test_alloc, &reporter, false, false, false, "zig");
+    defer inserter.deinit();
+
+    try inserter.buildEventMap(&parse_result.source_file);
+
+    // Should find BOTH close and close_and_delete for *File<open!>
+    const disposals = try inserter.findDisposalEvents("test:open!", "*File");
+    defer {
+        for (disposals) |d| {
+            test_alloc.free(d.qualified_name);
+            test_alloc.free(d.field_name);
+        }
+        test_alloc.free(disposals);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), disposals.len);
+
+    // Verify both are found (order may vary)
+    var found_close = false;
+    var found_close_and_delete = false;
+    for (disposals) |d| {
+        if (std.mem.eql(u8, d.qualified_name, "test:close[!]")) found_close = true;
+        if (std.mem.eql(u8, d.qualified_name, "test:close-and-delete[!]")) found_close_and_delete = true;
+    }
+    try std.testing.expect(found_close);
+    try std.testing.expect(found_close_and_delete);
+}
+
+test "findDisposalEvents with different types same phantom state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    const test_alloc = std.testing.allocator;
+
+    // Two types with same phantom state name but different base types
+    // This is the CRITICAL test - verifies that base type filtering works
+    const source =
+        \\~tor connect { }
+        \\| ok: *DbConn<connected!>
+        \\
+        \\~tor disconnect[!] { conn: *DbConn<!connected> }
+        \\
+        \\~tor acquire { }
+        \\| ok: *PoolConn<connected!>
+        \\
+        \\~tor release[!] { conn: *PoolConn<!connected> }
+    ;
+
+    const empty_flags: []const []const u8 = &.{};
+    var parser = try Parser.init(arena_alloc, source, "test.kz", empty_flags, null);
+    defer parser.deinit();
+
+    var parse_result = try parser.parse();
+    defer parse_result.deinit();
+
+    var reporter = try errors.ErrorReporter.init(test_alloc, "test.kz", source);
+    defer reporter.deinit();
+
+    var inserter = try AutoDischargeInserter.init(test_alloc, &reporter, false, false, false, "zig");
+    defer inserter.deinit();
+
+    try inserter.buildEventMap(&parse_result.source_file);
+
+    // DbConn<connected!> should ONLY find disconnect, NOT release
+    // Even though both consume <!connected>, base types differ
+    {
+        const disposals = try inserter.findDisposalEvents("test:connected!", "*DbConn");
+        defer {
+            for (disposals) |d| {
+                test_alloc.free(d.qualified_name);
+                test_alloc.free(d.field_name);
+            }
+            test_alloc.free(disposals);
+        }
+
+        try std.testing.expectEqual(@as(usize, 1), disposals.len);
+        try std.testing.expectEqualStrings("test:disconnect[!]", disposals[0].qualified_name);
+    }
+
+    // PoolConn<connected!> should ONLY find release, NOT disconnect
+    {
+        const disposals = try inserter.findDisposalEvents("test:connected!", "*PoolConn");
+        defer {
+            for (disposals) |d| {
+                test_alloc.free(d.qualified_name);
+                test_alloc.free(d.field_name);
+            }
+            test_alloc.free(disposals);
+        }
+
+        try std.testing.expectEqual(@as(usize, 1), disposals.len);
+        try std.testing.expectEqualStrings("test:release[!]", disposals[0].qualified_name);
+    }
+}
+
+test "findDisposalEvents excludes events with user-required extra inputs" {
+    // Auto-insert can supply the obligation binding, not user-authored args like sql.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    const test_alloc = std.testing.allocator;
+
+    const source =
+        \\~tor tx.exec { tx: *Transaction<!started>, sql: string }
+        \\| ok *Transaction<active!>
+        \\
+        \\~tor tx.rollback { tx: *Transaction<!active> }
+        \\| ok *Connection<active!>
+    ;
+
+    const empty_flags: []const []const u8 = &.{};
+    var parser = try Parser.init(arena_alloc, source, "test.kz", empty_flags, null);
+    defer parser.deinit();
+
+    var parse_result = try parser.parse();
+    defer parse_result.deinit();
+
+    var reporter = try errors.ErrorReporter.init(test_alloc, "test.kz", source);
+    defer reporter.deinit();
+
+    var inserter = try AutoDischargeInserter.init(test_alloc, &reporter, false, false, false, "zig");
+    defer inserter.deinit();
+
+    try inserter.buildEventMap(&parse_result.source_file);
+
+    const disposals = try inserter.findDisposalEvents("test:started!", "*Transaction");
+    defer {
+        for (disposals) |d| {
+            test_alloc.free(d.qualified_name);
+            test_alloc.free(d.field_name);
+        }
+        test_alloc.free(disposals);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), disposals.len);
+}
+
+test "checkArityInInvocation: labelled pun arg (had_explicit_label) binds by name, not index" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    const test_alloc = std.testing.allocator;
+
+    // `page: page` as a comptime transform emits it (the vaxis component synth
+    // produces exactly this inside `<paginator …/>`): name==value but the label
+    // flag is set, so the arg must resolve as the NAMED input `page`. The
+    // name==value pun heuristic is for BARE positionals (`paginator(x)`) —
+    // applying it to a labelled pun resolved `page` at arg index 2 to field[2]
+    // (`total`), `page` was reported missing, and the call was refused on a
+    // phantom omission (KORU080 — found via examples/component_paginator).
+    const source =
+        \\~tor paginator { win: i32, page: i32, total: i32, kind: i32 }
+        \\~paginator -> 0
+    ;
+
+    const empty_flags: []const []const u8 = &.{};
+    var parser = try Parser.init(arena_alloc, source, "test.kz", empty_flags, null);
+    defer parser.deinit();
+
+    var parse_result = try parser.parse();
+    defer parse_result.deinit();
+
+    var reporter = try errors.ErrorReporter.init(test_alloc, "test.kz", source);
+    defer reporter.deinit();
+
+    var inserter = try AutoDischargeInserter.init(test_alloc, &reporter, false, false, false, "zig");
+    defer inserter.deinit();
+
+    try inserter.buildEventMap(&parse_result.source_file);
+
+    const loc: errors.SourceLocation = .{ .line = 0, .column = 0, .file = "test.kz" };
+    const segs = [_][]const u8{"paginator"};
+
+    // The transform's emitted shape — labelled pun args out of declaration
+    // order. Every required input IS supplied; no error is the pass.
+    const labeled_args = [_]ast.Arg{
+        .{ .name = "win", .value = "w", .had_explicit_label = true },
+        .{ .name = "kind", .value = "\"dots\"", .had_explicit_label = true },
+        .{ .name = "page", .value = "page", .had_explicit_label = true },
+        .{ .name = "total", .value = "total", .had_explicit_label = true },
+    };
+    const labeled_inv: ast.Invocation = .{
+        .path = .{ .module_qualifier = null, .segments = &segs },
+        .args = &labeled_args,
+    };
+    try inserter.checkArityInInvocation(&labeled_inv, loc, "test");
+    try std.testing.expect(!reporter.hasErrors());
+
+    // Control: the same tuple WITHOUT the label flag is positional — arg 0
+    // binds `win`, and `page`/`total`/`kind` are genuinely missing.
+    const positional_args = [_]ast.Arg{
+        .{ .name = "w", .value = "w" },
+    };
+    const positional_inv: ast.Invocation = .{
+        .path = .{ .module_qualifier = null, .segments = &segs },
+        .args = &positional_args,
+    };
+    try inserter.checkArityInInvocation(&positional_inv, loc, "test");
+    try std.testing.expect(reporter.hasErrors());
+}

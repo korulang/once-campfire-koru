@@ -1,0 +1,523 @@
+// Koru Standard Library: the `gate` part of store.kz.
+// Joined via `~part gate` in store.kz; merged into the module at load.
+
+// The handle-observation gate and the take predicate it builds on — lifted
+// out of store.new.kz so both parts stay under their line baselines.
+// Self-contained: everything arrives as a parameter or a module-scope name
+// (`ast`, `StoreIndexDecls` — the part merge makes them visible here).
+
+// Can ANY row of this store be removed while a rule pass is running?
+// Only a `take` can remove one, and a take reached through a CALLED
+// flow is invisible to a scan of the rule's own arm — so the question
+// is asked of the WHOLE PROGRAM, not of the arm. A program that never
+// mentions take cannot remove a row from anywhere, by construction,
+// and every one of its rule passes can use the query path's
+// `for (0..len)` instead of the removal-tolerant `while`.
+//
+// The question is whether a row of THIS store can be removed while one
+// of its passes is running. The old predicate asked something far
+// cruder — `std.mem.indexOf(text, "take") != null` over every
+// condition, path segment and argument in the program.
+//
+// MEASURED 2026-08-03, and it is worth 6.1x: one match flips every
+// standing rule in the program off the dense cursor onto the handle
+// round-trip, and that round-trip's @panic sites forbid vectorization
+// (0.77 -> 4.8 cycles/row, rf_stripe_1 at 10k rows, 2260 -> 13806
+// ns/iter, checksum oracle identical). What tripped it:
+//   - `taken`, the store's OWN obligation state, so any program with an
+//     [entity(...)] discharger de-optimized itself;
+//   - a take on a COMPLETELY UNRELATED store;
+//   - the word `mistake` inside a string literal, measured directly.
+// The grep itself is free; it is the wrong ANSWER that costs 6.1x.
+//
+// Now: an actual `std/store:take` invocation whose addressing head
+// names THIS store, in either spelling (raw, or already lowered to
+// `__store_take_<s>` if this scan runs after that rewrite). Per-ARM
+// since 690_301: the reachability machinery — the arm's own
+// continuation tree plus every subflow impl it invokes — is
+// ast_functional.armReachesInvocation; what lives here is the
+// predicate that knows what a take on THIS store spells like.
+// Anything unparseable answers YES and stays conservative.
+// Finds a named arm and peels tap-inserted wrappers — shared by the
+// qsite walker (store.new.kz) and the gate's querySite check.
+
+const TapPeel = struct {
+    const ast = @import("ast");
+    fn voidBranch(conts: []const ast.Continuation) ?*const ast.Continuation {
+        for (conts) |*k| {
+            if (std.mem.trim(u8, k.branch, " ").len == 0) return k;
+        }
+        if (conts.len == 1) return &conts[0];
+        return null;
+    }
+    fn findArm(conts: []const ast.Continuation, arm: []const u8) ?*const ast.Continuation {
+        var found: ?*const ast.Continuation = null;
+        for (conts) |*c| {
+            const bname = std.mem.trim(u8, c.branch, " ");
+            if (bname.len == 0) continue;
+            if (!std.mem.eql(u8, bname, arm)) continue;
+            if (found != null) return null;
+            found = c;
+        }
+        return found;
+    }
+    fn peel(c: *const ast.Continuation) ?*const ast.Continuation {
+        var cur: *const ast.Continuation = c;
+        var depth: usize = 0;
+        while (depth < 12) : (depth += 1) {
+            const node = cur.node orelse return null;
+            switch (node) {
+                .label_with_invocation => return cur,
+                .invocation => |inv| {
+                    if (!inv.inserted_by_tap) return cur;
+                    if (cur.continuations.len == 0) return null;
+                    cur = voidBranch(cur.continuations) orelse return null;
+                },
+                else => {
+                    if (cur.continuations.len == 0) return null;
+                    cur = voidBranch(cur.continuations) orelse return null;
+                },
+            }
+        }
+        return null;
+    }
+};
+
+
+const TakeScan = struct {
+    const ast = @import("ast");
+    fn isTakeOn(store: []const u8, inv: *const ast.Invocation) bool {
+        if (inv.path.segments.len != 1) return false;
+        const seg = inv.path.segments[0];
+        if (std.mem.startsWith(u8, seg, "__store_take_")) {
+            return std.mem.eql(u8, seg["__store_take_".len..], store);
+        }
+        if (!std.mem.eql(u8, seg, "take")) return false;
+        const mq = inv.path.module_qualifier orelse return true;
+        if (!std.mem.eql(u8, mq, "std.store")) return false;
+        for (inv.args) |a| {
+            if (!std.mem.eql(u8, a.name, "expr")) continue;
+            const v = if (a.value.len >= 2 and a.value[0] == '"') a.value[1 .. a.value.len - 1] else a.value;
+            const lb = std.mem.indexOfScalar(u8, v, '[') orelse return true;
+            return std.mem.eql(u8, std.mem.trim(u8, v[0..lb], " "), store);
+        }
+        return true;
+    }
+};
+
+
+// --- THE HANDLE GATE — does the program ever observe a row handle of
+// THIS store? A store that cannot pays nothing for one.
+// A program-visible row value is a HANDLE — sparse slot | brand<<24
+// | generation<<32 — and keeping that promise costs ~3.3 ns/row on
+// insert (the hslot freelist plus two handle-table stores) and ~5.6
+// ns/row on take, paid by every plural store whether or not a handle
+// ever leaves it. When NOTHING can observe one — no take, no `s[h]`
+// index, no bound `| row`, no `[id]` request, no lifecycle arm
+// carrying one — the machinery elides: the cell is columns + len,
+// insert is capacity-check + column writes + len++, and take /
+// row_of / resolve / handle_of are simply not emitted. A `| full`
+// site keeps working: the insertf unit still exists, its optional
+// `| row` payload just carries the dense index — unreachable by
+// construction, because a site that BINDS it flips this gate.
+//
+// The scan is CONSERVATIVE BY CONSTRUCTION and re-runs the same
+// detections the site transforms themselves run — TakeScan.isTakeOn
+// for take in both spellings, the `s[` boundary match the indexed
+// rewriter keys on, the request-block parse the query/rule arms
+// share — over the whole pre-transform program (flatItems). Anything
+// it cannot read as one of those keeps the handles: a missed
+// consumer under lean would be an emitted reference to a method that
+// does not exist.
+const Gate = struct {
+    const ast = @import("ast");
+    const isIdentCh = @import("emitter_helpers").isKebabIdentChar;
+
+    /// `<s>[` at an identifier boundary, in expression context — an
+    /// index expression on this store in ANY position: read, write,
+    /// or the bare `take(s[h])` head `storeIndexedRefs` deliberately
+    /// skips (it only rewrites `s[...].field`).
+    fn indexes(alloc: std.mem.Allocator, store: []const u8, t: []const u8) bool {
+        const mask = ast.expressionMask(alloc, t);
+        var i: usize = 0;
+        while (i + store.len < t.len) : (i += 1) {
+            if (mask[i] and ast.identBoundaryBefore(t, i) and (i == 0 or t[i - 1] != '.') and
+                std.mem.startsWith(u8, t[i..], store) and t[i + store.len] == '[') return true;
+        }
+        return false;
+    }
+
+    /// An already-lowered reference: every `__koru_` member of the
+    /// cell IS handle machinery (hslot arrays, brand, the three
+    /// methods), and `__store_take_`/`__store_inserth_`/
+    /// `__store_insertf_` are the lowered spellings of sites whose
+    /// arm visibility this text can no longer offer — so text is
+    /// conservative where the node form below is precise.
+    fn lowered(alloc: std.mem.Allocator, store: []const u8, t: []const u8) bool {
+        const cell = std.fmt.allocPrint(alloc, "__koru_store_{s}.__koru_", .{store}) catch unreachable;
+        if (std.mem.indexOf(u8, t, cell) != null) return true;
+        const take = std.fmt.allocPrint(alloc, "__store_take_{s}", .{store}) catch unreachable;
+        const inserth = std.fmt.allocPrint(alloc, "__store_inserth_{s}", .{store}) catch unreachable;
+        const insertf = std.fmt.allocPrint(alloc, "__store_insertf_{s}", .{store}) catch unreachable;
+        return std.mem.indexOf(u8, t, take) != null or
+            std.mem.indexOf(u8, t, inserth) != null or
+            std.mem.indexOf(u8, t, insertf) != null;
+    }
+
+    /// One text slot. `bare` — a query/rule arm's row binding — also
+    /// probes for the bare (non-`.`) reads that mint a handle.
+    fn text(alloc: std.mem.Allocator, store: []const u8, t: []const u8, bare: ?[]const u8) bool {
+        if (indexes(alloc, store, t) or lowered(alloc, store, t)) return true;
+        if (bare) |b| return bareBind(alloc, t, b);
+        return false;
+    }
+
+    /// The bare row-binding rule, mirroring SRewrite.refs: on a
+    /// multi-column store a bare `<bind>` — not `<bind>.` and not a
+    /// longer identifier — reads the ROW RECORD, which the sweepbody
+    /// rewrite hands out as `__koru_handle_of(cursor)`.
+    fn bareBind(alloc: std.mem.Allocator, t: []const u8, bind: []const u8) bool {
+        if (bind.len == 0) return false;
+        const mask = ast.expressionMask(alloc, t);
+        var i: usize = 0;
+        while (i + bind.len <= t.len) : (i += 1) {
+            if (!mask[i]) continue;
+            if (!ast.identBoundaryBefore(t, i) or (i > 0 and t[i - 1] == '.')) continue;
+            if (!std.mem.startsWith(u8, t[i..], bind)) continue;
+            const after = i + bind.len;
+            const next_is_ident = after < t.len and isIdentCh(t[after]);
+            const next_is_dot = after < t.len and t[after] == '.';
+            if (!next_is_ident and !next_is_dot) return true;
+        }
+        return false;
+    }
+
+    /// `| row`'s payload IS the handle, so a BOUND arm keeps the
+    /// machinery — `| row _` and an absent arm stay lean. Shared by
+    /// the raw `insert` door and the lowered inserth/insertf nodes.
+    fn boundRow(site_conts: []const ast.Continuation) bool {
+        for (site_conts) |*c| {
+            if (!std.mem.eql(u8, std.mem.trim(u8, c.branch, " "), "row")) continue;
+            const b = c.binding orelse continue;
+            if (!std.mem.eql(u8, std.mem.trim(u8, b, " "), "_")) return true;
+        }
+        return false;
+    }
+
+    /// The request block a sweep arm carries, parsed the same way the
+    /// query transform and the qsites loop parse it: `[row]<name>`
+    /// renames the row binding, `[id]<name>` asks for the handle.
+    fn armReqs(arm: *const ast.Continuation) struct { bind: ?[]const u8, wants_id: bool } {
+        var req_row: ?[]const u8 = null;
+        var wants_id = false;
+        for (arm.destructure) |df| {
+            for (df.annotations) |a| {
+                if (std.mem.eql(u8, a, "row")) req_row = df.name;
+                if (std.mem.eql(u8, a, "id")) wants_id = true;
+            }
+        }
+        return .{ .bind = req_row orelse arm.binding, .wants_id = wants_id };
+    }
+
+    /// The bare-binding half of a sweep arm — `! query`/`! first`,
+    /// `! row`, `! preorder` all mint `__koru_handle_of(cursor)` for a
+    /// bound bare read on a multi-column store (SRewrite.refs rule 2).
+    /// `row_identity` is the one-column rule: the bare bind there is
+    /// the VALUE.
+    fn sweepArm(alloc: std.mem.Allocator, prog: *const ast.Program, arm: *const ast.Continuation, store: []const u8, fields: []const []const u8, row_identity: bool) bool {
+        const req = armReqs(arm);
+        if (req.wants_id) return true;
+        if (row_identity) return false;
+        const bind = req.bind orelse return false;
+        if (std.mem.eql(u8, std.mem.trim(u8, bind, " "), "_")) return false;
+        // The `when` guard rides the arm (qsites reads `qc.condition`
+        // the same way); the subtree walk below covers it and the
+        // whole tap-peeled chain inside.
+        return cont(alloc, prog, arm, store, fields, bind);
+    }
+
+    /// `! query`/`! first` on this store — directly, or through a
+    /// store-view it is a member of. `[id]` and the bare row binding
+    /// keep the machinery; `[ordinal]` and `<bind>.<field>`
+    /// projections never mint a handle.
+    fn querySite(alloc: std.mem.Allocator, prog: *const ast.Program, site_conts: []const ast.Continuation, store: []const u8, target: []const u8, fields: []const []const u8) bool {
+        var member_of_view = false;
+        var hits = std.mem.eql(u8, target, store);
+        if (!hits) {
+            if (storeViewMembers(alloc, prog, target)) |mems| {
+                member_of_view = true;
+                for (mems) |m| {
+                    if (std.mem.eql(u8, m, store)) hits = true;
+                }
+            }
+        }
+        if (!hits) return false;
+        const sc = TapPeel.findArm(site_conts, "query") orelse (TapPeel.findArm(site_conts, "first") orelse return false);
+        // A one-column store's bare bind reads the VALUE (the row IS
+        // the column), never the cursor — the same identity rule the
+        // sweepbody rewrite itself applies. A view's members are
+        // conservative: its bare bind would mint a handle off a cell
+        // that is not this store's to decide.
+        const row_identity = !member_of_view and fields.len == 1 and std.mem.eql(u8, fields[0], ast.STORE_IDENTITY_COLUMN);
+        return sweepArm(alloc, prog, sc, store, fields, row_identity);
+    }
+
+    /// One invocation node plus the continuations carrying its site
+    /// arms — `f.body.continuations` at a head site, the holding
+    /// continuation's own when nested (the pairing foldNestedSites
+    /// counts sites by).
+    fn inv(alloc: std.mem.Allocator, prog: *const ast.Program, iv: *const ast.Invocation, site_conts: []const ast.Continuation, store: []const u8, fields: []const []const u8) bool {
+        if (TakeScan.isTakeOn(store, iv)) return true;
+        if (iv.path.segments.len == 1) {
+            const seg = iv.path.segments[0];
+            const ih = std.fmt.allocPrint(alloc, "__store_inserth_{s}", .{store}) catch unreachable;
+            const if_ = std.fmt.allocPrint(alloc, "__store_insertf_{s}", .{store}) catch unreachable;
+            if ((std.mem.eql(u8, seg, ih) or std.mem.eql(u8, seg, if_)) and boundRow(site_conts)) return true;
+        }
+        if (SX.isStoreDoor(iv)) |door| {
+            const target = SX.siteName(iv);
+            if (std.mem.eql(u8, door, "insert")) {
+                if (std.mem.eql(u8, target, store) and boundRow(site_conts)) return true;
+            } else if (std.mem.eql(u8, door, "query")) {
+                if (querySite(alloc, prog, site_conts, store, target, fields)) return true;
+            } else if (std.mem.eql(u8, door, "rule") or std.mem.eql(u8, door, "preorder")) {
+                // `[id]` asks for the handle outright. A bare `e` is
+                // NOT a handle read here — entityRefs maps it to the
+                // cursor input itself, which is `__koru_sdix_*`-dense
+                // unless the arm can remove (and that is caught by the
+                // take scan and qsites' may_remove).
+                if (std.mem.eql(u8, target, store)) {
+                    const arm_name: []const u8 = if (std.mem.eql(u8, door, "preorder")) "preorder" else "row";
+                    if (TapPeel.findArm(site_conts, arm_name)) |arm| {
+                        for (arm.destructure) |df| {
+                            for (df.annotations) |a| {
+                                if (std.mem.eql(u8, a, "id")) return true;
+                            }
+                        }
+                    }
+                }
+            } else if (!std.mem.eql(u8, door, "take") and !std.mem.eql(u8, door, "clear") and
+                !std.mem.eql(u8, door, "stripe") and !std.mem.eql(u8, door, "stored") and
+                !std.mem.eql(u8, door, "watch") and !std.mem.eql(u8, door, "default") and
+                !std.mem.eql(u8, door, "new") and !std.mem.eql(u8, door, "view") and
+                !std.mem.eql(u8, door, "explain-store"))
+            {
+                // A store door this gate does not know is a site that
+                // could read the row however it likes — keep.
+                if (std.mem.eql(u8, target, store)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn invText(alloc: std.mem.Allocator, iv: *const ast.Invocation, store: []const u8, bare: ?[]const u8) bool {
+        for (iv.args) |*a| {
+            if (text(alloc, store, a.value, bare)) return true;
+            if (a.expression_value) |ev| {
+                if (text(alloc, store, ev.text, bare)) return true;
+            }
+            if (a.source_value) |sv| {
+                if (text(alloc, store, sv.text, bare)) return true;
+            }
+        }
+        if (iv.inline_body) |ib| {
+            if (text(alloc, store, ib, bare)) return true;
+        }
+        if (iv.preamble_code) |pc| {
+            if (text(alloc, store, pc, bare)) return true;
+        }
+        return false;
+    }
+
+    fn fieldText(alloc: std.mem.Allocator, f: *const ast.Field, store: []const u8, bare: ?[]const u8) bool {
+        if (text(alloc, store, f.type, bare)) return true;
+        if (f.expression_str) |es| {
+            if (text(alloc, store, es, bare)) return true;
+        }
+        if (f.default) |d| {
+            if (text(alloc, store, d, bare)) return true;
+        }
+        return false;
+    }
+
+    fn bcText(alloc: std.mem.Allocator, bc: *const ast.BranchConstructor, store: []const u8, bare: ?[]const u8) bool {
+        if (bc.plain_value) |pv| {
+            if (text(alloc, store, pv, bare)) return true;
+        }
+        for (bc.fields) |*f| {
+            if (fieldText(alloc, f, store, bare)) return true;
+        }
+        return false;
+    }
+
+    fn node(alloc: std.mem.Allocator, prog: *const ast.Program, n: *const ast.Node, site_conts: []const ast.Continuation, store: []const u8, fields: []const []const u8, bare: ?[]const u8) bool {
+        switch (n.*) {
+            .invocation => |*iv| {
+                if (inv(alloc, prog, iv, site_conts, store, fields)) return true;
+                if (invText(alloc, iv, store, bare)) return true;
+            },
+            .label_with_invocation => |*lw| {
+                if (inv(alloc, prog, &lw.invocation, site_conts, store, fields)) return true;
+                if (invText(alloc, &lw.invocation, store, bare)) return true;
+            },
+            .label_jump => |*lj| {
+                for (lj.args) |*a| {
+                    if (text(alloc, store, a.value, bare)) return true;
+                }
+            },
+            .branch_constructor => |*bc| {
+                if (bcText(alloc, bc, store, bare)) return true;
+            },
+            .conditional_block => |*cb| {
+                if (cb.condition) |cd| {
+                    if (text(alloc, store, cd, bare)) return true;
+                }
+                for (cb.nodes) |*nn| {
+                    if (node(alloc, prog, nn, &.{}, store, fields, bare)) return true;
+                }
+            },
+            .inline_code => |ic| {
+                if (text(alloc, store, ic, bare)) return true;
+            },
+            .expression => |e| {
+                if (text(alloc, store, e, bare)) return true;
+            },
+            .foreach => |*fe| {
+                if (text(alloc, store, fe.iterable, bare)) return true;
+                for (fe.branches) |*b| {
+                    if (conts(alloc, prog, b.body, store, fields, bare)) return true;
+                }
+            },
+            .conditional => |*cd| {
+                if (text(alloc, store, cd.condition, bare)) return true;
+                for (cd.branches) |*b| {
+                    if (conts(alloc, prog, b.body, store, fields, bare)) return true;
+                }
+            },
+            .switch_result => |*sr| {
+                if (text(alloc, store, sr.expression, bare)) return true;
+                for (sr.branches) |*b| {
+                    if (conts(alloc, prog, b.body, store, fields, bare)) return true;
+                }
+            },
+            .assignment => |*asg| {
+                if (text(alloc, store, asg.target, bare)) return true;
+                for (asg.fields) |*f| {
+                    if (fieldText(alloc, f, store, bare)) return true;
+                }
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    fn cont(alloc: std.mem.Allocator, prog: *const ast.Program, c: *const ast.Continuation, store: []const u8, fields: []const []const u8, bare: ?[]const u8) bool {
+        if (c.condition) |cond| {
+            if (text(alloc, store, cond, bare)) return true;
+        }
+        if (c.node) |*n| {
+            if (node(alloc, prog, n, c.continuations, store, fields, bare)) return true;
+        }
+        return conts(alloc, prog, c.continuations, store, fields, bare);
+    }
+
+    fn conts(alloc: std.mem.Allocator, prog: *const ast.Program, cs: []const ast.Continuation, store: []const u8, fields: []const []const u8, bare: ?[]const u8) bool {
+        for (cs) |*c| {
+            if (cont(alloc, prog, c, store, fields, bare)) return true;
+        }
+        return false;
+    }
+
+    fn scanFlow(alloc: std.mem.Allocator, prog: *const ast.Program, f: *const ast.Flow, store: []const u8, fields: []const []const u8) bool {
+        if (f.preamble_code) |pc| {
+            if (text(alloc, store, pc, null)) return true;
+        }
+        if (f.inline_body) |ib| {
+            if (text(alloc, store, ib, null)) return true;
+        }
+        return cont(alloc, prog, &f.body, store, fields, null);
+    }
+
+    fn scanItem(alloc: std.mem.Allocator, prog: *const ast.Program, pi: *const ast.Item, store: []const u8, fields: []const []const u8) bool {
+        switch (pi.*) {
+            .flow => |*f| return scanFlow(alloc, prog, f, store, fields),
+            .host_line => |hl| return text(alloc, store, hl.content, null),
+            .inline_code => |ic| return text(alloc, store, ic.code, null),
+            .proc_decl => |*pd| {
+                if (text(alloc, store, pd.body.text, null)) return true;
+                for (pd.body.scope.bindings) |b| {
+                    if (text(alloc, store, b.value_ref, null)) return true;
+                    if (text(alloc, store, b.type, null)) return true;
+                }
+                for (pd.inline_flows) |*inf| {
+                    if (scanFlow(alloc, prog, inf, store, fields)) return true;
+                }
+                return false;
+            },
+            .event_tap => |*et| return conts(alloc, prog, et.continuations, store, fields, null),
+            .label_decl => |*ld| return conts(alloc, prog, ld.continuations, store, fields, null),
+            .host_type_decl => |*ht| {
+                for (ht.shape.fields) |*f| {
+                    if (fieldText(alloc, f, store, null)) return true;
+                }
+                return false;
+            },
+            .immediate_impl => |*ii| return bcText(alloc, &ii.value, store, null),
+            .native_loop => |*nl| {
+                if (text(alloc, store, nl.start_expr, null) or
+                    text(alloc, store, nl.end_expr, null) or
+                    text(alloc, store, nl.body_code, null)) return true;
+                if (nl.step_expr) |se| {
+                    if (text(alloc, store, se, null)) return true;
+                }
+                for (nl.done_field_values) |fv| {
+                    if (text(alloc, store, fv.value_expr, null)) return true;
+                }
+                return false;
+            },
+            .fused_event => |*fe| return text(alloc, store, fe.fused_body, null),
+            .inlined_event => |*ie| return text(alloc, store, ie.inline_body, null),
+            .event_decl => |*ed| {
+                // `= <expr>` field defaults are the one expression
+                // surface a decl carries.
+                for (ed.input.fields) |*f| {
+                    if (fieldText(alloc, f, store, null)) return true;
+                }
+                for (ed.branches) |*b| {
+                    for (b.payload.fields) |*f| {
+                        if (fieldText(alloc, f, store, null)) return true;
+                    }
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// The decision itself. Semantic overrides first — each is a fact the
+    /// text scan cannot see — then the whole-program walk. `program_items`
+    /// arrives visibility-scoped from the caller (visibleStoreItems):
+    /// koru_std bodies' same-named locals can never name a program store
+    /// (690_335). Anything unrecognized upstream keeps the machinery — a
+    /// missed consumer under lean is an emitted reference to a method that
+    /// does not exist.
+    fn needsHandles(alloc: std.mem.Allocator, prog: *const ast.Program, program_items: []const *const ast.Item, store: []const u8, fields: []const []const u8, is_tree: bool, has_step: bool, lifecycle_id: bool, rule_needs: bool) bool {
+        // A [tree] store's `parent` column IS a handle column — the cycle
+        // guard and the preorder walk resolve through it.
+        if (is_tree) return true;
+        // `! step`'s `complete` is a swap-remove: survivor rows' handles
+        // must move with them (store.pverbs.kz).
+        if (has_step) return true;
+        // A declared index maps key->handle and `! first` routes through
+        // it (store.index.kz) — the map itself is handle storage.
+        if (StoreIndexDecls.declsOf(alloc, prog, store).len > 0) return true;
+        // A lifecycle arm that asked for the row's handle (`[id]`), or a
+        // standing rule that did — or whose body can reach a take
+        // (may_remove threads `__koru_qrow` as a handle).
+        if (lifecycle_id or rule_needs) return true;
+        for (program_items) |pi| {
+            if (scanItem(alloc, prog, pi, store, fields)) return true;
+        }
+        return false;
+    }
+};

@@ -1,0 +1,52 @@
+// Koru Standard Library: the `parse` part of interpreter.kz.
+// Joined via `~part parse` in interpreter.kz; merged into the interpreter
+// module at load.
+// Parse WITHOUT executing — the other half of `eval`.
+//
+// Interpreter source is pure Koru: it has no file, so it has no host half and
+// no ``. That is why this takes no file name. The full compiler parser
+// derives its host/pure mode from the filename extension
+// (`src/parser.zig:707`), so handing it a synthetic name silently answers a
+// question interpreted source does not have; `flow_parser` has no such notion
+// and is the only correct parser here.
+//
+// The returned Flow and every slice it points at are allocated from
+// `allocator` — the caller owns the AST and may `eval` it as many times as it
+// likes.
+~[retain]pub tor parse {
+    source: string,
+    allocator: std.mem.Allocator
+}
+| flow *const ast.Flow
+| parse-error { message: string, line: u32, column: u32 }
+
+~proc parse|zig {
+    if (findHostTilde(source)) |t| {
+        return .{ .parse_error = .{
+            .message = "`~` is not legal in interpreter source. It switches a host-embedded file (.kz/.kjs) from the host language into Koru; interpreter source is already pure Koru, so it marks nothing. Drop it: write `open(path: \"x\")`, not `~open(path: \"x\")`.",
+            .line = t.line,
+            .column = t.column,
+        }};
+    }
+
+    // The parsed Flow borrows slices of the source text, so the copy has to
+    // live in the caller's allocator alongside the AST it feeds.
+    const owned_source = allocator.dupe(u8, source) catch {
+        return .{ .parse_error = .{ .message = "out of memory", .line = 0, .column = 0 } };
+    };
+
+    switch (flow_parser.parseFlow(allocator, owned_source)) {
+        .flow => |f| {
+            const owned_flow = allocator.create(ast.Flow) catch {
+                return .{ .parse_error = .{ .message = "out of memory", .line = 0, .column = 0 } };
+            };
+            owned_flow.* = f;
+            return .{ .flow = owned_flow };
+        },
+        .err => |e| return .{ .parse_error = .{
+            .message = e.message,
+            .line = @intCast(e.line),
+            .column = @intCast(e.column),
+        }},
+    }
+}

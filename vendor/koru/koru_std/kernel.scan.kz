@@ -1,0 +1,109 @@
+// Koru Standard Library: the `scan` part of kernel.kz — declaration recovery.
+// Joined via `~part scan` in kernel.kz; merged into the kernel module.
+//
+// These are the init transform's AST scanners: each walks program items
+// (descending `.module_decl`) to recover the text of a declaration the
+// transform needs after the source block is gone — a `std/kernel:shape`'s
+// field list, a `std/store:new` store's SoA schema, a shape source's field
+// text. Module-scope fns (not proc-local struct.call) so the pin on
+// kernel.kz stays under its baseline — the ~part split doctrine.
+
+// `ast` doesn't exist at module scope in this module (proc bodies keep it
+// local — a module-scope `const ast` would collide under Zig's no-shadowing
+// rule), so the parts share this alias.
+const kast = @import("ast");
+
+// Find the source text for a std.kernel:shape(name) declaration.
+// Descends through `.module_decl`: a shape declared in the same library as
+// the init it types is one level down from `program.items` (115_005), and a
+// miss here does not refuse — it falls through to a hardcoded
+// `x, y, mass` default, so the boundary showed up as a wrongly-shaped
+// struct rather than as a diagnostic.
+fn kernelFindShapeSource(prog_internal: *const kast.Program, target_type: []const u8) ?[]const u8 {
+    return kernelScanShapeSource(prog_internal.items, target_type);
+}
+
+fn kernelScanShapeSource(items_internal: []const kast.Item, target_type: []const u8) ?[]const u8 {
+    for (items_internal) |item_internal| {
+        if (item_internal == .module_decl) {
+            if (kernelScanShapeSource(item_internal.module_decl.items, target_type)) |s| return s;
+            continue;
+        }
+        if (item_internal == .flow) {
+            const f = item_internal.flow;
+            if (f.inv().path.segments.len == 1 and
+                std.mem.eql(u8, f.inv().path.segments[0], "shape") and
+                f.inv().path.module_qualifier != null and
+                std.mem.eql(u8, f.inv().path.module_qualifier.?, "std.kernel"))
+            {
+                // Check if first arg matches target_type
+                for (f.inv().args) |arg| {
+                    if (std.mem.eql(u8, arg.name, "expr")) {
+                         var name = arg.value;
+                         if (name.len >= 2 and name[0] == '"') name = name[1..name.len-1];
+                         if (std.mem.eql(u8, name, target_type)) {
+                             // Found it! Get source arg
+                             for (f.inv().args) |s_arg| {
+                                 if (std.mem.eql(u8, s_arg.name, "source")) {
+                                     return s_arg.source_value.?.text;
+                                 }
+                             }
+                         }
+                    }
+                }
+            }
+        }
+    }
+    return null;
+}
+
+// Recover a store's SoA column schema. The `std/store:new` flow is
+// consumed by the store transform BEFORE this init transform runs (measured
+// 2026-08-14: zero `new` flows remain at init time), so the declaration is
+// gone. What survives is the per-store apply tor the store transform
+// synthesizes — `__store_apply_<name>` — whose BRANCHES are exactly the
+// typed column list in declaration order (`x : f64` branch, `vx : f64`
+// branch, …). Returns a shape-source `{ x: f64, vx: f64, mass: f64 }` or
+// null when `expr` names no store.
+fn kernelFindStoreDecl(alloc: std.mem.Allocator, prog_internal: *const kast.Program, target_store: []const u8) ?[]const u8 {
+    const want = std.fmt.allocPrint(alloc, "__store_apply_{s}", .{target_store}) catch unreachable;
+    return kernelScanStoreDecl(alloc, prog_internal.items, want);
+}
+
+fn kernelScanStoreDecl(alloc: std.mem.Allocator, items_internal: []const kast.Item, want: []const u8) ?[]const u8 {
+    for (items_internal) |item_internal| {
+        if (item_internal == .module_decl) {
+            if (kernelScanStoreDecl(alloc, item_internal.module_decl.items, want)) |s| return s;
+            continue;
+        }
+        if (item_internal != .event_decl) continue;
+        const ed = item_internal.event_decl;
+        if (ed.path.segments.len != 1) continue;
+        if (!std.mem.eql(u8, ed.path.segments[0], want)) continue;
+        var buf = std.ArrayList(u8).initCapacity(alloc, 64) catch unreachable;
+        buf.append(alloc, '{') catch unreachable;
+        for (ed.branches, 0..) |br, bi| {
+            if (bi > 0) buf.appendSlice(alloc, ", ") catch unreachable;
+            var ftype: []const u8 = "f64";
+            if (br.payload.fields.len > 0) ftype = br.payload.fields[0].type;
+            const piece = std.fmt.allocPrint(alloc, "{s}: {s}", .{ br.name, ftype }) catch unreachable;
+            buf.appendSlice(alloc, piece) catch unreachable;
+        }
+        buf.append(alloc, '}') catch unreachable;
+        return buf.toOwnedSlice(alloc) catch unreachable;
+    }
+    return null;
+}
+
+// Transform Koru shape source "x: f64, y: f64" to Zig struct fields "x: f64, y: f64,"
+fn kernelParseShapeFields(alloc: std.mem.Allocator, shape_source: []const u8) []const u8 {
+    var res = std.ArrayList(u8).initCapacity(alloc, shape_source.len) catch unreachable;
+    var iter_f = std.mem.splitSequence(u8, shape_source, ",");
+    while (iter_f.next()) |field_raw| {
+        const field = std.mem.trim(u8, field_raw, " \t\n\r{}");
+        if (field.len == 0) continue;
+        res.appendSlice(alloc, field) catch unreachable;
+        res.appendSlice(alloc, ", ") catch unreachable;
+    }
+    return res.items;
+}

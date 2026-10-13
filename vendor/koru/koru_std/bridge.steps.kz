@@ -1,0 +1,131 @@
+// Koru Standard Library: the `steps` part of bridge.kz — the multi-item
+// turn's per-step loop. Joined via `~part steps` in bridge.kz; merged into
+// the bridge module at load.
+
+/// What a multi-item turn's step run produced: the rendered report plus the
+/// counters the outcome arms need. The report string is page-backed.
+const StepRun = struct {
+    report: []const u8,
+    all_residue: bool,
+    wire_failures: u32,
+    used: u64,
+    total: u32,
+};
+
+/// Run a segmented turn item by item: define items install into the session,
+/// gate refusals bind residue or strike as wire failures, dispatched items
+/// report value + durable binding (a chain's inner links surface through
+/// their trace line). Execution continues past every refusal — a partial
+/// program RUNS, and the model learns every step's outcome in one
+/// observation instead of discovering failures one turn at a time.
+fn runSteps(br: *Bridge, source: []const u8, items: []const TurnItem) StepRun {
+    var report = std.ArrayList(u8){};
+    defer report.deinit(br.allocator);
+    const writer = report.writer(br.allocator);
+    var used_total: u64 = 0;
+    // Steps that failed as wire — parse-error, validation, denied, dispatch —
+    // count here. Residue steps do NOT: prose is the sanctioned channel and
+    // binds for redelivery, but a malformed step beside a working one is a
+    // rejected wire reply and the caller's strike bound needs to see it.
+    var wire_failures: u32 = 0;
+    const total: u32 = @intCast(items.len);
+    // A turn whose EVERY item bound residue is the single `residue` outcome,
+    // not `partial` — reached only when the all-prose fast path's bind failed.
+    var all_residue = true;
+    for (items, 0..) |it, idx| {
+        const step: u32 = @intCast(idx + 1);
+        const item = std.mem.trim(u8, source[it.start..it.end], " \t\r\n");
+        if (isDefineItem(item)) {
+            all_residue = false;
+            switch (installDefine(br, item)) {
+                .defined => |d| writer.print("step {d}/{d} defined: {s}\n", .{ step, total, d }) catch {},
+                .parse_error => |e| {
+                    wire_failures += 1;
+                    writer.print("step {d}/{d} parse-error: {s}\n", .{ step, total, e.message }) catch {};
+                },
+            }
+            continue;
+        }
+        // The wire gate holds per item; a refused slice is a step line.
+        if (wireGate(br, item)) |e| {
+            if (e.not_invocation) {
+                const rn = bindResidue(br, item);
+                if (rn.len > 0) {
+                    const head = item[0..@min(std.mem.indexOfScalar(u8, item, '\n') orelse item.len, 48)];
+                    writer.print("step {d}/{d} residue bound: {s} — '{s}' is not wire; nothing reached the user, but the observer kept it. `say:` reaches the user, `note:` thinks, `verb(field: ...)` calls — `vocabulary()` lists every verb\n", .{ step, total, rn, head }) catch {};
+                    continue;
+                }
+            }
+            if (isNoteAttempt(br, item)) {
+                const rn = bindResidue(br, item);
+                if (rn.len > 0) {
+                    writer.print("step {d}/{d} residue bound: {s} — your note did not parse as wire, but the observer kept it. Well-formed: note(text: \"...\") or note: <prose>; to reach the user, re-emit the text under `say:`\n", .{ step, total, rn }) catch {};
+                    continue;
+                }
+            }
+            all_residue = false;
+            wire_failures += 1;
+            writer.print("step {d}/{d} parse-error: {s}\n", .{ step, total, e.message }) catch {};
+            continue;
+        }
+        all_residue = false;
+        const result = dispatchThroughScope(br, item);
+        switch (result) {
+            .result => |r| {
+                used_total += r.used;
+                const bound = if (r.bound.len > 0) r.bound else bindResult(br, r.value);
+                // A chain's inner links surface above its result line — each
+                // dispatch's issued value, durable name, and arm binding.
+                if (r.trace.len > 0) writer.print("step {d}/{d} trace:\n{s}", .{ step, total, r.trace }) catch {};
+                writer.print("step {d}/{d} result: {s} bound: {s}\n", .{ step, total, r.value.toJsonBuf(), bound }) catch {};
+            },
+            .unhandled_branch => |u| {
+                if (u.branch.len == 0) {
+                    wire_failures += 1;
+                    writer.print("step {d}/{d} unhandled-branch: the call issued its ordinary result but no arm bound it — an ordinary result binds with `| ok name |>`; other arm words match nothing (held {s})\n", .{ step, total, u.handles }) catch {};
+                } else {
+                    writer.print("step {d}/{d} unhandled-branch: {s} — {s} (held {s}); to keep going, arm it `| {s} name |>` — the arm word is the branch name, nothing else matches\n", .{ step, total, u.branch, u.payload, u.handles, u.branch }) catch {};
+                }
+            },
+            .exhausted => |e| {
+                wire_failures += 1;
+                used_total += e.used;
+                writer.print("step {d}/{d} exhausted: used={d} last={s}\n", .{ step, total, e.used, e.last_event }) catch {};
+            },
+            .parse_error => |e| {
+                wire_failures += 1;
+                writer.print("step {d}/{d} parse-error: {s}\n", .{ step, total, e.message }) catch {};
+            },
+            .validation_error => |e| {
+                wire_failures += 1;
+                writer.print("step {d}/{d} validation-error: {s}\n", .{ step, total, e }) catch {};
+            },
+            .shape_error => |e| {
+                wire_failures += 1;
+                writer.print("step {d}/{d} shape-error {s}: {s}\n", .{ step, total, e.branch, e.message }) catch {};
+            },
+            .event_denied => |e| {
+                wire_failures += 1;
+                writer.print("step {d}/{d} event-denied: {s}\n", .{ step, total, e }) catch {};
+            },
+            .dispatch_error => |e| {
+                wire_failures += 1;
+                // Links that did dispatch before the refusal still report —
+                // the model sees what it got before it hit the wall.
+                if (e.trace.len > 0) writer.print("step {d}/{d} trace:\n{s}", .{ step, total, e.trace }) catch {};
+                writer.print("step {d}/{d} dispatch-error {s}: {s}\n", .{ step, total, e.event_name, e.message }) catch {};
+            },
+            .scope_not_found => |e| {
+                wire_failures += 1;
+                writer.print("step {d}/{d} scope-not-found: {s}\n", .{ step, total, e }) catch {};
+            },
+        }
+    }
+    return .{
+        .report = std.heap.page_allocator.dupe(u8, report.items) catch "",
+        .all_residue = all_residue,
+        .wire_failures = wire_failures,
+        .used = used_total,
+        .total = total,
+    };
+}

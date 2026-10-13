@@ -1,0 +1,374 @@
+// Koru Standard Library: Type Declarations
+// =========================================
+//
+// This module is the SURVIVING slice of the old type-mint surface. The mint
+// verbs (`std/types:struct`, `:type`, `:enum`, `:union`) were retired
+// 2026-08-23: a construct whose only demand was its own test cluster was
+// redundant with the language spine (frag-type-system-design, fourth
+// dissolution). What remains:
+//
+//   - `fields-of(T)` — comptime traversal SOURCE over an EXISTING type's
+//     fields; consumed by std/constructor's struct terminal.
+//   - Nominal primitives — `string(EmailAddress)`, `int(UserId)`,
+//     `float(Temperature)`, `bool(IsActive)` — distinct named wrappers.
+//
+// The declaration front door going forward is `~std/types:proto(name)`
+// (layout-silent registry entries), landing with std/list as its first
+// consumer. Until then std/types intentionally declares NO composite types.
+
+~[comptime|runtime]
+
+const std = @import("std");
+
+// ============================================================================
+// COMPTIME FIELD REFLECTION
+// ============================================================================
+// `fields-of(T)` — a comptime traversal SOURCE over an existing type's fields.
+// Iteration is EMERGENT: like `for`, it pulses `! each f` (each `f` a reflected
+// field, `.name` / `.type`) rather than handing an iterator to a loop. Round one is
+// consumed by std/constructor's struct terminal (lowered to Zig `@typeInfo`); a
+// standalone lowering — `fields-of` traversing outside a constructor — is the later
+// generalization, and the surface where Koru-level type reflection eventually lands.
+~[comptime]pub tor fields-of { expr: Expression }
+! each *
+| ?done
+
+// STANDALONE lowering — `fields-of(T)` used OUTSIDE a constructor. Mirrors for's
+// template, but the iterable is `@typeInfo(T).@"struct".fields` and the loop is
+// `inline for` (reflected fields are heterogeneous — each `.type` differs — so it
+// must comptime-unroll). INSIDE a constructor the `.pre` struct terminal consumes
+// `fields-of` before this template ever runs, so the two paths never collide.
+~[template]proc fields-of|zig {
+    inline for (@typeInfo({{ expr }}).@"struct".fields) |__koru_item| {
+        {% for h in effects["each"] %}{{ h.inlined_link[scope] }}(__koru_item);
+        {% endfor %}
+    }
+    {{ continuations["done"].continue }}
+}
+
+// ============================================================================
+// NOMINAL PRIMITIVE TYPES
+// ============================================================================
+
+// ============================================================================
+// PROTO ENTRIES
+// ============================================================================
+// `proto(Name) { field: type, ... }` declares a COMPILE-TIME registry entry —
+// layout-silent, with no emission of its own: the first consumer derives what
+// it needs (std/list:new synthesizes the element struct plus its
+// `List_<Name>` container from these fields; the vector/table consumers are
+// later rungs on the same entry). Registration is the AST scans' job: the
+// checker and the type registry read the declaration flow FROM THE PRE-TRANSFORM
+// AST (the same copy they read `struct`/nominal declarations from), and this
+// transform self-erases the site into a comment so nothing runtime is emitted.
+//
+// USAGE:
+//   std/types:proto(Car) { rpm: i32, serial: string }
+//
+// RULED 2026-08-23 (frag-type-system-design, proto rung): the entry is the
+// identity — two registrants of the same name are a loud collision, and values
+// over two different protos must not interchange (both refused at the KORU
+// layer by the nominal-distinctness gate; see scanDeclaredTypes + the
+// container registration it derives).
+~[keyword|comptime|transform]pub tor proto {
+    expr: Expression,
+    source: Source,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator,
+    reporter: *std/compiler:ErrorReporter
+} -> SiteResult
+
+~proc proto|zig {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    var type_name = expr;
+    if (type_name.len >= 2 and type_name[0] == '"' and type_name[type_name.len - 1] == '"') {
+        type_name = type_name[1 .. type_name.len - 1];
+    }
+    const name = std.mem.trim(u8, type_name, " \t");
+
+    // The entry name must be an identifier the derived container can be shown
+    // with; refuse anything else loudly (never crash).
+    var name_ok = name.len > 0;
+    for (name, 0..) |c, i| {
+        const legal = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c == '_') or (i > 0 and c >= '0' and c <= '9') or (c == '-');
+        if (!legal) {
+            name_ok = false;
+            break;
+        }
+    }
+    if (!name_ok or name.len == 0) {
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/types:proto: the entry name '{s}' is not usable — a proto name must be an identifier (a-z, A-Z, 0-9, '_', '-'; no leading digit)", .{name}) };
+    }
+
+    // Field grammar: one `name: type` per line (comma optional, trailing commas
+    // fine). Scalars only this rung — the derived container emits Zig struct
+    // fields from these types, so a type the stdlib cannot carry is a
+    // declaration fault, caught HERE not in the consumer.
+    var field_lines: usize = 0;
+    // The entry grammar is gated once over the whole block before a single
+    // field's type is checked — one `name: type` per line, each name bound
+    // once (types.fields.kz). The walk below is the consumer, not the checker.
+    const fields = switch (protoFieldBlock(allocator, source.text)) {
+        .entries => |es| es,
+        .fault => |msg| return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/types/proto({s}): {s}", .{ name, msg }) },
+    };
+    for (fields) |e| {
+        const scalars = [_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "bool", "string" };
+        var known = false;
+        for (scalars) |s| {
+            if (std.mem.eql(u8, e.ftype, s)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/types/proto({s}): field '{s}' uses unsupported type '{s}' — scalar fields only this rung (i8/i16/i32/i64/u8/u16/u32/u64/f32/f64/bool/string)", .{ name, e.fname, e.ftype }) };
+        }
+        field_lines += 1;
+    }
+    if (field_lines == 0) {
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/types/proto({s}): an entry with no fields derives nothing — declare at least one `name: type` field", .{name}) };
+    }
+
+    // Layout-silent self-erase: a ONE-LINE comment carries the registry's
+    // content for anyone reading the emitted module; nothing else is emitted
+    // for the entry itself (the consumer's derived struct is what the program
+    // runs on). The collapse is load-bearing: a multi-line body left its
+    // second and later lines as RAW TEXT in the emitted Zig module (they are
+    // not comments — only the first line carries `//`), and the backend died
+    // on `serial: string` as a bare statement. Fields join with ", " — the
+    // same separator std/list's marker parser splits on.
+    const flat = blk: {
+        var buf = std.ArrayList(u8).initCapacity(allocator, source.text.len + 1) catch unreachable;
+        var it = std.mem.splitScalar(u8, source.text, '\n');
+        while (it.next()) |raw| {
+            const seg = std.mem.trim(u8, raw, " \t\r,");
+            if (seg.len == 0) continue;
+            if (buf.items.len > 0) buf.appendSlice(allocator, ", ") catch unreachable;
+            buf.appendSlice(allocator, seg) catch unreachable;
+        }
+        break :blk buf.toOwnedSlice(allocator) catch unreachable;
+    };
+    const code = std.fmt.allocPrint(
+        allocator,
+        "// proto {s}: {s}",
+        .{ name, flat },
+    ) catch unreachable;
+
+    const inline_code_item = ast.Item{
+        .inline_code = ast.InlineCode{
+            .code = code,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        },
+    };
+
+    return .{ .replacement = inline_code_item };
+}
+
+~[keyword|comptime|transform]pub tor string {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc string|zig {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Parse type name from expr (strip quotes if present)
+    var type_name = expr;
+    if (type_name.len >= 2 and type_name[0] == '"' and type_name[type_name.len - 1] == '"') {
+        type_name = type_name[1 .. type_name.len - 1];
+    }
+
+    // Check for [pub] annotation
+    var is_pub = false;
+    for (flow.annotations) |ann| {
+        if (std.mem.eql(u8, ann, "pub")) {
+            is_pub = true;
+            break;
+        }
+    }
+
+    const pub_prefix = if (is_pub) "pub " else "";
+
+    // Emit: const EmailAddress = []const u8;
+    const code = std.fmt.allocPrint(
+        allocator,
+        "{s}const {s} = []const u8;",
+        .{ pub_prefix, type_name }
+    ) catch unreachable;
+
+    const inline_code_item = ast.Item{
+        .inline_code = ast.InlineCode{
+            .code = code,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        },
+    };
+
+    return .{ .replacement = inline_code_item };
+}
+
+// Declare a nominal integer type (wraps i64)
+~[keyword|comptime|transform]pub tor int {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc int|zig {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    var type_name = expr;
+    if (type_name.len >= 2 and type_name[0] == '"' and type_name[type_name.len - 1] == '"') {
+        type_name = type_name[1 .. type_name.len - 1];
+    }
+
+    var is_pub = false;
+    for (flow.annotations) |ann| {
+        if (std.mem.eql(u8, ann, "pub")) {
+            is_pub = true;
+            break;
+        }
+    }
+
+    const pub_prefix = if (is_pub) "pub " else "";
+
+    // Emit: const UserId = i64;
+    const code = std.fmt.allocPrint(
+        allocator,
+        "{s}const {s} = i64;",
+        .{ pub_prefix, type_name }
+    ) catch unreachable;
+
+    const inline_code_item = ast.Item{
+        .inline_code = ast.InlineCode{
+            .code = code,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        },
+    };
+
+    return .{ .replacement = inline_code_item };
+}
+
+// Declare a nominal float type (wraps f64)
+~[keyword|comptime|transform]pub tor float {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc float|zig {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    var type_name = expr;
+    if (type_name.len >= 2 and type_name[0] == '"' and type_name[type_name.len - 1] == '"') {
+        type_name = type_name[1 .. type_name.len - 1];
+    }
+
+    var is_pub = false;
+    for (flow.annotations) |ann| {
+        if (std.mem.eql(u8, ann, "pub")) {
+            is_pub = true;
+            break;
+        }
+    }
+
+    const pub_prefix = if (is_pub) "pub " else "";
+
+    // Emit: const Temperature = f64;
+    const code = std.fmt.allocPrint(
+        allocator,
+        "{s}const {s} = f64;",
+        .{ pub_prefix, type_name }
+    ) catch unreachable;
+
+    const inline_code_item = ast.Item{
+        .inline_code = ast.InlineCode{
+            .code = code,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        },
+    };
+
+    return .{ .replacement = inline_code_item };
+}
+
+// Declare a nominal bool type (wraps bool)
+~[keyword|comptime|transform]pub tor bool {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc bool|zig {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    var type_name = expr;
+    if (type_name.len >= 2 and type_name[0] == '"' and type_name[type_name.len - 1] == '"') {
+        type_name = type_name[1 .. type_name.len - 1];
+    }
+
+    var is_pub = false;
+    for (flow.annotations) |ann| {
+        if (std.mem.eql(u8, ann, "pub")) {
+            is_pub = true;
+            break;
+        }
+    }
+
+    const pub_prefix = if (is_pub) "pub " else "";
+
+    // Emit: const IsActive = bool;
+    const code = std.fmt.allocPrint(
+        allocator,
+        "{s}const {s} = bool;",
+        .{ pub_prefix, type_name }
+    ) catch unreachable;
+
+    const inline_code_item = ast.Item{
+        .inline_code = ast.InlineCode{
+            .code = code,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        },
+    };
+
+    return .{ .replacement = inline_code_item };
+}
+
+~part fields
+~part enum

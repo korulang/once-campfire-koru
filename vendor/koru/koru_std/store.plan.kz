@@ -1,0 +1,236 @@
+// Koru Standard Library: the `plan` part of store — joined via
+// `~part plan` in store.kz; members land in koru_store.
+//
+// The explainer's SQL-EXPLAIN rung: which store carries a declared index,
+// and per query site the plan the `query` transform would emit — sweep,
+// early-exit sweep, index lookup, or refusal. The ruling (frag: an
+// explainer runs the transform's fold, not a second reading) means the
+// plan comes from the very functions the transform calls — the same
+// `findArm` over the same continuations, the same `rewriteIsGuard`,
+// the same `SRewrite.refs` lowering of the `when` guard, and the same
+// `StoreIndex.guardRoute` routing decision — never a re-read of the
+// source condition. Refusal wording is shared, not mirrored: the KORU161
+// texts below are the strings the transform itself refuses with.
+
+const SPlan = struct {
+    const SH = @import("site_hash");
+    const struct_literal = @import("struct_literal");
+    const Entry = ast_find.ExplainReport.Entry;
+
+    // --- shared KORU161 texts: one string, two sinks ---
+    // The transform (store.query.kz) passes these to ast.refusal; the
+    // explainer formats the same consts for `refused:` plan rows, so the
+    // explanation can never drift from the error it explains.
+    const MSG_both_arms = "std/store:query({s}): `! query` and `! first` are alternatives — exactly one per site";
+    const MSG_none_pairs = "std/store:query({s}): `| none` pairs with `! first` — a `! query` sweep visits every row and has no absent case";
+    const MSG_no_arm = "std/store:query({s}): exactly one `! query <row>` or `! first <row>` branch per site";
+    const MSG_unannotated = "std/store:query({s}): '{s}' is an unannotated entry — the query arm binds its row (`! query <row> |> ... <row>.<field> ...`); a request block names what the VISIT synthesizes (`[row]`, `[ordinal]`), never columns";
+    const MSG_unknown_req = "std/store:query({s}): unknown request `[{s}]` on '{s}' — this arm understands [row], [ordinal] and [id]";
+    const MSG_need_row = "std/store:query({s}): a request block must name the row — add `[row]<name>`";
+    const MSG_row_binding = "std/store:query({s}): the query arm needs a row binding: `! query <row> |> ...`";
+    const MSG_unknown_field = "std/store:query({s}): '{s}.{s}' - '{s}' is not a field of store '{s}'";
+
+    /// The arm resolution both the transform and the plan fold share —
+    /// lifted out of `query|zig`'s proc-local TapPeel. One matching branch
+    /// or null (a duplicate arm is the caller's ambiguity, also null).
+    fn findArm(conts: []const ast_find.Continuation, arm: []const u8) ?*const ast_find.Continuation {
+        var found: ?*const ast_find.Continuation = null;
+        for (conts) |*c| {
+            const bname = std.mem.trim(u8, c.branch, " ");
+            if (bname.len == 0) continue;
+            if (!std.mem.eql(u8, bname, arm)) continue;
+            if (found != null) return null;
+            found = c;
+        }
+        return found;
+    }
+
+    /// The continuation-nested half of the site fold: store doors inside a
+    /// flow's continuations (`| row a |> std/store:insert(...)`, a query
+    /// under a `|>` pipeline) count exactly as head sites do — except `new`,
+    /// which stays head-only. Witness pointers address the real tree via
+    /// `|*c|` iteration, the same contract collectSites' walkConts hashes.
+    fn foldNestedSites(alloc: std.mem.Allocator, stores: *std.ArrayList(SX.Store), conts: []const ast_find.Continuation, home: []const u8) void {
+        for (conts) |*c| {
+            if (c.node) |*node| {
+                if (node.* == .invocation) {
+                    const inv = &node.invocation;
+                    if (SX.isStoreDoor(inv)) |door| {
+                        const name = SX.siteName(inv);
+                        if (std.mem.eql(u8, door, "insert")) {
+                            SX.touch(alloc, stores, name, home).inserts.append(alloc, @intFromPtr(inv)) catch unreachable;
+                        } else if (std.mem.eql(u8, door, "query") or std.mem.eql(u8, door, "stripe")) {
+                            SX.touch(alloc, stores, name, home).queries.append(alloc, .{ .ptr = @intFromPtr(inv), .conts = c.continuations, .door = door }) catch unreachable;
+                        } else if (std.mem.eql(u8, door, "take")) {
+                            SX.touch(alloc, stores, name, home).takes.append(alloc, @intFromPtr(inv)) catch unreachable;
+                        } else if (std.mem.eql(u8, door, "clear")) {
+                            SX.touch(alloc, stores, name, home).clears.append(alloc, @intFromPtr(inv)) catch unreachable;
+                        } else if (std.mem.eql(u8, door, "default")) {
+                            SX.touch(alloc, stores, name, home).watches.append(alloc, @intFromPtr(inv)) catch unreachable;
+                        }
+                    }
+                }
+            }
+            foldNestedSites(alloc, stores, c.continuations, home);
+        }
+    }
+
+    /// Invocation pointers for a store's query-site list — the counted row's
+    /// `at` witnesses are the sites it counted.
+    fn qptrs(alloc: std.mem.Allocator, qsites: []const SX.QSite) []const usize {
+        const out = alloc.alloc(usize, qsites.len) catch unreachable;
+        for (qsites, 0..) |q, i| out[i] = q.ptr;
+        return out;
+    }
+
+    /// The store's column names as `__store_insert_<s>` would declare them —
+    /// pre-transform that tor does not exist, so the fold reads the same
+    /// member block through the same `SL.ProtoExpander` the `new` transform
+    /// runs (a proto member dissolves into `left.health`-spelled leaves; a
+    /// bare single member is the `__koru_value` identity column). A demanded
+    /// kind tag rides as the trailing `kind` column, like `new`'s emit.
+    fn colNames(alloc: std.mem.Allocator, program: *const ast_find.Program, s: *const SX.Store) []const []const u8 {
+        var seed = std.ArrayList(struct_literal.StructField).initCapacity(alloc, s.members.items.len) catch unreachable;
+        for (s.members.items) |m| {
+            var name: []const u8 = "";
+            var value = m.spelled;
+            if (std.mem.indexOfScalar(u8, m.spelled, ':')) |ci| {
+                name = std.mem.trim(u8, m.spelled[0..ci], " \t");
+                value = std.mem.trim(u8, m.spelled[ci + 1 ..], " \t");
+            }
+            if (std.mem.startsWith(u8, name, "*")) name = std.mem.trim(u8, name[1..], " \t");
+            if (name.len == 0) name = ast_find.STORE_IDENTITY_COLUMN;
+            seed.append(alloc, .{ .name = name, .value = value }) catch unreachable;
+        }
+        const scope_home = if (s.new_flow) |nf| SL.TermRef.scopeOfFlow(program, nf) else s.home;
+        var out = std.ArrayList(struct_literal.StructField).initCapacity(alloc, seed.items.len) catch unreachable;
+        var stack = std.ArrayList([]const u8).initCapacity(alloc, 4) catch unreachable;
+        var provs = std.ArrayList(SL.ColProv).initCapacity(alloc, 0) catch unreachable;
+        for (seed.items) |cf| {
+            const peeled = struct_literal.peelBaseType(cf.value);
+            const ftype = if (peeled.type.len != 0) peeled.type else std.mem.trim(u8, cf.value, " ");
+            if (SL.MemberRef.fieldsOf(program, ftype, scope_home) == null) {
+                out.append(alloc, cf) catch unreachable;
+                continue;
+            }
+            const fname = if (std.mem.eql(u8, cf.name, ast_find.STORE_IDENTITY_COLUMN)) "" else cf.name;
+            SL.ProtoExpander.expand(alloc, program, scope_home, "", fname, ftype, &stack, null, &out, &provs);
+        }
+        var names = std.ArrayList([]const u8).initCapacity(alloc, out.items.len + 1) catch unreachable;
+        for (out.items) |f| names.append(alloc, f.name) catch unreachable;
+        // The `[tree]` `parent` column is deliberately NOT added: the fold
+        // answers for `__store_insert_<s>`'s input fields, and the insert
+        // surface excludes `parent` — a guard naming it refuses in the
+        // transform, so the plan must refuse identically.
+        if (storeKindDemanded(alloc, program, s.name)) names.append(alloc, "kind") catch unreachable;
+        return names.toOwnedSlice(alloc) catch unreachable;
+    }
+
+    /// The `index` / `status` row for a store section: the declared
+    /// `std/indexes:store(<s>, <col>)` column with its site as the `at`
+    /// witness, or the refusal the transform would emit — second claim and
+    /// column-less claims refuse with the transform's own wording.
+    fn indexRows(alloc: std.mem.Allocator, program: *const ast_find.Program, store_name: []const u8, sites: []const SH.Site, entries: *std.ArrayList(Entry)) void {
+        const ds = StoreIndexDecls.declsOf(alloc, program, store_name);
+        if (ds.len == 0) return;
+        if (ds.len > 1) {
+            entries.append(alloc, .{ .property = .{ .key = "status", .value = .{ .string = std.fmt.allocPrint(alloc, "refused: " ++ StoreIndexDecls.MSG_second_decl, .{ store_name, ds[1].column orelse "?", store_name, ds[0].column orelse "?" }) catch unreachable } } }) catch unreachable;
+            return;
+        }
+        const col = ds[0].column orelse {
+            entries.append(alloc, .{ .property = .{ .key = "status", .value = .{ .string = std.fmt.allocPrint(alloc, "refused: " ++ StoreIndexDecls.MSG_no_column, .{ store_name, store_name }) catch unreachable } } }) catch unreachable;
+            return;
+        };
+        const at = SH.hashesFor(alloc, sites, &.{@intFromPtr(ds[0].flow.inv())}) catch &.{};
+        entries.append(alloc, .{ .property = .{ .key = "index", .value = .{ .string = col }, .at = at } }) catch unreachable;
+    }
+
+    /// One `query[i]` row per query/stripe site in document order — the
+    /// plan the transform's fold decides. Keys are indexed because the
+    /// json renderer emits property keys verbatim and repeated `query`
+    /// keys would collide in one section object.
+    fn queryRows(alloc: std.mem.Allocator, program: *const ast_find.Program, s: *const SX.Store, sites: []const SH.Site, entries: *std.ArrayList(Entry)) void {
+        const is_view = storeViewMembers(alloc, program, s.name) != null;
+        for (s.queries.items, 0..) |*q, qi| {
+            const key = std.fmt.allocPrint(alloc, "query[{d}]", .{qi}) catch unreachable;
+            const at = SH.hashesFor(alloc, sites, &.{q.ptr}) catch &.{};
+            entries.append(alloc, .{ .property = .{ .key = key, .value = .{ .string = planSite(alloc, program, s, q, is_view) }, .at = at } }) catch unreachable;
+        }
+    }
+
+    /// The per-site plan, run through the transform's own decision chain:
+    /// arm resolution, request-block rules, row binding, the `is`-guard
+    /// rewrite, the `SRewrite.refs` lowering, then `StoreIndex.guardRoute`.
+    /// Anywhere the chain would refuse, the row reports that refusal —
+    /// never a guessed plan.
+    fn planSite(alloc: std.mem.Allocator, program: *const ast_find.Program, s: *const SX.Store, q: *const SX.QSite, is_view: bool) []const u8 {
+        if (std.mem.eql(u8, q.door, "stripe")) return "stripe — sweep";
+        const conts = q.conts;
+        const sc_query = findArm(conts, "query");
+        const sc_first = findArm(conts, "first");
+        const none_arm = findArm(conts, "none");
+        if (sc_query != null and sc_first != null) {
+            return std.fmt.allocPrint(alloc, "refused: " ++ MSG_both_arms, .{s.name}) catch unreachable;
+        }
+        const is_first = sc_first != null;
+        if (none_arm != null and !is_first) {
+            return std.fmt.allocPrint(alloc, "refused: " ++ MSG_none_pairs, .{s.name}) catch unreachable;
+        }
+        const sc = sc_query orelse sc_first orelse {
+            return std.fmt.allocPrint(alloc, "refused: " ++ MSG_no_arm, .{s.name}) catch unreachable;
+        };
+        var req_row: ?[]const u8 = null;
+        for (sc.destructure) |df| {
+            if (df.annotations.len == 0) {
+                return std.fmt.allocPrint(alloc, "refused: " ++ MSG_unannotated, .{ s.name, df.name }) catch unreachable;
+            }
+            for (df.annotations) |a| {
+                if (std.mem.eql(u8, a, "row")) {
+                    req_row = df.name;
+                } else if (std.mem.eql(u8, a, "ordinal") or std.mem.eql(u8, a, "id")) {} else {
+                    return std.fmt.allocPrint(alloc, "refused: " ++ MSG_unknown_req, .{ s.name, a, df.name }) catch unreachable;
+                }
+            }
+        }
+        if (sc.destructure.len > 0 and req_row == null) {
+            return std.fmt.allocPrint(alloc, "refused: " ++ MSG_need_row, .{s.name}) catch unreachable;
+        }
+        const row_bind = req_row orelse sc.binding orelse {
+            return std.fmt.allocPrint(alloc, "refused: " ++ MSG_row_binding, .{s.name}) catch unreachable;
+        };
+        if (is_view) return "view — sweep";
+
+        const bind_key = blk: {
+            const k = alloc.dupe(u8, row_bind) catch unreachable;
+            for (k) |*ch| {
+                if (ch.* == '-') ch.* = '_';
+            }
+            break :blk k;
+        };
+        const srf_prefix = std.fmt.allocPrint(alloc, "__koru_srf_{s}_L{d}_", .{ bind_key, sc.location.line }) catch unreachable;
+        const srow_name = std.fmt.allocPrint(alloc, "__koru_sdix_{s}_L{d}", .{ bind_key, sc.location.line }) catch unreachable;
+        const col_names = colNames(alloc, program, s);
+        const used_cols = alloc.alloc(bool, col_names.len) catch unreachable;
+        for (used_cols) |*u| u.* = false;
+        var unknown_field: ?[]const u8 = null;
+
+        var is_refusal: ?[]const u8 = null;
+        const guard_is = if (sc.condition) |c| rewriteIsGuard(alloc, program, "query", s.name, row_bind, c, &is_refusal) else null;
+        if (is_refusal) |m| {
+            return std.fmt.allocPrint(alloc, "refused: {s}", .{m}) catch unreachable;
+        }
+        const guard_z: ?[]const u8 = if (sc.condition) |c|
+            SRewrite.refs(alloc, guard_is orelse c, row_bind, s.name, col_names, srf_prefix, srow_name, .input, used_cols, &unknown_field, is_view)
+        else
+            null;
+        if (unknown_field) |uf| {
+            return std.fmt.allocPrint(alloc, "refused: " ++ MSG_unknown_field, .{ s.name, row_bind, uf, uf, s.name }) catch unreachable;
+        }
+
+        return switch (StoreIndex.guardRoute(alloc, program, s.name, guard_z, srf_prefix)) {
+            .scan => std.fmt.allocPrint(alloc, "{s} {s} — {s}", .{ if (is_first) "! first" else "! query", row_bind, if (is_first) "sweep, stops at first match" else "sweep" }) catch unreachable,
+            .route => |r| std.fmt.allocPrint(alloc, "{s} {s} — index {s} on {s}", .{ if (is_first) "! first" else "! query", row_bind, if (is_first) "lookup" else "membership", r.icol }) catch unreachable,
+            .refuse => |op| std.fmt.allocPrint(alloc, "refused: " ++ StoreIndex.MSG_unlowered_key, .{ s.name, op }) catch unreachable,
+        };
+    }
+};

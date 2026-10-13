@@ -1,0 +1,103 @@
+// Koru Standard Library: the `ixrefs` part of store.kz.
+// Joined via `~part ixrefs` in store.kz; merged into the module at load.
+
+/// `store[index].field` → the SoA column read, for ONE store, in arbitrary text.
+///
+/// The index is itself an expression and may hold another indexed read
+/// (`cells[cells[h].next].v`, one hop along an intrusive chain). The outer match
+/// consumes the whole span, so the inner one is lowered by an explicit recursive
+/// descent over the same scope (690_245).
+fn storeIndexedRefs(alloc: std.mem.Allocator, prog: *const ast_find.Program, text: []const u8, store: []const u8, scope: StoreScope) []const u8 {
+    // Absent name → no `store[...]` read possible; skip the program scan.
+    if (std.mem.indexOf(u8, text, store) == null) return text;
+    const fields = storeFieldOrder(alloc, prog, store) orelse return text;
+    const prefix = scope.prefixFor(store);
+    var out = std.ArrayList(u8).initCapacity(alloc, text.len + 64) catch unreachable;
+    var i: usize = 0;
+    while (i < text.len) {
+        const at_boundary = ast_find.identBoundaryBefore(text, i);
+        if (at_boundary and (i == 0 or text[i - 1] != '.') and i + store.len < text.len and
+            std.mem.startsWith(u8, text[i..], store) and text[i + store.len] == '[')
+        {
+            const idx_start = i + store.len + 1;
+            var depth: usize = 1;
+            var j = idx_start;
+            while (j < text.len and depth > 0) : (j += 1) {
+                if (text[j] == '[') depth += 1;
+                if (text[j] == ']') {
+                    depth -= 1;
+                    if (depth == 0) break;
+                }
+            }
+            if (depth == 0 and j + 1 < text.len and text[j + 1] == '.') {
+                const index = std.mem.trim(u8, text[idx_start..j], " ");
+                const fstart = j + 2;
+                var fend = fstart;
+                while (fend < text.len and storeIdentChar(text[fend])) fend += 1;
+                const fname = text[fstart..fend];
+                var known = false;
+                for (fields) |f| {
+                    if (std.mem.eql(u8, f, fname)) {
+                        known = true;
+                        break;
+                    }
+                }
+                if (known and index.len > 0) {
+                    const inner = storeIndexedRefsIn(alloc, prog, index, scope);
+                    // Pointer-named base (`&`) — see colRead: a by-value base
+                    // copies the whole column before the resolve. C# arrays
+                    // index directly — and the resolve rides inside the
+                    // cell's __koru_read_<field> method so no call sits in
+                    // index position in the emitted text.
+                    const piece = if (storeHostTarget() == .cs)
+                        std.fmt.allocPrint(alloc, "{s}__koru_store_{s}.__koru_read_{s}({s})", .{ prefix, store, codegen_utils_store.HostShape.csFolded(alloc, fname), inner }) catch unreachable
+                    else
+                        std.fmt.allocPrint(alloc, "(&{s}__koru_store_{s}.{s})[{s}__koru_store_{s}.__koru_resolve({s})]", .{ prefix, store, fname, prefix, store, inner }) catch unreachable;
+                    out.appendSlice(alloc, piece) catch unreachable;
+                    i = fend;
+                    continue;
+                }
+            }
+        }
+        out.append(alloc, text[i]) catch unreachable;
+        i += 1;
+    }
+    return out.toOwnedSlice(alloc) catch unreachable;
+}
+
+/// Every store in `scope`, one pass each.
+fn storeIndexedRefsIn(alloc: std.mem.Allocator, prog: *const ast_find.Program, text: []const u8, scope: StoreScope) []const u8 {
+    var t = text;
+    for (scope.names) |nm| t = storeIndexedRefs(alloc, prog, t, nm, scope);
+    return t;
+}
+
+/// The whole program's stores, all reachable from the reader's own namespace.
+/// This is the scope a site-local rewrite (a `stored` value pass) uses.
+fn storeScopeBare(alloc: std.mem.Allocator, prog: *const ast_find.Program) StoreScope {
+    const names = storeAllNames(alloc, prog);
+    const px = alloc.alloc([]const u8, names.len) catch unreachable;
+    for (px) |*p| p.* = "";
+    return .{ .names = names, .prefixes = px };
+}
+fn storeNameIn(xs: []const []const u8, n: []const u8) bool {
+    for (xs) |x| if (std.mem.eql(u8, x, n)) return true;
+    return false;
+}
+
+fn isPrecededByIs(text: []const u8, idx: usize) bool {
+    var p = idx;
+    while (p > 0 and (text[p - 1] == ' ' or text[p - 1] == '\t')) p -= 1;
+    if (p >= 3 and std.mem.eql(u8, text[p - 3 .. p], "not")) {
+        const not_pos = p - 3;
+        if (not_pos == 0 or !storeIdentChar(text[not_pos - 1])) {
+            p = not_pos;
+            while (p > 0 and (text[p - 1] == ' ' or text[p - 1] == '\t')) p -= 1;
+        }
+    }
+    if (p >= 2 and std.mem.eql(u8, text[p - 2 .. p], "is")) {
+        const is_pos = p - 2;
+        if (is_pos == 0 or !storeIdentChar(text[is_pos - 1])) return true;
+    }
+    return false;
+}

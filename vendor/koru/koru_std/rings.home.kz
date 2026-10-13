@@ -1,0 +1,62 @@
+// Ring home resolution — where a ring declaration lives, spelled for
+// synthesized path qualifiers. Joined via `~part home` in rings.kz; merged
+// into the rings module.
+//
+// The generic tree walk (moduleHome) lives in ast_functional — every
+// comptime module needs it and .kz parts cannot share private fns. This
+// file declares the module's ast_functional import; rings.kz's `std`/`ast`
+// are already module-wide.
+const ast_functional = @import("ast_functional");
+
+const RH = struct {
+    // Where `ring_name` was declared, spelled for path qualifiers — the
+    // generated units live in the DECLARING module, which is not
+    // necessarily the chain step's. Both decl spellings count: a live
+    // `std/rings:new` flow and the `__rings_decl_<name>` host_line marker
+    // its lowering leaves. For top-level hits the containing item's own
+    // `.module` is already the entry file's qualifier spelling.
+    fn ringHome(alloc: std.mem.Allocator, prog: *const ast.Program, ring_name: []const u8) ?[]const u8 {
+        const W = struct {
+            fn scan(its: []const ast.Item, want: []const u8, marker: []const u8, enclosing: ?[]const u8) ?[]const u8 {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .flow => |*f| {
+                            if (f.body.node) |*n| {
+                                if (n.* == .invocation) {
+                                    const inv = &n.invocation;
+                                    if (inv.path.segments.len == 1 and std.mem.eql(u8, inv.path.segments[0], "new")) {
+                                        const mq = inv.path.module_qualifier orelse "";
+                                        if ((std.mem.eql(u8, mq, "std.rings") or std.mem.eql(u8, mq, "std/rings")) and std.mem.eql(u8, declEntryName(inv), want)) return enclosing orelse f.module;
+                                    }
+                                }
+                            }
+                        },
+                        .host_line => |*hl| {
+                            if (std.mem.indexOf(u8, hl.content, marker) != null) return enclosing orelse hl.module;
+                        },
+                        .module_decl => |*md| {
+                            if (scan(md.items, want, marker, md.logical_name)) |hit| return hit;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            }
+        };
+        return W.scan(prog.items, ring_name, R.declMarker(alloc, ring_name), null);
+    }
+
+    // The name a declaration invocation carries — first arg, label or
+    // value, `<`-suffixed consume labels stripped.
+    fn declEntryName(inv: *const ast.Invocation) []const u8 {
+        if (inv.args.len == 0) return "";
+        const a0 = inv.args[0];
+        if (R.isLabelled(a0)) {
+            const label = std.mem.trim(u8, a0.name, " \t");
+            if (std.mem.endsWith(u8, label, "<"))
+                return std.mem.trim(u8, label[0 .. label.len - 1], " \t");
+            return label;
+        }
+        return R.stripQuotes(a0.value);
+    }
+};

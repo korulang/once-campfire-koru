@@ -1,0 +1,62 @@
+// Koru Standard Library: the `bulkjoin` part of store.kz.
+// Joined via `~part bulkjoin` in store.kz; merged into the module at load.
+//
+// The per-row emission of a bulk insert: column stores, and — when the
+// store carries `std/indexes:store` — the index join that appends each
+// row's handle to the right key bucket.
+// ------------------------------------------------------------------
+const BulkJoin = struct {
+    const ast = @import("ast");
+    const struct_literal = @import("struct_literal");
+    const codegen_utils = @import("codegen_utils");
+
+    /// Emits the loop body of a bulk fill. Three registers carry the
+    /// join without touching memory where LLVM cannot promote it:
+    ///
+    /// - `__koru_ik` — the join key, taken from the seed expr (the column
+    ///   store reads it, never the reverse: reloading what this row just
+    ///   wrote is a store->load forwarding chain, ~4-5 cycles/row).
+    /// - `__koru_pv` — the previous row's key; the switch test is a
+    ///   register compare, not a column read-back.
+    /// - `__koru_bl`/`_bp`/`_bc` — the live bucket's tail; `items.len`
+    ///   is committed only on a key switch and after the loop. On the
+    ///   growth edge the local length is flushed BEFORE
+    ///   `ensureUnusedCapacity` — the check must see the rows already
+    ///   written through `bp`, or it skips the realloc and the append
+    ///   writes past the array.
+    ///
+    /// `__koru_mk`/`_mp` still cache the just-left bucket for key
+    /// ping-pong; `_fk` clears it when `getOrPut` rehashes.
+    fn row(w: anytype, alloc: std.mem.Allocator, prog: *const ast.Program, store: []const u8, flds: []const struct_literal.StructField, handles: bool, icol: ?[]const u8) void {
+        var ikv: ?[]const u8 = null;
+        if (icol) |ic| for (flds) |f| {
+            if (std.mem.eql(u8, f.name, ic)) ikv = f.value;
+        };
+        if (icol) |ic| {
+            if (ikv) |v| {
+                w.print("        const __koru_ik = {s};\n", .{v}) catch unreachable;
+            } else {
+                w.print("        const __koru_ik = __koru_store_{s}.{s}[__koru_bulk_base + __koru_bulk_j];\n", .{ store, codegen_utils.escapeZigIdentifier(alloc, ic) catch ic }) catch unreachable;
+            }
+        }
+        for (flds) |f| {
+            const col = codegen_utils.escapeZigIdentifier(alloc, f.name) catch f.name;
+            if (StoreRefHome.refTargetOf(alloc, prog, store, f.name) != null) w.print("        __koru_home_{s}_{s}({s});\n", .{ store, f.name, f.value }) catch unreachable;
+            const v = if (icol != null and std.mem.eql(u8, f.name, icol.?)) "__koru_ik" else f.value;
+            w.print("        __koru_store_{s}.{s}[__koru_bulk_base + __koru_bulk_j] = {s};\n", .{ store, col, v }) catch unreachable;
+        }
+        if (icol) |ic| {
+            w.print("        if (__koru_bulk_j == 0 or __koru_pv != __koru_ik) {{\n            const __koru_ol = __koru_im;\n            var __koru_fk = false;\n            if (__koru_ol) |__koru_op| __koru_op.items.len = __koru_bl;\n            if (__koru_mp != null and __koru_mk == __koru_ik) {{\n                __koru_im = __koru_mp;\n            }} else {{\n                const __koru_ig = __koru_store_{s}.__index_{s}.getOrPut(koru_allocator(), __koru_ik) catch @panic(\"std/indexes: index insert ran out of memory\");\n                __koru_fk = !__koru_ig.found_existing;\n                if (__koru_fk) __koru_ig.value_ptr.* = .{{}};\n                __koru_im = __koru_ig.value_ptr;\n            }}\n            if (__koru_fk) __koru_mp = null else if (__koru_ol != null) {{ __koru_mk = __koru_pv; __koru_mp = __koru_ol; }}\n            __koru_bl = __koru_im.?.items.len;\n            __koru_bp = __koru_im.?.items.ptr;\n            __koru_bc = __koru_im.?.capacity;\n        }}\n        __koru_pv = __koru_ik;\n        if (__koru_bl == __koru_bc) {{\n            __koru_im.?.items.len = __koru_bl;\n            __koru_im.?.ensureUnusedCapacity(koru_allocator(), 1) catch @panic(\"std/indexes: index insert ran out of memory\");\n            __koru_bp = __koru_im.?.items.ptr;\n            __koru_bc = __koru_im.?.capacity;\n        }}\n", .{ store, ic }) catch unreachable;
+            // `handle_of` re-derives the slot via `row_hslot[dense]` — the
+            // value THIS loop just stored — plus reloads of `gen0`/`ident`
+            // through the store pointer on every row. `__koru_bulk_slot`
+            // already holds the answer; `__koru_g0` is hoisted pre-loop so
+            // LLVM can unswitch the gen0 branch.
+            if (handles) {
+                w.print("        __koru_bp[__koru_bl] = if (__koru_g0) @as(i64, @intCast((__koru_bulk_base + __koru_bulk_j) | (@as(usize, __KoruStoreT_{s}.__koru_brand) << 24))) else (@as(i64, @intCast(__koru_bulk_slot | (@as(usize, __KoruStoreT_{s}.__koru_brand) << 24))) | (@as(i64, @intCast(__koru_store_{s}.__koru_hslot_gen[__koru_bulk_slot])) << 32));\n        __koru_bl += 1;\n", .{ store, store, store }) catch unreachable;
+            } else {
+                w.print("        __koru_bp[__koru_bl] = __koru_store_{s}.__koru_handle_of(__koru_bulk_base + __koru_bulk_j);\n        __koru_bl += 1;\n", .{store}) catch unreachable;
+            }
+        }
+    }
+};

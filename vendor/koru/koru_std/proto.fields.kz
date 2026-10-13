@@ -1,0 +1,58 @@
+// Koru Standard Library: the `fields` part of proto.kz.
+// Joined via `~part fields` in proto.kz; merged into the koru_proto module.
+//
+// The proto entry grammar, applied once per block wherever author field text
+// is re-parsed: a field line is ONE `name: type` entry, and one block binds
+// each name once. The `default` door (proto.kz) and the `<:` parent re-parse
+// (proto.resolve.kz) consume the same verdict — each caller owns only the
+// refusal's wrapper, a SiteResult at the door and a message string inside
+// the walk. Hand-rolled per the block-grammar ruling, but the rule is one
+// rule: fusedFieldLine names the second field's fragment and a seen-set
+// counts each name once.
+
+const ProtoFieldEntry = struct {
+    fname: []const u8,
+    ftype: []const u8,
+};
+
+const FieldBlock = union(enum) {
+    entries: []const ProtoFieldEntry,
+    fault: []const u8,
+};
+
+// Walk one block's field text and return its entries or the refusal's
+// reason. `comma_separates` selects the erased-marker convention — the
+// `// proto Name: f: t, g: u` marker joins fields on ", " — versus live
+// source, where a comma refuses: a wart, never a separator.
+fn protoFieldBlock(alloc: std.mem.Allocator, text: []const u8, comma_separates: bool) FieldBlock {
+    var entries = std.ArrayList(ProtoFieldEntry).initCapacity(alloc, 8) catch unreachable;
+    var seen = std.ArrayList([]const u8).initCapacity(alloc, 8) catch unreachable;
+    var lines = if (comma_separates)
+        std.mem.tokenizeAny(u8, text, "\n,")
+    else
+        std.mem.tokenizeAny(u8, text, "\n");
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, line, ',') != null) return .{ .fault = std.fmt.allocPrint(alloc, "field line '{s}' carries a ',' — fields separate on lines; a comma is a wart, not a separator", .{line}) catch unreachable };
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse
+            return .{ .fault = std.fmt.allocPrint(alloc, "field line '{s}' has no ':' — each field must be `name: type`", .{line}) catch unreachable };
+        const fname = std.mem.trim(u8, line[0..colon], " \t");
+        const ftype = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (fname.len == 0 or ftype.len == 0)
+            return .{ .fault = std.fmt.allocPrint(alloc, "field line '{s}' is missing a name or a type", .{line}) catch unreachable };
+        // A second `name:` after the type is a fused field — the tail is its
+        // own fragment and must be named, not misread as part of this type.
+        if (@import("struct_literal").fusedFieldLine(ftype)) |fused|
+            return .{ .fault = std.fmt.allocPrint(alloc, "'{s}' began a new field on the same line — proto fields are one `name: type` per line", .{fused}) catch unreachable };
+        // One block binds a name once — the merge's dedup is for a local
+        // field meeting an INHERITED one, not a repeat inside one block.
+        for (seen.items) |s| {
+            if (std.mem.eql(u8, s, fname))
+                return .{ .fault = std.fmt.allocPrint(alloc, "field '{s}' is bound twice — a proto entry takes each field name once", .{fname}) catch unreachable };
+        }
+        seen.append(alloc, fname) catch unreachable;
+        entries.append(alloc, .{ .fname = fname, .ftype = ftype }) catch unreachable;
+    }
+    return .{ .entries = entries.toOwnedSlice(alloc) catch unreachable };
+}

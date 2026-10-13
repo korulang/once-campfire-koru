@@ -1,0 +1,36 @@
+// Koru Standard Library: the `messages` part of pump — joined via
+// `~part messages` in pump.kz; members land in koru_pump.
+//
+// Every refusal text the three pump transforms can raise, named once.
+// The transforms pass these to `ast.refusal` (they carry the KORU161
+// format args); the explainer formats the SAME consts for its `status`
+// rows — so what `koruc explain` reports for a refusing program is the
+// diagnostic verbatim, and the two can never drift on wording.
+const PM = struct {
+    const create_needs_name = "std/pump:create needs a name - `std/pump:create(main)`";
+    const create_dup = "std/pump:create({s}): a pump named '{s}' already exists - one declaration, then joins";
+    const create_effect_arm = "std/pump:create({s}): `! {s}` doesn't parse on a declaration - verbs join via `std/pump({s}) ! step |> ...`, and `! idle` arms `std/pump:run`";
+    const create_unknown_arm = "std/pump:create({s}): unknown arm `| {s}` - the pump declaration's lifecycle is `| drained`, fired when every participant has retired";
+    const create_drained_once = "std/pump:create({s}): one `| drained` per pump - run fires it once";
+    const create_drained_needs_body = "std/pump:create({s}): `| drained` needs a body (`| drained |> ...`)";
+
+    const join_needs_name = "std/pump(name) is the join form - it needs the pump's name: `std/pump(main) ! step |> ...`";
+    const join_no_pump = "std/pump({s}): no pump named '{s}' - `std/pump:create({s})` declares it, and the declaration precedes its joins";
+    const join_after_run = "std/pump({s}): this join follows `std/pump:run({s})` - a join after the drive is never stepped; joins precede run in document order";
+    const join_terminal_arm = "std/pump({s}): `| {s}` doesn't parse on a join - a participant carries `! step`/`! live`/`! wait` verbs; the pump's own lifecycle (`| drained`) lives on `std/pump:create`";
+    const join_one_step = "std/pump({s}): one `! step` per join - a participant advances once per pass";
+    const join_one_live = "std/pump({s}): one `! live` per join";
+    const join_one_wait = "std/pump({s}): one `! wait` per join";
+    const join_unknown_verb = "std/pump({s}): unknown verb `! {s}` - a join carries `! step`, `! live`, `! wait` and nothing else";
+    const join_needs_step = "std/pump({s}): a join needs `! step |> <call>` - the verb that advances this participant once per pass (it answers `-> i32`: how many instances progressed)";
+    const join_wait_needs_live = "std/pump({s}): `! wait` needs `! live` beside it - interests are indexed `0..live()`, and without a live count the pump cannot enumerate them (an immortal participant's single interest is a later slice)";
+    const join_step_binds_nothing = "std/pump({s}): `! step` binds nothing - it advances the WHOLE participant; per-instance state is the callee's business (a store's `! step s` binds its row inside)";
+    const join_verb_needs_tor = "std/pump({s}): `! {s}`'s body must end in a call to a declared tor - the pump composes compile-time-known verbs";
+    const join_verb_no_return = "std/pump({s}): `! {s}`'s callee returns nothing - the contract is `-> {s}`";
+    const join_verb_wrong_return = "std/pump({s}): `! {s}`'s callee returns `{s}` - the contract is `-> {s}`";
+    const join_wait_no_interest = "std/pump({s}): `! wait`'s callee returns `{s}` - the interest contract is `-> i32` (a descriptor to poll), `-> i128` (a re-poll duration in ns), or `-> {{ fd: i32, wait_ns: i128 }}` (both)";
+    const join_wait_binds_index = "std/pump({s}): `! wait` binds the interest index - spell it `! wait i |> <call>(i)`; instance i's interest is `-> i32` (fd), `-> i128` (re-poll ns), or `{{ fd, wait_ns }}`";
+
+    // `run`'s refusals live in the `run-msgs` part (PMRun) — this file's
+    // pin went over when the retire contract landed.
+};

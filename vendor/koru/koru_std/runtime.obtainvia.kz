@@ -1,0 +1,62 @@
+// Koru Standard Library: the `obtainvia` part of runtime — the wire
+// grammar's obtain-via lines. Joined via `~part obtainvia` in runtime.kz;
+// merged into the runtime module at load.
+
+// Obtain-via lines: every obligation the scope can mint, rendered as WHO
+// mints it (verb + the arm word the model binds it through) and WHO spends
+// it (verb + arg). Derived from the same creates/discharges edges the
+// dispatcher enforces — the prompt's teaching and the refusal's law are one
+// table, so a scope whose register block changes cannot drift its grammar
+// away from its wall.
+fn wireObligationLines(allocator: std.mem.Allocator, m: *const ScopeManifest) []const u8 {
+    var out = std.ArrayList(u8).initCapacity(allocator, 256) catch unreachable;
+    var seen = std.ArrayList([]const u8).initCapacity(allocator, 8) catch unreachable;
+    for (m.events) |*ev| {
+        for (ev.creates) |c| {
+            var dup = false;
+            for (seen.items) |s| {
+                if (std.mem.eql(u8, s, c.obligation)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            seen.append(allocator, c.obligation) catch unreachable;
+
+            out.appendSlice(allocator, "- `<") catch unreachable;
+            out.appendSlice(allocator, c.obligation) catch unreachable;
+            out.appendSlice(allocator, ">` — minted by ") catch unreachable;
+            var first = true;
+            for (m.events) |*e2| {
+                for (e2.creates) |cc| {
+                    if (!std.mem.eql(u8, cc.obligation, c.obligation)) continue;
+                    if (!first) out.appendSlice(allocator, ", ") catch unreachable;
+                    first = false;
+                    out.appendSlice(allocator, e2.name) catch unreachable;
+                    out.appendSlice(allocator, "(...) | ") catch unreachable;
+                    out.appendSlice(allocator, cc.branch orelse "ok") catch unreachable;
+                }
+            }
+            first = true;
+            var wrote_spend = false;
+            for (m.events) |*e2| {
+                for (e2.discharges) |d| {
+                    if (!std.mem.eql(u8, d.obligation, c.obligation)) continue;
+                    if (!wrote_spend) {
+                        out.appendSlice(allocator, "; spent by ") catch unreachable;
+                        wrote_spend = true;
+                    }
+                    if (!first) out.appendSlice(allocator, ", ") catch unreachable;
+                    first = false;
+                    out.appendSlice(allocator, e2.name) catch unreachable;
+                    out.append(allocator, '(') catch unreachable;
+                    out.appendSlice(allocator, d.arg) catch unreachable;
+                    out.appendSlice(allocator, ":)") catch unreachable;
+                }
+            }
+            if (!wrote_spend) out.appendSlice(allocator, "; no verb spends it") catch unreachable;
+            out.append(allocator, '\n') catch unreachable;
+        }
+    }
+    return out.toOwnedSlice(allocator) catch unreachable;
+}

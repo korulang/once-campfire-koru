@@ -1,0 +1,174 @@
+// Koru Standard Library: the `explain` part of refine — joined via
+// `~part explain` in refine.kz; members land in koru_refine.
+//
+// The `[explainer]` is the transform's mirror: it folds every
+// `std/refine` block through the SAME machinery the transform uses —
+// invWant for the addressed (home, name), parseInto for each
+// contributor block, walkRefine for the fold, walkProto for the
+// anchor, terminalScalar for base resolution. The report is what the
+// meet decided, re-derived live, never a parallel re-implementation:
+// drift between what explain says and what the facet_decl carries is
+// impossible because both read one fold.
+//
+// `explain` runs INSTEAD of the pipeline, on the pre-transform tree —
+// so this explainer also answers for programs that would REFUSE: an
+// orphaned anchor, a missing field, a base mismatch, a non-integer
+// bound, an empty meet all surface as `status = "refused: …"` instead
+// of a KORU205 the user then has to decode.
+
+
+// The canonical facet spelling — same shape the driver's marker and
+// facet_decl carry: `name: base & >N & <=N & clamp(lo,hi)`; `spellTerms`
+// drops the `name: ` prefix for the catalog (`port.meet = "Port & >1024"`).
+fn spellField(alloc: std.mem.Allocator, f: *const Field) []const u8 {
+    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ f.name, spellTerms(alloc, f) }) catch unreachable;
+}
+
+fn spellTerms(alloc: std.mem.Allocator, f: *const Field) []const u8 {
+    var out = std.ArrayList(u8).initCapacity(alloc, 48) catch unreachable;
+    out.appendSlice(alloc, f.base) catch unreachable;
+    if (f.eq) |e| {
+        out.appendSlice(alloc, " & ") catch unreachable;
+        out.appendSlice(alloc, e.src) catch unreachable;
+    } else {
+        if (f.lo) |b| {
+            out.appendSlice(alloc, " & ") catch unreachable;
+            out.appendSlice(alloc, b.src) catch unreachable;
+        }
+        if (f.hi) |b| {
+            out.appendSlice(alloc, " & ") catch unreachable;
+            out.appendSlice(alloc, b.src) catch unreachable;
+        }
+    }
+    if (f.alts) |_| {
+        out.appendSlice(alloc, " & ") catch unreachable;
+        out.appendSlice(alloc, f.alts_src orelse "") catch unreachable;
+    }
+    if (f.clamp) |c| {
+        out.appendSlice(alloc, " & ") catch unreachable;
+        out.appendSlice(alloc, c.src) catch unreachable;
+    }
+    return out.toOwnedSlice(alloc) catch unreachable;
+}
+
+// A field a consumer acts on AT ALL — a term it JUDGES, or a normalizer it
+// applies to the value on the way in. Every catalog count is this test, so
+// the number cannot disagree with the rows printed above it (`facets_enforced
+// = 0` beside a guarded field is the failure this prevents).
+fn carriesTerms(f: *const Field) bool {
+    return af.facets.hasTerms(f) or f.clamp != null;
+}
+
+// The effect the meet declares for one field — what a consumer that
+// enforces the facet will DO at its boundary.
+fn fieldEffect(f: *const Field) []const u8 {
+    const has_bounds = af.facets.hasTerms(f);
+    if (f.clamp != null and has_bounds) return "saturate then refuse";
+    if (f.clamp != null) return "saturate";
+    if (has_bounds) return "refuse";
+    return "declared only";
+}
+
+// Catalog keys are field-scoped: `port.meet`, `port.scalar`, …
+fn fieldKey(alloc: std.mem.Allocator, fname: []const u8, k: []const u8) []const u8 {
+    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ fname, k }) catch unreachable;
+}
+
+// The report status for one met field — null when the field is legal.
+// Mirrors the driver's pass-3/pass-5 checks: existence on the anchor,
+// one base, integer legality on the resolved scalar, non-empty meet.
+fn fieldStatus(alloc: std.mem.Allocator, prog: *const ast.Program, home: []const u8, entry: []const u8, pfields: []const ProtoField, anchor_found: bool, f: *const Field) ?[]const u8 {
+    if (!anchor_found)
+        return std.fmt.allocPrint(alloc, "refused: no declaration named '{s}' in home '{s}' to refine", .{ entry, home }) catch unreachable;
+    var pf: ?ProtoField = null;
+    for (pfields) |p| {
+        if (std.mem.eql(u8, p.name, f.name)) pf = p;
+    }
+    const p = pf orelse
+        return std.fmt.allocPrint(alloc, "refused: names no field '{s}' on the declaration", .{f.name}) catch unreachable;
+    if (!std.mem.eql(u8, p.base, f.base))
+        return std.fmt.allocPrint(alloc, "refused: base '{s}' but the declaration says '{s}' — a meet needs one base", .{ f.base, p.base }) catch unreachable;
+    const has_terms = af.facets.hasTerms(f) or f.clamp != null;
+    if (has_terms) {
+        const scalar = terminalScalar(alloc, prog, home, f.base) orelse f.base;
+        if (!af.isIntScalar(scalar))
+            return std.fmt.allocPrint(alloc, "refused: '{s}' resolves to '{s}' — bounds and clamps refine integer scalars only", .{ f.base, scalar }) catch unreachable;
+    }
+    if (emptyField(f)) |pair|
+        return std.fmt.allocPrint(alloc, "refused: refines to nothing — '{s}' and '{s}' cannot both hold", .{ pair[0], pair[1] }) catch unreachable;
+    return null;
+}
+
+
+// The tor is declared pub in the contract (refine.k) — KORU111. The
+// proc is the implementation, living with the fold it reports on.
+~proc explain-refine|zig {
+    const Entry = ast.ExplainReport.Entry;
+    const Section = ast.ExplainReport.Section;
+
+    var targets = std.ArrayList(Target).initCapacity(allocator, 8) catch unreachable;
+    collectTargets(allocator, program.items, program.main_module_name, &targets);
+
+    if (targets.items.len == 0) {
+        return .{ .title = "std/refine", .sections = &.{
+            .{ .heading = "facets", .entries = &.{
+                .{ .note = "no std/refine blocks — nothing is refined" },
+            } },
+        } };
+    }
+
+    var sections = std.ArrayList(Section).initCapacity(allocator, targets.items.len) catch unreachable;
+    for (targets.items) |t| {
+        // The fold — live contributor blocks through the same walkRefine
+        // the transform runs; nothing is skipped, so every block meets.
+        var meet = std.ArrayList(Field).initCapacity(allocator, 8) catch unreachable;
+        walkRefine(allocator, null, null, program.items, program.main_module_name, t.want, t.scope, &meet, null);
+
+        var pfields = std.ArrayList(ProtoField).initCapacity(allocator, 8) catch unreachable;
+        var anchor_found = false;
+        walkProto(allocator, program.items, program.main_module_name, t.want, &pfields, &anchor_found);
+
+        const heading = if (t.scope) |s|
+            std.fmt.allocPrint(allocator, "{s}:{s}|{s}", .{ t.want.home, t.want.name, s }) catch unreachable
+        else
+            std.fmt.allocPrint(allocator, "{s}:{s}", .{ t.want.home, t.want.name }) catch unreachable;
+        var entries = std.ArrayList(Entry).initCapacity(allocator, meet.items.len * 4) catch unreachable;
+        entries.append(allocator, .{ .property = .{ .key = "contributors", .value = .{ .integer = @intCast(t.contributors) } } }) catch unreachable;
+        if (!anchor_found) {
+            entries.append(allocator, .{ .property = .{ .key = "status", .value = .{ .string = "refused: no std/proto declaration — an orphan refine" } } }) catch unreachable;
+        }
+        for (meet.items) |*f| {
+            // The explainer reports the SAME canonical form the transform
+            // lands: filtering a set against the field's other terms happens
+            // here too, through the one helper, so the catalog cannot spell a
+            // facet the compiler would not have carried.
+            _ = canonAlts(allocator, f);
+            if (fieldStatus(allocator, program, t.want.home, t.want.name, pfields.items, anchor_found, f)) |why| {
+                entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "{s} — {s}", .{ spellField(allocator, f), why }) catch unreachable }) catch unreachable;
+                entries.append(allocator, .{ .property = .{ .key = fieldKey(allocator, f.name, "status"), .value = .{ .string = why } } }) catch unreachable;
+                continue;
+            }
+            const resolved = terminalScalar(allocator, program, t.want.home, f.base);
+            const via = if (resolved) |s|
+                std.fmt.allocPrint(allocator, " → {s}", .{s}) catch unreachable
+            else
+                "";
+            entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "{s}{s} — {s}", .{ spellField(allocator, f), via, fieldEffect(f) }) catch unreachable }) catch unreachable;
+            entries.append(allocator, .{ .property = .{ .key = fieldKey(allocator, f.name, "meet"), .value = .{ .string = spellTerms(allocator, f) } } }) catch unreachable;
+            if (resolved) |s| {
+                entries.append(allocator, .{ .property = .{ .key = fieldKey(allocator, f.name, "scalar"), .value = .{ .string = s } } }) catch unreachable;
+            }
+            entries.append(allocator, .{ .property = .{ .key = fieldKey(allocator, f.name, "effect"), .value = .{ .string = fieldEffect(f) } } }) catch unreachable;
+            if (f.alt_default) |d| {
+                entries.append(allocator, .{ .property = .{ .key = fieldKey(allocator, f.name, "default"), .value = .{ .integer = d } } }) catch unreachable;
+                entries.append(allocator, .{ .note = "the `*` marks the fallback a boundary that SUPPLIES a value would select — push and insert enforce membership, never the default" }) catch unreachable;
+            }
+        }
+        sections.append(allocator, .{ .heading = heading, .entries = entries.toOwnedSlice(allocator) catch &.{} }) catch unreachable;
+    }
+
+    return .{
+        .title = "std/refine",
+        .sections = sections.toOwnedSlice(allocator) catch &.{},
+    };
+}

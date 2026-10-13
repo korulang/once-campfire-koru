@@ -1,0 +1,73 @@
+// std/list — growable list with an active/free ownership model.
+// The i64 trunk (List_i64) stays hand-written exactly as it always was; the
+// container-generating machinery generalizes it: `new(<element>)` is a
+// [transform] that routes by element name (the 660_026 dispatch-gap doctrine:
+// tors lower keyed by NAME only, so every concrete container gets its own
+// suffixed tors). A PRIMITIVE element routes to the hand-written
+// constructor (`new(i64)` -> `new-i64`); a PROTO entry (see std/types.proto,
+// types.kz) routes to a SYNTHESIZED container: the element struct, the
+// `List_<Name>` handle, and the full op set (push/len/get/pop/free) are
+// appended into the caller's module the first time that element is seen.
+// The five op tors are [transform]s too: each rewrites its call site to the
+// suffixed tor by resolving the container binding's element in the
+// enclosing flow (a `std/list:new` invocation whose binding branch carries the
+// handle — the findShapeSource-style walk, same power std/store uses to find
+// watch bodies).
+//
+// Ownership states (phantom on *List_<T> / *List_i64 — identical
+// protocol for every element type):
+//   <list!>  - new issues the obligation: this list must be freed (or drained).
+//   <list>   - borrowed: read/mutate in place (push, len), obligation untouched.
+//   <!list>  - consumed: free discharges the obligation.
+// Sliced scope (reported honestly): synthesized containers land in the CALLER's
+// module (the module of the flow invoking `std/list:new`) — a library declaring
+// a proto from which another module derives is beyond this rung. Ops route by
+// HANDLE, not by flow: the tor resolves the container from the `new` site that
+// bound it in the same flow, or from the enclosing tor's parameter type
+// (`*List_<Name>`) when the handle crosses flows. A handle the program never
+// built falls back to the `-i64` trunk and the shape check judges it there —
+// loud, never silent misrouting.
+
+const std = @import("std");
+const ast_find = @import("ast");
+// The shared std/refine enforcement surface (src/ast_functional.zig).
+const facets = @import("ast_functional").facets;
+
+pub const List_i64 = struct {
+    items: std.ArrayList(i64),
+    allocator: std.mem.Allocator,
+
+    // Package-private — only free/auto-discharge calls this.
+    fn deinit(self: *List_i64) void {
+        self.items.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+};
+
+// ============================================
+// Construction
+// ============================================
+// Generic constructor. `new(i64)` reads the element-type expression at comptime
+// and rewrites its call site to the concrete `new-<type>` runtime constructor
+// (e.g. `new-i64`). This is generic-by-name: when `new-f64` exists, `new(f64)`
+// routes to it automatically. A type expression is inherently comptime, so this
+// must be a [transform] — a plain tor taking the type as an Expression would make
+// the whole flow comptime. The branches (`| list` / `| err`) carry over to
+// the concrete constructor unchanged.
+// A PROTO element routes to SYNTHESIS, not a hand-written constructor: the
+// element's fields are read from the `std/types.proto(<Name>)` declaration
+// flow's body source (the `source:` argument), and the container the entry
+// promises to derive is appended into this flow's module exactly once per
+// element name. The dedupe marker is the REWRITTEN FIRST SITE: a later site
+// counting a `new-<Name>` invocation already present skips synthesis and
+// rewrites to the first site's announced tor — no heap state.
+~part new
+~part push
+~part len
+~part get
+~part pop
+~part protos
+~part synth
+~part fieldkit
+~part free
+~part explain

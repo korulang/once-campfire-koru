@@ -1,0 +1,2872 @@
+// Orisha — the implementation.
+//
+// Zig lives here: the socket calls, the request parser, the router transform,
+// the static-asset embedder. Every Koru declaration this module exposes is in
+// the companion `index.k` beside this file, which is why that one has no `~`
+// in it and this one does — the character is a parser switch, and there is a
+// host language here to switch out of.
+//
+// The two files share a stem and are ONE module. A `~pub tor` may not be
+// declared here while that companion exists (KORU111): the public surface is
+// the contract's job.
+
+~std/compiler:requires {
+    exe.linkSystemLibrary("z");
+    exe.linkLibC();
+}
+
+// Runtime gzip on handler-built bodies calls the same zlib the compile-time
+// static-route bake uses — the app binary needs the link too.
+~std/build:requires {
+    exe.linkSystemLibrary("z");
+    exe.linkLibC();
+}
+
+const std = @import("std");
+const ast = @import("ast");
+const Program = ast.Program;
+const posix = std.posix;
+const libc = std.c;
+// The ONE clock symbol Orisha needs, declared rather than @cImport-ed.
+//
+// `@cImport(@cInclude("time.h"))` needs libc HEADERS at compile time, and a
+// freestanding target has none — it was one of the two things stopping Orisha
+// from linking into a unikernel at all (`error: 'time.h' file not found`). An
+// `extern fn` needs no header: it resolves at link time against whatever libc
+// the image actually has, which on Unikraft is nolibc, in the same address
+// space. Same trick koru/examples/unikraft-net uses for socket/bind/listen.
+//
+// `gmtime_r` and `strftime` are gone with it — see formatHttpDate, which now
+// does the calendar arithmetic itself. Fewer symbols to find on a platform
+// that may not have them, and the HTTP date format is fixed by RFC 9110
+// anyway, so there was never anything for strftime to decide.
+extern fn time(t: ?*i64) i64;
+
+// ============================================================================
+// PUBLIC TYPES
+// ============================================================================
+
+pub const Request = struct {
+    method: []const u8,
+    path: []const u8,
+    query: ?[]const u8 = null,
+    body: ?[]const u8,
+    accept_encoding: ?[]const u8 = null,
+    if_none_match: ?[]const u8 = null,
+    // The raw header block — request line through the blank line — borrowed
+    // from the request bytes. `header`/`cookie` consult `head`'s captured
+    // pairs first and walk this block only for overflow or unparsed input.
+    headers: ?[]const u8 = null,
+    // The pump's one-pass parse of the same block; borrows the dispatch
+    // frame, so like `headers` it dies with the request. null on transports
+    // that never ran `scanRequest` (the wasm host builds Request itself).
+    head: ?*const koru_pump.Head = null,
+    // The descriptor the request arrived on — the same integer `pump:fileno`
+    // reports and `ws-send-fd` addresses. 0 on transports with no descriptor
+    // (the wasm host builds its Request itself and passes none).
+    fd: usize = 0,
+
+    // For param extraction by router
+    allocator: std.mem.Allocator,
+};
+
+pub const ServerHandle = struct {
+    inner: std.net.Server,
+    allocator: std.mem.Allocator,
+};
+
+pub const ConnHandle = struct {
+    stream: std.net.Stream,
+    allocator: std.mem.Allocator,
+};
+
+// ============================================================================
+// LISTEN — open the socket
+// ============================================================================
+
+~proc listen|zig {
+    const allocator = std.heap.c_allocator;
+
+    const address = std.net.Address.parseIp("0.0.0.0", port) catch {
+        return .{ .failed = "Invalid address" };
+    };
+
+    const server = address.listen(.{
+        .reuse_address = true,
+        .kernel_backlog = 128,
+    }) catch {
+        return .{ .failed = "Failed to listen" };
+    };
+
+    const handle = allocator.create(ServerHandle) catch {
+        return .{ .failed = "Failed to allocate server handle" };
+    };
+    handle.* = .{ .inner = server, .allocator = allocator };
+
+    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    return .{ .listening = handle };
+}
+~proc accept|zig {
+    const allocator = server.allocator;
+
+    // Accept connection
+    const conn = server.inner.accept() catch {
+        return .{ .failed = .{ .msg = "Accept failed", .server = server } };
+    };
+
+    // Read HTTP request
+    var buffer: [4096]u8 = undefined;
+    const bytes_read = conn.stream.read(&buffer) catch {
+        conn.stream.close();
+        return .{ .failed = .{ .msg = "Read failed", .server = server } };
+    };
+
+    if (bytes_read == 0) {
+        conn.stream.close();
+        return .{ .failed = .{ .msg = "Empty request", .server = server } };
+    }
+
+    // Parse HTTP request line: "GET /path HTTP/1.1"
+    const request_data = buffer[0..bytes_read];
+    var method: []const u8 = "GET";
+    var path: []const u8 = "/";
+
+    if (std.mem.indexOf(u8, request_data, " ")) |method_end| {
+        method = request_data[0..method_end];
+        const after_method = request_data[method_end + 1..];
+        if (std.mem.indexOf(u8, after_method, " ")) |path_end| {
+            // Same seam as `answer` below — a query string and percent-encoding
+            // both belong to the request target, not to the resource name.
+            path = requestPathKey(allocator, after_method[0..path_end]);
+        }
+    }
+
+    // Parse body from request data
+    var body: ?[]const u8 = null;
+    if (std.mem.indexOf(u8, request_data, "\r\n\r\n")) |header_end| {
+        const body_start = header_end + 4;
+        if (body_start < request_data.len) {
+            body = request_data[body_start..];
+        }
+    }
+
+    // Allocate request
+    const req = allocator.create(Request) catch {
+        conn.stream.close();
+        return .{ .failed = .{ .msg = "Failed to allocate request", .server = server } };
+    };
+    const duped_body: ?[]const u8 = if (body) |b| allocator.dupe(u8, b) catch b else null;
+    // `buffer` is this frame's stack — the block has to be duped for the same
+    // reason the body is, or `req.headers` would read a dead frame. A dupe
+    // that fails leaves null rather than a slice of the stack.
+    const headers_block: ?[]const u8 = if (std.mem.indexOf(u8, request_data, "\r\n\r\n")) |he|
+        allocator.dupe(u8, request_data[0 .. he + 4]) catch null
+    else
+        null;
+    req.* = .{
+        .method = allocator.dupe(u8, method) catch method,
+        .path = allocator.dupe(u8, path) catch path,
+        .body = duped_body,
+        .if_none_match = null,
+        .headers = headers_block,
+        .allocator = allocator,
+    };
+
+    // Allocate connection handle
+    const conn_handle = allocator.create(ConnHandle) catch {
+        conn.stream.close();
+        return .{ .failed = .{ .msg = "Failed to allocate connection", .server = server } };
+    };
+    conn_handle.* = .{ .stream = conn.stream, .allocator = allocator };
+
+    return .{ .request = .{ .req = req, .conn = conn_handle, .server = server } };
+}
+
+~proc send|zig {
+    const allocator = conn.allocator;
+    const ct = if (content_type) |ct_str| ct_str else "text/plain";
+
+    // Build HTTP response
+    var response_buf: std.ArrayList(u8) = .empty;
+    defer response_buf.deinit(allocator);
+
+    var len_buf: [20]u8 = undefined;
+    const len_str = std.fmt.bufPrint(&len_buf, "{}", .{body.len}) catch "0";
+    var date_buf: [29]u8 = undefined;
+    formatHttpDate(&date_buf);
+    if (headerPrefixClose(status)) |prefix| {
+        response_buf.appendSlice(allocator, prefix) catch {};
+        response_buf.appendSlice(allocator, len_str) catch {};
+        response_buf.appendSlice(allocator, "\r\nContent-Type: ") catch {};
+        response_buf.appendSlice(allocator, ct) catch {};
+        response_buf.appendSlice(allocator, "\r\nDate: ") catch {};
+        response_buf.appendSlice(allocator, &date_buf) catch {};
+        response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
+    } else {
+        response_buf.appendSlice(allocator, "HTTP/1.1 ") catch {};
+        var status_buf: [3]u8 = undefined;
+        _ = std.fmt.bufPrint(&status_buf, "{}", .{status}) catch {};
+        response_buf.appendSlice(allocator, &status_buf) catch {};
+        response_buf.appendSlice(allocator, " ") catch {};
+        response_buf.appendSlice(allocator, statusText(status)) catch {};
+        response_buf.appendSlice(allocator, "\r\n") catch {};
+        response_buf.appendSlice(allocator, "Content-Type: ") catch {};
+        response_buf.appendSlice(allocator, ct) catch {};
+        response_buf.appendSlice(allocator, "\r\n") catch {};
+        response_buf.appendSlice(allocator, "Content-Length: ") catch {};
+        response_buf.appendSlice(allocator, len_str) catch {};
+        response_buf.appendSlice(allocator, "\r\nDate: ") catch {};
+        response_buf.appendSlice(allocator, &date_buf) catch {};
+        response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
+    }
+
+    // Body
+    response_buf.appendSlice(allocator, body) catch {};
+
+    // Send
+    _ = conn.stream.writeAll(response_buf.items) catch {
+        conn.stream.close();
+        return .{ .failed = "Write failed" };
+    };
+
+    conn.stream.close();
+    return .{ .sent = {} };
+}
+
+
+// The response's content type. `?string` in a RETURN RECORD does not lower to
+// Zig yet (params lower via emitter_helpers.zig:907 / regression 400_181; the
+// bare-return record path writeBareReturnType only lowers exact `string`), so
+// the optional field names this module-local alias instead — the same
+// mechanism `*Request` uses.
+pub const ContentType = []const u8;
+
+// The response shape every handler/tor produces. A NAMED type so a user tor
+// chained from a router branch (`-> my-handler(req)`) returns the SAME Zig type
+// as the abstract handler — anonymous struct outputs are nominally distinct in
+// Zig and a `return` would fail to unify despite identical fields.
+pub const Response = struct {
+    status: u16,
+    body: []const u8,
+    content_type: ?ContentType,
+    content_encoding: ?ContentType = null,
+    // Handler-supplied headers as ONE preformatted block — "Name: value"
+    // lines, each CRLF-terminated, spliced into the head ahead of
+    // `Connection:`. This is how a 302 carries a Location and a login a
+    // Set-Cookie. The shape is a blob rather than a []Header list because the
+    // handler already holds the bytes (fmt:ln, a literal) — a list would make
+    // every response pay a walk it does not otherwise need. Well-formedness
+    // is checked in `answer`: a block that cannot splice cleanly is a handler
+    // bug and answers 500, never a truncated head.
+    extra_headers: ?ContentType = null,
+    // fmt.blk HTML is `allocPrint`; JSON `fmt:ln` is a TLS buffer; static
+    // routes are comptime slices. Only the first must be freed after send.
+    // Default false so existing `{ status, body, content_type }` produces stay
+    // honest — they do not own the bytes.
+    body_allocated: bool = false,
+    // Voucher: `body` is immortal memory — a comptime/rodata slice that
+    // outlives any in-flight send. Only set it for bytes that exist for the
+    // process's whole life: an io_uring send can still be reading them when
+    // the next pipelined request runs, which is exactly when arena and
+    // threadlocal buffers are already dead.
+    body_static: bool = false,
+    // `close: true` answers then drops the connection — the handler's half of
+    // `pump:hang-up`, which a Response can carry because the handler never
+    // sees the Exchange. On a 101 it means "frame the body, send a close
+    // frame, hang up" — Action Cable's reject-unauthorized reads exactly so.
+    close: bool = false,
+    // Voucher: `body` is a complete HTTP/1.x message — status line, headers,
+    // body — rendered by the handler (or by the compiler for a request-free
+    // route). Set, `answer` ships it verbatim as the head with no render
+    // pass: no Content-Type/Length/Powered-By additions, no "is this wire"
+    // probe per request. `wire_date_hole` is the byte offset the Date line
+    // splices at — known by whoever rendered the message, so it does not get
+    // searched for either. 0 means "head is already complete": a message
+    // that rendered its own Date at the splice point.
+    wire: bool = false,
+    wire_date_hole: usize = 0,
+    // Opt-in to the generation-keyed page cache: a GET 200 marked cacheable
+    // is stored once rendered (post-gzip, keyed on method + target + cookie +
+    // host + negotiated encoding) and later hits skip dispatch entirely. The
+    // handler's voucher is "this response depends only on those inputs and
+    // the current data generation" — writes the page must reflect are the
+    // app's signal to `generation-bump`, never the cache's guess.
+    cacheable: bool = false,
+};
+
+// The header is built into a buffer that outlives the frame, because `answer`
+// returns a SLICE of it and a slice of a dead frame is a bug this file has
+// shipped before.
+//
+// `threadlocal` is what makes that safe once a pump runs more than one loop.
+// A worker pool has several exchanges in flight at once, and a single shared
+// buffer would have two threads writing headers over each other — which does
+// not crash, it ships one response wearing another's Content-Length. That is
+// the same "sometimes it works" shape as every other bug in this file's
+// history, and the only reason a plain `var` was ever sound here is that the
+// pump had exactly one thread from the day the workers were removed.
+//
+// Freestanding gets one too. The unikernel never spawns a thread, so it has
+// exactly one of these. 1024 bytes — the managed head is ~250, the rest is
+// headroom for caller `extra_headers`.
+threadlocal var header_buf: [1024]u8 = undefined;
+
+// The wide twin, for responses that carry `extra_headers`. A 512-byte cap is
+// honest for the fixed head — it fits the longest canned status line plus
+// Date, Content-Type and Content-Length with room to spare — but it is not a
+// ceiling a handler's headers can live under, so the extras path gets its own
+// 4K instead of growing the fast one. The alternative ownership story (heap
+// per response) has no free site: `reply` writes `head` and drops it, with no
+// flag to say who owns it — and adding one would make every response pay for
+// the rare case. A block that does not fit 4K answers 500 rather than going
+// out truncated; a truncated head is a response split, not a shorter reply.
+threadlocal var header_buf_wide: [4096]u8 = undefined;
+
+// ============================================================================
+// THE ALLOCATOR SEAM
+// ============================================================================
+// `Request.allocator` used to be `std.heap.page_allocator` outright. That is an
+// OPERATING SYSTEM allocator: it reaches `std.posix` for mmap, and on
+// x86_64-freestanding `std.posix` has no `MAP` and no `MREMAP` to reach for.
+// It was the second of the two things that stopped Orisha linking into a
+// unikernel — and, unlike the libc time header, it is not a missing symbol but
+// a missing MACHINE. There is no kernel to ask for pages.
+//
+// So the allocator becomes a seam, the same way the readiness loop did. A
+// hosted build keeps the page allocator. A freestanding build gets a fixed
+// arena carved out of the image itself, reset at the top of every exchange —
+// which is sound for exactly the reason the header buffer above is sound: a
+// pump delivers one exchange at a time. Nothing above this line changes, and
+// `answer` still never names a platform.
+const koru_builtin = @import("builtin");
+const orisha_freestanding = koru_builtin.target.os.tag == .freestanding;
+
+// The arena is threadlocal for the same reason the header buffers are: the
+// pump runs one worker per thread, and a shared arena lets one worker's
+// reset() drop live allocations another worker's handler is still reading.
+// The FBA state is threadlocal too — `allocator()` returns a pointer into
+// it, so it cannot be a stack local in requestAllocator.
+threadlocal var request_arena_buf: [64 * 1024]u8 = undefined;
+threadlocal var request_arena_state: std.heap.FixedBufferAllocator = undefined;
+threadlocal var request_arena_started: bool = false;
+
+fn requestAllocator() std.mem.Allocator {
+    if (!request_arena_started) {
+        request_arena_state = std.heap.FixedBufferAllocator.init(&request_arena_buf);
+        request_arena_started = true;
+    } else request_arena_state.reset();
+    return request_arena_state.allocator();
+}
+
+// The request target is not the lookup key, and the difference is invisible
+// until a real site is behind it.
+//
+// A browser sends what the LINK says. `/blog?utm_source=x` and `/blog` want the
+// same page, and a filename with a space in it arrives percent-encoded — the
+// route table holds the decoded name, because that is what the file is called.
+// Matching the target verbatim, as this did until 2026-08-10, misses both, and
+// the miss is silent: the SPA fallback answers 200 with the shell, so the
+// browser renders something and only the missing image tells you.
+//
+// Measured against korulang.org: two screenshots referenced from studio.html and
+// a blog post never arrived, and every link carrying a query string — including
+// the site's own `?status=` lesson filter — landed on the fallback.
+fn requestPathKey(allocator: std.mem.Allocator, target: []const u8) []const u8 {
+    // A query string addresses the same resource.
+    return pathKeyDecoded(allocator, if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target);
+}
+
+// The path part with the query already split off — `answer` has the '?'
+// index in hand from the query extraction, so it skips a second scan.
+fn pathKeyDecoded(allocator: std.mem.Allocator, without_query: []const u8) []const u8 {
+    // Common case allocates nothing.
+    if (std.mem.indexOfScalar(u8, without_query, '%') == null) return without_query;
+
+    var out = allocator.alloc(u8, without_query.len) catch return without_query;
+    var w: usize = 0;
+    var r: usize = 0;
+    while (r < without_query.len) {
+        if (without_query[r] == '%' and r + 2 < without_query.len) {
+            const hi = std.fmt.charToDigit(without_query[r + 1], 16) catch {
+                out[w] = without_query[r];
+                w += 1;
+                r += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(without_query[r + 2], 16) catch {
+                out[w] = without_query[r];
+                w += 1;
+                r += 1;
+                continue;
+            };
+            out[w] = hi * 16 + lo;
+            w += 1;
+            r += 3;
+        } else {
+            out[w] = without_query[r];
+            w += 1;
+            r += 1;
+        }
+    }
+    return out[0..w];
+}
+
+// First match wins, over the pairs the pump captured — a miss is definitive
+// when every header fit (`unstored_tail == 0`) and resumes as a line walk
+// over the overflow tail when it didn't. `head == null` — a Request built by
+// hand or a dispatch path with no scan — reads the block the way it always
+// did. `base` is whichever buffer the caller parsed: `x.raw` on the way in,
+// `req.headers` on the lazy path; the pair offsets index both identically.
+fn headValueParsed(head: ?*const koru_pump.Head, base: []const u8, name: []const u8) ?[]const u8 {
+    const h = head orelse return headerValue(base, name);
+    if (h.head_len == 0 or h.head_len > base.len) return headerValue(base, name);
+    for (h.pairs[0..h.pair_count]) |p| {
+        if (std.ascii.eqlIgnoreCase(base[p.name_off..][0..p.name_len], name)) {
+            return base[p.value_off..][0..p.value_len];
+        }
+    }
+    if (h.unstored_tail == 0) return null;
+    var scan: usize = h.unstored_tail;
+    while (scan < h.head_len) {
+        const nl = std.mem.indexOfPos(u8, base, scan, "\r\n") orelse break;
+        const line = base[scan..nl];
+        scan = nl + 2;
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+fn headerValue(raw: []const u8, name: []const u8) ?[]const u8 {
+    const first_line = std.mem.indexOf(u8, raw, "\r\n") orelse return null;
+    var scan: usize = first_line + 2;
+    while (scan < raw.len) {
+        const nl = std.mem.indexOfPos(u8, raw, scan, "\r\n") orelse break;
+        const line = raw[scan..nl];
+        scan = nl + 2;
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+fn transferEncodingChunkedHead(head: []const u8) bool {
+    const value = headerValue(head, "transfer-encoding") orelse return false;
+    var lower_buf: [128]u8 = undefined;
+    if (value.len > lower_buf.len) return false;
+    const lower = std.ascii.lowerString(&lower_buf, value);
+    return std.mem.indexOf(u8, lower, "chunked") != null;
+}
+
+fn decodeChunkedPayload(body: []const u8, out: []u8) ?[]const u8 {
+    var pos: usize = 0;
+    var w: usize = 0;
+    while (true) {
+        const line_end = std.mem.indexOfPos(u8, body, pos, "\r\n") orelse return null;
+        const chunk_size = std.fmt.parseInt(usize, body[pos..line_end], 16) catch return null;
+        pos = line_end + 2;
+        if (chunk_size == 0) return out[0..w];
+        if (w + chunk_size > out.len) return null;
+        @memcpy(out[w .. w + chunk_size], body[pos .. pos + chunk_size]);
+        w += chunk_size;
+        pos += chunk_size;
+        if (pos + 2 > body.len or body[pos] != '\r' or body[pos + 1] != '\n') return null;
+        pos += 2;
+    }
+}
+
+// The whole contract an `extra_headers` block has to satisfy: a sequence of
+// "Name: value" lines, each CRLF-terminated, no blank line anywhere. A blank
+// line IS the head terminator — one here pushes everything after it into the
+// body, which is response splitting; a missing final CRLF welds the last
+// header onto `Connection:`; a line with no colon is not a header at all.
+// Each check is cheap against the cost of splicing garbage onto the wire.
+fn extraHeadersWellFormed(extras: []const u8) bool {
+    if (extras.len == 0 or !std.mem.endsWith(u8, extras, "\r\n")) return false;
+    var scan: usize = 0;
+    while (scan < extras.len) {
+        const nl = std.mem.indexOfPos(u8, extras, scan, "\r\n") orelse return false;
+        const line = extras[scan..nl];
+        if (line.len == 0) return false;
+        if (std.mem.indexOfScalar(u8, line, ':') == null) return false;
+        // A bare \r or \n inside a line is a malformed line ending wearing
+        // a colon — it splices as a second, unvalidated line.
+        if (std.mem.indexOfAny(u8, line, "\r\n") != null) return false;
+        scan = nl + 2;
+    }
+    return true;
+}
+
+// One pair out of a `Cookie:` header — "a=1; b=2" — so a handler does not
+// split it itself. Cookie names are case-sensitive (RFC 6265); the answer is
+// a borrow of the header block, so it dies with the request.
+fn cookieValue(cookies: []const u8, name: []const u8) ?[]const u8 {
+    var pairs = std.mem.splitScalar(u8, cookies, ';');
+    while (pairs.next()) |pair| {
+        const trimmed = std.mem.trim(u8, pair, " \t");
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        if (std.mem.eql(u8, trimmed[0..eq], name)) {
+            return std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
+        }
+    }
+    return null;
+}
+
+// application/x-www-form-urlencoded, the ONE codec `form` and `query-param`
+// share: '+' is a space, %XX a byte. An input with no escapes answers its own
+// slice — the common case allocates nothing. The escaped case decodes into
+// the request's arena, which lives exactly as long as the value can be used.
+fn urlDecode(allocator: std.mem.Allocator, s: []const u8) ?[]const u8 {
+    if (std.mem.indexOfAny(u8, s, "%+") == null) return s;
+    const out = allocator.alloc(u8, s.len) catch return null;
+    var w: usize = 0;
+    var r: usize = 0;
+    while (r < s.len) {
+        if (s[r] == '+') {
+            out[w] = ' ';
+            w += 1;
+            r += 1;
+        } else if (s[r] == '%' and r + 2 < s.len) {
+            const hi = std.fmt.charToDigit(s[r + 1], 16) catch {
+                out[w] = s[r];
+                w += 1;
+                r += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(s[r + 2], 16) catch {
+                out[w] = s[r];
+                w += 1;
+                r += 1;
+                continue;
+            };
+            out[w] = hi * 16 + lo;
+            w += 1;
+            r += 3;
+        } else {
+            out[w] = s[r];
+            w += 1;
+            r += 1;
+        }
+    }
+    return out[0..w];
+}
+
+// "k1=v1&k2=v2" -> the decoded value of `name`, borrowed or arena-decoded as
+// urlDecode decides. Keys arrive encoded too, so the comparison runs against
+// the decoded key — for an unescaped key that is the slice itself, so the
+// common case still allocates nothing. A pair with no '=' is a flag and
+// matches no name.
+fn formField(allocator: std.mem.Allocator, encoded: []const u8, name: []const u8) ?[]const u8 {
+    var pairs = std.mem.splitScalar(u8, encoded, '&');
+    while (pairs.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = urlDecode(allocator, pair[0..eq]) orelse continue;
+        if (std.mem.eql(u8, key, name)) {
+            return urlDecode(allocator, pair[eq + 1 ..]);
+        }
+    }
+    return null;
+}
+
+// The one canned failure answer, shared by every leg that cannot build a
+// head. It announces an EMPTY body, so it must never have bytes written
+// after it — on keep-alive the next read would parse them as a response.
+const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+// ============================================================================
+// PAGE CACHE — generation-keyed finished responses
+// ============================================================================
+// A GET 200 whose handler set `Response.cacheable` is stored post-gzip and
+// later hits return the stored bytes without dispatch. The key hashes
+// everything the render may observe: method, decoded path, query, Cookie
+// header, Host header, and the negotiated encoding (gzip and identity
+// variants coexist as different keys). Writes invalidate through
+// `generation-bump`: a stale entry is skipped on lookup and freed on the
+// next store, so nothing ever serves across a bump. Every slice the map
+// holds is cache-owned; a hit serves a private dupe, so no send in flight
+// can ever point at memory an eviction frees.
+
+const PageEntry = struct {
+    gen: u64,
+    status: u16,
+    content_type: ?[]const u8,
+    content_encoding: ?[]const u8,
+    extra_headers: ?[]const u8,
+    body: []const u8,
+};
+
+var page_cache_mu: std.Thread.Mutex = .{};
+var page_cache_map: ?std.AutoHashMap(u128, PageEntry) = null;
+var page_cache_gen: std.atomic.Value(u64) = .init(1);
+const PAGE_CACHE_MAX: usize = 1024;
+
+pub fn generationBump() void {
+    _ = page_cache_gen.fetchAdd(1, .acq_rel);
+}
+
+fn pageCacheKey(method: []const u8, path: []const u8, query: ?[]const u8, cookie: ?[]const u8, host: ?[]const u8, ae_gzip: bool) u128 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(method);
+    h.update("\x00");
+    h.update(path);
+    h.update("\x00");
+    if (query) |q| h.update(q);
+    h.update("\x00");
+    if (cookie) |c| h.update(c);
+    h.update("\x00");
+    if (host) |hh| h.update(hh);
+    var out: [32]u8 = undefined;
+    h.final(&out);
+    out[0] ^= @intFromBool(ae_gzip);
+    return std.mem.readInt(u128, out[0..16], .little);
+}
+
+fn pageCacheFree(e: PageEntry) void {
+    const a = koru_allocator();
+    a.free(e.body);
+    if (e.content_type) |s| a.free(s);
+    if (e.content_encoding) |s| a.free(s);
+    if (e.extra_headers) |s| a.free(s);
+}
+
+// A hit's small header fields are duped alongside the body so nothing served
+// references the map after the lock drops. The caller frees these three
+// after the head is rendered (they are spliced into head_out, never sent
+// directly); `body` goes out with body_allocated and is released by the
+// normal post-send path.
+const PageHit = struct {
+    res: Response,
+    small: [3]?[]const u8,
+};
+
+fn pageCacheGet(key: u128) ?PageHit {
+    page_cache_mu.lock();
+    defer page_cache_mu.unlock();
+    const map = if (page_cache_map) |*m| m else return null;
+    const e = map.get(key) orelse return null;
+    if (e.gen != page_cache_gen.load(.acquire)) return null;
+    const a = koru_allocator();
+    const body = a.dupe(u8, e.body) catch return null;
+    var small: [3]?[]const u8 = .{ null, null, null };
+    if (e.content_type) |s| small[0] = a.dupe(u8, s) catch null;
+    if (e.content_encoding) |s| small[1] = a.dupe(u8, s) catch null;
+    if (e.extra_headers) |s| small[2] = a.dupe(u8, s) catch null;
+    return .{ .res = .{ .status = e.status, .body = body, .content_type = small[0], .content_encoding = small[1], .extra_headers = small[2], .body_allocated = true }, .small = small };
+}
+
+fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encoding: ?[]const u8, extra_headers: ?[]const u8, body: []const u8) void {
+    const a = koru_allocator();
+    page_cache_mu.lock();
+    defer page_cache_mu.unlock();
+    if (page_cache_map == null) page_cache_map = std.AutoHashMap(u128, PageEntry).init(a);
+    const map = &page_cache_map.?;
+    const gen = page_cache_gen.load(.acquire);
+    // Retire entries a bump made unservable, then bound the map.
+    var keys: [64]u128 = undefined;
+    var n: usize = 0;
+    var it = map.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.gen != gen and n < keys.len) {
+            keys[n] = kv.key_ptr.*;
+            n += 1;
+        }
+    }
+    for (keys[0..n]) |k| {
+        const e = map.fetchRemove(k) orelse continue;
+        pageCacheFree(e.value);
+    }
+    if (map.count() >= PAGE_CACHE_MAX) {
+        var it2 = map.iterator();
+        while (it2.next()) |kv| pageCacheFree(kv.value_ptr.*);
+        map.clearRetainingCapacity();
+    }
+    const owned: PageEntry = .{
+        .gen = gen,
+        .status = status,
+        .content_type = if (content_type) |s| (a.dupe(u8, s) catch return) else null,
+        .content_encoding = if (content_encoding) |s| (a.dupe(u8, s) catch return) else null,
+        .extra_headers = if (extra_headers) |s| (a.dupe(u8, s) catch return) else null,
+        .body = a.dupe(u8, body) catch return,
+    };
+    if (map.fetchRemove(key)) |old| pageCacheFree(old.value);
+    map.put(key, owned) catch pageCacheFree(owned);
+}
+
+~proc answer|zig {
+    const req_allocator = $mod.requestAllocator();
+    const raw = x.raw;
+    const parsed = x.head;
+    const fd: usize = @intCast(x.fd);
+    var method: []const u8 = "GET";
+    var path: []const u8 = "/";
+    var query: ?[]const u8 = null;
+
+    if (parsed) |h| {
+        // The pump's scan already split the request line — read it back.
+        if (h.target_len > 0) {
+            if (h.method_len > 0) method = raw[h.method_off..][0..h.method_len];
+            const target = raw[h.target_off..][0..h.target_len];
+            if (std.mem.indexOfScalar(u8, target, '?')) |q| {
+                query = target[q + 1 ..];
+                path = $mod.pathKeyDecoded(req_allocator, target[0..q]);
+            } else {
+                path = $mod.pathKeyDecoded(req_allocator, target);
+            }
+        }
+    } else {
+        // A dispatch path that never scanned (none today — every pump
+        // produces a Head) still answers: walk the request line here.
+        var i: usize = 0;
+        while (i < raw.len and raw[i] != ' ') : (i += 1) {}
+        if (i < raw.len) {
+            method = raw[0..i];
+            i += 1;
+            var j: usize = i;
+            while (j < raw.len and raw[j] != ' ') : (j += 1) {}
+            if (j > i) {
+                const target = raw[i..j];
+                if (std.mem.indexOfScalar(u8, target, '?')) |q| {
+                    query = target[q + 1 ..];
+                }
+                path = $mod.requestPathKey(req_allocator, target);
+            }
+        }
+    }
+
+    // Request-free dispatch: literal arms (`! [GET /x] -> { ... }`) produce a
+    // fixed Response and cannot touch `req`, so they are collected by the
+    // router transform into handler-lite — consulted here, before any of the
+    // request materialization below. A hit shares the same response tail as
+    // the full path; a miss pays one call and a few compares and everything
+    // proceeds exactly as it always did.
+    // Read once at function scope: the lite path skips the request-
+    // materialization block below, but the runtime-gzip tail negotiates on
+    // this header no matter which dispatch produced the response.
+    const accept_encoding: ?[]const u8 = if (parsed) |h|
+        (if (h.accept_encoding_off != 0) raw[h.accept_encoding_off..][0..h.accept_encoding_len] else null)
+    else
+        $mod.headValueParsed(parsed, raw, "accept-encoding");
+
+    // Page-cache lookup precedes even handler-lite — a hit is a finished
+    // response rejoining the shared tail. Only GETs are ever stored, so
+    // everything else skips the key hash entirely. `served_small` carries a
+    // hit's three duped header fields; they are dead the moment the head is
+    // rendered, and the defer settles them on every return path.
+    var served_small: [3]?[]const u8 = .{ null, null, null };
+    defer for (served_small) |s| {
+        if (s) |v| koru_allocator().free(v);
+    };
+    const page_key: u128 = if (std.mem.eql(u8, method, "GET")) pageCacheKey(
+        method,
+        path,
+        query,
+        $mod.headValueParsed(parsed, raw, "cookie"),
+        $mod.headValueParsed(parsed, raw, "host"),
+        aeWantsGzip(accept_encoding),
+    ) else 0;
+
+    const res = res_blk: {
+        if (page_key != 0) {
+            if (pageCacheGet(page_key)) |hit| {
+                served_small = hit.small;
+                break :res_blk hit.res;
+            }
+        }
+        break :res_blk $mod.handler_lite_event.handler(.{ .method = method, .path = path }) orelse blk: {
+        var client_etag: ?[]const u8 = null;
+        // Header names are case-insensitive. The Vercel adapter used to omit this
+        // header entirely; once it forwards it, browsers send `If-None-Match` in
+        // whatever casing their stack picked, and a literal search would miss.
+        const etag_raw: ?[]const u8 = if (parsed) |h|
+            (if (h.if_none_match_off != 0) raw[h.if_none_match_off..][0..h.if_none_match_len] else null)
+        else
+            $mod.headValueParsed(parsed, raw, "if-none-match");
+        if (etag_raw) |tag| {
+            if (tag.len >= 2 and tag[0] == '"' and tag[tag.len - 1] == '"') {
+                client_etag = tag[1 .. tag.len - 1];
+            } else {
+                client_etag = tag;
+            }
+        }
+
+        var body: ?[]const u8 = null;
+        var headers_block: ?[]const u8 = null;
+
+        if (parsed) |h| {
+            headers_block = raw[0..h.head_len];
+            const body_raw = if (h.head_len < raw.len) raw[h.head_len..] else "";
+            if (h.chunked) {
+                var decoded_buf: [4096]u8 = undefined;
+                if (decodeChunkedPayload(body_raw, &decoded_buf)) |decoded| {
+                    body = decoded;
+                }
+            } else if (body_raw.len > 0) {
+                body = body_raw;
+            }
+        } else if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |header_end| {
+            const headers_end = header_end + 4;
+            const block = raw[0..headers_end];
+            headers_block = block;
+            const body_raw = if (headers_end < raw.len) raw[headers_end..] else "";
+            if (transferEncodingChunkedHead(block)) {
+                var decoded_buf: [4096]u8 = undefined;
+                if (decodeChunkedPayload(body_raw, &decoded_buf)) |decoded| {
+                    body = decoded;
+                }
+            } else if (body_raw.len > 0) {
+                body = body_raw;
+            }
+        }
+
+        var req = Request{
+            .method = method,
+            .path = path,
+            .query = query,
+            .body = body,
+            .accept_encoding = accept_encoding,
+            .if_none_match = client_etag,
+            .headers = headers_block,
+            .head = parsed,
+            .fd = fd,
+            .allocator = req_allocator,
+        };
+
+        break :blk $mod.handler_event.handler(.{ .req = &req });
+        };
+    };
+
+    // A handler that already rendered a whole response (a static route) hands
+    // it back verbatim; it goes out as the head with no separate body. The
+    // `wire` voucher says so up front and carries the splice offset, so a
+    // compiler-rendered response skips the probe and the hole search alike.
+    if (res.wire) {
+        return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = res.wire_date_hole, .close = res.close, .head_static = res.body_static, .body_static = false };
+    }
+    if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
+        // Pre-rendered static routes: the whole message is `head`. `body`
+        // is empty, so it must not carry the allocated flag — freeing ""
+        // would be a phantom free of a literal.
+        // Baked messages carry no Date — it is serve-time (RFC 9110 §10.1.1),
+        // so the send path splices the current line in after the status line.
+        // `date_hole` is that insertion offset; 0 means "head is already
+        // complete" and every non-baked head takes it. A baked head that
+        // rendered its own Date right at the splice point is complete too —
+        // splicing would emit the field twice.
+        var hole: usize = 0;
+        if (std.mem.indexOfScalar(u8, res.body, '\r')) |cr| {
+            const at = cr + 2;
+            if (at + 6 > res.body.len or !std.mem.eql(u8, res.body[at..][0..6], "Date: ")) hole = at;
+        }
+        return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = hole, .close = res.close, .head_static = res.body_static, .body_static = false };
+    }
+
+    // `content_type: null` means NO Content-Type header — a bare redirect or
+    // empty-body answer has no type to declare. The old text/plain default
+    // spelled a header the handler never asked for, which matters on the wire:
+    // topcoat's 307 carries none, and a hard default makes it unspellable.
+    var ct_line_buf: [512]u8 = undefined;
+    const res_ct: []const u8 = if (res.content_type) |ct_str|
+        std.fmt.bufPrint(&ct_line_buf, "Content-Type: {s}\r\n", .{ct_str}) catch ""
+    else
+        "";
+    var date_buf: [29]u8 = undefined;
+    formatHttpDate(&date_buf);
+
+    // `extra_headers` is the one knob a handler has over the head: one
+    // preformatted block of "Name: value" lines, spliced in ahead of
+    // `Connection:`. A block that cannot splice is a handler bug — and an
+    // owned body still must not leak, so it is freed HERE rather than handed
+    // to release-body through a record that no longer carries it.
+    const extras: []const u8 = if (res.extra_headers) |raw_extras| blk: {
+        if (!extraHeadersWellFormed(raw_extras)) {
+            if (res.body_allocated) koru_allocator().free(res.body);
+            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false };
+        }
+        break :blk raw_extras;
+    } else "";
+
+    // Extras get the wide buffer; a response without them stays on the 512
+    // one it has always used — the no-extras answer is byte-for-byte the path
+    // it was.
+    const head_out: []u8 = if (extras.len == 0) header_buf[0..] else header_buf_wide[0..];
+
+    // 101 is a handshake, not a response: no Content-Length, no managed
+    // `Connection` (the handler spells `Connection: Upgrade` in extras). The
+    // body passes through — on the wire it is not an HTTP body at all but the
+    // connection's FIRST WEBSOCKET FRAME, which `reply` frames and sends
+    // right after the handshake bytes. That is how a protocol that must speak
+    // first (Action Cable's `welcome`) can: the upgrade answer carries it.
+    if (res.status == 101) {
+        const head101 = std.fmt.bufPrint(
+            head_out,
+            "HTTP/1.1 101 Switching Protocols\r\n{s}Date: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n\r\n",
+            .{ extras, &date_buf },
+        ) catch {
+            if (res.body_allocated) koru_allocator().free(res.body);
+            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false };
+        };
+        return .{ .head = head101, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = res.body_static and !res.body_allocated };
+    }
+
+    // Runtime gzip for dynamic bodies. Static routes bake both
+    // representations at build time; a handler-built body gets the fast dial
+    // here when the client advertised gzip and the type compresses. The
+    // scratch slice leaves through the copy path — body_static forced false —
+    // so the next exchange on this worker may overwrite the buffer. A body
+    // the handler already encoded is left alone: double-encoding is a
+    // protocol violation, not an optimization.
+    var body_out = res.body;
+    var body_allocated = res.body_allocated;
+    var content_encoding = res.content_encoding;
+    var body_static = res.body_static;
+    if (content_encoding == null and body_out.len >= 100 and
+        res.content_type != null and isCompressible(res.content_type.?) and
+        aeWantsGzip(accept_encoding))
+    {
+        if (gzipCompressLevel(koru_allocator(), body_out, zlib.Z_BEST_SPEED)) |gz| {
+            if (gz.len < body_out.len) {
+                if (body_allocated) koru_allocator().free(body_out);
+                body_out = gz;
+                body_allocated = true;
+                body_static = false;
+                content_encoding = "gzip";
+            } else koru_allocator().free(gz);
+        }
+    }
+
+    // Store the finished response — post-gzip, so each negotiated encoding
+    // lands under its own key and hits never pay deflate twice. Opted-in GET
+    // 200s only; the lookup key was built before dispatch and stays valid.
+    if (res.cacheable and page_key != 0 and res.status == 200) {
+        pageCachePut(page_key, res.status, res.content_type, content_encoding, res.extra_headers, body_out);
+    }
+
+    // A bufPrint failure answers null now, not the canned 500, so the leg
+    // below can send an EMPTY body. The old shape wrote the 500's
+    // "Content-Length: 0" head and then still shipped res.body after it —
+    // on keep-alive those bytes became the NEXT response's head.
+    const head = if (content_encoding) |enc| blk: {
+        if (headerPrefixKeepAlive(res.status)) |prefix| {
+            break :blk std.fmt.bufPrint(
+                head_out,
+                "{s}{d}\r\n{s}Content-Encoding: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}\r\n",
+                .{ prefix, body_out.len, res_ct, enc, &date_buf, extras },
+            ) catch null;
+        }
+        break :blk std.fmt.bufPrint(
+            head_out,
+            "HTTP/1.1 {d} {s}\r\n{s}Content-Encoding: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}\r\n",
+            .{ res.status, statusText(res.status), res_ct, enc, body_out.len, &date_buf, extras },
+        ) catch null;
+    } else if (headerPrefixKeepAlive(res.status)) |prefix|
+        std.fmt.bufPrint(head_out, "{s}{d}\r\n{s}Date: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}\r\n", .{ prefix, body_out.len, res_ct, &date_buf, extras }) catch
+            null
+    else
+        std.fmt.bufPrint(
+            head_out,
+            "HTTP/1.1 {d} {s}\r\n{s}Content-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}\r\n",
+            .{ res.status, statusText(res.status), res_ct, body_out.len, &date_buf, extras },
+        ) catch null;
+
+    const head_slice = head orelse {
+        if (body_allocated) koru_allocator().free(body_out);
+        return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false };
+    };
+    return .{ .head = head_slice, .body = body_out, .body_allocated = body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = body_static and !body_allocated };
+}
+
+~proc release-body|zig {
+    if (allocated) {
+        koru_allocator().free(body);
+    }
+}
+
+~proc generation-bump|zig {
+    generationBump();
+}
+
+// The descriptor the request arrived on — the handler's half of
+// `pump:fileno`. Names the connection so a route can register it for
+// `ws-send-fd` pushes or ask `ws-shut`-style teardown without ever seeing
+// the Exchange itself.
+~proc fd|zig {
+    return req.fd;
+}
+
+// The lazy read over `req.headers`: scan the block only when a handler asks.
+// The answer is a borrow of the request bytes — valid for the handler's life,
+// which is as long as anything may keep it.
+~proc header|zig {
+    const block = req.headers orelse return null;
+    return headValueParsed(req.head, block, name);
+}
+
+// base64(SHA-1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")) — RFC 6455 §4.2.2.
+// The answer lives in the request arena: the upgrade head is built and sent
+// before the arm returns, so the accept value's life is the request's.
+~proc ws-accept|zig {
+    const block = req.headers orelse return null;
+    const key = headValueParsed(req.head, block, "sec-websocket-key") orelse return null;
+    var sha = std.crypto.hash.Sha1.init(.{});
+    sha.update(key);
+    sha.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    var digest: [20]u8 = undefined;
+    sha.final(&digest);
+    var enc: [28]u8 = undefined;
+    const out = std.base64.standard.Encoder.encode(&enc, &digest);
+    return $mod.requestAllocator().dupe(u8, out) catch null;
+}
+
+~proc cookie|zig {
+    const block = req.headers orelse return null;
+    const cookies = headValueParsed(req.head, block, "cookie") orelse return null;
+    return cookieValue(cookies, name);
+}
+
+// `form` reads fields only off a body that declared itself urlencoded — a
+// JSON body parsed as pairs is how a string value becomes a phantom field.
+~proc form|zig {
+    const block = req.headers orelse return null;
+    const ct = headValueParsed(req.head, block, "content-type") orelse return null;
+    const urlencoded = "application/x-www-form-urlencoded";
+    if (ct.len < urlencoded.len or !std.ascii.eqlIgnoreCase(ct[0..urlencoded.len], urlencoded)) return null;
+    const body = req.body orelse return null;
+    return formField(req.allocator, body, name);
+}
+
+~proc query-param|zig {
+    const q = req.query orelse return null;
+    return formField(req.allocator, q, name);
+}
+
+threadlocal var ids_buf: [1024]u8 = undefined;
+
+// form-ids' worker: walk the pair list, keep every pair whose decoded key
+// matches `name`, decimal-parse each value (leading digits only — Rails'
+// to_i semantics), and join the survivors ",". Nothing numeric -> "0", an
+// IN list that selects no rows.
+~proc form-ids|zig {
+    const block = req.headers orelse return "0";
+    const ct = headValueParsed(req.head, block, "content-type") orelse return "0";
+    const urlencoded = "application/x-www-form-urlencoded";
+    if (ct.len < urlencoded.len or !std.ascii.eqlIgnoreCase(ct[0..urlencoded.len], urlencoded)) return "0";
+    const body = req.body orelse return "0";
+    var w: usize = 0;
+    var pairs = std.mem.splitScalar(u8, body, '&');
+    while (pairs.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = urlDecode(req.allocator, pair[0..eq]) orelse continue;
+        if (!std.mem.eql(u8, key, name)) continue;
+        const val = urlDecode(req.allocator, pair[eq + 1 ..]) orelse continue;
+        var n: i64 = 0;
+        var digits: usize = 0;
+        for (val) |c| {
+            if (c < '0' or c > '9') break;
+            n = n * 10 + (c - '0');
+            digits += 1;
+        }
+        if (digits == 0) continue;
+        const written = std.fmt.bufPrint(ids_buf[w..], "{s}{d}", .{ if (w == 0) "" else ",", n }) catch break;
+        w += written.len;
+    }
+    if (w == 0) return "0";
+    return ids_buf[0..w];
+}
+
+~proc raw-body|zig {
+    return req.body orelse "";
+}
+
+fn statusText(status: u16) []const u8 {
+    return switch (status) {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        101 => "Switching Protocols",
+        // The redirect family — `extra_headers` makes a 302 with a Location a
+        // first-class answer, so it stops reading "Unknown" on the wire.
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        else => "Unknown",
+    };
+}
+
+/// `Sun, 09 Aug 2026 14:41:49 GMT` — exactly 29 bytes, the only shape RFC 9110
+/// allows in a Date header. Sliced out of the stamped line, so the value is
+/// as fresh as the last pump tick rather than a clock read of its own.
+fn formatHttpDate(buf: *[29]u8) void {
+    @memcpy(buf[0..29], httpDateLine()[6..35]);
+}
+
+/// The whole `Date: …\r\n` line (37 bytes) as a stable threadlocal slice, for
+/// callers that splice the header into a baked message — the send path's
+/// `date_hole` iovec points straight at this. The line is refreshed by a
+/// stamp, not by the call: a pump's drive loop stamps once per wakeup, and
+/// Date's second granularity means the stamped line is always fresh enough —
+/// a per-response clock read measures nothing the header can express.
+threadlocal var cached_line_epoch: i64 = -1;
+threadlocal var date_line_buf: [37]u8 = undefined;
+// True once this thread has stamped — the flag, not a timestamp, is what
+// tells httpDateLine whether anyone is ticking. A thread with no pump loop
+// never flips it and gets the refresh-on-every-call behavior it always had.
+threadlocal var date_stamped = false;
+
+/// Read the wall clock and reformat the Date line if the second flipped.
+/// Call once per event-loop wakeup; the batch of responses that wakeup
+/// produces all borrow the one stamped line.
+pub fn stampHttpDateLine() void {
+    const epoch = time(null);
+    if (epoch != cached_line_epoch) {
+        cached_line_epoch = epoch;
+        var v: [29]u8 = undefined;
+        formatHttpDateFromEpoch(&v, epoch);
+        @memcpy(date_line_buf[0..6], "Date: ");
+        @memcpy(date_line_buf[6..35], &v);
+        @memcpy(date_line_buf[35..37], "\r\n");
+    }
+    date_stamped = true;
+}
+
+pub fn httpDateLine() *const [37]u8 {
+    // Outside a pump there is no tick, so a call on an unstamped thread
+    // refreshes here — same behavior it always had. Once stamped, one branch.
+    if (!date_stamped) stampHttpDateLine();
+    return &date_line_buf;
+}
+
+fn formatHttpDateFromEpoch(buf: *[29]u8, epoch: i64) void {
+    const days = @divFloor(epoch, 86400);
+    const secs = @as(u32, @intCast(epoch - days * 86400));
+
+    // Howard Hinnant's civil_from_days: shift the era to March so the leap day
+    // lands at the end of a year and the month lengths become a linear formula.
+    const z = days + 719468;
+    const era = @divFloor(z, 146097);
+    const doe = @as(u32, @intCast(z - era * 146097));
+    const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const y0 = @as(i64, yoe) + era * 400;
+    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp = (5 * doy + 2) / 153;
+    const d = doy - (153 * mp + 2) / 5 + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    const y = if (m <= 2) y0 + 1 else y0;
+
+    const wday = @as(u32, @intCast(@mod(days + 4, 7))); // 1970-01-01 was a Thursday
+    const DAY = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    const MON = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    @memcpy(buf[0..3], DAY[wday]);
+    buf[3] = ',';
+    buf[4] = ' ';
+    two(buf[5..7], d);
+    buf[7] = ' ';
+    @memcpy(buf[8..11], MON[m - 1]);
+    buf[11] = ' ';
+    four(buf[12..16], @as(u32, @intCast(y)));
+    buf[16] = ' ';
+    two(buf[17..19], secs / 3600);
+    buf[19] = ':';
+    two(buf[20..22], (secs % 3600) / 60);
+    buf[22] = ':';
+    two(buf[23..25], secs % 60);
+    @memcpy(buf[25..29], " GMT");
+}
+
+
+fn two(dst: *[2]u8, v: u32) void {
+    dst[0] = '0' + @as(u8, @intCast((v / 10) % 10));
+    dst[1] = '0' + @as(u8, @intCast(v % 10));
+}
+
+fn four(dst: *[4]u8, v: u32) void {
+    dst[0] = '0' + @as(u8, @intCast((v / 1000) % 10));
+    dst[1] = '0' + @as(u8, @intCast((v / 100) % 10));
+    dst[2] = '0' + @as(u8, @intCast((v / 10) % 10));
+    dst[3] = '0' + @as(u8, @intCast(v % 10));
+}
+
+fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
+    return switch (status) {
+        200 => "HTTP/1.1 200 OK\r\nContent-Length: ",
+        201 => "HTTP/1.1 201 Created\r\nContent-Length: ",
+        204 => "HTTP/1.1 204 No Content\r\nContent-Length: ",
+        400 => "HTTP/1.1 400 Bad Request\r\nContent-Length: ",
+        401 => "HTTP/1.1 401 Unauthorized\r\nContent-Length: ",
+        403 => "HTTP/1.1 403 Forbidden\r\nContent-Length: ",
+        404 => "HTTP/1.1 404 Not Found\r\nContent-Length: ",
+        500 => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: ",
+        else => null,
+    };
+}
+
+
+// Compile-time echo of the route matcher the transform emits — does a
+// declared pattern possibly match this exact literal path? Used to keep
+// handler-lite's pre-Request dispatch honest about first-match order: a
+// literal arm is only pre-dispatched when no earlier, non-literal pattern
+// could swallow its path first. Segment rules mirror the emitted code:
+// ':' consumes one non-empty segment, '*' consumes the rest, literals
+// must equal, and a non-wildcard pattern must consume the path exactly.
+fn patternMatchesLiteral(pattern: []const u8, literal: []const u8) bool {
+    var pit = std.mem.splitScalar(u8, pattern, '/');
+    var lit = std.mem.splitScalar(u8, literal, '/');
+    _ = lit.next(); // leading empty segment before the first '/'
+    while (pit.next()) |seg| {
+        if (seg.len == 0) continue;
+        if (seg.len == 1 and seg[0] == '*') return true;
+        const cur = lit.next() orelse return false;
+        if (seg.len > 1 and seg[0] == ':') {
+            if (cur.len == 0) return false;
+        } else if (!std.mem.eql(u8, seg, cur)) {
+            return false;
+        }
+    }
+    return lit.next() == null;
+}
+
+// Decode the `body:` string of a produce literal and, when it spells a
+// complete HTTP/1.x message, return the Date splice offset — the value the
+// `answer` tail would otherwise re-derive per request with a prefix check
+// and a CR scan. null means "not a wire response" and the arm emits
+// untagged. The decode must mirror the literal: the transform sees Koru
+// escapes (`\r\n`), the wire sees the bytes they spell.
+fn literalWireDateHole(allocator: std.mem.Allocator, plain: []const u8) ?usize {
+    const body_at = std.mem.indexOf(u8, plain, "body:") orelse return null;
+    var q = body_at + "body:".len;
+    while (q < plain.len and (plain[q] == ' ' or plain[q] == '\t')) q += 1;
+    if (q >= plain.len or plain[q] != '"') return null;
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
+    var i = q + 1;
+    while (i < plain.len) {
+        const c = plain[i];
+        if (c == '"') break;
+        if (c == '\\' and i + 1 < plain.len) {
+            const e = plain[i + 1];
+            const d: u8 = switch (e) {
+                'r' => '\r',
+                'n' => '\n',
+                't' => '\t',
+                '\\' => '\\',
+                '"' => '"',
+                else => {
+                    decoded.append(allocator, '\\') catch return null;
+                    i += 1;
+                    continue;
+                },
+            };
+            decoded.append(allocator, d) catch return null;
+            i += 2;
+            continue;
+        }
+        decoded.append(allocator, c) catch return null;
+        i += 1;
+    }
+    const body = decoded.items;
+    if (!std.mem.startsWith(u8, body, "HTTP/1.")) return null;
+    const cr = std.mem.indexOfScalar(u8, body, '\r') orelse return 0;
+    const at = cr + 2;
+    if (at + 6 <= body.len and std.mem.eql(u8, body[at..][0..6], "Date: ")) return 0;
+    return at;
+}
+
+// Wire voucher: a produce literal whose `body:` already spells a complete
+// HTTP/1.x message carries `.wire` plus the compile-time splice offset — the
+// `answer` tail then takes `res.wire` and skips the startsWith/CR-scan/
+// `Date: ` probe entirely. Inserted inside the record braces the same way
+// mark_body_allocated rides in.
+fn wireTagArmCode(allocator: std.mem.Allocator, cont: *const ast.Continuation, code: []const u8) []const u8 {
+    const n = cont.node orelse return code;
+    if (n != .branch_constructor) return code;
+    const pv = n.branch_constructor.plain_value orelse return code;
+    const hole = literalWireDateHole(allocator, pv) orelse return code;
+    const close = std.mem.lastIndexOfScalar(u8, code, '}') orelse return code;
+    return std.fmt.allocPrint(allocator, "{s}, .wire = true, .wire_date_hole = {} {s}", .{ code[0..close], hole, code[close..] }) catch code;
+}
+
+// Rename orisha's `handler-lite` default impl to `handler-lite.default` —
+// exactly what resolve_abstract_impl.renameToDefault does at parse time,
+// applied here because the override impl is synthesized only now, inside
+// the transform. `const` is cast off for the same reason resolve mutates
+// in place: the AST lives on the compile arena and is rewritten, not
+// shared immutable data.
+fn renameLiteDefault(items: []const ast.Item, allocator: std.mem.Allocator) void {
+    for (@constCast(items)) |*it| {
+        switch (it.*) {
+            .module_decl => |*md| renameLiteDefault(md.items, allocator),
+            .immediate_impl => |*ii| {
+                if (ii.event_path.segments.len > 0 and
+                    std.mem.eql(u8, ii.event_path.segments[0], "handler-lite") and
+                    std.mem.eql(u8, ii.module, "orisha"))
+                {
+                    const new_segments = allocator.alloc([]const u8, ii.event_path.segments.len) catch unreachable;
+                    new_segments[0] = "handler-lite.default";
+                    for (ii.event_path.segments[1..], 1..) |seg, i| {
+                        new_segments[i] = seg;
+                    }
+                    ii.event_path.segments = new_segments;
+                }
+            },
+            .flow => |*fl| {
+                if (fl.impl_of) |*impl_path| {
+                    if (impl_path.segments.len > 0 and
+                        std.mem.eql(u8, impl_path.segments[0], "handler-lite") and
+                        std.mem.eql(u8, fl.module, "orisha"))
+                    {
+                        const new_segments = allocator.alloc([]const u8, impl_path.segments.len) catch unreachable;
+                        new_segments[0] = "handler-lite.default";
+                        for (impl_path.segments[1..], 1..) |seg, i| {
+                            new_segments[i] = seg;
+                        }
+                        impl_path.segments = new_segments;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+// Whole-word substring: does `code` reference the token `word` at an
+// identifier boundary? The lite-table gate runs this over generated arm
+// code to disqualify literal arms that still name `req`.
+fn indexOfWord(code: []const u8, word: []const u8) ?usize {
+    if (word.len == 0 or code.len < word.len) return null;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, code, i, word)) |hit| {
+        const before_ok = hit == 0 or
+            !(std.ascii.isAlphanumeric(code[hit - 1]) or code[hit - 1] == '_');
+        const after = hit + word.len;
+        const after_ok = after >= code.len or
+            !(std.ascii.isAlphanumeric(code[after]) or code[after] == '_');
+        if (before_ok and after_ok) return hit;
+        i = hit + 1;
+    }
+    return null;
+}
+
+~proc router|zig {
+    const ast_mod = @import("ast");
+    const ast_functional = @import("ast_functional");
+    const continuation_codegen = @import("continuation_codegen");
+
+    // Get the flow containing this router invocation
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Check if already transformed
+    for (flow.inv().marks) |m| {
+        if (std.mem.startsWith(u8, m, "@pass_ran")) {
+            return .{};
+        }
+    }
+
+    // Detect whether this is the flow's own invocation or a nested one.
+    // findContainingItem returns the parent flow, so for nested routers
+    // we must search the continuation tree for the actual invocation.
+    const is_pointer_top = (invocation == flow.inv());
+
+    // Get the request expression from invocation args (the call-site value to splice)
+    var req_expr: []const u8 = "req";
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "req")) {
+            req_expr = arg.value;
+            break;
+        }
+    }
+
+    // Collect pattern branches from the correct continuations.
+    // For top-level: flow.continuations (the flow IS the router).
+    // For nested: find the continuation whose node IS our invocation,
+    // then use its sub-continuations as pattern branches.
+    const PatternCont = struct {
+        pattern: []const u8,
+        cont: *const ast_mod.Continuation,
+    };
+
+    // Helper to find the continuation containing a specific invocation by pointer
+    const findContWithInvocation = struct {
+        fn search(continuations: []const ast_mod.Continuation, target_inv: *const ast_mod.Invocation) ?*const ast_mod.Continuation {
+            for (continuations) |*cont| {
+                if (cont.node) |*node| {
+                    if (node.* == .invocation and &node.invocation == target_inv) {
+                        return cont;
+                    }
+                }
+                if (search(cont.continuations, target_inv)) |found| {
+                    return found;
+                }
+            }
+            return null;
+        }
+    }.search;
+
+    const source_continuations = if (is_pointer_top)
+        flow.body.continuations
+    else blk: {
+        const parent_cont = findContWithInvocation(flow.body.continuations, invocation) orelse {
+            std.debug.print("[ROUTER TRANSFORM] WARNING: Could not find nested invocation\n", .{});
+            return .{};
+        };
+        break :blk parent_cont.continuations;
+    };
+
+    var patterns: std.ArrayList([]const u8) = .empty;
+    var pattern_conts: std.ArrayList(PatternCont) = .empty;
+    // Kind awareness: the router DISPATCHES into the matched route, which is
+    // effect semantics — so its pattern branches must be effect branches (`!`),
+    // not terminal (`|`). Orisha predates BranchKind and was kind-blind; this
+    // makes it reject the terminal form loudly (see the @compileError below).
+    var has_terminal_pattern = false;
+    // The `[...]` glyphs are a source ENCODING of a quoted branch name — the
+    // parser strips them (flow_parser.zig parseBranchInfo), so the AST carries
+    // `GET /users/:id` or `*`, never `[GET /users/:id]`. A router pattern is
+    // therefore a branch that is the catch-all `*` or carries a `METHOD path`
+    // pair (contains a space).
+    const isPatternBranch = struct {
+        fn check(branch: []const u8) bool {
+            if (std.mem.eql(u8, branch, "*")) return true;
+            return std.mem.indexOfScalar(u8, branch, ' ') != null;
+        }
+    }.check;
+    for (source_continuations, 0..) |*cont, i| {
+        if (isPatternBranch(cont.branch)) {
+            if (cont.kind != .effect) has_terminal_pattern = true;
+            patterns.append(allocator, cont.branch) catch unreachable;
+            pattern_conts.append(allocator, .{
+                .pattern = cont.branch,
+                .cont = &source_continuations[i],
+            }) catch unreachable;
+        }
+    }
+
+    if (patterns.items.len == 0) {
+        return .{};
+    }
+
+    std.debug.print("[ROUTER TRANSFORM] Found {} pattern branches\n", .{patterns.items.len});
+
+    // Parsed pattern info
+    const ParsedPattern = struct {
+        raw: []const u8,
+        method: []const u8,
+        path: []const u8,
+        params: []const []const u8,
+        is_catchall: bool,
+    };
+
+    // Parse all patterns
+    var parsed_patterns: std.ArrayList(ParsedPattern) = .empty;
+    for (patterns.items) |pattern| {
+        if (std.mem.eql(u8, pattern, "*")) {
+            parsed_patterns.append(allocator, .{
+                .raw = pattern,
+                .method = "*",
+                .path = "*",
+                .params = &.{},
+                .is_catchall = true,
+            }) catch unreachable;
+            continue;
+        }
+
+        const inner = pattern; // brackets already stripped by the parser
+        const space_idx = std.mem.indexOf(u8, inner, " ") orelse continue;
+        const method = inner[0..space_idx];
+        const path = inner[space_idx + 1 ..];
+
+        var params_list: std.ArrayList([]const u8) = .empty;
+        var path_iter = std.mem.splitScalar(u8, path, '/');
+        while (path_iter.next()) |segment| {
+            if (segment.len > 1 and segment[0] == ':') {
+                params_list.append(allocator, segment[1..]) catch unreachable;
+            }
+        }
+
+        parsed_patterns.append(allocator, .{
+            .raw = pattern,
+            .method = method,
+            .path = path,
+            .params = params_list.toOwnedSlice(allocator) catch unreachable,
+            .is_catchall = false,
+        }) catch unreachable;
+    }
+
+    // Profile-guided branch order — same `orisha.profile` access log as static
+    // routes. Reorders the if-chain so hot HttpArena paths (baseline, json, …)
+    // are compared first. See orisha/httparena/profiles/ and workload.py.
+    if (loadProfileHits(allocator)) |loaded| {
+        defer allocator.free(loaded.storage);
+        var hits = loaded.hits;
+        defer hits.deinit();
+
+        const ScoreCtx = struct {
+            h: *std.StringHashMap(u64),
+            fn patternPrefix(pp: @TypeOf(parsed_patterns.items[0])) []const u8 {
+                if (pp.params.len == 0) return pp.path;
+                var end: usize = 0;
+                var it = std.mem.splitScalar(u8, pp.path, '/');
+                while (it.next()) |seg| {
+                    if (seg.len > 0 and seg[0] == ':') break;
+                    end += seg.len + 1;
+                }
+                return if (end > 0) pp.path[0..end] else pp.path;
+            }
+            fn routeScore(self: @This(), pp: @TypeOf(parsed_patterns.items[0])) u64 {
+                if (pp.is_catchall) return 0;
+                var sum: u64 = self.h.get(pp.path) orelse 0;
+                if (pp.params.len > 0) {
+                    const prefix = patternPrefix(pp);
+                    var it = self.h.iterator();
+                    while (it.next()) |entry| {
+                        const key = entry.key_ptr.*;
+                        if (!std.mem.eql(u8, key, pp.path) and std.mem.startsWith(u8, key, prefix)) {
+                            sum += entry.value_ptr.*;
+                        }
+                    }
+                }
+                return sum;
+            }
+            fn hotter(self: @This(), a: @TypeOf(parsed_patterns.items[0]), b: @TypeOf(parsed_patterns.items[0])) bool {
+                const ha = self.routeScore(a);
+                const hb = self.routeScore(b);
+                if (ha != hb) return ha > hb;
+                return std.mem.lessThan(u8, a.raw, b.raw);
+            }
+        };
+        std.sort.block(@TypeOf(parsed_patterns.items[0]), parsed_patterns.items, ScoreCtx{ .h = &hits }, ScoreCtx.hotter);
+        const hottest_label = blk: {
+            for (parsed_patterns.items) |pp| {
+                if (!pp.is_catchall) break :blk pp.raw;
+            }
+            break :blk parsed_patterns.items[0].raw;
+        };
+        std.debug.print("[ROUTER TRANSFORM] profile: {d} requests — hottest pattern is {s}\n", .{ loaded.counted, hottest_label });
+    } else {
+        std.debug.print("[ROUTER TRANSFORM] profile: none (orisha.profile absent) — pattern order unchanged\n", .{});
+    }
+
+    // Build inline_body: flat if-else-if-else chain with branch bodies inlined.
+    // This runs inline (in scope), so runtime values like the expr are accessible.
+    // Using a proper if-else chain means Zig can prove all paths are covered
+    // (when a catch-all [*] exists), without needing unreachable.
+    var ib: std.ArrayList(u8) = .empty;
+    ib.appendSlice(allocator, "//@koru:inline_stmt\n") catch unreachable;
+
+    // Find catch-all pattern and its continuation
+    var catch_all_cont: ?*const ast_mod.Continuation = null;
+    for (parsed_patterns.items) |*pp| {
+        if (pp.is_catchall) {
+            for (pattern_conts.items) |pc| {
+                if (std.mem.eql(u8, pc.pattern, pp.raw)) {
+                    catch_all_cont = pc.cont;
+                    break;
+                }
+            }
+        }
+    }
+
+    var result_counter: usize = 0;
+
+    // Group non-catchall patterns by method, preserving the profile-sorted
+    // order inside each group. A request matches at most one method, so
+    // per-method blocks keep first-match semantics while the method string
+    // is checked once per request instead of once per branch.
+    var method_names: std.ArrayList([]const u8) = .empty;
+    var method_groups: std.ArrayList(std.ArrayList(usize)) = .empty;
+    for (parsed_patterns.items, 0..) |*pp, pi| {
+        if (pp.is_catchall) continue;
+        var gi: ?usize = null;
+        for (method_names.items, 0..) |mn, i| {
+            if (std.mem.eql(u8, mn, pp.method)) {
+                gi = i;
+                break;
+            }
+        }
+        const idx = gi orelse blk: {
+            method_names.append(allocator, pp.method) catch unreachable;
+            method_groups.append(allocator, .empty) catch unreachable;
+            break :blk method_names.items.len - 1;
+        };
+        method_groups.items[idx].append(allocator, pi) catch unreachable;
+    }
+
+    // handler-lite table — the pre-Request dispatch. A route arm that is a
+    // `-> { ... }` literal (a `.branch_constructor` produce) is request-free
+    // by construction UNLESS its body still names `req` — checked on the
+    // generated code, not the AST, so a `req.path` inside a field literal
+    // quietly disqualifies the arm instead of silently dispatching past it.
+    // A literal arm joins the table only when no earlier pattern in its own
+    // method group could match its path — earlier dynamic routes keep their
+    // first-match semantics because lite-miss falls through to the full
+    // chain, which still contains every route in order.
+    var lite_route_pis: std.ArrayList(usize) = .empty;
+    {
+        for (method_names.items, 0..) |_, mi| {
+            for (method_groups.items[mi].items, 0..) |pi, gi| {
+                const pp = &parsed_patterns.items[pi];
+                // Exact-path patterns only: a ':' or '*' pattern is a shape,
+                // not a fixed answer.
+                if (pp.params.len != 0) continue;
+                var path_iter_chk = std.mem.splitScalar(u8, pp.path, '/');
+                var has_star = false;
+                while (path_iter_chk.next()) |seg| {
+                    if (seg.len == 1 and seg[0] == '*') has_star = true;
+                }
+                if (has_star) continue;
+
+                // Literal arm check + req-independence, on the generated code.
+                const cont = find_cont: {
+                    for (pattern_conts.items) |pc| {
+                        if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
+                    }
+                    break :find_cont null;
+                };
+                const pc_node = if (cont) |c| c.node else null;
+                const is_literal = if (pc_node) |n| n == .branch_constructor else false;
+                if (!is_literal) continue;
+
+                var lite_counter: usize = 0;
+                const arm_code = continuation_codegen.generateContinuationChainWithItems(
+                    allocator,
+                    cont.?,
+                    program.main_module_name,
+                    &lite_counter,
+                    2,
+                    program.items,
+                ) catch unreachable;
+                if (indexOfWord(arm_code, req_expr) != null) continue;
+
+                // Shadow check: an earlier pattern in this method group that
+                // is not itself an admitted literal route must not be able to
+                // match this route's exact path — in the full chain it wins
+                // first-match, and lite must not reorder past it.
+                var shadowed = false;
+                for (method_groups.items[mi].items[0..gi]) |pji| {
+                    var earlier_in_lite = false;
+                    for (lite_route_pis.items) |lpi| {
+                        if (lpi == pji) earlier_in_lite = true;
+                    }
+                    if (earlier_in_lite) continue;
+                    const pp2 = &parsed_patterns.items[pji];
+                    if (patternMatchesLiteral(pp2.path, pp.path)) {
+                        shadowed = true;
+                        break;
+                    }
+                }
+                if (shadowed) continue;
+
+                lite_route_pis.append(allocator, pi) catch unreachable;
+            }
+        }
+    }
+
+    // The catch-all body is generated once and emitted inside every method
+    // group — a request whose method matched but whose path didn't must
+    // still reach it — and once more in the final else for methods outside
+    // the table.
+    var catch_all_code: ?[]const u8 = null;
+    if (catch_all_cont) |cont| {
+        catch_all_code = continuation_codegen.generateContinuationChainWithItems(
+            allocator,
+            cont,
+            program.main_module_name,
+            &result_counter,
+            2,
+            program.items,
+        ) catch unreachable;
+    }
+
+    // Emit method-grouped if / else if blocks for all non-catchall patterns.
+    var first_group = true;
+    for (method_names.items, 0..) |mname, mi| {
+        if (first_group) {
+            ib.appendSlice(allocator, "    if (") catch unreachable;
+            first_group = false;
+        } else {
+            ib.appendSlice(allocator, " else if (") catch unreachable;
+        }
+        ib.appendSlice(allocator, "std.mem.eql(u8, (") catch unreachable;
+        ib.appendSlice(allocator, req_expr) catch unreachable;
+        ib.appendSlice(allocator, ").method, \"") catch unreachable;
+        ib.appendSlice(allocator, mname) catch unreachable;
+        ib.appendSlice(allocator, "\")) {\n") catch unreachable;
+
+        var first_branch = true;
+        for (method_groups.items[mi].items) |pi| {
+            const pp = &parsed_patterns.items[pi];
+
+            // Find continuation for this pattern
+            const cont = find_cont: {
+                for (pattern_conts.items) |pc| {
+                    if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
+                }
+                break :find_cont null;
+            };
+
+            // Emit if / else if
+            if (first_branch) {
+                ib.appendSlice(allocator, "    if (") catch unreachable;
+                first_branch = false;
+            } else {
+                ib.appendSlice(allocator, " else if (") catch unreachable;
+            }
+
+        // A parameterized pattern keeps the prefix fast path only when its
+        // single ':' segment is the LAST segment. Anything more — a param
+        // mid-pattern ("/rooms/:id/messages"), multiple params, or a '*'
+        // segment — takes the segment-wise matcher: the prefix path emitted
+        // startsWith(prefix) + a greedy capture, silently truncating the
+        // pattern's tail and shadowing every more-specific route behind it.
+        var seen_param_seg = false;
+        var param_then_trailing = false;
+        var has_wildcard_seg = false;
+        {
+            var sit = std.mem.splitScalar(u8, pp.path, '/');
+            while (sit.next()) |seg| {
+                if (seg.len == 0) continue;
+                if (seen_param_seg) param_then_trailing = true;
+                if (seg.len > 1 and seg[0] == ':') {
+                    seen_param_seg = true;
+                } else if (seg.len == 1 and seg[0] == '*') {
+                    has_wildcard_seg = true;
+                }
+            }
+        }
+        const simple_param = pp.params.len == 1 and !param_then_trailing and !has_wildcard_seg;
+
+        if (pp.params.len == 0 and !has_wildcard_seg) {
+            // Exact path match
+            ib.appendSlice(allocator, "std.mem.eql(u8, (") catch unreachable;
+            ib.appendSlice(allocator, req_expr) catch unreachable;
+            ib.appendSlice(allocator, ").path, \"") catch unreachable;
+            ib.appendSlice(allocator, pp.path) catch unreachable;
+            ib.appendSlice(allocator, "\")") catch unreachable;
+        } else if (simple_param) {
+            // Prefix match for trailing-param routes. The captured segment
+            // may not contain '/' (a param never crosses a separator) and
+            // may not be empty — both checked here so "/rooms/x/messages"
+            // falls through to the longer pattern instead of being eaten.
+            var prefix_end: usize = 0;
+            var path_iter = std.mem.splitScalar(u8, pp.path, '/');
+            while (path_iter.next()) |seg| {
+                if (seg.len > 0 and seg[0] == ':') break;
+                prefix_end += seg.len + 1;
+            }
+            const prefix = if (prefix_end > 0) pp.path[0..prefix_end] else "/";
+
+            var plen_buf: [10]u8 = undefined;
+            const plen_str = std.fmt.bufPrint(&plen_buf, "{}", .{prefix.len}) catch "0";
+
+            ib.appendSlice(allocator, "std.mem.startsWith(u8, (") catch unreachable;
+            ib.appendSlice(allocator, req_expr) catch unreachable;
+            ib.appendSlice(allocator, ").path, \"") catch unreachable;
+            ib.appendSlice(allocator, prefix) catch unreachable;
+            ib.appendSlice(allocator, "\") and (") catch unreachable;
+            ib.appendSlice(allocator, req_expr) catch unreachable;
+            ib.appendSlice(allocator, ").path.len > ") catch unreachable;
+            ib.appendSlice(allocator, plen_str) catch unreachable;
+            ib.appendSlice(allocator, " and std.mem.indexOfScalar(u8, (") catch unreachable;
+            ib.appendSlice(allocator, req_expr) catch unreachable;
+            ib.appendSlice(allocator, ").path[") catch unreachable;
+            ib.appendSlice(allocator, plen_str) catch unreachable;
+            ib.appendSlice(allocator, "..], '/') == null") catch unreachable;
+        } else {
+            // Segment-wise match: literals compare, ':' segments capture,
+            // '*' consumes the rest, and the path must end exactly.
+            ib.appendSlice(allocator, "blk: {\n") catch unreachable;
+            ib.appendSlice(allocator, "            var _it = std.mem.splitScalar(u8, (") catch unreachable;
+            ib.appendSlice(allocator, req_expr) catch unreachable;
+            ib.appendSlice(allocator, ").path, '/');\n            _ = _it.next();\n") catch unreachable;
+            var wsegs = std.mem.splitScalar(u8, pp.path, '/');
+            var wildcard_emitted = false;
+            while (wsegs.next()) |seg| {
+                if (seg.len == 0) continue;
+                if (seg.len == 1 and seg[0] == '*') {
+                    ib.appendSlice(allocator, "            break :blk true;\n") catch unreachable;
+                    wildcard_emitted = true;
+                    break;
+                }
+                if (seg.len > 1 and seg[0] == ':') {
+                    ib.appendSlice(allocator, "            _ = _it.next() orelse break :blk false;\n") catch unreachable;
+                } else {
+                    ib.appendSlice(allocator, "            if (!std.mem.eql(u8, _it.next() orelse break :blk false, \"") catch unreachable;
+                    ib.appendSlice(allocator, seg) catch unreachable;
+                    ib.appendSlice(allocator, "\")) break :blk false;\n") catch unreachable;
+                }
+            }
+            if (!wildcard_emitted) {
+                ib.appendSlice(allocator, "            if (_it.next() != null) break :blk false;\n            break :blk true;\n") catch unreachable;
+            }
+            ib.appendSlice(allocator, "        }") catch unreachable;
+        }
+
+        ib.appendSlice(allocator, ") {\n") catch unreachable;
+
+        // Parameter extraction for parameterized routes
+        if (pp.params.len > 0) {
+            if (cont) |param_cont| {
+                const needs_param = if (param_cont.binding) |binding|
+                    !(binding.len > 0 and binding[0] == '_')
+                else
+                    false;
+
+                if (needs_param) {
+                    if (simple_param) {
+                        var prefix_end2: usize = 0;
+                        var path_iter2 = std.mem.splitScalar(u8, pp.path, '/');
+                        while (path_iter2.next()) |seg| {
+                            if (seg.len > 0 and seg[0] == ':') break;
+                            prefix_end2 += seg.len + 1;
+                        }
+                        const prefix2 = if (prefix_end2 > 0) pp.path[0..prefix_end2] else "/";
+
+                        var len_buf: [10]u8 = undefined;
+                        const prefix_len_str = std.fmt.bufPrint(&len_buf, "{}", .{prefix2.len}) catch "0";
+                        ib.appendSlice(allocator, "        const _p = (") catch unreachable;
+                        ib.appendSlice(allocator, req_expr) catch unreachable;
+                        ib.appendSlice(allocator, ").path;\n") catch unreachable;
+                        ib.appendSlice(allocator, "        const _param = if (_p.len >= ") catch unreachable;
+                        ib.appendSlice(allocator, prefix_len_str) catch unreachable;
+                        ib.appendSlice(allocator, ") _p[") catch unreachable;
+                        ib.appendSlice(allocator, prefix_len_str) catch unreachable;
+                        ib.appendSlice(allocator, "..] else \"\";\n") catch unreachable;
+                        ib.appendSlice(allocator, "        const ") catch unreachable;
+                        ib.appendSlice(allocator, param_cont.binding.?) catch unreachable;
+                        ib.appendSlice(allocator, " = .{ .") catch unreachable;
+                        ib.appendSlice(allocator, pp.params[0]) catch unreachable;
+                        ib.appendSlice(allocator, " = _param };\n") catch unreachable;
+                    } else {
+                        // Re-walk the path positionally: the condition's
+                        // matcher already proved the shape, so captures are
+                        // just the ':' segments in order.
+                        ib.appendSlice(allocator, "        const _p = (") catch unreachable;
+                        ib.appendSlice(allocator, req_expr) catch unreachable;
+                        ib.appendSlice(allocator, ").path;\n") catch unreachable;
+                        ib.appendSlice(allocator, "        var _it2 = std.mem.splitScalar(u8, _p, '/');\n        _ = _it2.next();\n") catch unreachable;
+                        var cap_idx: usize = 0;
+                        var csegs = std.mem.splitScalar(u8, pp.path, '/');
+                        while (csegs.next()) |seg| {
+                            if (seg.len == 0) continue;
+                            if (seg.len == 1 and seg[0] == '*') break;
+                            if (seg.len > 1 and seg[0] == ':') {
+                                var nbuf: [10]u8 = undefined;
+                                const nstr = std.fmt.bufPrint(&nbuf, "{}", .{cap_idx}) catch "0";
+                                ib.appendSlice(allocator, "        const _cap") catch unreachable;
+                                ib.appendSlice(allocator, nstr) catch unreachable;
+                                ib.appendSlice(allocator, " = _it2.next() orelse \"\";\n") catch unreachable;
+                                cap_idx += 1;
+                            } else {
+                                ib.appendSlice(allocator, "        _ = _it2.next();\n") catch unreachable;
+                            }
+                        }
+                        ib.appendSlice(allocator, "        const ") catch unreachable;
+                        ib.appendSlice(allocator, param_cont.binding.?) catch unreachable;
+                        ib.appendSlice(allocator, " = .{ ") catch unreachable;
+                        for (pp.params, 0..) |pname, i| {
+                            if (i > 0) ib.appendSlice(allocator, ", ") catch unreachable;
+                            var nbuf: [10]u8 = undefined;
+                            const nstr = std.fmt.bufPrint(&nbuf, "{}", .{i}) catch "0";
+                            ib.appendSlice(allocator, ".") catch unreachable;
+                            ib.appendSlice(allocator, pname) catch unreachable;
+                            ib.appendSlice(allocator, " = _cap") catch unreachable;
+                            ib.appendSlice(allocator, nstr) catch unreachable;
+                        }
+                        ib.appendSlice(allocator, " };\n") catch unreachable;
+                    }
+                }
+            }
+        }
+
+        // Continuation code
+        if (cont) |active_cont| {
+            const code = wireTagArmCode(allocator, active_cont, continuation_codegen.generateContinuationChainWithItems(
+                allocator,
+                active_cont,
+                program.main_module_name,
+                &result_counter,
+                2,
+                program.items,
+            ) catch unreachable);
+            ib.appendSlice(allocator, code) catch unreachable;
+        }
+
+            ib.appendSlice(allocator, "    }") catch unreachable;
+        }
+
+        // A path miss inside a matched method still lands on the catch-all.
+        if (catch_all_code) |code| {
+            ib.appendSlice(allocator, " else {\n") catch unreachable;
+            ib.appendSlice(allocator, code) catch unreachable;
+            ib.appendSlice(allocator, "    }\n") catch unreachable;
+        }
+        ib.appendSlice(allocator, "    }") catch unreachable;
+    }
+
+    // And so does a method outside the table.
+    if (catch_all_code) |code| {
+        ib.appendSlice(allocator, " else {\n") catch unreachable;
+        ib.appendSlice(allocator, code) catch unreachable;
+        ib.appendSlice(allocator, "    }\n") catch unreachable;
+    } else {
+        ib.appendSlice(allocator, "\n") catch unreachable;
+    }
+
+    const _generated_dispatch = ib.toOwnedSlice(allocator) catch unreachable;
+    // If any pattern branch was terminal (`|`) rather than effect (`!`), replace
+    // the whole dispatch with a hard compile error. The router is kind-aware now.
+    const inline_body_str: []const u8 = if (has_terminal_pattern)
+        "//@koru:inline_stmt\ncomptime { @compileError(\"orisha:router pattern branches must use effect `!`, not terminal `|`. Write `! [GET /path]` instead.\"); }\n"
+    else
+        _generated_dispatch;
+    std.debug.print("[ROUTER TRANSFORM] Generated inline dispatch:\n{s}\n", .{inline_body_str});
+
+    // Emit the handler-lite body over admitted literal routes — a flat
+    // first-match chain on (method, path), the same order the full dispatch
+    // emits them. Each arm regenerates its code under its own counter; the
+    // emitted `result_` names live in a different function than the main
+    // chain's, so nothing collides.
+    var lite_body_str: ?[]const u8 = null;
+    if (lite_route_pis.items.len > 0) {
+        var lb: std.ArrayList(u8) = .empty;
+        lb.appendSlice(allocator, "//@koru:inline_stmt\n") catch unreachable;
+        for (lite_route_pis.items, 0..) |pi, li| {
+            const pp = &parsed_patterns.items[pi];
+            const cont = find_cont: {
+                for (pattern_conts.items) |pc| {
+                    if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
+                }
+                break :find_cont null;
+            };
+            lb.appendSlice(allocator, if (li == 0) "    if (" else "    else if (") catch unreachable;
+            lb.appendSlice(allocator, "std.mem.eql(u8, method, \"") catch unreachable;
+            lb.appendSlice(allocator, pp.method) catch unreachable;
+            lb.appendSlice(allocator, "\") and std.mem.eql(u8, path, \"") catch unreachable;
+            lb.appendSlice(allocator, pp.path) catch unreachable;
+            lb.appendSlice(allocator, "\")) {\n") catch unreachable;
+            var lite_counter2: usize = 0;
+            var arm_code = if (cont) |lite_cont|
+                continuation_codegen.generateContinuationChainWithItems(
+                    allocator,
+                    lite_cont,
+                    program.main_module_name,
+                    &lite_counter2,
+                    2,
+                    program.items,
+                ) catch unreachable
+            else
+                continue;
+            if (cont) |lite_cont| {
+                arm_code = wireTagArmCode(allocator, lite_cont, arm_code);
+            }
+            lb.appendSlice(allocator, arm_code) catch unreachable;
+            lb.appendSlice(allocator, "    }\n") catch unreachable;
+        }
+        lb.appendSlice(allocator, "    return null;\n") catch unreachable;
+        lite_body_str = lb.toOwnedSlice(allocator) catch unreachable;
+        std.debug.print("[ROUTER TRANSFORM] Generated handler-lite dispatch ({} routes):\n{s}\n", .{ lite_route_pis.items.len, lite_body_str.? });
+    }
+
+    if (!is_pointer_top) {
+        // NESTED CASE: replace the invocation node with inline_code, not the whole flow.
+        // Strip the //@koru:inline_stmt prefix — inline_code nodes emit raw code.
+        const prefix = "//@koru:inline_stmt\n";
+        const code_str = if (std.mem.startsWith(u8, inline_body_str, prefix))
+            inline_body_str[prefix.len..]
+        else
+            inline_body_str;
+
+        const new_node = ast_mod.Node{ .inline_code = code_str };
+        const empty_conts = allocator.alloc(ast_mod.Continuation, 0) catch unreachable;
+        const maybe_new = ast_functional.replaceInvocationNodeAndContinuationsRecursive(
+            allocator,
+            program,
+            invocation,
+            new_node,
+            empty_conts,
+            true, // synthesized graft — exempt from structural branch rules
+        ) catch unreachable;
+        if (maybe_new) |new_program_val| {
+            const result = allocator.create(ast_mod.Program) catch unreachable;
+            result.* = new_program_val;
+            return .{ .whole_program = result };
+        }
+        return .{};
+    }
+
+    // TOP-LEVEL CASE: replace the entire flow
+    // Mark as transformed (keep original invocation path)
+    const new_inv_marks = allocator.alloc([]const u8, flow.inv().marks.len + 1) catch unreachable;
+    for (flow.inv().marks, 0..) |m, j| {
+        new_inv_marks[j] = m;
+    }
+    new_inv_marks[flow.inv().marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_invocation = ast_mod.Invocation{
+        .path = flow.inv().path,
+        .args = flow.inv().args,
+        .annotations = flow.inv().annotations,
+        .marks = new_inv_marks,
+    };
+
+    const empty_conts = allocator.alloc(ast_mod.Continuation, 0) catch unreachable;
+
+    var transformed_flow = flow.*;
+    transformed_flow.body = ast_mod.rootSite(new_invocation, empty_conts, flow.location);
+    transformed_flow.inline_body = inline_body_str;
+
+    const new_item = ast_mod.Item{ .flow = transformed_flow };
+
+    // Replace using recursive search (handles .flow and nested module_decls)
+    const maybe_new_program = ast_functional.replaceFlowRecursive(allocator, program, flow, new_item) catch unreachable;
+    if (maybe_new_program) |new_program_val| {
+        const result = allocator.create(ast_mod.Program) catch unreachable;
+        result.* = new_program_val;
+
+        if (lite_body_str) |lite_body| {
+            // Synthesize `orisha:handler-lite` — an impl flow carrying the
+            // pre-Request dispatch. resolve_abstract_impl ran at parse time,
+            // before this impl existed, so orisha's default impl is still
+            // named handler-lite; renameLiteDefault applies the same rename
+            // resolve would have done had the override been in the source.
+            const lite_segments = allocator.alloc([]const u8, 1) catch unreachable;
+            lite_segments[0] = "handler-lite";
+            const lite_path = ast_mod.DottedPath{
+                .module_qualifier = "orisha",
+                .segments = lite_segments,
+            };
+            const lite_args = allocator.alloc(ast_mod.Arg, 2) catch unreachable;
+            lite_args[0] = .{ .name = "method", .value = "method" };
+            lite_args[1] = .{ .name = "path", .value = "path" };
+            const lite_invocation = ast_mod.Invocation{
+                .path = lite_path,
+                .args = lite_args,
+                .source_module = program.main_module_name,
+            };
+            const empty_lite_conts = allocator.alloc(ast_mod.Continuation, 0) catch unreachable;
+            const lite_flow = ast_mod.Flow{
+                .body = ast_mod.rootSite(lite_invocation, empty_lite_conts, flow.location),
+                .impl_of = lite_path,
+                .is_impl = true,
+                .inline_body = lite_body,
+                .module = program.main_module_name,
+            };
+
+            const grown = allocator.alloc(ast_mod.Item, result.items.len + 1) catch unreachable;
+            @memcpy(grown[0..result.items.len], result.items);
+            grown[result.items.len] = .{ .flow = lite_flow };
+            result.items = grown;
+
+            renameLiteDefault(result.items, allocator);
+        }
+
+        return .{ .whole_program = result };
+    } else {
+        std.debug.print("ERROR: Router transform failed - flow not found in program\n", .{});
+        return .{};
+    }
+}
+
+// ============================================================================
+// STATIC FILE SERVING
+// ============================================================================
+// Compile-time static file embedding with gzip compression, ETags, and
+// automatic MIME type detection.
+//
+// Usage:
+//   ~orisha:static(name: "site", root: "public", fallback: "200.html")
+//   ~orisha:handler = orisha:static-router(name: "site")
+//   ~orisha:serve(port: 3000)
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const zlib = @cImport({
+    @cInclude("zlib.h");
+});
+
+const ProcessedRoute = struct {
+    method: []const u8,
+    path: []const u8,
+    response: []const u8,
+    response_gzip: ?[]const u8,
+    etag: []const u8,
+    etag_gzip: ?[]const u8,
+};
+
+fn stripQuotes(s: []const u8) []const u8 {
+    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') {
+        return s[1 .. s.len - 1];
+    }
+    return s;
+}
+
+fn processDirectory(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRoute), method: []const u8, base_path: []const u8, dir_path: []const u8) void {
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var walker = dir.walk(allocator) catch return;
+    defer walker.deinit();
+    while (walker.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const file_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path }) catch continue;
+        const route_path = if (std.mem.eql(u8, base_path, "/"))
+            std.fmt.allocPrint(allocator, "/{s}", .{entry.path}) catch continue
+        else
+            std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_path, entry.path }) catch continue;
+        const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch continue;
+        // SvelteKit's hashed assets all live under /_app/ — their URLs change
+        // when the content does, so they are safe to cache as immutable.
+        const http_resp = buildHttpResponse(allocator, content, mimeTypeFromPath(file_path), std.mem.startsWith(u8, route_path, "/_app/")) catch continue;
+        routes.append(allocator, .{ .method = method, .path = route_path, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch continue;
+        if (std.mem.eql(u8, entry.path, "index.html") and std.mem.eql(u8, base_path, "/")) {
+            routes.append(allocator, .{ .method = method, .path = "/", .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch continue;
+        }
+
+        // A page is requested at /blog, and it is stored as blog.html. Serving
+        // only the literal name is what every other static server resolves for
+        // you, and skipping it does not look like a bug — the SPA fallback
+        // answers 200 with the empty shell, so the browser fills the page in and
+        // only a crawler can tell. Measured against korulang.org's own build on
+        // 2026-08-10: 233 real pages embedded, ONE of them (the root) reachable.
+        //
+        // Both spellings get registered, with and without the trailing slash,
+        // because a link may carry either and neither should be a miss.
+        if (std.mem.endsWith(u8, route_path, ".html")) {
+            const stem = route_path[0 .. route_path.len - ".html".len];
+            const target = if (std.mem.endsWith(u8, stem, "/index"))
+                stem[0 .. stem.len - "/index".len] // /docs/index.html -> /docs
+            else
+                stem; // /blog.html -> /blog
+            if (target.len > 0) {
+                routes.append(allocator, .{ .method = method, .path = target, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch continue;
+                const slashed = std.fmt.allocPrint(allocator, "{s}/", .{target}) catch continue;
+                routes.append(allocator, .{ .method = method, .path = slashed, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch continue;
+            }
+        }
+    }
+}
+
+fn processFile(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRoute), method: []const u8, path: []const u8, file_path: []const u8, content_type_override: ?[]const u8) void {
+    const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch return;
+    const content_type = content_type_override orelse mimeTypeFromPath(file_path);
+    const http_resp = buildHttpResponse(allocator, content, content_type, std.mem.startsWith(u8, path, "/_app/")) catch return;
+    routes.append(allocator, .{ .method = method, .path = path, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch return;
+}
+
+fn computeEtag(content: []const u8, out: *[64]u8) void {
+    var hash: [32]u8 = undefined;
+    Sha256.hash(content, &hash, .{});
+    const hex_chars = "0123456789abcdef";
+    for (hash, 0..) |byte, i| {
+        out[i * 2] = hex_chars[byte >> 4];
+        out[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+}
+
+const HttpResponse = struct { response: []const u8, response_gzip: ?[]const u8, etag: []const u8, etag_gzip: ?[]const u8 };
+
+fn isCompressible(content_type: []const u8) bool {
+    if (std.mem.startsWith(u8, content_type, "text/")) return true;
+    if (std.mem.startsWith(u8, content_type, "application/javascript")) return true;
+    if (std.mem.startsWith(u8, content_type, "application/json")) return true;
+    if (std.mem.startsWith(u8, content_type, "image/svg")) return true;
+    return false;
+}
+
+/// Did this coding's own parameters refuse it? `q=0` is an explicit
+/// refusal — presence in the list is not consent. A malformed qvalue
+/// refuses too: identity is always legal, so doubt serves identity.
+/// (Same logic as the emitted `codingRefused` in the static-route
+/// template — kept in step deliberately.)
+fn aeCodingRefused(params: []const u8) bool {
+    var it = std.mem.splitScalar(u8, params, ';');
+    while (it.next()) |param| {
+        const p = std.mem.trim(u8, param, " \t");
+        if (p.len >= 2 and (p[0] == 'q' or p[0] == 'Q') and p[1] == '=') {
+            const v = std.fmt.parseFloat(f64, std.mem.trim(u8, p[2..], " \t")) catch return true;
+            return v == 0;
+        }
+    }
+    return false;
+}
+
+fn aeWantsGzip(accept_encoding: ?[]const u8) bool {
+    const ae = accept_encoding orelse return false;
+    var star: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, ae, ',');
+    while (it.next()) |raw_entry| {
+        const entry = std.mem.trim(u8, raw_entry, " \t");
+        const semi = std.mem.indexOfScalar(u8, entry, ';') orelse entry.len;
+        const name = std.mem.trim(u8, entry[0..semi], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "gzip")) {
+            // An explicit entry beats the wildcard (RFC 9110 §12.5.3).
+            return !aeCodingRefused(entry[semi..]);
+        }
+        if (std.mem.eql(u8, name, "*")) star = entry[semi..];
+    }
+    const sp = star orelse return false;
+    return !aeCodingRefused(sp);
+}
+
+fn gzipCompress(allocator: std.mem.Allocator, content: []const u8) ?[]const u8 {
+    return gzipCompressLevel(allocator, content, zlib.Z_DEFAULT_COMPRESSION);
+}
+
+fn gzipCompressLevel(allocator: std.mem.Allocator, content: []const u8, level: c_int) ?[]const u8 {
+    if (content.len < 100) return null;
+    const max_output = zlib.compressBound(@intCast(content.len));
+    const output = allocator.alloc(u8, max_output) catch return null;
+    var strm: zlib.z_stream = std.mem.zeroes(zlib.z_stream);
+    strm.next_in = @constCast(content.ptr);
+    strm.avail_in = @intCast(content.len);
+    strm.next_out = output.ptr;
+    strm.avail_out = @intCast(output.len);
+    if (zlib.deflateInit2(&strm, level, zlib.Z_DEFLATED, 15 + 16, 8, zlib.Z_DEFAULT_STRATEGY) != zlib.Z_OK) {
+        allocator.free(output);
+        return null;
+    }
+    const result = zlib.deflate(&strm, zlib.Z_FINISH);
+    const compressed_size = output.len - strm.avail_out;
+    _ = zlib.deflateEnd(&strm);
+    if (result != zlib.Z_STREAM_END or compressed_size >= content.len) {
+        allocator.free(output);
+        return null;
+    }
+    return allocator.realloc(output, compressed_size) catch output[0..compressed_size];
+}
+
+// Both representations are baked per route — identity always, gzip when the
+// MIME type is compressible and deflate actually wins — because the client is
+// only known at request time. Serving the gzip bytes to a client that never
+// advertised `Accept-Encoding: gzip` is a protocol violation; a body it cannot
+// decode is a 200 that renders as garbage. `Vary: Accept-Encoding` goes on
+// BOTH variants so a shared cache keys them apart instead of replaying
+// whichever one it saw first.
+fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_type: []const u8, is_immutable: bool) !HttpResponse {
+    var etag_buf: [64]u8 = undefined;
+    computeEtag(content, &etag_buf);
+    const etag = try allocator.dupe(u8, etag_buf[0..16]);
+    const compressed = if (isCompressible(content_type)) gzipCompress(allocator, content) else null;
+    const negotiated = compressed != null;
+    // Strong etags are per-REPRESENTATION (RFC 9110 §8.8.3): the identity and
+    // gzip bodies are different bytes, so they carry different validators.
+    // Sharing one strong etag lets a cache treat the two as interchangeable.
+    var etag_gzip: ?[]const u8 = null;
+    if (compressed) |gz| {
+        var gz_buf: [64]u8 = undefined;
+        computeEtag(gz, &gz_buf);
+        etag_gzip = try allocator.dupe(u8, gz_buf[0..16]);
+    }
+    const response = try renderResponse(allocator, content, content_type, etag, false, negotiated, is_immutable);
+    const response_gzip: ?[]const u8 = if (compressed) |gz|
+        try renderResponse(allocator, gz, content_type, etag_gzip.?, true, true, is_immutable)
+    else
+        null;
+    return .{ .response = response, .response_gzip = response_gzip, .etag = etag, .etag_gzip = etag_gzip };
+}
+
+fn renderResponse(allocator: std.mem.Allocator, body: []const u8, content_type: []const u8, etag: []const u8, gzipped: bool, negotiated: bool, is_immutable: bool) ![]const u8 {
+    var response: std.ArrayList(u8) = .empty;
+    try response.appendSlice(allocator, "HTTP/1.1 200 OK\r\nContent-Type: ");
+    try response.appendSlice(allocator, content_type);
+    try response.appendSlice(allocator, "\r\n");
+    if (gzipped) try response.appendSlice(allocator, "Content-Encoding: gzip\r\n");
+    if (negotiated) try response.appendSlice(allocator, "Vary: Accept-Encoding\r\n");
+    try response.appendSlice(allocator, "Content-Length: ");
+    var len_buf: [20]u8 = undefined;
+    try response.appendSlice(allocator, std.fmt.bufPrint(&len_buf, "{}", .{body.len}) catch "0");
+    try response.appendSlice(allocator, "\r\nETag: \"");
+    try response.appendSlice(allocator, etag);
+    // The baked content cannot change without a rebuild, so it is safe to
+    // cache: hashed asset URLs are immutable for a year; pages get a one-day
+    // shared-cache lifetime with stale-while-revalidate, and the client
+    // revalidates via the ETag above (max-age=0 on the client-facing header).
+    //
+    // Vercel will cache a Function response that carries s-maxage — but only
+    // if that directive sits on `Vercel-CDN-Cache-Control` (or
+    // `CDN-Cache-Control`). Putting s-maxage on `Cache-Control` alone is what
+    // we did first: Vercel strips it before the browser sees the response
+    // (`cache-control: public, max-age=0`) and still runs the function every
+    // time (`x-vercel-cache: MISS`). The two CDN headers are the ones that
+    // actually move a deployment off the function-per-request meter.
+    //
+    // A Koru/Orisha response is baked by the runtime that answers it. This
+    // header is the self-identification — the crown, not a host label — so
+    // any caller can verify the page was served by Orisha (never a SvelteKit
+    // hydration shell) straight off the wire. It sits before the `\r\n\r\n`
+    // that terminates the head; putting it after the head
+    // terminator would push it into the BODY and corrupt every baked response.
+    try response.appendSlice(allocator, "\"\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n");
+    if (is_immutable) {
+        try response.appendSlice(allocator, "Cache-Control: public, max-age=31536000, s-maxage=31536000, immutable\r\n" ++
+            "CDN-Cache-Control: public, s-maxage=31536000, immutable\r\n" ++
+            "Vercel-CDN-Cache-Control: public, s-maxage=31536000, immutable\r\n\r\n");
+    } else {
+        try response.appendSlice(allocator, "Cache-Control: public, max-age=0, s-maxage=86400, stale-while-revalidate=86400\r\n" ++
+            "CDN-Cache-Control: public, s-maxage=86400, stale-while-revalidate=86400\r\n" ++
+            "Vercel-CDN-Cache-Control: public, s-maxage=86400, stale-while-revalidate=86400\r\n\r\n");
+    }
+    try response.appendSlice(allocator, body);
+    return response.items;
+}
+
+fn mimeTypeFromPath(path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".js")) return "application/javascript; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".json")) return "application/json";
+    if (std.mem.endsWith(u8, path, ".png")) return "image/png";
+    if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) return "image/jpeg";
+    if (std.mem.endsWith(u8, path, ".gif")) return "image/gif";
+    if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
+    if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
+    if (std.mem.endsWith(u8, path, ".woff")) return "font/woff";
+    if (std.mem.endsWith(u8, path, ".woff2")) return "font/woff2";
+    if (std.mem.endsWith(u8, path, ".ttf")) return "font/ttf";
+    if (std.mem.endsWith(u8, path, ".webp")) return "image/webp";
+    return "application/octet-stream";
+}
+
+fn appendFmt(allocator: std.mem.Allocator, list: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
+    var buf: [4096]u8 = undefined;
+    try list.appendSlice(allocator, std.fmt.bufPrint(&buf, fmt, args) catch return error.OutOfMemory);
+}
+
+// Order the routes by how often they are actually requested.
+//
+// This is the compile-time half of what a C toolchain calls profile-guided
+// optimisation, and it is available here for a reason no other web server can
+// copy: at the moment this runs, the entire site is a value in memory. nginx
+// cannot reorder around your traffic because nginx has not met your site yet —
+// it discovers files at runtime, one open() at a time, which is the only moment
+// at which reordering is no longer free.
+//
+// What ordering buys is NOT lookup: the table is a comptime hash and a hash does
+// not care where an entry sits. What it buys is LAYOUT — the response bodies are
+// emitted in this order, so the pages that serve most of the traffic end up
+// adjacent in the binary instead of scattered across it by alphabetical
+// accident. Whether that is worth anything is an empirical question and it may
+// well be worth nothing; see benchmarks/twobox.
+//
+// The profile is `orisha.profile` in the working directory when it exists — a
+// plain access log. No profile, no reordering, and it says which it did.
+fn loadProfileHits(allocator: std.mem.Allocator) ?struct { hits: std.StringHashMap(u64), counted: u64, storage: []u8 } {
+    const profile_text = std.fs.cwd().readFileAlloc(allocator, "orisha.profile", 64 * 1024 * 1024) catch return null;
+
+    var hits = std.StringHashMap(u64).init(allocator);
+    var lines = std.mem.splitScalar(u8, profile_text, '\n');
+    var counted: u64 = 0;
+    while (lines.next()) |line| {
+        const q = std.mem.indexOfScalar(u8, line, '"') orelse continue;
+        var parts = std.mem.tokenizeScalar(u8, line[q + 1 ..], ' ');
+        _ = parts.next() orelse continue; // method
+        const target = parts.next() orelse continue;
+        const path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
+        const gop = hits.getOrPut(path) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+        counted += 1;
+    }
+    if (counted == 0) {
+        hits.deinit();
+        allocator.free(profile_text);
+        return null;
+    }
+    return .{ .hits = hits, .counted = counted, .storage = profile_text };
+}
+
+fn orderByProfile(allocator: std.mem.Allocator, routes: []ProcessedRoute) void {
+    const loaded = loadProfileHits(allocator) orelse {
+        std.debug.print("[STATIC_ROUTER] profile: none (orisha.profile absent) — routes keep directory order\n", .{});
+        return;
+    };
+    defer allocator.free(loaded.storage);
+    var hits = loaded.hits;
+    defer hits.deinit();
+
+    const Ctx = struct {
+        h: *std.StringHashMap(u64),
+        fn hotter(self: @This(), a: ProcessedRoute, b: ProcessedRoute) bool {
+            const ha = self.h.get(a.path) orelse 0;
+            const hb = self.h.get(b.path) orelse 0;
+            if (ha != hb) return ha > hb;
+            return std.mem.lessThan(u8, a.path, b.path); // stable for the cold tail
+        }
+    };
+    std.sort.block(ProcessedRoute, routes, Ctx{ .h = &hits }, Ctx.hotter);
+
+    var named: u64 = 0;
+    for (routes) |r| { if (hits.get(r.path)) |_| named += 1; }
+    std.debug.print("[STATIC_ROUTER] profile: {d} requests over {d} paths — hottest is {s}, {d}/{d} routes appear\n", .{ loaded.counted, hits.count(), routes[0].path, named, routes.len });
+}
+
+fn appendZigString(allocator: std.mem.Allocator, output: *std.ArrayList(u8), bytes: []const u8) !void {
+    try output.append(allocator, '"');
+    for (bytes) |byte| {
+        switch (byte) {
+            '\n' => try output.appendSlice(allocator, "\\n"),
+            '\r' => try output.appendSlice(allocator, "\\r"),
+            '\t' => try output.appendSlice(allocator, "\\t"),
+            '"' => try output.appendSlice(allocator, "\\\""),
+            '\\' => try output.appendSlice(allocator, "\\\\"),
+            0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try output.append(allocator, byte),
+            else => {
+                var hex_buf: [4]u8 = undefined;
+                _ = std.fmt.bufPrint(&hex_buf, "\\x{x:0>2}", .{byte}) catch unreachable;
+                try output.appendSlice(allocator, &hex_buf);
+            },
+        }
+    }
+    try output.append(allocator, '"');
+}
+
+fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const ProcessedRoute, name: []const u8) !void {
+    // Copied because ordering mutates, and the caller's slice is shared.
+    const routes = try allocator.dupe(ProcessedRoute, routes_const);
+    defer allocator.free(routes);
+    orderByProfile(allocator, routes);
+
+    std.fs.cwd().makeDir("generated") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    try output.appendSlice(allocator,
+        \\// AUTO-GENERATED by Orisha
+        \\const std = @import("std");
+        \\pub const Route = struct { method: []const u8, path: []const u8, response: []const u8, response_gzip: ?[]const u8, etag: []const u8, etag_gzip: ?[]const u8 };
+        \\pub const response_304 = "HTTP/1.1 304 Not Modified\r\n\r\n";
+        \\pub const routes = [_]Route{
+        \\
+    );
+    for (routes) |route| {
+        try appendFmt(allocator, &output, "    .{{ .method = \"{s}\", .path = \"{s}\", .etag = \"{s}\", .response = ", .{ route.method, route.path, route.etag });
+        try appendZigString(allocator, &output, route.response);
+        if (route.response_gzip) |gz| {
+            try output.appendSlice(allocator, ", .response_gzip = ");
+            try appendZigString(allocator, &output, gz);
+        } else {
+            try output.appendSlice(allocator, ", .response_gzip = null");
+        }
+        if (route.etag_gzip) |eg| {
+            try appendFmt(allocator, &output, ", .etag_gzip = \"{s}\"", .{eg});
+        } else {
+            try output.appendSlice(allocator, ", .etag_gzip = null");
+        }
+        try output.appendSlice(allocator, " },\n");
+    }
+    // The index, keyed on path, built while this program compiles.
+    //
+    // This was a linear walk of every route with a string compare per entry,
+    // which for this site meant up to 1,587 `memcmp`s to answer one request.
+    // It also made throughput a function of ALPHABETICAL POSITION: `/index.html`
+    // sits 10th and `/200.html` 832nd, and the two benchmarked 25% apart for
+    // that reason alone — a difference we spent a morning attributing to
+    // payload size.
+    //
+    // Nothing here needed discovering at runtime. Every route is known while
+    // the program compiles, which is the whole premise, and the dispatch was
+    // the one place not acting like it.
+    try output.appendSlice(allocator,
+        \\};
+        \\
+        \\/// path -> index into `routes`. Built at comptime; no scan at runtime.
+        \\pub const by_path = std.StaticStringMap(u32).initComptime(.{
+        \\
+    );
+    for (routes, 0..) |route, i| {
+        try appendFmt(allocator, &output, "    .{{ \"{s}\", {d} }},\n", .{ route.path, i });
+    }
+    try output.appendSlice(allocator,
+        \\});
+        \\
+        \\/// Did this coding's own parameters refuse it? `q=0` is an explicit
+        \\/// refusal — presence in the list is not consent. A malformed qvalue
+        \\/// refuses too: identity is always legal, so doubt serves identity.
+        \\fn codingRefused(params: []const u8) bool {
+        \\    var it = std.mem.splitScalar(u8, params, ';');
+        \\    while (it.next()) |param| {
+        \\        const p = std.mem.trim(u8, param, " \t");
+        \\        if (p.len >= 2 and (p[0] == 'q' or p[0] == 'Q') and p[1] == '=') {
+        \\            const v = std.fmt.parseFloat(f64, std.mem.trim(u8, p[2..], " \t")) catch return true;
+        \\            return v == 0;
+        \\        }
+        \\    }
+        \\    return false;
+        \\}
+        \\pub fn wantsGzip(accept_encoding: ?[]const u8) bool {
+        \\    const ae = accept_encoding orelse return false;
+        \\    var star: ?[]const u8 = null;
+        \\    var it = std.mem.splitScalar(u8, ae, ',');
+        \\    while (it.next()) |raw_entry| {
+        \\        const entry = std.mem.trim(u8, raw_entry, " \t");
+        \\        const semi = std.mem.indexOfScalar(u8, entry, ';') orelse entry.len;
+        \\        const name = std.mem.trim(u8, entry[0..semi], " \t");
+        \\        if (std.ascii.eqlIgnoreCase(name, "gzip")) {
+        \\            // An explicit entry beats the wildcard (RFC 9110 §12.5.3).
+        \\            return !codingRefused(entry[semi..]);
+        \\        }
+        \\        if (std.mem.eql(u8, name, "*")) star = entry[semi..];
+        \\    }
+        \\    const sp = star orelse return false;
+        \\    return !codingRefused(sp);
+        \\}
+        \\/// A GET route also answers HEAD — same selected representation, with
+        \\/// only the head on the wire (RFC 9110 §9.3.2: no body, ever).
+        \\fn headOnly(response: []const u8) []const u8 {
+        \\    const end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return response;
+        \\    return response[0 .. end + 4];
+        \\}
+        \\pub fn lookup(method: []const u8, path: []const u8) ?[]const u8 {
+        \\    const head = std.mem.eql(u8, method, "HEAD");
+        \\    const i = by_path.get(path) orelse return null;
+        \\    const r = routes[i];
+        \\    if (!std.mem.eql(u8, r.method, if (head) "GET" else method)) return null;
+        \\    return if (head) headOnly(r.response) else r.response;
+        \\}
+        \\pub fn lookupWithEtag(method: []const u8, path: []const u8, client_etag: ?[]const u8, accept_encoding: ?[]const u8) ?[]const u8 {
+        \\    const head = std.mem.eql(u8, method, "HEAD");
+        \\    const i = by_path.get(path) orelse return null;
+        \\    const r = routes[i];
+        \\    if (!std.mem.eql(u8, r.method, if (head) "GET" else method)) return null;
+        \\    // If-None-Match validates the SELECTED representation: identity and
+        \\    // gzip are different bytes and carry different strong etags.
+        \\    const use_gz = r.response_gzip != null and wantsGzip(accept_encoding);
+        \\    const picked = if (use_gz) r.response_gzip.? else r.response;
+        \\    const picked_etag = if (use_gz) r.etag_gzip.? else r.etag;
+        \\    if (client_etag) |e| if (std.mem.eql(u8, e, picked_etag)) return response_304;
+        \\    return if (head) headOnly(picked) else picked;
+        \\}
+        \\
+        \\test "wantsGzip reads the advertisement" {
+        \\    try std.testing.expect(!wantsGzip(null));
+        \\    try std.testing.expect(wantsGzip("gzip"));
+        \\    try std.testing.expect(wantsGzip("br, GZIP, deflate"));
+        \\    try std.testing.expect(!wantsGzip("br"));
+        \\    try std.testing.expect(!wantsGzip("deflate"));
+        \\
+        \\    // q=0 is an explicit refusal — presence is not consent.
+        \\    try std.testing.expect(!wantsGzip("gzip;q=0"));
+        \\    try std.testing.expect(!wantsGzip("gzip;q=0.000"));
+        \\    try std.testing.expect(!wantsGzip("br;q=1, gzip;q=0"));
+        \\    try std.testing.expect(wantsGzip("gzip;q=0.5"));
+        \\    try std.testing.expect(wantsGzip("gzip ; q=0.5"));
+        \\
+        \\    // The wildcard admits what nothing refused — and an explicit
+        \\    // gzip entry decides over it in either direction.
+        \\    try std.testing.expect(wantsGzip("*"));
+        \\    try std.testing.expect(wantsGzip("br, *"));
+        \\    try std.testing.expect(!wantsGzip("*;q=0"));
+        \\    try std.testing.expect(!wantsGzip("gzip;q=0, *"));
+        \\    try std.testing.expect(wantsGzip("*;q=0, gzip"));
+        \\}
+        \\
+        \\test "negotiated routes serve identity unless gzip is advertised" {
+        \\    for (routes) |r| {
+        \\        const gz = r.response_gzip orelse continue;
+        \\        try std.testing.expectEqualStrings(r.response, lookupWithEtag(r.method, r.path, null, null).?);
+        \\        try std.testing.expectEqualStrings(r.response, lookupWithEtag(r.method, r.path, null, "br").?);
+        \\        try std.testing.expectEqualStrings(r.response, lookupWithEtag(r.method, r.path, null, "gzip;q=0").?);
+        \\        try std.testing.expectEqualStrings(gz, lookupWithEtag(r.method, r.path, null, "gzip").?);
+        \\        try std.testing.expectEqualStrings(gz, lookupWithEtag(r.method, r.path, null, "*").?);
+        \\        const gz_head = gz[0..std.mem.indexOf(u8, gz, "\r\n\r\n").?];
+        \\        const id_head = r.response[0..std.mem.indexOf(u8, r.response, "\r\n\r\n").?];
+        \\        try std.testing.expect(std.mem.indexOf(u8, gz_head, "Content-Encoding: gzip") != null);
+        \\        try std.testing.expect(std.mem.indexOf(u8, gz_head, "Vary: Accept-Encoding") != null);
+        \\        try std.testing.expect(std.mem.indexOf(u8, id_head, "Vary: Accept-Encoding") != null);
+        \\        try std.testing.expect(std.mem.indexOf(u8, id_head, "Content-Encoding") == null);
+        \\        try std.testing.expectEqualStrings(response_304, lookupWithEtag(r.method, r.path, r.etag, null).?);
+        \\    }
+        \\}
+        \\
+        \\test "non-negotiated routes serve identity even when gzip is advertised" {
+        \\    for (routes) |r| {
+        \\        if (r.response_gzip != null) continue;
+        \\        try std.testing.expectEqualStrings(r.response, lookupWithEtag(r.method, r.path, null, "gzip").?);
+        \\        const head = r.response[0..std.mem.indexOf(u8, r.response, "\r\n\r\n").?];
+        \\        try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding") == null);
+        \\    }
+        \\}
+        \\
+        \\test "HEAD answers with the selected variant's head and no body" {
+        \\    for (routes) |r| {
+        \\        const head = lookupWithEtag("HEAD", r.path, null, null).?;
+        \\        const head_end = std.mem.indexOf(u8, r.response, "\r\n\r\n").? + 4;
+        \\        // The head is the identity variant's head — and it is ALL of it.
+        \\        try std.testing.expectEqualStrings(r.response[0..head_end], head);
+        \\        try std.testing.expectEqual(head_end, head.len);
+        \\        if (r.response_gzip) |gz| {
+        \\            const gz_head = lookupWithEtag("HEAD", r.path, null, "gzip").?;
+        \\            const gz_end = std.mem.indexOf(u8, gz, "\r\n\r\n").? + 4;
+        \\            try std.testing.expectEqualStrings(gz[0..gz_end], gz_head);
+        \\            try std.testing.expectEqual(gz_end, gz_head.len);
+        \\        }
+        \\    }
+        \\}
+        \\
+        \\test "identity and gzip carry distinct strong etags" {
+        \\    for (routes) |r| {
+        \\        const gz_etag = r.etag_gzip orelse continue;
+        \\        try std.testing.expect(!std.mem.eql(u8, r.etag, gz_etag));
+        \\        // 304 only when the client holds the SELECTED variant's etag.
+        \\        try std.testing.expectEqualStrings(response_304, lookupWithEtag(r.method, r.path, gz_etag, "gzip").?);
+        \\        try std.testing.expectEqualStrings(response_304, lookupWithEtag(r.method, r.path, r.etag, null).?);
+        \\        // The other variant's etag does not validate this selection.
+        \\        try std.testing.expectEqualStrings(r.response_gzip.?, lookupWithEtag(r.method, r.path, r.etag, "gzip").?);
+        \\    }
+        \\}
+        \\
+    );
+    const filename = try std.fmt.allocPrint(allocator, "generated/{s}_routes.zig", .{name});
+    const file = try std.fs.cwd().createFile(filename, .{});
+    defer file.close();
+    try file.writeAll(output.items);
+}
+
+~proc static-router|zig {
+    const ast_mod = @import("ast");
+    const ast_functional = @import("ast_functional");
+
+    // Get the flow containing this static-router invocation
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Check if already transformed
+    for (flow.inv().marks) |m| {
+        if (std.mem.startsWith(u8, m, "@pass_ran")) {
+            return .{};
+        }
+    }
+
+    // Extract name parameter
+    var static_name: []const u8 = "site";
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "name")) {
+            static_name = stripQuotes(arg.value);
+            break;
+        }
+    }
+
+    std.debug.print("[STATIC_ROUTER TRANSFORM] Processing static-router for '{s}'\n", .{static_name});
+
+    // Find the matching ~orisha:static(name: "...") declaration in the program
+    var static_root: ?[]const u8 = null;
+    var static_fallback: ?[]const u8 = null;
+
+    for (program.items) |prog_item| {
+        if (prog_item != .flow) continue;
+        const inv = prog_item.flow.inv().*;
+        if (inv.path.segments.len == 0) continue;
+        const last_segment = inv.path.segments[inv.path.segments.len - 1];
+        if (!std.mem.eql(u8, last_segment, "static")) continue;
+
+        var found_name: ?[]const u8 = null;
+        for (inv.args) |arg| {
+            if (std.mem.eql(u8, arg.name, "name")) found_name = stripQuotes(arg.value);
+            if (std.mem.eql(u8, arg.name, "root")) static_root = stripQuotes(arg.value);
+            if (std.mem.eql(u8, arg.name, "fallback")) static_fallback = stripQuotes(arg.value);
+        }
+        if (found_name) |n| {
+            if (std.mem.eql(u8, n, static_name)) break;
+        }
+        // Reset if this wasn't the matching declaration
+        static_root = null;
+        static_fallback = null;
+    }
+
+    if (static_root == null) {
+        std.debug.print("ERROR: No ~orisha:static(name: \"{s}\") declaration found\n", .{static_name});
+        return .{};
+    }
+
+    std.debug.print("[STATIC_ROUTER] root={s}, fallback={s}\n", .{
+        static_root.?,
+        if (static_fallback) |f| f else "(none)",
+    });
+
+    // Process the directory and generate routes file
+    var routes: std.ArrayList(ProcessedRoute) = .empty;
+    processDirectory(allocator, &routes, "GET", "/", static_root.?);
+
+    const routes_filename = std.fmt.allocPrint(allocator, "generated/{s}_routes.zig", .{static_name}) catch unreachable;
+    std.debug.print("[STATIC_ROUTER] Generating {s} ({} routes)\n", .{ routes_filename, routes.items.len });
+
+    generateNamedRoutesFile(allocator, routes.items, static_name) catch |err| {
+        std.debug.print("ERROR generating {s}: {}\n", .{ routes_filename, err });
+        return .{};
+    };
+
+    // Build inline_body: import routes, lookup, return response
+    var ib: std.ArrayList(u8) = .empty;
+    ib.appendSlice(allocator, "//@koru:inline_stmt\n") catch unreachable;
+
+    // Import the generated routes — use @import with the generated file path
+    ib.appendSlice(allocator, "    const _static_routes = @import(\"generated/") catch unreachable;
+    ib.appendSlice(allocator, static_name) catch unreachable;
+    ib.appendSlice(allocator, "_routes.zig\");\n") catch unreachable;
+
+    // Lookup with ETag: use req from the handler's scope
+    ib.appendSlice(allocator, "    if (_static_routes.lookupWithEtag(req.method, req.path, req.if_none_match, req.accept_encoding)) |_static_resp| {\n") catch unreachable;
+    ib.appendSlice(allocator, "        return .{ .status = 200, .body = _static_resp, .content_type = null };\n") catch unreachable;
+    ib.appendSlice(allocator, "    }") catch unreachable;
+
+    // Fallback handling
+    if (static_fallback) |fallback| {
+        // SPA fallback: look up the fallback file
+        // HEAD must keep its head-only semantics through the fallback too —
+        // hardcoding "GET" here would ship the body (RFC 9110 §9.3.2).
+        ib.appendSlice(allocator, " else if (_static_routes.lookupWithEtag(if (std.mem.eql(u8, req.method, \"HEAD\")) \"HEAD\" else \"GET\", \"/") catch unreachable;
+        ib.appendSlice(allocator, fallback) catch unreachable;
+        ib.appendSlice(allocator, "\", null, req.accept_encoding)) |_fallback_resp| {\n") catch unreachable;
+        ib.appendSlice(allocator, "        return .{ .status = 200, .body = _fallback_resp, .content_type = null };\n") catch unreachable;
+        ib.appendSlice(allocator, "    } else {\n") catch unreachable;
+        ib.appendSlice(allocator, "        return .{ .status = 404, .body = \"Not Found\", .content_type = null };\n") catch unreachable;
+        ib.appendSlice(allocator, "    }\n") catch unreachable;
+    } else {
+        // No fallback: 404
+        ib.appendSlice(allocator, " else {\n") catch unreachable;
+        ib.appendSlice(allocator, "        return .{ .status = 404, .body = \"Not Found\", .content_type = null };\n") catch unreachable;
+        ib.appendSlice(allocator, "    }\n") catch unreachable;
+    }
+
+    const inline_body_str = ib.toOwnedSlice(allocator) catch unreachable;
+    std.debug.print("[STATIC_ROUTER TRANSFORM] Generated inline dispatch:\n{s}\n", .{inline_body_str});
+
+    // Check if this invocation is the flow's top-level invocation or nested in a continuation.
+    // If the flow's invocation IS static-router, we're standalone (top-level handler).
+    // If it's something else (e.g., router), we're nested in a catch-all continuation.
+    //
+    // The name is the DECLARED one — kebab, as `[comptime|transform]pub tor
+    // static-router` spells it in the companion contract. It read `static_router`
+    // here until 2026-08-10, and a name that never matches does not fail loudly:
+    // the nested branch below finds no continuation either, and falls through to
+    // replacing the WHOLE flow. Standalone handlers survived that by coincidence;
+    // a router with a static catch-all had every one of its own routes discarded.
+    const flow_inv_name = if (flow.inv().path.segments.len > 0)
+        flow.inv().path.segments[flow.inv().path.segments.len - 1]
+    else
+        "";
+    const is_top_level = std.mem.eql(u8, flow_inv_name, "static-router");
+
+    if (!is_top_level) {
+        // Nested case: only replace the continuation's node, preserving the parent flow
+        // so the outer transform (e.g., router) can still process it.
+        std.debug.print("[STATIC_ROUTER TRANSFORM] Nested in '{s}' flow — replacing continuation only\n", .{flow_inv_name});
+
+        // Strip //@koru:inline_stmt prefix — not needed for continuation inline_code nodes
+        const prefix = "//@koru:inline_stmt\n";
+        var nested_code = inline_body_str;
+        if (std.mem.startsWith(u8, nested_code, prefix)) {
+            nested_code = nested_code[prefix.len..];
+        }
+
+        // Find the continuation whose node is the static-router invocation and replace its node
+        var new_conts = allocator.alloc(ast_mod.Continuation, flow.body.continuations.len) catch unreachable;
+        var replaced = false;
+        for (flow.body.continuations, 0..) |cont, ci| {
+            if (!replaced) {
+                if (cont.node) |node| {
+                    if (node == .invocation) {
+                        const segs = node.invocation.path.segments;
+                        if (segs.len > 0 and std.mem.eql(u8, segs[segs.len - 1], "static-router")) {
+                            // Verify name arg matches
+                            var name_match = false;
+                            for (node.invocation.args) |arg| {
+                                if (std.mem.eql(u8, arg.name, "name") and
+                                    std.mem.eql(u8, stripQuotes(arg.value), static_name)) {
+                                    name_match = true;
+                                    break;
+                                }
+                            }
+                            if (name_match) {
+                                // Copy-then-mutate: preserve every continuation field
+                                // (incl. kind — the router re-runs after this and is
+                                // kind-aware), swap only the node for the inline code.
+                                var new_cont = cont;
+                                new_cont.node = ast_mod.Node{ .inline_code = nested_code };
+                                new_conts[ci] = new_cont;
+                                replaced = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            new_conts[ci] = cont;
+        }
+
+        if (replaced) {
+            // Keep the original invocation (no @pass_ran!) — only swap the
+            // branch continuations under it.
+            var modified_flow = flow.*;
+            var new_body = flow.body;
+            new_body.continuations = new_conts;
+            modified_flow.body = new_body;
+
+            const new_item = ast_mod.Item{ .flow = modified_flow };
+            const maybe_new_program = ast_functional.replaceFlowRecursive(allocator, program, flow, new_item) catch unreachable;
+            if (maybe_new_program) |new_program_val| {
+                const result = allocator.create(ast_mod.Program) catch unreachable;
+                result.* = new_program_val;
+                std.debug.print("[STATIC_ROUTER TRANSFORM] Replaced nested continuation (preserving parent flow for '{s}')\n", .{flow_inv_name});
+                return .{ .whole_program = result };
+            }
+        }
+        // Fall through to top-level behavior if replacement didn't work
+        std.debug.print("[STATIC_ROUTER TRANSFORM] WARNING: Could not find matching continuation, falling back to top-level replacement\n", .{});
+    }
+
+    // Top-level case: replace the entire flow (standalone handler)
+    // Mark as transformed
+    const new_inv_marks = allocator.alloc([]const u8, flow.inv().marks.len + 1) catch unreachable;
+    for (flow.inv().marks, 0..) |m, j| {
+        new_inv_marks[j] = m;
+    }
+    new_inv_marks[flow.inv().marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_invocation = ast_mod.Invocation{
+        .path = flow.inv().path,
+        .args = flow.inv().args,
+        .annotations = flow.inv().annotations,
+        .marks = new_inv_marks,
+    };
+
+    const empty_conts = allocator.alloc(ast_mod.Continuation, 0) catch unreachable;
+
+    var transformed_flow = flow.*;
+    transformed_flow.body = ast_mod.rootSite(new_invocation, empty_conts, flow.location);
+    transformed_flow.inline_body = inline_body_str;
+
+    const new_item = ast_mod.Item{ .flow = transformed_flow };
+
+    // Hand the runner the change as a VALUE and let it own the placement.
+    //
+    // This used to rewrite the whole program itself and return it through the
+    // `whole_program` escape. That escape is reserved for transforms that are
+    // irreducibly global, and this one is not — it replaces exactly one site.
+    // The cost was not style: the runner presents a NESTED site (a static
+    // catch-all inside a router) as a synthetic top-level view, so the rewrite
+    // landed on that synthetic copy and the real invocation was never replaced.
+    // The compiler calls that out as KORU124 rather than letting it through.
+    // `replacement` works for both positions — root swaps the whole item,
+    // nested swaps the holding continuation's node.
+    return .{ .replacement = new_item };
+}

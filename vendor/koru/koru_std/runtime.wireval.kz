@@ -1,0 +1,31 @@
+// Koru Standard Library: the `wireval` part of runtime — the wire grammar's
+// teaching prose and its rejection vocabulary. Joined via `~part wireval`
+// in runtime.kz; merged into the runtime module at load.
+//
+// WIRE_GRAMMAR_TEXT and the `wirescan` scanner are the pair that must move
+// together: the text describes exactly what the scanner enforces.
+
+const WIRE_GRAMMAR_TEXT =
+    \\Your reply IS wire — open it with an invocation, never narration: verb(field: value, field: value) with `|` arms chaining what each call issues.
+    \\- An arm binds what a call issued to a name for the next call: `| ok u |>` for an ordinary result, `| chosen c |>` for a named branch — the arm word is the branch name the verb's line in the vocabulary declares; an outcome marked `?` in that line may go unarmed, every other named outcome must be armed or the turn stops with `unhandled-branch`.
+    \\- The verb is a bare name from your vocabulary — letters, digits, '-', '_' — immediately followed by '('.
+    \\- A value is a double-quoted string (escape \" and \\ inside) or a bare literal: a number, true/false, or a name a `|` arm already bound.
+    \\- A verb whose only field is `Source` takes its prose after the verb and a colon — `say: I'd be happy to help, what's your user id?` writes prose, commas and newlines and all, until the next invocation line — quotes never needed (`say(text: "...")` spells the same for one line). A field typed `Expression` takes expression text bare: `calc(expr: 2 + 3)`.
+    \\- A field typed `name<x>` takes only a bound name the session minted `<x!>` — an `rN` from an earlier verb or an arm binding, never literal text.
+    \\- A bound name keeps its fields: `r3.user_id` reads that field out of the value r3 bound — the whole result stays readable in the session, not just its name.
+    \\- A second invocation starts a second item: one invocation per line runs each in order — to think out loud, `note: the reasoning` on its own line, then the call that acts on the next.
+    \\- Invent a verb: `tor name { field: type }` declares it, `name = a call or chain` defines it — `tor greet { msg: string }` + `greet = say(text: msg)` — callable in the same reply and in your vocabulary thereafter.
+    \\- Prose is not wire — it binds as residue: "residue bound: rN — your reply was not wire; nothing reached the user" keeps YOUR reply at rN — and a reply that is only prose is a turn spent reaching nobody.
+;
+
+// `not_invocation` marks the refusals where nothing ever lexed as `verb(` —
+// prose, markdown fences, a lone arm — as opposed to a malformed invocation.
+// The bridge binds those items as residue so the model's own words become a
+// session value it can re-emit through a real verb.
+const WireRejection = struct { message: []const u8, byte: usize, not_invocation: bool };
+
+// The character predicates (`wireIdentStart`/`wireIdentChar`/`wireBareValueChar`),
+// rejection builders (`wireReject`/`wireRejectResidue`), and `wireLineColumn` live
+// in runtime.wirelex.kz (the `wirelex` part). The scanner is the `wirescan` part —
+// type-directed there, scope-blind when called without lookups.
+

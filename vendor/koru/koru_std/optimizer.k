@@ -1,0 +1,31 @@
+// Koru Optimizer - Coordinates optimization passes
+// ==============================================================
+// Abstract optimization pipeline that users can override.
+// Individual optimizations live in optimizations/*.kz
+//
+// Pipeline order:
+//   1. optimize_kernels  - Kernel operation fusion (pairwise + position update)
+//   2. optimize_loops    - Recursive patterns → native for loops
+//
+// Usage:
+//   Runs automatically as part of compiler pipeline.
+//   To override: std/optimizer:optimize = your_custom_optimizer(ctx)
+
+[comptime]
+
+import std/compiler
+import std/optimizations/kernels
+import std/optimizations/loops
+
+// Optimization segment: AST transformations for performance (abstract, can be overridden)
+// This is where we create IR nodes (NativeLoop, etc.)
+[comptime|abstract] pub tor optimize { ctx: std/compiler:CompilerContext } -> std/compiler:CompilerContext
+
+// ============================================================
+// DEFAULT OPTIMIZE IMPLEMENTATION
+// ============================================================
+// Provides the default implementation for std/compiler:optimize
+// Users can override with std/compiler:optimize = ...
+
+// Default optimization pipeline - chains all optimization passes
+optimize = std/optimizations/kernels:optimize(ctx): c1 |> std/optimizations/loops:optimize(ctx: c1): c2 -> c2

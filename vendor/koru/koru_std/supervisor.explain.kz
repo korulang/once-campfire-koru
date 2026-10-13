@@ -1,0 +1,490 @@
+// Koru Standard Library: the `explain` part of supervisor.kz — joined via
+// `~part explain`; members land in koru_supervisor.
+//
+// `supervised` is the most elaborating surface in std: the arm you write
+// retargets the call that produced its branch (retarget_producer), the
+// outcome dispatch moves to a generated step tor, and every name inside a
+// re-entry expression resolves in the STEP's scope — the attempt's inputs
+// and the retry counter, not the caller's. The explainer lifts exactly
+// that: per site it reports the producer, the child's declared vocabulary
+// (a void branch stays void), the step tor and `#`/`@` fold the site
+// becomes, the policy it read, and which names the re-entry expressions
+// actually rebind.
+//
+// Then it shows the work: the program is cloned, the real transform pass
+// runs over the clone, and the generated step decl + the retargeted home
+// flow print through the canonical AST printer (src/ast_printer.zig). The
+// elaborated view cannot drift from the transform — it IS the transform's
+// output.
+
+const SH = @import("site_hash");
+const SL = @import("struct_literal");
+const printer = @import("ast_printer");
+const functional = @import("ast_functional");
+
+// A discovered supervised site: the arm carrying `|> supervised`, the arm
+// whose invocation produced that branch (the call the transform retargets),
+// and the flow that owns both.
+const SupSite = struct {
+    site: *const ast.Continuation,
+    producer: *const ast.Continuation,
+    home_flow: *const ast.Flow,
+    module: []const u8,
+};
+
+fn isSupervisedInv(inv: *const ast.Invocation) bool {
+    if (inv.path.segments.len == 0) return false;
+    if (!std.mem.eql(u8, inv.path.segments[inv.path.segments.len - 1], "supervised")) return false;
+    const mq = inv.path.module_qualifier orelse return true; // bare keyword form
+    return std.mem.eql(u8, mq, "std/supervisor") or std.mem.eql(u8, mq, "std.supervisor");
+}
+
+fn collectSites(alloc: std.mem.Allocator, cont: *const ast.Continuation, parent: ?*const ast.Continuation, flow: *const ast.Flow, out: *std.ArrayList(SupSite)) void {
+    if (cont.node) |*n| {
+        if (n.* == .invocation and isSupervisedInv(&n.invocation)) {
+            out.append(alloc, .{ .site = cont, .producer = parent orelse cont, .home_flow = flow, .module = flow.module }) catch {};
+        }
+    }
+    for (cont.continuations) |*c| collectSites(alloc, c, cont, flow, out);
+}
+
+fn collectInItems(alloc: std.mem.Allocator, items: []const ast.Item, out: *std.ArrayList(SupSite)) void {
+    for (items) |*it| {
+        switch (it.*) {
+            .flow => |*f| collectSites(alloc, &f.body, null, f, out),
+            .module_decl => |*m| collectInItems(alloc, m.items, out),
+            else => {},
+        }
+    }
+}
+
+// Spell a field list `{ port: i64, t: i64 }` from decl fields.
+fn spellFields(alloc: std.mem.Allocator, fields: []const ast.Field) []const u8 {
+    var buf = std.ArrayList(u8).initCapacity(alloc, 48) catch unreachable;
+    buf.appendSlice(alloc, "{ ") catch unreachable;
+    for (fields, 0..) |f, i| {
+        if (i > 0) buf.appendSlice(alloc, ", ") catch unreachable;
+        const s = std.fmt.allocPrint(alloc, "{s}: {s}", .{ f.name, f.type }) catch unreachable;
+        buf.appendSlice(alloc, s) catch unreachable;
+    }
+    buf.appendSlice(alloc, " }") catch unreachable;
+    return buf.items;
+}
+
+// Spell a call `dial(port: port + 1)` from an invocation's args.
+fn spellCall(alloc: std.mem.Allocator, inv: *const ast.Invocation) []const u8 {
+    var buf = std.ArrayList(u8).initCapacity(alloc, 48) catch unreachable;
+    buf.appendSlice(alloc, inv.path.segments[inv.path.segments.len - 1]) catch unreachable;
+    buf.append(alloc, '(') catch unreachable;
+    for (inv.args, 0..) |a, i| {
+        if (i > 0) buf.appendSlice(alloc, ", ") catch unreachable;
+        if (a.had_explicit_label) {
+            const s = std.fmt.allocPrint(alloc, "{s}: {s}", .{ a.name, a.value }) catch unreachable;
+            buf.appendSlice(alloc, s) catch unreachable;
+        } else {
+            buf.appendSlice(alloc, a.value) catch unreachable;
+        }
+    }
+    buf.append(alloc, ')') catch unreachable;
+    return buf.items;
+}
+
+// Which step-input names an expression text reads — the scope lift. A name
+// listed here resolves to the generated step's own input (the attempt that
+// just ended), never the caller's.
+fn readsOf(alloc: std.mem.Allocator, expr: []const u8, input_names: []const []const u8, counter: []const u8, reads: *std.ArrayList([]const u8)) void {
+    for (input_names) |n| {
+        if (std.mem.eql(u8, n, "__last")) continue; // spacing clock, not a policy input
+        if (H.mentionsWord(expr, n)) {
+            const tag = if (std.mem.eql(u8, n, counter))
+                std.fmt.allocPrint(alloc, "{s} (the retries-spent counter)", .{n}) catch unreachable
+            else
+                std.fmt.allocPrint(alloc, "{s} (the attempt's input)", .{n}) catch unreachable;
+            var dup = false;
+            for (reads.items) |r| if (std.mem.eql(u8, r, tag)) { dup = true; break; };
+            if (!dup) reads.append(alloc, tag) catch unreachable;
+        }
+    }
+}
+
+// A branch's spelled payload status: `ok` / `ok i64` / `?!boom { n: i64 }`.
+// A positional payload's field name is the parser's `__type_ref` marker —
+// spell the type, not the interned name.
+fn spellBranch(alloc: std.mem.Allocator, b: *const ast.Branch) []const u8 {
+    if (!H.hasPayload(b)) return b.name;
+    if (b.payload.is_wildcard) return std.fmt.allocPrint(alloc, "{s} <any>", .{b.name}) catch unreachable;
+    if (b.payload.fields.len == 1 and
+        (b.payload.fields[0].name.len == 0 or std.mem.eql(u8, b.payload.fields[0].name, "__type_ref")))
+        return std.fmt.allocPrint(alloc, "{s} {s}", .{ b.name, b.payload.fields[0].type }) catch unreachable;
+    var named = std.ArrayList(u8).initCapacity(alloc, 48) catch unreachable;
+    named.appendSlice(alloc, "{ ") catch unreachable;
+    for (b.payload.fields, 0..) |f, i| {
+        if (i > 0) named.appendSlice(alloc, ", ") catch unreachable;
+        const fname = if (std.mem.eql(u8, f.name, "__type_ref")) "" else f.name;
+        const s = if (fname.len == 0)
+            std.fmt.allocPrint(alloc, "{s}", .{f.type}) catch unreachable
+        else
+            std.fmt.allocPrint(alloc, "{s}: {s}", .{ fname, f.type }) catch unreachable;
+        named.appendSlice(alloc, s) catch unreachable;
+    }
+    named.appendSlice(alloc, " }") catch unreachable;
+    return std.fmt.allocPrint(alloc, "{s} {s}", .{ b.name, named.items }) catch unreachable;
+}
+
+// Find a flow in `items` whose body carries a `#`-labeled invocation for
+// `label` — the retargeted home flow in the elaborated tree. Post-transform
+// the head's `label_with_invocation` lifts to `flow.pre_label`, so both
+// shapes count.
+fn flowWithLabel(cont: *const ast.Continuation, label: []const u8) bool {
+    if (cont.node) |*n| {
+        switch (n.*) {
+            .label_with_invocation => |*lwi| if (std.mem.eql(u8, lwi.label, label)) return true,
+            else => {},
+        }
+    }
+    for (cont.continuations) |*c| if (flowWithLabel(c, label)) return true;
+    return false;
+}
+
+fn findFlowWithLabel(items: []const ast.Item, label: []const u8) ?*const ast.Flow {
+    for (items) |*it| {
+        switch (it.*) {
+            .flow => |*f| {
+                if (f.pre_label) |pl| if (std.mem.eql(u8, pl, label)) return f;
+                if (flowWithLabel(&f.body, label)) return f;
+            },
+            .module_decl => |*m| if (findFlowWithLabel(m.items, label)) |f| return f,
+            else => {},
+        }
+    }
+    return null;
+}
+
+// A flow implementing `name` — the generated step's body in the elaborated
+// tree.
+fn findFlowImpl(items: []const ast.Item, name: []const u8) ?*const ast.Flow {
+    for (items) |*it| {
+        switch (it.*) {
+            .flow => |*f| {
+                if (f.impl_of) |io| {
+                    if (io.segments.len > 0 and std.mem.eql(u8, io.segments[io.segments.len - 1], name)) return f;
+                }
+            },
+            .module_decl => |*m| if (findFlowImpl(m.items, name)) |f| return f,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn appendSourceLines(alloc: std.mem.Allocator, entries: *std.ArrayList(ast.ExplainReport.Entry), source: []const u8) void {
+    var it = std.mem.splitScalar(u8, source, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        entries.append(alloc, .{ .note = std.fmt.allocPrint(alloc, "  {s}", .{line}) catch unreachable }) catch unreachable;
+    }
+}
+
+// @retain: explain_supervised_event is referenced from generated code
+// (koruc's koru_explain_gather invokes every discovered [explainer]).
+~[comptime|explainer]pub tor explain-supervised {
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> ExplainReport
+
+~proc explain-supervised|zig {
+    const Entry = ast.ExplainReport.Entry;
+    const Section = ast.ExplainReport.Section;
+
+    var sup_sites = std.ArrayList(SupSite).initCapacity(allocator, 4) catch unreachable;
+    collectInItems(allocator, program.items, &sup_sites);
+
+    if (sup_sites.items.len == 0) {
+        return .{ .title = "std/supervisor", .sections = &.{ .{ .heading = "supervised", .entries = &.{
+            .{ .note = "no supervised sites — `| <branch> |> std/supervisor:supervised` on a call arm declares bounded re-entry" },
+        } } } };
+    }
+
+    const sites = SH.collectSites(allocator, program) catch &.{};
+    var sections = std.ArrayList(Section).initCapacity(allocator, sup_sites.items.len + 1) catch unreachable;
+    var step_names = std.ArrayList(struct { step: []const u8, label: []const u8 }).initCapacity(allocator, sup_sites.items.len) catch unreachable;
+
+    for (sup_sites.items) |*ss| {
+        var entries = std.ArrayList(Entry).initCapacity(allocator, 24) catch unreachable;
+        const site = ss.site;
+
+        const prod_inv: ?*const ast.Invocation = if (ss.producer.node) |*n|
+            (if (n.* == .invocation) &n.invocation else null)
+        else
+            null;
+        const child_name: []const u8 = if (prod_inv) |ci|
+            ci.path.segments[ci.path.segments.len - 1]
+        else
+            "?";
+
+        const line_no = site.location.line;
+        const step_name = std.fmt.allocPrint(allocator, "__sup_step_L{d}", .{line_no}) catch unreachable;
+        const label_name = std.fmt.allocPrint(allocator, "__sup_L{d}", .{line_no}) catch unreachable;
+        step_names.append(allocator, .{ .step = step_name, .label = label_name }) catch unreachable;
+
+        // The producing call — the invocation the transform retargets.
+        // The witness is the `|> supervised` invocation itself (site_hash
+        // indexes invocations, not continuations).
+        const at_site = if (site.node) |*n|
+            (if (n.* == .invocation)
+                SH.hashesFor(allocator, sites, &.{@intFromPtr(&n.invocation)}) catch &.{}
+            else &.{})
+        else
+            &.{};
+        entries.append(allocator, .{ .property = .{ .key = "site", .value = .{ .string = std.fmt.allocPrint(allocator, "| {s} |> supervised", .{site.branch}) catch unreachable }, .at = at_site } }) catch unreachable;
+        if (prod_inv) |ci| {
+            entries.append(allocator, .{ .property = .{ .key = "produces", .value = .{ .string = std.fmt.allocPrint(allocator, "{s} — the call this arm rewrites (retarget_producer)", .{spellCall(allocator, ci)}) catch unreachable } } }) catch unreachable;
+        } else {
+            entries.append(allocator, .{ .property = .{ .key = "refuses", .value = .{ .string = "supervised sits on a branch arm of the call it supervises — this site's parent is not a call" } } }) catch unreachable;
+        }
+
+        // The child's declared vocabulary — the branches that stay verbatim.
+        var child_decl: ?*const ast.EventDecl = null;
+        for (program.items) |*pi| {
+            if (pi.* != .event_decl) continue;
+            const ed = &pi.event_decl;
+            if (ed.path.segments.len == 1 and std.mem.eql(u8, ed.path.segments[0], child_name)) {
+                child_decl = ed;
+                break;
+            }
+        }
+        var counter_name: []const u8 = "__t";
+        var counter_named = false;
+        for (site.continuations) |*c| {
+            if (std.mem.eql(u8, c.branch, "retry") and c.binding != null and !counter_named) {
+                counter_name = c.binding.?;
+                counter_named = true;
+            }
+        }
+
+        var input_names = std.ArrayList([]const u8).initCapacity(allocator, 8) catch unreachable;
+        if (child_decl) |decl| {
+            var vocab = std.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+            var void_count: usize = 0;
+            for (decl.branches, 0..) |*b, i| {
+                if (i > 0) vocab.appendSlice(allocator, " ") catch unreachable;
+                const spelled = spellBranch(allocator, b);
+                vocab.appendSlice(allocator, "| ") catch unreachable;
+                vocab.appendSlice(allocator, spelled) catch unreachable;
+                if (!H.hasPayload(b)) void_count += 1;
+            }
+            const vtail = if (void_count == decl.branches.len)
+                " — all void; nothing rides them"
+            else
+                " — a void branch stays void through the fold";
+            entries.append(allocator, .{ .property = .{ .key = "declares", .value = .{ .string = std.fmt.allocPrint(allocator, "{s}{s}", .{ vocab.items, vtail }) catch unreachable } } }) catch unreachable;
+
+            var declared = false;
+            for (decl.branches) |*b| {
+                if (std.mem.eql(u8, b.name, site.branch)) declared = true;
+            }
+            if (!declared) {
+                entries.append(allocator, .{ .property = .{ .key = "refuses", .value = .{ .string = std.fmt.allocPrint(allocator, "'{s}' declares no branch '| {s}'", .{ child_name, site.branch }) catch unreachable } } }) catch unreachable;
+            }
+
+            for (decl.input.fields) |fld| input_names.append(allocator, fld.name) catch unreachable;
+            input_names.append(allocator, counter_name) catch unreachable;
+
+            // The step tor signature the transform mints: child inputs +
+            // the counter (+ `__last` under `within`).
+            var sig = std.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+            sig.appendSlice(allocator, step_name) catch unreachable;
+            sig.appendSlice(allocator, " { ") catch unreachable;
+            for (decl.input.fields, 0..) |fld, i| {
+                if (i > 0) sig.appendSlice(allocator, ", ") catch unreachable;
+                const s = std.fmt.allocPrint(allocator, "{s}: {s}", .{ fld.name, fld.type }) catch unreachable;
+                sig.appendSlice(allocator, s) catch unreachable;
+            }
+            if (decl.input.fields.len > 0) sig.appendSlice(allocator, ", ") catch unreachable;
+            const cs = std.fmt.allocPrint(allocator, "{s}: i64", .{counter_name}) catch unreachable;
+            sig.appendSlice(allocator, cs) catch unreachable;
+
+            // within adds __last
+            var within_text: ?[]const u8 = null;
+            var restart_text: ?[]const u8 = null;
+            var policy_name: ?[]const u8 = null;
+            var args_text: ?[]const u8 = null;
+            for (site.node.?.invocation.args) |arg| {
+                if (std.mem.eql(u8, arg.name, "source")) {
+                    const braced = std.fmt.allocPrint(allocator, "{{{s}}}", .{arg.value}) catch unreachable;
+                    if (SL.parseFields(allocator, braced)) |pfs| {
+                        for (pfs) |pf| {
+                            if (std.mem.eql(u8, pf.name, "restart")) restart_text = pf.value;
+                            if (std.mem.eql(u8, pf.name, "within")) within_text = pf.value;
+                            if (std.mem.eql(u8, pf.name, "policy")) policy_name = std.mem.trim(u8, pf.value, " ");
+                            if (std.mem.eql(u8, pf.name, "args")) args_text = pf.value;
+                        }
+                    } else |_| {}
+                }
+            }
+            if (within_text != null) sig.appendSlice(allocator, ", __last: i128") catch unreachable;
+            sig.appendSlice(allocator, " }") catch unreachable;
+            entries.append(allocator, .{ .property = .{ .key = "becomes", .value = .{ .string = sig.items } } }) catch unreachable;
+
+            // Step vocabulary: child branches verbatim + __more.
+            var step_vocab = std.ArrayList(u8).initCapacity(allocator, 80) catch unreachable;
+            for (decl.branches) |*b| {
+                const spelled = spellBranch(allocator, b);
+                const s = std.fmt.allocPrint(allocator, "| {s} ", .{spelled}) catch unreachable;
+                step_vocab.appendSlice(allocator, s) catch unreachable;
+            }
+            // `__more`'s payload IS the step's input record — the
+            // signature's `{ … }` tail.
+            step_vocab.appendSlice(allocator, "| __more ") catch unreachable;
+            step_vocab.appendSlice(allocator, std.mem.trimLeft(u8, sig.items[step_name.len..], " ")) catch unreachable;
+            entries.append(allocator, .{ .property = .{ .key = "branches", .value = .{ .string = step_vocab.items } } }) catch unreachable;
+
+            // Policy rows.
+            if (restart_text) |rt| {
+                entries.append(allocator, .{ .property = .{ .key = "policy", .value = .{ .string = std.fmt.allocPrint(allocator, "restart: {s} — same-args re-entry while the counter is below the bound", .{rt}) catch unreachable } } }) catch unreachable;
+            }
+            if (policy_name) |pn| {
+                entries.append(allocator, .{ .property = .{ .key = "policy", .value = .{ .string = std.fmt.allocPrint(allocator, "policy: {s} — decisions delegated to a same-module tor producing | retry | exhausted", .{pn}) catch unreachable } } }) catch unreachable;
+            }
+            if (args_text) |atx| {
+                entries.append(allocator, .{ .property = .{ .key = "args", .value = .{ .string = atx } } }) catch unreachable;
+            }
+            if (within_text) |wt| {
+                entries.append(allocator, .{ .property = .{ .key = "within", .value = .{ .string = std.fmt.allocPrint(allocator, "{s} — min spacing between restarts (wall clock)", .{std.mem.trim(u8, wt, " ")}) catch unreachable } } }) catch unreachable;
+            }
+            for (site.continuations) |*c| {
+                if (std.mem.eql(u8, c.branch, "retry")) {
+                    var reads = std.ArrayList([]const u8).initCapacity(allocator, 4) catch unreachable;
+                    const cond = c.condition orelse "(unconditional — the transform refuses this)";
+                    var call_text: []const u8 = "re-enter same args";
+                    if (c.node) |*n| {
+                        if (n.* == .invocation) {
+                            call_text = spellCall(allocator, &n.invocation);
+                            for (n.invocation.args) |a| readsOf(allocator, a.value, input_names.items, counter_name, &reads);
+                        }
+                    }
+                    if (c.condition) |cc| readsOf(allocator, cc, input_names.items, counter_name, &reads);
+                    const bind = c.binding orelse "__t";
+                    var line = std.ArrayList(u8).initCapacity(allocator, 96) catch unreachable;
+                    const head = std.fmt.allocPrint(allocator, "| retry {s} when {s} |> {s}", .{ bind, cond, call_text }) catch unreachable;
+                    line.appendSlice(allocator, head) catch unreachable;
+                    if (reads.items.len > 0) {
+                        line.appendSlice(allocator, " — reads: ") catch unreachable;
+                        for (reads.items, 0..) |r, i| {
+                            if (i > 0) line.appendSlice(allocator, ", ") catch unreachable;
+                            line.appendSlice(allocator, r) catch unreachable;
+                        }
+                    }
+                    entries.append(allocator, .{ .note = line.items }) catch unreachable;
+                } else if (std.mem.eql(u8, c.branch, "exhausted")) {
+                    const what = if (c.node) |*n| switch (n.*) {
+                        .branch_constructor => |*bc| bc.branch_name,
+                        else => "?",
+                    } else "forwards the last outcome in kind";
+                    entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "| exhausted => {s}", .{what}) catch unreachable }) catch unreachable;
+                }
+            }
+
+            // The fold at the site.
+            entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "fold: #{s} {s}(<args>, {s}: 0); | __more s |> @{s}(s.<input>, …)", .{ label_name, step_name, counter_name, label_name }) catch unreachable }) catch unreachable;
+
+            // The ambient rebinding — stated once, derived from real reads.
+            var any_reads = false;
+            for (site.continuations) |*c| {
+                if (!std.mem.eql(u8, c.branch, "retry")) continue;
+                if (c.node) |*n| {
+                    if (n.* == .invocation) {
+                        for (n.invocation.args) |a| {
+                            var dummy = std.ArrayList([]const u8).initCapacity(allocator, 1) catch unreachable;
+                            readsOf(allocator, a.value, input_names.items, counter_name, &dummy);
+                            if (dummy.items.len > 0) any_reads = true;
+                        }
+                    }
+                }
+            }
+            if (any_reads) {
+                entries.append(allocator, .{ .note = "a re-entry expression reads the STEP's inputs — the values of the attempt that just ended, not the caller's" }) catch unreachable;
+            }
+        } else {
+            entries.append(allocator, .{ .property = .{ .key = "refuses", .value = .{ .string = std.fmt.allocPrint(allocator, "no event declaration found for '{s}' in this module", .{child_name}) catch unreachable } } }) catch unreachable;
+        }
+
+        var home: []const u8 = "(top-level flow)";
+        if (ss.home_flow.impl_of) |io| {
+            if (io.segments.len > 0) home = io.segments[io.segments.len - 1];
+        }
+        sections.append(allocator, .{ .heading = std.fmt.allocPrint(allocator, "{s} → {s}", .{ home, child_name }) catch unreachable, .entries = entries.toOwnedSlice(allocator) catch &.{} }) catch unreachable;
+    }
+
+    // ---- The elaborated program -----------------------------------------
+    // Clone, run the real transform pass over the clone, print the items
+    // the transform wrote. This section cannot drift: it is the pass.
+    var elab_entries = std.ArrayList(Entry).initCapacity(allocator, 64) catch unreachable;
+    var cloned = functional.cloneSourceFile(allocator, program) catch |err| {
+        elab_entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "elaborated view unavailable — program clone failed ({s})", .{@errorName(err)}) catch unreachable }) catch unreachable;
+        sections.append(allocator, .{ .heading = "elaborated", .entries = elab_entries.toOwnedSlice(allocator) catch &.{} }) catch unreachable;
+        return .{ .title = "std/supervisor", .sections = sections.toOwnedSlice(allocator) catch &.{} };
+    };
+    const file_name = if (sup_sites.items.len > 0) sup_sites.items[0].site.location.file else "<program>";
+    var rep = errors.ErrorReporter.init(allocator, file_name, "") catch unreachable;
+    var xctx = koru_std.koru_compiler.CompilerContext{
+        .ast = &cloned,
+        .original_ast = &cloned,
+        .allocator = allocator,
+        .errors = .{ .items = &.{}, .capacity = 0 },
+        .warnings = .{ .items = &.{}, .capacity = 0 },
+        .error_policy = .collect_all,
+        .current_pass = null,
+        .passes_completed = 0,
+        .tap_registry = null,
+        .reporter = &rep,
+    };
+    const elaborated = @import("root").process_all_transforms("transform", &cloned, allocator, @ptrCast(&xctx)) catch |err| blk: {
+        elab_entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "the transform pass failed ({s}) — `koruc` on this file prints the diagnostic", .{@errorName(err)}) catch unreachable }) catch unreachable;
+        break :blk null;
+    };
+    if (rep.hasErrors()) {
+        elab_entries.append(allocator, .{ .note = "the transform refuses this program — `koruc` on this file prints the diagnostic" }) catch unreachable;
+    }
+    if (elaborated) |elab| {
+        for (step_names.items) |sn| {
+            var found_step = false;
+            for (elab.items) |*it| {
+                if (it.* == .event_decl) {
+                    const ed = &it.event_decl;
+                    if (ed.path.segments.len == 1 and std.mem.eql(u8, ed.path.segments[0], sn.step)) {
+                        found_step = true;
+                        const src = printer.printItemSource(allocator, it) catch |err| {
+                            elab_entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "{s}: printed shape unavailable ({s})", .{ sn.step, @errorName(err) }) catch unreachable }) catch unreachable;
+                            continue;
+                        };
+                        appendSourceLines(allocator, &elab_entries, src);
+                    }
+                }
+            }
+            if (!found_step) {
+                elab_entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "{s}: not in the elaborated program — the transform refused this site", .{sn.step}) catch unreachable }) catch unreachable;
+            }
+            if (findFlowImpl(elab.items, sn.step)) |f| {
+                const item = ast.Item{ .flow = f.* };
+                if (printer.printItemSource(allocator, &item)) |src| {
+                    appendSourceLines(allocator, &elab_entries, src);
+                    elab_entries.append(allocator, .{ .note = "" }) catch unreachable;
+                } else |err| {
+                    elab_entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "{s} body: printed shape unavailable ({s})", .{ sn.step, @errorName(err) }) catch unreachable }) catch unreachable;
+                }
+            }
+            if (findFlowWithLabel(elab.items, sn.label)) |f| {
+                const item = ast.Item{ .flow = f.* };
+                const src = printer.printItemSource(allocator, &item) catch |err| {
+                    elab_entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "the retargeted flow contains a node with no surface spelling ({s})", .{@errorName(err)}) catch unreachable }) catch unreachable;
+                    continue;
+                };
+                appendSourceLines(allocator, &elab_entries, src);
+            }
+        }
+    }
+    sections.append(allocator, .{ .heading = "elaborated — the transform's output, printed", .entries = elab_entries.toOwnedSlice(allocator) catch &.{} }) catch unreachable;
+
+    return .{ .title = "std/supervisor", .sections = sections.toOwnedSlice(allocator) catch &.{} };
+}

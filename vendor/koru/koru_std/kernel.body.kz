@@ -1,0 +1,69 @@
+// Koru Standard Library: the `body` part of kernel.kz.
+// Joined via `~part body` in kernel.kz; merged into the kernel module at load.
+
+// ============================================================================
+// OP-BODY LOWERING — koru-authored statement text -> host source
+// ============================================================================
+
+/// The ONE Koru expression lowering — see `codegen_utils.lowerKoruExpr`.
+/// A kernel OP BODY is Koru expression text the user wrote inside `! step`
+/// or `! pairwise`, and this transform splices it into a loop it assembles
+/// itself. That route never reached the emitter's lowering, so `@sqrt(dsq)`
+/// arrived at `node` with the `@` still on it — even though `js_emitter` has
+/// mapped `@sqrt` to `Math.sqrt` all along. The mapping was never missing; the
+/// text just never passed the pass. On Zig this is the identity.
+///
+/// Refuses by name when the body uses an `@`-operation the vocabulary does not
+/// model, so an unrunnable JS kernel is a diagnostic rather than a syntax error
+/// in the emitted file.
+fn kernelLowerOpBody(alloc: std.mem.Allocator, text: []const u8, is_js: bool) []const u8 {
+    var d = codegen_utils_kernel.LowerDiag{};
+    // `.koru_body`, not `.koru_expr`: an op body is a STATEMENT SEQUENCE in host
+    // syntax (`const dx = k.other.x - k.x; …`), so its `const`/`let` are host
+    // keywords rather than binding references. Under `.koru_expr` the
+    // reserved-word rename hit them and emitted `const$ dx = …` (390_020).
+    return codegen_utils_kernel.lowerKoruExpr(alloc, text, if (is_js) .js else .zig, .koru_body, &d) catch |err| switch (err) {
+        error.OutOfMemory => unreachable,
+        error.UnsupportedBuiltin => {
+            std.debug.print("error[KORU122]: std/kernel op body names `@{s}`, and that operation has no lowering for the --lang target - the operations Koru names with `@` are the shared table in codegen_utils.lowerBuiltin\n", .{d.unknown_builtin});
+            std.process.exit(1);
+        },
+    };
+}
+
+/// Does a rewritten op body still need a terminating `;` appended? A body
+/// ending in `}` needs none when the brace closes a BLOCK statement —
+/// `if (…) {…} else {…};` is not legal Zig — but DOES need one when it is a
+/// struct-literal tail (`const v = Foo{…}`). Distinguished by the token
+/// before the `{` matching the trailing `}`: `)` or `else` = control flow.
+fn kernelBodyNeedsTerminator(text: []const u8) bool {
+    const t = std.mem.trimRight(u8, text, " \t\n\r");
+    if (t.len == 0) return true;
+    const last = t[t.len - 1];
+    if (last == ';') return false;
+    if (last != '}') return true;
+    var depth: usize = 0;
+    var open: usize = 0;
+    var i: usize = t.len;
+    while (i > 0) {
+        i -= 1;
+        switch (t[i]) {
+            '}' => depth += 1,
+            '{' => {
+                depth -= 1;
+                if (depth == 0) {
+                    open = i;
+                    break;
+                }
+            },
+            else => {},
+        }
+    }
+    var j = open;
+    while (j > 0 and std.ascii.isWhitespace(t[j - 1])) j -= 1;
+    if (j == 0) return false;
+    if (t[j - 1] == ')') return false;
+    if (j >= 4 and std.mem.eql(u8, t[j - 4 .. j], "else") and
+        (j < 5 or !(std.ascii.isAlphanumeric(t[j - 5]) or t[j - 5] == '_'))) return false;
+    return true;
+}

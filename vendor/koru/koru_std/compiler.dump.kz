@@ -1,0 +1,24 @@
+// Koru Standard Library: the `dump` part of compiler.kz.
+// Joined via `~part dump` in compiler.kz; merged into the compiler
+// module at load.
+
+// Helper: Dump AST as JSON for introspection
+// Usage: Insert at key points in pipeline to inspect AST state
+// Void tor - just prints and continues
+// Example: ast-dump(ctx: c, flag: "elaborate") |> ...
+~[comptime]pub tor ast-dump {
+    ctx: CompilerContext,
+    flag: string
+}
+
+~proc ast-dump|zig {
+    // Serialize AST to JSON
+    const ast_serializer = @import("ast_serializer");
+    var serializer = ast_serializer.AstSerializer.init(ctx.allocator) catch unreachable;
+    defer serializer.deinit();
+
+    const json_output = serializer.serializeToJson(ctx.ast) catch unreachable;
+
+    // Print to stderr with separator showing which dump this is
+    std.debug.print("=== AST DUMP: {s} ===\n{s}\n", .{flag, json_output});
+}

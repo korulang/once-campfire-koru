@@ -1,0 +1,27 @@
+// Koru Standard Library: the `deflines` part of bridge.kz — the session's
+// invented verbs as vocabulary lines, shared by the grammar render and
+// the affordances render so "what you may say" and "what you may call
+// now" spell the same contract. Joined via `~part deflines` in bridge.kz;
+// merged into the bridge module at load.
+
+/// One `name(args) | outcomes` line per session-defined flow — the same
+/// signature spelling the compiled vocabulary uses, plus the declared
+/// outcome contract the flow's `define` captured at install.
+fn appendDefinedLines(out: *std.ArrayList(u8), allocator: std.mem.Allocator, defined: ?*DefinedFlows) void {
+    const d = defined orelse return;
+    var it = d.map.iterator();
+    while (it.next()) |entry| {
+        const flow = entry.value_ptr.*;
+        if (out.items.len > 0) out.append(allocator, '\n') catch unreachable;
+        out.appendSlice(allocator, flow.name) catch unreachable;
+        out.append(allocator, '(') catch unreachable;
+        for (flow.params, 0..) |pname, i| {
+            if (i > 0) out.appendSlice(allocator, ", ") catch unreachable;
+            out.appendSlice(allocator, pname) catch unreachable;
+            out.appendSlice(allocator, ": ") catch unreachable;
+            out.appendSlice(allocator, flow.param_types[i]) catch unreachable;
+        }
+        out.append(allocator, ')') catch unreachable;
+        out.appendSlice(allocator, flow.contract_suffix) catch unreachable;
+    }
+}

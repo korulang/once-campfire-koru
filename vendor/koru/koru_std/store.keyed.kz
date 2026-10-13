@@ -1,0 +1,43 @@
+// Koru Standard Library: Reactive Stores — the `keyed` part.
+// Joined via `~part keyed` in store.kz; merged into the store module at load.
+//
+// `store[key: value]` is a pinned hole (690_018): `std/store:new` accepts
+// `key:` and emits ZERO lookup machinery — no key->row map, nothing
+// maintained at insert/take/swap-remove — and every `store[...]` consumer
+// splices the bracket interior verbatim into `__koru_resolve`, source
+// syntax in a host call position. The backend's `expected ')', found ':'`
+// was the first diagnostic the surface ever produced. The law is honor or
+// refuse (frag-std-store-design); honoring means a maintained key->handle
+// map — the shape `std/indexes:store` already emits for `when` routing —
+// so absent that machinery every consumer refuses, located, naming the
+// pin and the working spelling.
+//
+// Residual hole: `storeIndexedRefs` (store.kz) is a pure text rewriter
+// with no refusal channel — keyed reads reached through rule/query/guard
+// positions still splice verbatim. Extend the wall when it gets one.
+
+const KeyedAddressing = struct {
+    const ast = @import("ast");
+    const codegen_utils = @import("codegen_utils");
+    const struct_literal = @import("struct_literal");
+
+    /// The refusal item when `text` carries keyed addressing — a `:` inside
+    /// a `[...]` span — or null. `site` is the consumer's own label
+    /// ("std/store:take") so the diagnostic names who refused.
+    fn in(alloc: std.mem.Allocator, reporter: anytype, flow: *const ast.Flow, site: []const u8, text: []const u8) ?ast.Item {
+        if (!codegen_utils.colonInsideBrackets(text)) return null;
+        return ast.refusal(alloc, reporter, .KORU161, flow.location, flow.module, "{s}: keyed addressing '{s}' is a pinned hole (690_018) - no key->row map is emitted; address the row by handle instead (store[handle])", .{ site, text });
+    }
+
+    /// Same refusal over a parsed field list — checks the field NAME (a
+    /// write target like `pool[id: 7].hp`) and each VALUE (a keyed read
+    /// inside a seed/rhs like `pool[id: 7].hp - 10`). One gate for both
+    /// sides of a write block.
+    fn inFields(alloc: std.mem.Allocator, reporter: anytype, flow: *const ast.Flow, site: []const u8, fields: []const struct_literal.StructField) ?ast.Item {
+        for (fields) |f| {
+            if (in(alloc, reporter, flow, site, f.name)) |r| return r;
+            if (in(alloc, reporter, flow, site, f.value)) |r| return r;
+        }
+        return null;
+    }
+};

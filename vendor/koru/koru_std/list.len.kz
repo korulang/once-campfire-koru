@@ -1,0 +1,23 @@
+// Koru Standard Library: the `len` part of list.kz.
+// Joined via `~part len` in list.kz; merged into the list module at load.
+
+// Current length as a scalar. (The `xs.len` expression form rides a separate
+// bridge; this tor is the plain call form.)
+~[comptime|transform]pub tor len {
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc len|zig {
+    if (item.* != .flow) @panic("std/list:len transform: containing item is not a flow");
+    return routeOpCall(allocator, program, &item.flow, "len", invocation);
+}
+
+~pub tor len-i64 { xs: *List_i64<list> } -> usize
+
+~proc len-i64|zig {
+    return xs.items.items.len;
+}
+

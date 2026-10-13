@@ -1,0 +1,108 @@
+// Koru Standard Library: the `fields` part of kernel.kz.
+// Joined via `~part fields` in kernel.kz; merged into the kernel module.
+//
+// The init transform's field-list machinery: the `{ name: value }` texts it
+// consumes — its own data block and the `std/kernel:shape` declaration it
+// recovers — are validated by the shared field parser (the refusal below)
+// and lowered by the comma splitter. Module-scope fns (not proc-local
+// struct.call) so the pin on kernel.kz stays under its baseline — the ~part
+// split doctrine, same as `scan`.
+
+// `kast` is the shared alias the scan part declares (module-scope `const ast`
+// would collide under Zig's no-shadowing rule); this part uses it without
+// redeclaring — parts merge into one module scope.
+
+// Helper: transform "x: 42, y: 0" -> ".x = 42, .y = 0" (Zig), "x: 42, y: 0"
+// (JS object literal). A bare comma split — callers must have run the text
+// through kernelInitFieldListRefusal first, or a fused/half-dropped field
+// reaches the emitted static unparsed.
+fn kernelTransformFields(alloc: std.mem.Allocator, block_text: []const u8, is_js: bool) []const u8 {
+    var resArr = std.ArrayList(u8).initCapacity(alloc, block_text.len * 2) catch unreachable;
+    var iter_fields = std.mem.splitSequence(u8, block_text, ",");
+    var first = true;
+    while (iter_fields.next()) |field_raw| {
+        const field = std.mem.trim(u8, field_raw, " \t\n\r{}");
+        if (field.len == 0) continue;
+
+        if (std.mem.indexOf(u8, field, ":")) |colon_idx| {
+            const name = std.mem.trim(u8, field[0..colon_idx], " \t\n\r");
+            const value = std.mem.trim(u8, field[colon_idx + 1 ..], " \t\n\r");
+
+            if (!first) resArr.appendSlice(alloc, ", ") catch unreachable;
+            first = false;
+
+            // `.x = 1.5` is a Zig struct-field initializer; JS spells the
+            // same thing `x: 1.5` in an object literal.
+            if (!is_js) resArr.append(alloc, '.') catch unreachable;
+            resArr.appendSlice(alloc, name) catch unreachable;
+            resArr.appendSlice(alloc, if (is_js) ": " else " = ") catch unreachable;
+            resArr.appendSlice(alloc, value) catch unreachable;
+        }
+    }
+    return resArr.items;
+}
+
+// `std/kernel:init`'s data block and the `std/kernel:shape` declaration it
+// consumes are the same `{ name: value }` list struct_literal parses
+// everywhere else — but the consumers (kernelTransformFields,
+// parseShapeAstFields, kernelParseShapeFields) are bare comma splits, so a
+// fused field (`x: 0 y: 0`), a nameless `: 0`, or a typeless `x:` rode them
+// into the emitted static or the host struct decl and died in backend Zig as
+// `expected ',' after initializer` / `after field`. The block is Source-typed,
+// so the frontend's record-value check cannot reach it — the owning transform
+// gates the text through the one field parser BEFORE any splitter runs.
+// Returns the refusal item init replaces itself with, or null when every list
+// parses.
+fn kernelInitFieldListRefusal(
+    alloc: std.mem.Allocator,
+    source_text: []const u8,
+    is_array_mode: bool,
+    shape_src: ?[]const u8,
+    flow: *const kast.Flow,
+    reporter: *@import("errors").ErrorReporter,
+) ?kast.Item {
+    const check = struct {
+        fn call(a: std.mem.Allocator, text: []const u8) ?[]const u8 {
+            const inner = std.mem.trim(u8, text, " \t\n\r");
+            if (inner.len == 0) return null;
+            const wrapped = if (inner[0] == '{' and inner[inner.len - 1] == '}')
+                inner
+            else
+                std.fmt.allocPrint(a, "{{{s}}}", .{inner}) catch unreachable;
+            _ = @import("struct_literal").parseFields(a, wrapped) catch |err| {
+                if (err == error.OutOfMemory) unreachable;
+                return std.fmt.allocPrint(a, "{s}", .{@import("struct_literal").describeErrorIn(a, err, wrapped)}) catch "malformed field list";
+            };
+            return null;
+        }
+    }.call;
+    var field_err: ?[]const u8 = null;
+    if (is_array_mode) {
+        var check_iter = std.mem.splitSequence(u8, source_text, "}");
+        while (check_iter.next()) |block_raw| {
+            if (std.mem.indexOf(u8, block_raw, "{")) |brace_idx| {
+                field_err = check(alloc, block_raw[brace_idx + 1 ..]);
+                if (field_err != null) break;
+            }
+        }
+    } else {
+        field_err = check(alloc, source_text);
+    }
+    if (field_err == null) {
+        if (shape_src) |s| field_err = check(alloc, s);
+    }
+    const msg = field_err orelse return null;
+    reporter.addErrorAtLocation(.KORU170, flow.location, "kernel:init {s}", .{msg}) catch {};
+    const compile_error_code = std.fmt.allocPrint(
+        alloc,
+        "comptime {{ @compileError(\"kernel:init {s}\"); }}",
+        .{msg},
+    ) catch unreachable;
+    return kast.Item{
+        .inline_code = kast.InlineCode{
+            .code = compile_error_code,
+            .location = flow.location,
+            .module = alloc.dupe(u8, flow.module) catch unreachable,
+        },
+    };
+}

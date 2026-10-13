@@ -1,0 +1,31 @@
+// Compiler pipeline control flow.
+//
+// [template] constructs (std/control:if, cond, for) splice host source text
+// and only expand where the per-call template pass reaches. Compiler pipeline
+// definitions — coordinate overrides and other impl-of-comptime flows — are
+// rebuilt downstream of that pass, so templates never expand there; the
+// fallback (calling the unreachable stub handler) always fails. Branch here
+// on VALUES instead: a plain proc returning a branch union lowers in every
+// position — pipeline overrides, walked flows, and plain runtime code.
+~[comptime]pub tor branch { cond: bool }
+| yes
+| no
+
+~proc branch|zig {
+    if (cond) {
+        return .{ .yes = .{} };
+    }
+    return .{ .no = .{} };
+}
+
+// Helper: Format metrics string
+~pub tor metrics-format { passes_completed: u32, allocator: std.mem.Allocator } -> string
+
+~proc metrics-format|zig {
+    const metrics = std.fmt.allocPrint(
+        allocator,
+        "Passes: {d} (flow-based: elaborate, analysis, emission)",
+        .{passes_completed}
+    ) catch "Passes: <unknown> (flow-based: elaborate, analysis, emission)";
+    return metrics;
+}

@@ -1,0 +1,1003 @@
+// Koru Standard Library: I/O
+// Basic input/output operations for Koru programs
+//
+// Finally! After achieving consciousness (metacircular compilation),
+// we can now print "Hello, World!"
+
+~[comptime|runtime]
+
+~import std/build
+~part jsprec
+~part csprec
+~part lowers
+~part blkcs
+
+const std = @import("std");
+const codegen_utils_io = @import("codegen_utils");
+
+// Print without trailing newline — the no-newline sibling of print.ln.
+// SAME implementation (__printInterpolate, with_newline=false): comptime
+// {{ }} interpolation, rerouted to print.impl for shape checking.
+//
+// The old RUNTIME passthrough tor (`print { text }` + |zig/|js procs) died
+// here (2026-06-11, Lars ruling: std/io's print surface is comptime-only;
+// stage/runtime printing is the future std/compiler print-family). Its
+// positional-arg mis-emit bug died with the codepath.
+~[keyword|comptime|transform]pub tor print {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+// `println` REMOVED — subsumed by `print.ln` (the interpolating print). Calling
+// `std/io:println` is now an unknown-event error by design (greenfield: the old
+// form must fail loudly once removed).
+
+// Print formatted text
+// NOTE: printf with varargs would require runtime support — deliberately absent.
+
+// One blocking line from stdin. EOF is a branch, not an empty string —
+// an empty line is `line` with length 0. The buffer is module-static:
+// the returned slice is valid until the next readln (the caller must
+// finish with the line first). That is the interactive/pipe contract
+// (`650_009`); read.ln remains the leaky slurp-a-chunk sibling.
+~pub tor readln {}
+| line string
+| eof
+| failed string
+
+var readln_buf: [8192]u8 = undefined;
+
+~proc readln|zig {
+    const stdin = std.fs.File.stdin();
+    var i: usize = 0;
+    while (i < $mod.readln_buf.len) {
+        var b: [1]u8 = undefined;
+        const n = stdin.read(b[0..]) catch return .{ .failed = "Failed to read stdin" };
+        if (n == 0) {
+            if (i == 0) return .{ .eof = .{} };
+            return .{ .line = $mod.readln_buf[0..i] };
+        }
+        if (b[0] == '\n') {
+            if (i > 0 and $mod.readln_buf[i - 1] == '\r') i -= 1;
+            return .{ .line = $mod.readln_buf[0..i] };
+        }
+        $mod.readln_buf[i] = b[0];
+        i += 1;
+    }
+    return .{ .failed = "line too long" };
+}
+
+// Simple line reader - returns the line, or empty string on EOF/error
+// No error handling, just returns what it gets
+~pub tor read.ln {} -> string
+
+~proc read.ln|zig {
+    const stdin = std.fs.File.stdin();
+    var buf: [4096]u8 = undefined;
+    const n = stdin.read(&buf) catch return "";
+    if (n == 0) return "";
+    // Find newline and exclude it
+    var end: usize = 0;
+    while (end < n and buf[end] != '\n') : (end += 1) {}
+    const duped = koru_allocator().dupe(u8, buf[0..end]) catch "";
+    return duped;
+}
+
+// Debug print for development
+// NOTE: debug with anytype would require runtime support - skipping for now
+// pub tor io.debug { label: string, value: anytype }
+// | printed {}
+//
+// proc io.debug {
+//     std.debug.print("[DEBUG {s}]: ", .{label});
+//     std.debug.print("{any}\n", .{value});
+//     return .{ .printed = .{} };
+// }
+
+// Print error to stderr
+~pub tor eprintln { message: string }
+
+~proc eprintln|zig {
+    const stderr = std.fs.File.stderr().writer();
+    stderr.print("ERROR: {s}\n", .{message}) catch {
+        // Fall back to debug print if stderr fails
+        std.debug.print("ERROR: {s}\n", .{message});
+    };
+}
+
+// Success message with green color (if terminal supports it)
+~pub tor success { message: string }
+
+~proc success|zig {
+    std.debug.print("✅ {s}\n", .{message});
+}
+
+// Warning message
+~pub tor warn { message: string }
+
+~proc warn|zig {
+    std.debug.print("⚠️  {s}\n", .{message});
+}
+
+// ============================================================================
+// FILE/STDIN READING - For interpreter and scripting
+// ============================================================================
+
+// Read stdin as a stream of lines — the same effect contract as
+// std/fs:read-lines, sourced from stdin (the interactive/pipe vertical).
+~[
+- aspirational
+  Same gap as std/fs:read-lines: a per-line streaming surface backed by a
+  whole-stream slurp (readToEndAlloc), bounded by RAM. True streaming is the
+  deferred honest fix; marked so the gap is explicit and greppable.
+]pub tor read-lines {}
+! line string
+| done usize
+| failed string
+
+~proc read-lines|zig {
+    // HYGIENE: this body INLINES into the consumer's frame (effect
+    // lowering), so locals are __koru-prefixed to never collide with
+    // user bindings in the surrounding flow.
+    const __koru_rl_stdin = std.fs.File.stdin();
+    const __koru_rl_content = __koru_rl_stdin.readToEndAlloc(koru_allocator(), std.math.maxInt(usize)) catch |err| {
+        const __koru_rl_msg = switch (err) {
+            error.OutOfMemory => "Out of memory reading stdin",
+            else => "Failed to read stdin",
+        };
+        return .{ .failed = __koru_rl_msg };
+    };
+    defer koru_allocator().free(__koru_rl_content);
+
+    var __koru_rl_n: usize = 0;
+    var __koru_rl_it = std.mem.splitScalar(u8, __koru_rl_content, '\n');
+    while (__koru_rl_it.next()) |__koru_rl_raw| {
+        if (__koru_rl_raw.len == 0 and __koru_rl_it.peek() == null) break;
+        const __koru_rl_l = if (__koru_rl_raw.len > 0 and __koru_rl_raw[__koru_rl_raw.len - 1] == '\r') __koru_rl_raw[0 .. __koru_rl_raw.len - 1] else __koru_rl_raw;
+        line(__koru_rl_l);
+        __koru_rl_n += 1;
+    }
+    return .{ .done = __koru_rl_n };
+}
+
+// Read entire stdin as text. The buffer is allocator-owned and carries the
+// `allocated!` obligation: hand it to `std/io:free` (auto-discharge inserts
+// the call when the trace is unambiguous — most callers never write it).
+// Ruled 2026-07-31 (the 335_042/043 question): one label, `allocated`, for
+// every allocator-owned buffer an io tor hands back; `std/io:free` is the
+// one disposer.
+~pub tor read-stdin {}
+| ok string<allocated!>
+| eof
+| failed string
+
+~proc read-stdin|zig {
+    const stdin = std.fs.File.stdin();
+    const content = stdin.readToEndAlloc(koru_allocator(), std.math.maxInt(usize)) catch |err| {
+        const msg = switch (err) {
+            error.OutOfMemory => "Out of memory reading stdin",
+            else => "Failed to read stdin",
+        };
+        return .{ .failed = msg };
+    };
+
+    if (content.len == 0) {
+        return .{ .eof = .{} };
+    }
+
+    return .{ .ok = content };
+}
+
+// Read entire file as text. `ok` carries the `allocated!` obligation — see
+// read-stdin's header; `std/io:free` discharges it.
+~pub tor read-file { path: string }
+| ok string<allocated!>
+| not-found
+| failed string
+
+~proc read-file|zig {
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        return switch (err) {
+            error.FileNotFound => .{ .not_found = .{} },
+            error.AccessDenied => .{ .failed = "Access denied" },
+            error.IsDir => .{ .failed = "Path is a directory" },
+            else => .{ .failed = "Failed to open file" },
+        };
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(koru_allocator(), std.math.maxInt(usize)) catch |err| {
+        const msg = switch (err) {
+            error.OutOfMemory => "Out of memory reading file",
+            else => "Failed to read file",
+        };
+        return .{ .failed = msg };
+    };
+
+    return .{ .ok = content };
+}
+
+// Discharge the `allocated!` obligation on a buffer an io tor handed back
+// (read-file, read-stdin). The one disposer for the one label.
+~pub tor free { content: string<!allocated> }
+
+~proc free|zig {
+    koru_allocator().free(content);
+}
+
+~proc free|cs {
+    // The host owns memory — a Koru string is a managed C# string and the
+    // GC settles the `allocated!` debt. Empty by construction.
+}
+
+// Get command line arguments
+~pub tor args {} -> []string
+
+~proc args|zig {
+    var arg_list = std.ArrayList([]const u8).init(koru_allocator());
+    var iter = std.process.args();
+    while (iter.next()) |arg| {
+        arg_list.append(arg) catch continue;
+    }
+    return arg_list.toOwnedSlice() catch &.{};
+}
+
+// ============================================================================
+// PRINT.LN - Interpolated printing with Expression (ZERO OVERHEAD)
+// ============================================================================
+//
+// Syntax: std/io:print.ln("Hello {{ name }}! Count: {{ count }}")
+//
+// ARCHITECTURE:
+// - print.ln is a comptime transform that generates inline Zig code
+// - Parses {{ ... }} placeholders from the Expression string
+// - Optional format specifier: {{ name:s }} or {{ count:d }}
+// - Generates: std.debug.print("Hello {}! Count: {}\n", .{name, count});
+//
+// This is NOT a regular tor - it's a pure compile-time transformation.
+
+~[keyword|comptime|transform]pub tor print.ln {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[norun]pub tor print.impl {
+    expr: string<*>,
+}
+
+// eprint / eprint.ln — the stderr siblings of print / print.ln. Same engine
+// (__printInterpolate), routed to fd 2. They reuse print.impl for shape
+// checking (the reroute is analysis-only; the inline body does the write).
+~[keyword|comptime|transform]pub tor eprint.ln {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[keyword|comptime|transform]pub tor eprint {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+// ============================================================================
+// Shared interpolation engine for the comptime print family. `print` IS
+// `print.ln` without the trailing newline — ONE implementation, parameterized
+// at comptime. Both reroute to the [norun] print.impl tor for shape
+// checking. (Stage/runtime printing belongs to the future std/compiler
+// print-family — std/io's print surface is comptime-only by ruling,
+// 2026-06-11.)
+//
+// `item: anytype` + lazy ast import keep this fn unanalyzed (and harmless)
+// if it rides along into runtime emission units where @import("ast") does
+// not exist — Zig only analyzes referenced declarations.
+// ============================================================================
+// A literal `{` or `}` from the user's message has to reach Zig's `std.fmt`
+// DOUBLED, or the message's own braces are read as format placeholders.
+// `{{ … }}` is the interpolation opener and is consumed before a byte ever
+// gets here, so every brace that arrives IS the user's own text.
+//
+// Found by the ECS benchmark: without this no Koru program could print a JSON
+// line — `print.ln("{\"a\":1}")` died inside std.fmt at comptime, in the
+// STDLIB's format string, with no source location the author could act on.
+fn __appendFmtLiteralByte(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, byte: u8) void {
+    if (byte == '{' or byte == '}') buf.append(allocator, byte) catch unreachable;
+    buf.append(allocator, byte) catch unreachable;
+}
+
+// ONE writer, four call sites. `print`/`print.ln`/`eprint`/`eprint.ln` share
+// __printInterpolate; `print.blk` has two more lowerings of its own (|zig and
+// |raw_posix), each with a :f/:any fallback. Every one of them has to reach the
+// OS, and pasting the host branch into each is precisely how two lowerings of one
+// construct drift apart — a shape this file has already produced four times.
+//
+// The branch itself is a NECESSITY, not a preference: `std.posix.write` does not
+// exist on a freestanding target, so without it every print in the stdlib is a
+// compile error there, which is what kept Koru off unikernels. ISO C `fputs` and
+// not POSIX `write`, because freestanding has no guaranteed fd table — measured
+// on Unikraft 0.21.0, `write` links only after four more Kconfig libraries, costs
+// 12,544 image bytes, and still traps at boot because nothing opened fd 1.
+//
+// Chunked through its OWN 4 KB buffer rather than NUL-terminating the caller's:
+// the callers' buffer is 65,536 bytes, which is Unikraft's ENTIRE default boot
+// stack (order 4 = 16 pages, exactly 64 KB), and a writer needing a second copy
+// of that would double a requirement that is already the whole stack.
+//
+// KORU_OUT_UNESCAPED is the source of truth. KORU_OUT_FN is the same text with
+// braces doubled, derived at comptime, because four of the five call sites splice
+// it into an allocPrint FORMAT string where a bare `{` is a format specifier and
+// the fifth (raw_io_prefix) is a plain concatenation. Deriving rather than
+// keeping two hand-maintained copies is the whole point of this const existing.
+const KORU_OUT_UNESCAPED: []const u8 =
+    "fn __kout(__fd: i32, __b: []const u8) void { " ++
+    "if (@import(\"builtin\").os.tag == .freestanding) { " ++
+    "const __kc = struct { extern var stdout: ?*anyopaque; extern var stderr: ?*anyopaque; " ++
+    "extern fn fputs(__s: [*:0]const u8, __st: ?*anyopaque) c_int; }; " ++
+    "var __kt: [4096]u8 = undefined; " ++
+    "for (0..(__b.len + __kt.len - 2) / (__kt.len - 1)) |__ki| { const __kn = @min(__kt.len - 1, __b.len - __ki * (__kt.len - 1)); " ++
+    "@memcpy(__kt[0..__kn], __b[__ki * (__kt.len - 1)..][0..__kn]); __kt[__kn] = 0; " ++
+    "@import(\"std\").mem.doNotOptimizeAway(__kc.fputs(@as([*:0]const u8, @ptrCast(&__kt)), " ++
+    "if (__fd == 2) __kc.stderr else __kc.stdout)); } " ++
+    "} else { @import(\"std\").mem.doNotOptimizeAway(@import(\"std\").posix.write(__fd, __b) catch @as(usize, 0)); } } ";
+
+fn __doubleBraces(comptime s: []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (s) |c| {
+            out = out ++ switch (c) {
+                '{' => "{{",
+                '}' => "}}",
+                else => &[_]u8{c},
+            };
+        }
+        return out;
+    }
+}
+
+const KORU_OUT_FN: []const u8 = __doubleBraces(KORU_OUT_UNESCAPED);
+
+fn __printInterpolate(
+    expr: []const u8,
+    item: anytype,
+    rep: anytype,
+    allocator: std.mem.Allocator,
+    comptime with_newline: bool,
+    comptime label: []const u8,
+    to_fd: u8,
+) @import("ast").SiteResult {
+    const ast = @import("ast");
+
+    // Helper: Check if identifier is a Zig keyword
+    const isZigKeyword = struct {
+        fn check(word: []const u8) bool {
+            const keywords = [_][]const u8{
+                "error", "type", "async", "await", "suspend", "resume",
+                "try", "catch", "if", "else", "switch", "while",
+                "for", "break", "continue", "return", "defer", "errdefer",
+                "test", "pub", "export", "extern", "packed", "inline",
+                "noinline", "comptime", "nosuspend", "volatile", "allowzero",
+                "align", "linksection", "callconv", "noalias",
+                "struct", "enum", "union", "opaque", "fn", "const",
+                "var", "anyframe", "anytype", "anyerror", "unreachable",
+                "undef", "null", "true", "false", "and", "or",
+                "orelse", "threadlocal",
+            };
+            for (keywords) |kw| {
+                if (std.mem.eql(u8, word, kw)) return true;
+            }
+            // Zig primitive names — a local may not shadow them, so they
+            // escape exactly like keywords (230_018).
+            const primitives = [_][]const u8{
+                "bool",         "void",     "noreturn", "anyopaque",
+                "usize",        "isize",    "f16",      "f32",
+                "f64",          "f80",      "f128",     "undefined",
+                "comptime_int", "comptime_float",       "c_char",
+                "c_short",      "c_ushort", "c_int",    "c_uint",
+                "c_long",       "c_ulong",  "c_longlong",
+                "c_ulonglong",  "c_longdouble",
+            };
+            for (primitives) |p| {
+                if (std.mem.eql(u8, word, p)) return true;
+            }
+            // u<digits> / i<digits> — the arbitrary-width integer family.
+            if (word.len >= 2 and (word[0] == 'u' or word[0] == 'i')) {
+                var all_digits = true;
+                for (word[1..]) |c| {
+                    if (c < '0' or c > '9') all_digits = false;
+                }
+                if (all_digits) return true;
+            }
+            return false;
+        }
+    }.check;
+
+    // Helper: Append path with escaped keywords (e.g., err.error -> err.@"error")
+    const appendEscapedPath = struct {
+        fn append(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, path: []const u8) void {
+            var start: usize = 0;
+            var pos: usize = 0;
+            var is_first = true;
+
+            while (pos <= path.len) {
+                if (pos == path.len or path[pos] == '.') {
+                    const segment = path[start..pos];
+                    if (!is_first) {
+                        buf.append(alloc, '.') catch unreachable;
+                        // Check if this segment is a keyword
+                        if (isZigKeyword(segment)) {
+                            buf.appendSlice(alloc, "@\"") catch unreachable;
+                            buf.appendSlice(alloc, segment) catch unreachable;
+                            buf.append(alloc, '"') catch unreachable;
+                        } else {
+                            buf.appendSlice(alloc, segment) catch unreachable;
+                        }
+                    } else if (isZigKeyword(segment)) {
+                        // A bare binding may legally collide with a Zig
+                        // keyword or primitive (`: u1` — 230_018); the first
+                        // segment escapes like any other.
+                        buf.appendSlice(alloc, "@\"") catch unreachable;
+                        buf.appendSlice(alloc, segment) catch unreachable;
+                        buf.append(alloc, '"') catch unreachable;
+                    } else {
+                        buf.appendSlice(alloc, segment) catch unreachable;
+                    }
+                    is_first = false;
+                    start = pos + 1;
+                }
+                pos += 1;
+            }
+        }
+    }.append;
+
+    // Get the flow from the item (flows with impl context now use item.flow with impl_of set)
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Parse the Expression string for ${...} placeholders
+    var format_buf = std.ArrayList(u8).initCapacity(allocator, 128) catch unreachable;
+    var args_buf = std.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+    var i: usize = 0;
+    var first_arg = true;
+
+    var missing_spec: ?[]const u8 = null;
+    var function_call_expr: ?[]const u8 = null;
+    var keyed_placeholder: ?[]const u8 = null;
+
+    // Use the expression parser to detect function calls properly
+    const expr_parser = @import("expression_parser");
+
+    // Detect string literal vs bare expression
+    const is_string_literal = expr.len > 0 and expr[0] == '"';
+    // Skip leading/trailing quotes if string literal
+    const start: usize = if (is_string_literal) 1 else 0;
+    const end: usize = if (is_string_literal and expr[expr.len - 1] == '"') expr.len - 1 else expr.len;
+    const raw_content = expr[start..end];
+    // Bare expression (not a string literal): wrap as {{ raw_content }} for single-value interpolation
+    // If expression already has a format spec (contains :), don't add :s
+    const content = if (!is_string_literal and raw_content.len > 0) blk: {
+        const has_format_spec = std.mem.indexOf(u8, raw_content, ":") != null;
+        const suffix = if (has_format_spec) " }}" else ":s }}";
+        var wrapped = std.ArrayList(u8).initCapacity(allocator, raw_content.len + 8) catch unreachable;
+        wrapped.appendSlice(allocator, "{{ ") catch unreachable;
+        wrapped.appendSlice(allocator, raw_content) catch unreachable;
+        wrapped.appendSlice(allocator, suffix) catch unreachable;
+        break :blk wrapped.items;
+    } else raw_content;
+
+    while (i < content.len) {
+        // Look for {% if var %}...{% endif %} control blocks
+        if (i + 1 < content.len and content[i] == '{' and content[i + 1] == '%') {
+            const tag_start = i + 2;
+            // Skip whitespace after {%
+            var ws_start = tag_start;
+            while (ws_start < content.len and (content[ws_start] == ' ' or content[ws_start] == '\t')) : (ws_start += 1) {}
+
+            // Check for "if " keyword
+            if (ws_start + 3 <= content.len and std.mem.eql(u8, content[ws_start..ws_start + 3], "if ")) {
+                const var_start = ws_start + 3;
+                // Skip whitespace after "if"
+                var var_pos = var_start;
+                while (var_pos < content.len and (content[var_pos] == ' ' or content[var_pos] == '\t')) : (var_pos += 1) {}
+
+                // Find end of variable name (until whitespace or %)
+                var var_end = var_pos;
+                while (var_end < content.len and content[var_end] != ' ' and content[var_end] != '\t' and content[var_end] != '%') : (var_end += 1) {}
+                const cond_var = content[var_pos..var_end];
+
+                // Find closing %}
+                var tag_end = var_end;
+                while (tag_end + 1 < content.len and !(content[tag_end] == '%' and content[tag_end + 1] == '}')) : (tag_end += 1) {}
+
+                if (tag_end + 1 < content.len) {
+                    const body_start = tag_end + 2;
+
+                    // Find matching {% endif %}
+                    const endif_marker = "{% endif %}";
+                    if (std.mem.indexOf(u8, content[body_start..], endif_marker)) |endif_offset| {
+                        const body_end = body_start + endif_offset;
+                        const body_content = content[body_start..body_end];
+
+                        // Generate: {s} with arg: if (var) "content" else ""
+                        format_buf.appendSlice(allocator, "{s}") catch unreachable;
+
+                        if (!first_arg) {
+                            args_buf.appendSlice(allocator, ", ") catch unreachable;
+                        }
+                        args_buf.appendSlice(allocator, "if (") catch unreachable;
+                        appendEscapedPath(&args_buf, allocator, cond_var);
+                        args_buf.appendSlice(allocator, ") \"") catch unreachable;
+                        // Escape body content for Zig string
+                        for (body_content) |c| {
+                            switch (c) {
+                                '"' => args_buf.appendSlice(allocator, "\\\"") catch unreachable,
+                                '\\' => args_buf.appendSlice(allocator, "\\\\") catch unreachable,
+                                '\n' => args_buf.appendSlice(allocator, "\\n") catch unreachable,
+                                '\r' => args_buf.appendSlice(allocator, "\\r") catch unreachable,
+                                '\t' => args_buf.appendSlice(allocator, "\\t") catch unreachable,
+                                else => args_buf.append(allocator, c) catch unreachable,
+                            }
+                        }
+                        args_buf.appendSlice(allocator, "\" else \"\"") catch unreachable;
+                        first_arg = false;
+
+                        i = body_end + endif_marker.len;
+                        continue;
+                    }
+                }
+            }
+            // Not a recognized tag, treat as literal
+            __appendFmtLiteralByte(&format_buf, allocator, content[i]);
+            i += 1;
+        }
+        // Look for {{ ... }} placeholders (Liquid-style syntax)
+        else if (i + 1 < content.len and content[i] == '{' and content[i + 1] == '{') {
+            const placeholder_start = i + 2;
+            // Skip leading whitespace inside {{ }}
+            var ws_start = placeholder_start;
+            while (ws_start < content.len and (content[ws_start] == ' ' or content[ws_start] == '\t')) : (ws_start += 1) {}
+
+            // Find closing }}
+            var j = ws_start;
+            while (j + 1 < content.len and !(content[j] == '}' and content[j + 1] == '}')) : (j += 1) {}
+
+            if (j + 1 < content.len) {
+                // Trim trailing whitespace
+                var ws_end = j;
+                while (ws_end > ws_start and (content[ws_end - 1] == ' ' or content[ws_end - 1] == '\t')) : (ws_end -= 1) {}
+
+                const placeholder = content[ws_start..ws_end];
+                var var_name: []const u8 = placeholder;
+                var format_spec: []const u8 = "any";
+                var has_spec = false;
+
+                // Keyed addressing `store[key: value]` is a pinned hole
+                // (690_018): the `key:` decl emits no lookup machinery, and
+                // the bracket `:` would misfire the format-spec split below.
+                // Honor or refuse: refuse, before either defect runs.
+                if (keyed_placeholder == null and codegen_utils_io.colonInsideBrackets(placeholder)) {
+                    keyed_placeholder = placeholder;
+                }
+
+                // Check for format specifier: {{ name:s }}
+                if (std.mem.indexOf(u8, placeholder, ":")) |colon_pos| {
+                    var_name = placeholder[0..colon_pos];
+                    format_spec = placeholder[colon_pos + 1..];
+                    has_spec = true;
+                }
+
+                // Function call check: parse the expression and check for
+                // USER function calls. The store rewriters splice their
+                // synthesized `__koru_resolve` handle deref into hole text
+                // after admission; that machinery call is not the user's.
+                if (function_call_expr == null) {
+                    var parser = expr_parser.ExpressionParser.init(allocator, var_name);
+                    defer parser.deinit();
+                    if (parser.parse()) |parsed_expr| {
+                        if (expr_parser.containsUserFunctionCall(parsed_expr)) {
+                            function_call_expr = var_name;
+                        }
+                    } else |_| {
+                        // Parse failed - let the Zig compiler catch it later
+                    }
+                }
+
+                // Missing specifier: record error (first one only)
+                if (!has_spec and missing_spec == null) {
+                    missing_spec = placeholder;
+                }
+
+                // :f maps to {} in Zig (default float format — Zig has no {f}).
+                // :S is the handle form (610_007, ruled 2026-09-05): the arg is
+                // a *String, read as `.data` INSIDE the emitted step — the
+                // owner binding is live and KORU030-checked there, so the
+                // borrow never outlives anything. Zero-copy, zero new state.
+                const zig_fmt_spec_ln = if (std.mem.eql(u8, format_spec, "f")) "" else if (std.mem.eql(u8, format_spec, "S")) "s" else format_spec;
+                format_buf.append(allocator, '{') catch unreachable;
+                format_buf.appendSlice(allocator, zig_fmt_spec_ln) catch unreachable;
+                format_buf.append(allocator, '}') catch unreachable;
+
+                if (!first_arg) {
+                    args_buf.appendSlice(allocator, ", ") catch unreachable;
+                }
+                // Escape Zig keywords in dotted paths (e.g., err.error -> err.@"error")
+                appendEscapedPath(&args_buf, allocator, var_name);
+                if (std.mem.eql(u8, format_spec, "S")) args_buf.appendSlice(allocator, ".data") catch unreachable;
+                first_arg = false;
+
+                i = j + 2; // Skip past }}
+            } else {
+                __appendFmtLiteralByte(&format_buf, allocator, content[i]);
+                i += 1;
+            }
+        } else {
+            __appendFmtLiteralByte(&format_buf, allocator, content[i]);
+            i += 1;
+        }
+    }
+
+    if (with_newline) {
+        format_buf.appendSlice(allocator, "\\n") catch unreachable;
+    }
+
+    const inline_code = if (function_call_expr) |fn_expr| kblk1: {
+        rep.addErrorAtLocation(.KORU168, flow.location, "std/io:" ++ label ++ ": '{{{{ {s} }}}}' contains a function call — function calls are not allowed in expressions. Use tor chaining instead.", .{fn_expr}) catch {};
+        break :kblk1 std.fmt.allocPrint(
+            allocator,
+            "@compileError(\"std/io:" ++ label ++ ": '{{{{ {s} }}}}' contains a function call — function calls are not allowed in expressions. Use tor chaining instead.\");",
+            .{fn_expr}
+        ) catch unreachable;
+    }
+    else if (keyed_placeholder) |placeholder| kblk_keyed: {
+        rep.addErrorAtLocation(.KORU168, flow.location, "std/io:" ++ label ++ ": '{{{{ {s} }}}}' uses keyed addressing 'store[key: value]' - a pinned hole (690_018); bind the row's handle and interpolate store[handle].field instead", .{placeholder}) catch {};
+        break :kblk_keyed std.fmt.allocPrint(
+            allocator,
+            "@compileError(\"std/io:" ++ label ++ ": '{{{{ {s} }}}}' uses keyed addressing - a pinned hole (690_018); use store[handle].field\");",
+            .{placeholder}
+        ) catch unreachable;
+    }
+    else if (missing_spec) |placeholder| kblk2: {
+        rep.addErrorAtLocation(.KORU168, flow.location, "std/io:" ++ label ++ ": '{{{{ {s} }}}}' requires a format specifier (:d, :s, :f, or :any)", .{placeholder}) catch {};
+        break :kblk2 std.fmt.allocPrint(
+            allocator,
+            "@compileError(\"std/io:" ++ label ++ ": '{{{{ {s} }}}}' requires a format specifier (:d, :s, :f, or :any)\");",
+            .{placeholder}
+        ) catch unreachable;
+    }
+    else
+        // Write to to_fd (1 = stdout for print/print.ln, 2 = stderr for eprint/
+        // eprint.ln). Inline (struct { fn w }).w("fmt", .{args}) — the args tuple
+        // is evaluated in the OUTER scope, so captured interpolation vars work;
+        // the body holds the 64K stack buffer. Unbuffered write of a bufPrint'd
+        // slice — no flush, version-stable (std.debug.print is stderr-only). NO
+        // `_` token: the flow/tap emitter rewrites a bare `_` to the binding
+        // name, so the discard goes through doNotOptimizeAway.
+        // (64K cap per call; longer output is dropped — rare, the suite catches it.)
+        // Reaches the OS through the shared KORU_OUT_FN writer — see its
+        // definition for why the freestanding branch exists and why it is fputs.
+        std.fmt.allocPrint(
+            allocator,
+            "(struct {{ " ++ KORU_OUT_FN ++ "fn __kw(comptime __f: []const u8, __a: anytype) void {{ var __kb: [65536]u8 = undefined; const __ks = @import(\"std\").fmt.bufPrint(&__kb, __f, __a) catch __kb[0..0]; __kout({d}, __ks); }} }}).__kw(\"{s}\", .{{{s}}});",
+            .{ to_fd, format_buf.items, args_buf.items }
+        ) catch unreachable;
+
+    // Position-agnostic: the runner lifts nested sites into a synthetic
+    // top-level flow, so the flow's own invocation is correct at every depth.
+
+    // Re-route path to void print.impl tor for shape checking
+    const impl_segments = allocator.alloc([]const u8, 2) catch unreachable;
+    impl_segments[0] = allocator.dupe(u8, "print") catch unreachable;
+    impl_segments[1] = allocator.dupe(u8, "impl") catch unreachable;
+    const impl_path = ast.DottedPath{
+        .module_qualifier = flow.inv().path.module_qualifier,
+        .segments = impl_segments,
+    };
+
+    // Already transformed — don't re-run
+    if (flow.inline_body != null) {
+        return .{};
+    }
+
+    const new_marks = allocator.alloc([]const u8, flow.inv().marks.len + 1) catch unreachable;
+    for (flow.inv().marks, 0..) |m, idx| new_marks[idx] = m;
+    new_marks[flow.inv().marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_invocation = ast.Invocation{
+        .path = impl_path,
+        .args = flow.inv().args,
+        .annotations = flow.inv().annotations,
+        .marks = new_marks,
+        .inserted_by_tap = flow.inv().inserted_by_tap,
+        .from_opaque_tap = flow.inv().from_opaque_tap,
+    };
+
+    // Whole-struct copy, NOT a field-list literal: a hand-rolled literal
+    // silently drops any field it doesn't name (this exact rebuild used to
+    // lose impl_variant, breaking variant subflows whose body is a print).
+    var transformed_flow = flow.*;
+    transformed_flow.body = ast.rootSite(new_invocation, flow.body.continuations, flow.location);
+    transformed_flow.inline_body = inline_code;
+
+    const new_item = ast.Item{ .flow = transformed_flow };
+
+    return .{ .replacement = new_item };
+}
+
+~proc print.ln|zig {
+    _ = invocation;
+    _ = program;
+    return __printInterpolate(expr, item, reporter, allocator, true, "print.ln", 1);
+}
+
+~proc print|zig {
+    _ = invocation;
+    _ = program;
+    return __printInterpolate(expr, item, reporter, allocator, false, "print", 1);
+}
+
+// eprint family — same interpolation engine, routed to stderr (fd 2). The
+// stdout/stderr split: print/print.ln -> stdout, eprint/eprint.ln -> stderr.
+~proc eprint.ln|zig {
+    _ = invocation;
+    _ = program;
+    return __printInterpolate(expr, item, reporter, allocator, true, "eprint.ln", 2);
+}
+
+~proc eprint|zig {
+    _ = invocation;
+    _ = program;
+    return __printInterpolate(expr, item, reporter, allocator, false, "eprint", 2);
+}
+
+// ============================================================================
+// JS-target interpolation engine for the comptime print family. The parallel
+// of __printInterpolate: SAME expr surface — string-literal vs bare expression,
+// `{{ var:fmt }}` placeholders, `{% if v %}…{% endif %}` blocks — but it emits
+// a JS string-concat and a `process.{stdout,stderr}.write(…)` call instead of
+// the Zig posix.write inline. Format specs (:d/:s/:f/:any) are accepted and
+// dropped except a `:.N` precision tail, which emits `Number(x).toFixed(N)`
+// — the same honoring `fmt`'s jsPlaceholder gives `ln|js`. `to_fd` selects the stream (1 =
+// stdout, 2 = stderr); the trailing newline for the `.ln` variants is appended
+// as a `+ "\n"` operand, matching |zig's fd + `\n` semantics (neither stream
+// adds an implicit newline).
+//
+// Literal text from a string-literal expr is ALREADY escaped for a `"…"` body
+// (Koru string escapes are C-like and valid inside a JS `"…"`), so literal runs
+// are copied VERBATIM — the key divergence from print.blk|js, whose source
+// block holds raw text that must be re-escaped. On a bare expression the whole
+// value is stringified (`"" + (expr)`), the `""` forcing string-concat context.
+// ============================================================================
+fn __printInterpolateJs(
+    expr: []const u8,
+    item: anytype,
+    allocator: std.mem.Allocator,
+    comptime with_newline: bool,
+    to_fd: u8,
+) @import("ast").SiteResult {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Already transformed — don't re-run.
+    if (flow.inline_body != null) {
+        return .{};
+    }
+
+    var buf = std.ArrayList(u8).initCapacity(allocator, 128) catch unreachable;
+    var first = true;
+    var in_literal = false;
+
+    const openLit = struct {
+        fn call(b: *std.ArrayList(u8), a: std.mem.Allocator, f: *bool, il: *bool) void {
+            if (!il.*) {
+                if (!f.*) b.appendSlice(a, " + ") catch unreachable;
+                b.append(a, '"') catch unreachable;
+                il.* = true;
+                f.* = false;
+            }
+        }
+    }.call;
+
+    const closeLit = struct {
+        fn call(b: *std.ArrayList(u8), a: std.mem.Allocator, il: *bool) void {
+            if (il.*) {
+                b.append(a, '"') catch unreachable;
+                il.* = false;
+            }
+        }
+    }.call;
+
+    const is_string_literal = expr.len > 0 and expr[0] == '"';
+
+    if (is_string_literal) {
+        // Scan the INSIDE of the quotes — already-escaped, valid in a JS `"…"`.
+        const end: usize = if (expr[expr.len - 1] == '"') expr.len - 1 else expr.len;
+        const content = expr[1..end];
+        var i: usize = 0;
+        while (i < content.len) {
+            // {% if var %}body{% endif %} → + (var ? "body" : "") +
+            if (i + 1 < content.len and content[i] == '{' and content[i + 1] == '%') {
+                var ws_start = i + 2;
+                while (ws_start < content.len and (content[ws_start] == ' ' or content[ws_start] == '\t')) : (ws_start += 1) {}
+
+                if (ws_start + 3 <= content.len and std.mem.eql(u8, content[ws_start .. ws_start + 3], "if ")) {
+                    var var_pos = ws_start + 3;
+                    while (var_pos < content.len and (content[var_pos] == ' ' or content[var_pos] == '\t')) : (var_pos += 1) {}
+                    var var_end = var_pos;
+                    while (var_end < content.len and content[var_end] != ' ' and content[var_end] != '\t' and content[var_end] != '%') : (var_end += 1) {}
+                    const cond_var = content[var_pos..var_end];
+
+                    var tag_end = var_end;
+                    while (tag_end + 1 < content.len and !(content[tag_end] == '%' and content[tag_end + 1] == '}')) : (tag_end += 1) {}
+
+                    if (tag_end + 1 < content.len) {
+                        const body_start = tag_end + 2;
+                        const endif_marker = "{% endif %}";
+                        if (std.mem.indexOf(u8, content[body_start..], endif_marker)) |endif_offset| {
+                            const body_end = body_start + endif_offset;
+                            const body_content = content[body_start..body_end];
+
+                            closeLit(&buf, allocator, &in_literal);
+                            if (!first) buf.appendSlice(allocator, " + ") catch unreachable;
+                            first = false;
+
+                            buf.append(allocator, '(') catch unreachable;
+                            buf.appendSlice(allocator, cond_var) catch unreachable;
+                            buf.appendSlice(allocator, " ? \"") catch unreachable;
+                            buf.appendSlice(allocator, body_content) catch unreachable; // verbatim — already escaped
+                            buf.appendSlice(allocator, "\" : \"\")") catch unreachable;
+
+                            i = body_end + endif_marker.len;
+                            continue;
+                        }
+                    }
+                }
+                // Unrecognized {% — treat as literal.
+                openLit(&buf, allocator, &first, &in_literal);
+                buf.append(allocator, content[i]) catch unreachable;
+                i += 1;
+            }
+            // {{ var:fmt }} → + var +  (fmt dropped — JS auto-stringifies)
+            else if (i + 1 < content.len and content[i] == '{' and content[i + 1] == '{') {
+                var ws_start = i + 2;
+                while (ws_start < content.len and (content[ws_start] == ' ' or content[ws_start] == '\t')) : (ws_start += 1) {}
+
+                var j = ws_start;
+                while (j + 1 < content.len and !(content[j] == '}' and content[j + 1] == '}')) : (j += 1) {}
+
+                if (j + 1 < content.len) {
+                    var ws_end = j;
+                    while (ws_end > ws_start and (content[ws_end - 1] == ' ' or content[ws_end - 1] == '\t')) : (ws_end -= 1) {}
+
+                    closeLit(&buf, allocator, &in_literal);
+                    if (first) {
+                        // Seed string-concat context so a lone/leading numeric
+                        // value is promoted to a string, never arithmetic-added
+                        // (process.stdout.write demands a string arg).
+                        buf.appendSlice(allocator, "\"\" + ") catch unreachable;
+                        first = false;
+                    } else {
+                        buf.appendSlice(allocator, " + ") catch unreachable;
+                    }
+                    // Spec split + `:.N` precision + operand emission live in
+                    // io.jsprec (line-baseline wall) — same honoring fmt's
+                    // jsPlaceholder gives ln|js.
+                    ioJsPlaceholderOperand(&buf, allocator, content[ws_start..ws_end]);
+
+                    i = j + 2;
+                } else {
+                    openLit(&buf, allocator, &first, &in_literal);
+                    buf.append(allocator, content[i]) catch unreachable;
+                    i += 1;
+                }
+            } else {
+                openLit(&buf, allocator, &first, &in_literal);
+                buf.append(allocator, content[i]) catch unreachable;
+                i += 1;
+            }
+        }
+        closeLit(&buf, allocator, &in_literal);
+        // Empty template → emit `""` so write() gets a valid string arg.
+        if (first) {
+            buf.appendSlice(allocator, "\"\"") catch unreachable;
+            first = false;
+        }
+    } else {
+        // Bare expression: stringify the whole value; leading `""` forces
+        // string-concat context so a Number is promoted, not arithmetic-added.
+        buf.appendSlice(allocator, "\"\" + (") catch unreachable;
+        buf.appendSlice(allocator, ioLowerJsExpr(allocator, expr)) catch unreachable;
+        buf.append(allocator, ')') catch unreachable;
+        first = false;
+    }
+
+    if (with_newline) {
+        if (!first) buf.appendSlice(allocator, " + ") catch unreachable;
+        buf.appendSlice(allocator, "\"\\n\"") catch unreachable;
+    }
+
+    const write_fn: []const u8 = if (to_fd == 2) "__koru_stderr_write" else "__koru_stdout_write";
+    const inline_code = std.fmt.allocPrint(
+        allocator,
+        "{s}({s});",
+        .{ write_fn, buf.items },
+    ) catch unreachable;
+
+    // Re-route to the [norun] print.impl tor for shape checking — the reroute
+    // is analysis-only; the spliced inline_body does the write. Mirrors |zig's
+    // __printInterpolate AST surgery (whole-struct copy, not a field literal).
+    const impl_segments = allocator.alloc([]const u8, 2) catch unreachable;
+    impl_segments[0] = allocator.dupe(u8, "print") catch unreachable;
+    impl_segments[1] = allocator.dupe(u8, "impl") catch unreachable;
+    const impl_path = ast.DottedPath{
+        .module_qualifier = flow.inv().path.module_qualifier,
+        .segments = impl_segments,
+    };
+
+    const new_marks = allocator.alloc([]const u8, flow.inv().marks.len + 1) catch unreachable;
+    for (flow.inv().marks, 0..) |m, idx| new_marks[idx] = m;
+    new_marks[flow.inv().marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_invocation = ast.Invocation{
+        .path = impl_path,
+        .args = flow.inv().args,
+        .annotations = flow.inv().annotations,
+        .marks = new_marks,
+        .inserted_by_tap = flow.inv().inserted_by_tap,
+        .from_opaque_tap = flow.inv().from_opaque_tap,
+    };
+
+    var transformed_flow = flow.*;
+    transformed_flow.body = ast.rootSite(new_invocation, flow.body.continuations, flow.location);
+    transformed_flow.inline_body = inline_code;
+
+    const new_item = ast.Item{ .flow = transformed_flow };
+    return .{ .replacement = new_item };
+}
+
+// JS variants of the print family — selected on a --lang=js build, the way
+// print.blk|js is. Same fd + newline semantics as the |zig procs above, routed
+// through the shared __printInterpolateJs engine.
+~proc print.ln|js {
+    _ = invocation;
+    _ = program;
+    return __printInterpolateJs(expr, item, allocator, true, 1);
+}
+
+~proc print|js {
+    _ = invocation;
+    _ = program;
+    return __printInterpolateJs(expr, item, allocator, false, 1);
+}
+
+~proc eprint.ln|js {
+    _ = invocation;
+    _ = program;
+    return __printInterpolateJs(expr, item, allocator, true, 2);
+}
+
+~proc eprint|js {
+    _ = invocation;
+    _ = program;
+    return __printInterpolateJs(expr, item, allocator, false, 2);
+}
+
+~part blk

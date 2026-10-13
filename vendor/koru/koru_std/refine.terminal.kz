@@ -1,0 +1,85 @@
+// Koru Standard Library: the terminal part of refine — joined via
+// `~part terminal` in refine.kz; members land in koru_refine.
+
+// A field base that isn't a scalar spelling may name a terminal —
+// `port: Port` where `std/proto:i64(Port)` minted the identity. Resolve
+// the name to its host scalar: a bare `Port` answers to the anchor's
+// home; a qualified `home/path:Name` carries its own. Live terminal
+// doors and erased `// proto-terminal Name: scalar` markers both
+// resolve, so dissolution order doesn't matter.
+fn terminalScalar(alloc: std.mem.Allocator, prog: *const ast.Program, home: []const u8, base: []const u8) ?[]const u8 {
+    var want_home = home;
+    var want_name = base;
+    if (std.mem.lastIndexOfScalar(u8, base, ':')) |ci| {
+        want_name = base[ci + 1 ..];
+        // `app/alpha:Health` — the logical home is dotted, the
+        // declared base spells slashes; canonicalize like invWant.
+        const dotted = alloc.dupe(u8, base[0..ci]) catch unreachable;
+        for (dotted) |*c| {
+            if (c.* == '/') c.* = '.';
+        }
+        want_home = dotted;
+    }
+    const Walker = struct {
+        fn scan(entries: []const ast.Item, scope_home: []const u8, wh: []const u8, wn: []const u8) ?[]const u8 {
+            for (entries) |entry| {
+                switch (entry) {
+                    .flow => |candidate| {
+                        if (candidate.body.node) |*node| {
+                            if (node.* == .invocation and std.mem.eql(u8, scope_home, wh)) {
+                                const inv = &node.invocation;
+                                if (inv.path.segments.len == 1 and inv.args.len > 0) {
+                                    const verb = inv.path.segments[0];
+                                    const mq = inv.path.module_qualifier orelse "";
+                                    const known_home = std.mem.eql(u8, mq, "std.types") or
+                                        std.mem.eql(u8, mq, "std/types") or
+                                        std.mem.eql(u8, mq, "std.proto") or
+                                        std.mem.eql(u8, mq, "std/proto");
+                                    if (af.isScalar(verb) and (mq.len == 0 or known_home) and
+                                        std.mem.eql(u8, bareName(inv.args[0].value), wn))
+                                    {
+                                        return verb;
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    .inline_code => |ic| {
+                        if (!std.mem.eql(u8, scope_home, wh)) continue;
+                        var lines = std.mem.splitScalar(u8, ic.code, '\n');
+                        while (lines.next()) |raw| {
+                            const line = std.mem.trimLeft(u8, raw, " \t");
+                            const prefix = "// proto-terminal ";
+                            if (!std.mem.startsWith(u8, line, prefix)) continue;
+                            const colon = std.mem.indexOfScalar(u8, line[prefix.len..], ':') orelse continue;
+                            const declared = std.mem.trim(u8, line[prefix.len .. prefix.len + colon], " \t");
+                            if (std.mem.eql(u8, declared, wn)) {
+                                return std.mem.trim(u8, line[prefix.len + colon + 1 ..], " \t");
+                            }
+                        }
+                    },
+                    .module_decl => |module| {
+                        if (scan(module.items, module.logical_name, wh, wn)) |s| return s;
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        }
+    };
+    return Walker.scan(prog.items, prog.main_module_name, want_home, want_name);
+}
+
+// Scalar legality on the MET field, judged post-merge so a contributor's
+// bound on a non-integer field refuses too. The base resolves to an
+// integer scalar spelled directly (`i64`) or through a terminal
+// (`Port` → `i64` via `std/proto:i64(Port)`).
+fn legalBase(alloc: std.mem.Allocator, rep: *koru_std.koru_compiler.ErrorReporter, fl: *const ast.Flow, entry_name: []const u8, prog: *const ast.Program, home: []const u8, f: *const Field) ?SiteResult {
+    if (!carriesTerms(f)) return null;
+    const scalar = terminalScalar(alloc, prog, home, f.base) orelse f.base;
+    if (!af.isIntScalar(scalar)) {
+        return .{ .replacement = ast.refusal(alloc, rep, .KORU205, fl.location, fl.module, "std/refine({s}): field '{s}' constrains base '{s}' — bounds and clamps refine integer scalars only", .{ entry_name, f.name, f.base }) };
+    }
+    return null;
+}
+

@@ -1,0 +1,279 @@
+// Koru Standard Library: the `handles` part of interpreter.kz — the
+// handle-pool custody cluster: the assert-held gate, the discharge sweeps,
+// and the held-handles report. Joined via `~part handles` in interpreter.kz;
+// merged into the interpreter module at load.
+
+/// The NAMED handles an under-handled turn leaves on the bridge, as a JSON
+/// list — "not the count `run` returns today" (430_056 ruling): a host or
+/// shell line addresses them by name. Page-backed like the other durable
+/// strings; the reporter for the hand-back may never die beneath the host.
+fn renderHeldHandles(pool: *HandlePool) []const u8 {
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(std.heap.page_allocator);
+    const w = buf.writer(std.heap.page_allocator);
+    w.writeByte('[') catch return "[]";
+    var first = true;
+    for (pool.handles.items) |h| {
+        if (h.discharged) continue;
+        if (!first) w.writeByte(',') catch return "[]";
+        first = false;
+        w.writeByte('"') catch return "[]";
+        w.writeAll(h.handle_id) catch return "[]";
+        w.writeByte('"') catch return "[]";
+    }
+    w.writeByte(']') catch return "[]";
+    return std.heap.page_allocator.dupe(u8, buf.items) catch "[]";
+}
+
+/// Refuse a discharge tor that names a handle the pool does not hold.
+///
+/// The handle name IS the capability: a run may act on what it was handed and
+/// on nothing else. Called BEFORE the dispatcher, because the discharge proc is
+/// the irreversible half — releasing a resource you were never given cannot be
+/// walked back by observing afterwards that no obligation was retired.
+///
+/// `error.HandleNotHeld` surfaces as `dispatch-error` carrying that name, the
+/// same channel `EventDenied` uses for a verb the scope refuses.
+fn assertHandlesHeld(
+    ctx: *InterpreterContext,
+    pool: *HandlePool,
+    event_name: []const u8,
+    args: []const ast.Arg,
+) !void {
+    if (ctx.discharges_spec_fn) |spec_fn| {
+        for (spec_fn(event_name)) |spec| {
+            for (args) |arg| {
+                if (!std.mem.eql(u8, arg.name, spec.arg_name)) continue;
+                // SPEND possession — `field: T<!state>` must name a live
+                // handle carrying EXACTLY that obligation, the same gate the
+                // borrow pass below enforces for `T<state>`. An existence-only
+                // check let a live-but-wrong-tag arg reach the spend proc —
+                // a <found> in `confirm(held:)` booked the search JSON
+                // env-side, and the discharge machinery would have retired
+                // the <found>. Measured on kopium's airline-native scope.
+                const h = pool.findByHandleId(arg.value, ctx.scope_name) orelse {
+                    // "names nothing" vs "was already spent": the pool keeps
+                    // discharged handles, so a raw scan tells a spent rN
+                    // from a literal that never was one.
+                    var spent = false;
+                    for (pool.handles.items) |*x| {
+                        if (x.discharged and
+                            std.mem.eql(u8, x.scope_name, ctx.scope_name) and
+                            std.mem.eql(u8, x.handle_id, arg.value)) {
+                            spent = true;
+                            break;
+                        }
+                    }
+                    const clause: []const u8 = if (spent)
+                        "was already spent — an obligation discharges once" else
+                        "names nothing the session holds";
+                    ctx.error_detail = std.fmt.allocPrint(ctx.allocator,
+                        "'{s}' wants a live <{s}> to spend — '{s}' {s}. Mint one through a verb whose signature ends '-> <{s}!>'",
+                        .{ spec.arg_name, spec.obligation_name, arg.value, clause, spec.obligation_name }) catch null;
+                    return error.HandleNotHeld;
+                };
+                if (!std.mem.eql(u8, h.obligation_name, spec.obligation_name)) {
+                    ctx.error_detail = std.fmt.allocPrint(ctx.allocator,
+                        "'{s}' wants a <{s}> to spend — '{s}' is a <{s}>. Mint one through a verb whose signature ends '-> <{s}!>'",
+                        .{ spec.arg_name, spec.obligation_name, arg.value, h.obligation_name, spec.obligation_name }) catch null;
+                    return error.HandleNotHeld;
+                }
+                break;
+            }
+        }
+    } else if (ctx.discharges_obligations_fn) |discharges_fn| {
+        if (discharges_fn(event_name).len != 0 and args.len > 0 and
+            pool.findByHandleIdAnyScope(args[0].value) == null)
+        {
+            return error.HandleNotHeld;
+        }
+    }
+
+    // BORROW possession — `field: T<state>` (no `!`) must name a live handle
+    // carrying that obligation. Consumes are covered by the spec pass above;
+    // a borrow proves the session holds the value without spending it — the
+    // arg IS the capability either way. A literal in this position is a
+    // forgery the wire cannot express any other way.
+    const input_fn = ctx.input_fn orelse return;
+    const fields = input_fn(event_name) orelse return;
+    for (fields) |field| {
+        const p = field.phantom orelse continue;
+        if (p.len == 0 or p[0] == '!' or p[p.len - 1] == '!') continue;
+        const state = if (std.mem.lastIndexOfScalar(u8, p, ':')) |c| p[c + 1 ..] else p;
+        for (args) |arg| {
+            if (!std.mem.eql(u8, arg.name, field.name)) continue;
+            const h = pool.findByHandleId(arg.value, ctx.scope_name) orelse {
+                ctx.error_detail = std.fmt.allocPrint(ctx.allocator,
+                    "'{s}' wants a live <{s}> — '{s}' names nothing the session holds. Mint one through a verb whose signature ends '-> <{s}!>'",
+                    .{ field.name, state, arg.value, state }) catch null;
+                return error.HandleNotHeld;
+            };
+            if (!std.mem.eql(u8, h.obligation_name, state)) {
+                ctx.error_detail = std.fmt.allocPrint(ctx.allocator,
+                    "'{s}' wants a live <{s}> — '{s}' is a <{s}>. Mint one through a verb whose signature ends '-> <{s}!>'",
+                    .{ field.name, state, arg.value, h.obligation_name, state }) catch null;
+                return error.HandleNotHeld;
+            }
+            break;
+        }
+    }
+}
+
+fn autoDischargeHandles(
+    auto_discharge: bool,
+    using_external_pool: bool,
+    active_pool: *HandlePool,
+    discharges_spec_fn: ?DischargesSpecFn,
+    dispatcher: DispatchFn,
+    allocator: std.mem.Allocator,
+) void {
+    if (!auto_discharge) return;
+
+    // Auto-discharge only for LOCAL pools. A bridge-managed pool outlives the
+    // run by design, so its handles are released when the SESSION ends — see
+    // `std/bridge:close`, which calls the same loop below.
+    if (using_external_pool) return;
+
+    dischargeAllHandles("AUTO-DISCHARGE", active_pool, discharges_spec_fn, dispatcher, allocator);
+}
+
+/// Release every handle still held on `pool` by invoking its recorded discharge
+/// tor through `dispatcher`.
+///
+/// The ONE implementation of "release what is still held". A run ending and a
+/// session hanging up are the same act at two lifetime scales, and they were
+/// written twice — once here, honestly, and once in `std/bridge.dischargeAll`
+/// as a print and a boolean that released nothing while satisfying the counter.
+///
+/// `label` names the caller in the trace, so a bridge hang-up does not report
+/// itself as an auto-discharge.
+///
+/// The synthesized discharge invocations are SCRATCH — nothing here escapes the
+/// loop — so this owns an arena over the caller's allocator rather than leaving
+/// litter in it. A run's arena is reset anyway; a bridge's allocator is the
+/// produced program's leak-checked one, and it noticed.
+pub fn dischargeAllHandles(
+    label: []const u8,
+    pool: *HandlePool,
+    discharges_spec_fn: ?DischargesSpecFn,
+    dispatcher: DispatchFn,
+    allocator: std.mem.Allocator,
+) void {
+    if (pool.countUndischarged() == 0) return;
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const scratch_alloc = scratch.allocator();
+
+
+    // Guarded release loop (Cordis Theorem 63 + Theorem 16 ordering, mirror
+    // side): a handle may be released only when no undischarged handle
+    // depends on it, and among independent handles the pool is walked in
+    // REVERSE acquisition order — LIFO, exactly as Cordis's accumulator does
+    // (`disposables.splice(0).reverse()`, the paper's Theorem 16: effects
+    // revert in the reverse of the order they were applied). Dependents go
+    // first, providers last; the provider outlives its consumers. The pass
+    // is repeated because releasing a dependent may unblock its provider;
+    // each pass scans the pool, so a handle blocked by a dependent is
+    // simply skipped until that dependent is gone.
+    var progressed = true;
+    while (progressed) {
+        progressed = false;
+        var i = pool.handles.items.len;
+        while (i > 0) {
+            i -= 1;
+            const handle = pool.handles.items[i];
+            if (handle.discharged) continue;
+            if (pool.hasUndischargedDependents(handle.id)) continue;
+
+            // Find the arg_name for this discharge tor by looking up DischargeSpec
+            var arg_name: ?[]const u8 = null;
+            if (discharges_spec_fn) |spec_fn| {
+                const specs = spec_fn(handle.discharge_event);
+                // Match on obligation_module/name (don't assume first item)
+                for (specs) |spec| {
+                    if (std.mem.eql(u8, spec.obligation_module, handle.obligation_module) and
+                        std.mem.eql(u8, spec.obligation_name, handle.obligation_name)) {
+                        arg_name = spec.arg_name;
+                        break;
+                    }
+                }
+            }
+
+            if (arg_name == null) {
+                std.debug.print("[{s}] No spec for '{s}' [{s}:{s}], skipping\n",
+                    .{label, handle.handle_id, handle.obligation_module, handle.obligation_name});
+                continue;
+            }
+
+            var discharge_inv = buildDischargeInvocation(
+                handle.discharge_event,
+                handle.handle_id,
+                arg_name.?,
+                scratch_alloc,
+            );
+
+            var discharge_result: DispatchResult = undefined;
+            dispatcher(&discharge_inv, &discharge_result) catch |err| {
+                std.debug.print("[{s}] Failed '{s}': {s}\n",
+                    .{label, handle.discharge_event, @errorName(err)});
+                continue;  // Don't mark as discharged if dispatch failed
+            };
+            std.debug.print("[{s}] Invoked '{s}' for handle '{s}' [{s}:{s}]\n",
+                .{label, handle.discharge_event, handle.handle_id, handle.obligation_module, handle.obligation_name});
+
+            // Mark discharged after successful dispatch
+            pool.dischargeById(handle.id);
+            progressed = true;
+        }
+    }
+}
+
+/// Build an AST invocation for a discharge tor
+/// Used by auto-discharge to invoke cleanup tors
+fn buildDischargeInvocation(
+    discharge_event: []const u8,
+    handle_id: []const u8,
+    arg_name: []const u8,
+    allocator: std.mem.Allocator,
+) ast.Invocation {
+    // Parse the tor name (e.g., "sqlite3:close" -> module="sqlite3", segments=["close"])
+    var module_qualifier: ?[]const u8 = null;
+    var event_name: []const u8 = discharge_event;
+
+    if (std.mem.indexOf(u8, discharge_event, ":")) |colon_idx| {
+        module_qualifier = allocator.dupe(u8, discharge_event[0..colon_idx]) catch null;
+        event_name = discharge_event[colon_idx + 1 ..];
+    }
+
+    // Build path segments - use static array for fallback
+    const segment_copy = allocator.dupe(u8, event_name) catch event_name;
+    const segments_storage = allocator.alloc([]const u8, 1) catch {
+        // Fallback to empty segments
+        return .{
+            .path = .{ .module_qualifier = module_qualifier, .segments = &[_][]const u8{} },
+            .args = &[_]ast.Arg{},
+        };
+    };
+    segments_storage[0] = segment_copy;
+
+    // Build single argument with handle_id
+    const args_storage = allocator.alloc(ast.Arg, 1) catch {
+        return .{
+            .path = .{ .module_qualifier = module_qualifier, .segments = segments_storage },
+            .args = &[_]ast.Arg{},
+        };
+    };
+    args_storage[0] = .{
+        .name = allocator.dupe(u8, arg_name) catch arg_name,
+        .value = allocator.dupe(u8, handle_id) catch handle_id,
+    };
+
+    return .{
+        .path = .{
+            .module_qualifier = module_qualifier,
+            .segments = segments_storage,
+        },
+        .args = args_storage,
+    };
+}

@@ -1,0 +1,138 @@
+~[comptime]
+
+// Koru Standard Library: Control Flow
+// Provides if for zero-overhead conditional branching
+//
+// ARCHITECTURE: if is a pure comptime transform that generates inline Zig code.
+// - if(expr) | then |> ... | else |> ... becomes a literal if/else statement
+// - No function call overhead, full access to outer scope
+// - Uses template_utils.lookupTemplate + interpolate for metaprogramming!
+
+~import std/template
+~part targets
+
+const std = @import("std");
+
+// IF - Conditional as a template over the continuation-return mechanism.
+//
+// Syntax: if(cond)
+//         | then |> ...      // REQUIRED: an `if` with no true arm is an omission, not a shape
+//         | else |> ...      // optional: `if(c) | then |> f()` is a complete statement
+//
+// ARCHITECTURE:
+// - `if` is a `[template]` proc, NOT a dedicated AST node (no ConditionalNode).
+//   The body is a literal Zig if/else. `then` / `else` are TERMINAL
+//   continuations, CONTINUED by the template via `{{ continuations["X"].continue }}`
+//   — the same producer→consumer dispatch every branched tor uses. Where
+//   `for` CALLS effects during the loop, `if` CONTINUES to one of its terminals in
+//   the matching arm. Same machine; `if`'s "during" half is just empty.
+// - Zero-overhead: the consumer's `then` / `else` body is spliced into the
+//   matching arm in the enclosing scope. An omitted optional branch mints no
+//   marker, so its arm renders empty.
+~[keyword]pub tor if { expr: Expression }
+| then
+| ?else
+
+~[template]proc if|zig {
+    if ({{ expr }}) {
+        {{ continuations["then"].continue }}
+    } else {
+        {{ continuations["else"].continue }}
+    }
+}
+
+// The |js and |cs host variants of if/cond/for live in control.targets.kz —
+// the part holds every non-zig template body because their surfaces converge.
+// ============================================================================
+// COND - Flat multi-way dispatch (ZERO OVERHEAD)
+// ============================================================================
+//
+// Syntax: cond(scrutinee)
+//         | c b when <guard> -> <value>   // N guarded arms, first match wins
+//         | c _ -> <default>              // guardless final arm (the else)
+//
+// ARCHITECTURE:
+// - `cond` is a `[template]` proc, like `if`. `| c *` is a single VARIADIC
+//   terminal branch — the wildcard `*` legalizes the lone declaration (parser
+//   single-branch exemption) and marks it as filled by N guarded arms at the
+//   use site. The template renders continuations["c"] as ONE `if / else if /
+//   else` cascade: each guarded arm's `when` becomes a condition (`arm.guard`)
+//   and its body the matching block (`arm.continue[unguarded]`), with the
+//   guardless `| c _` arm as the trailing `else`. Same continuation-return
+//   machine as if; if's two fixed arms become N guard-selected ones.
+// - DISPATCH IS EXCLUSIVE — the arm whose guard matches runs, and no other. The
+//   cascade is what makes that structural: `else if` cannot re-test a guard
+//   against state an earlier arm just wrote. Pinned by 320_138, whose two arms
+//   toggle one store field back and forth.
+// - `{{ binds }}` emits every arm's binder ONCE, ahead of the cascade, because
+//   a guard in condition position must already see the name its arm binds.
+//   Per-arm binding is what a cascade cannot express, and reaching for N
+//   independent blocks to get it is what made dispatch fall through.
+// - KORU050/051 require the guardless arm to exist and KORU053 requires it last,
+//   so the cascade always closes with a real `else` and never re-orders an arm.
+~[keyword]pub tor cond { expr: Expression }
+| c *
+
+~[template]proc cond|zig {
+    {{ binds }}
+    {% for arm in continuations["c"] %}{% if arm.guard != "" %}if ({{ arm.guard }}) {
+        {{ arm.continue[unguarded] }}
+    } else {% else %}{
+        {{ arm.continue }}
+    }{% endif %}{% endfor %}
+}
+
+
+// ============================================================================
+// FOR - Iteration as a template over the effect-branch engine (ZERO OVERHEAD)
+// ============================================================================
+//
+// Syntax: for(iterable_expr)
+//         ! each item |> process(value: item)
+//         | done |> finalize()        // optional: runs once after the loop
+//
+// ARCHITECTURE:
+// - `for` is a `[template]` proc, NOT a dedicated AST node. The body is a
+//   literal Zig `for`; each `! each` effect handler is called inside it
+//   (guarded by its `when`, if any). The optional `| done` terminal is RETURNED
+//   via `{{ continuations["done"].continue }}` — the producer→consumer dispatch,
+//   not an emitter append. Effects are called during; continuations returned.
+// - The `! each` handlers lower to a synthesized Handlers struct + in-scope
+//   alias (emitter inline-body bridge); the template references each by link
+//   and emits a guarded call. No ForeachNode. Mirrors `if` above (pure
+//   continuation-return); `for` and `if` are one mechanism.
+// - Zero-overhead: comptime-known handlers inline into the loop.
+
+// - `keep:` is OPTIONAL and turns the loop into one that STOPS: the emitted body
+//   breaks the moment the expression goes false. Omit it and `for` is exactly
+//   what it always was — an absent `keep` renders no line at all, so every
+//   existing call site emits byte-identical code.
+//
+//   This started life as a separate `scan` keyword and that was WRONG. The two
+//   templates differed by ONE line and shared everything else, across two targets
+//   — four procs where two do. That is the two-lowerings-of-one-construct shape
+//   this repo keeps getting bitten by (`frag-a-fix-lands-in-one-lowering-path`),
+//   installed deliberately by someone who had written that concept's newest
+//   section the same morning. A second copy that merely agrees today is the same
+//   bug waiting: the next person to improve the JS range handling would have had
+//   to remember there were two homes for it. Lars caught it; converging is the
+//   concept's own prescription.
+~[keyword]pub tor for { expr: Expression, keep: ?Expression }
+! each *
+| ?done
+
+~[template]proc for|zig {
+    for ({{ expr }}) |__koru_item{{ __site }}| {
+        {% if keep != "" %}if (!({{ keep }})) break;
+        {% endif %}{% for h in effects["each"] %}{{ h.inlined_link[scope] }}(__koru_item{{ __site }});
+        {% endfor %}
+    }
+    {{ continuations["done"].continue }}
+}
+
+
+
+// CONST moved to koru_std/declarations.kz — it is a value declaration, not
+// control flow (and not a type). See `declarations.kz` for the tor + the
+// per-target template procs.
+~part capture

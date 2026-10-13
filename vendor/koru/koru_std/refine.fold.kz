@@ -1,0 +1,216 @@
+// Koru Standard Library: the fold part of refine — joined via
+// `~part fold` in refine.kz; members land in koru_refine.
+//
+// One fold, three readers: the transform (refine.body.kz) walks it to
+// mint the facet_decl, the explainer re-derives the report from it, and
+// consumers (std/list, std/store, decoders) call metFields at their own
+// boundary. Drift between them is impossible — there is one fold.
+
+// Live `std/refine` invocations and `facet_decl` nodes targeting
+// the same (home, name) — all contributors fold onto one meet, so
+// the facet is visitation-order-independent. `scope` is the facet's
+// target (null = universal): a contributor folds iff its own scope
+// is null (universal — governs every target) or equals `scope`.
+fn contributes(contrib_scope: ?[]const u8, scope: ?[]const u8) bool {
+    if (contrib_scope == null) return true;
+    if (scope == null) return false;
+    return std.mem.eql(u8, contrib_scope.?, scope.?);
+}
+
+fn walkRefine(alloc: std.mem.Allocator, rep: ?*koru_std.koru_compiler.ErrorReporter, fl: ?*const ast.Flow, items: []const ast.Item, scope_home: []const u8, w: Want, scope: ?[]const u8, fields: *std.ArrayList(Field), skip: ?*const ast.Invocation) void {
+    for (items) |entry| {
+        switch (entry) {
+            .flow => |candidate| {
+                if (candidate.body.node) |*node| {
+                    if (node.* == .invocation and isRefineDoor(&node.invocation) and
+                        @as(?*const ast.Invocation, &node.invocation) != skip and
+                        contributes(node.invocation.variant, scope))
+                    {
+                        const cw = invWant(alloc, &node.invocation, scope_home);
+                        if (std.mem.eql(u8, cw.home, w.home) and std.mem.eql(u8, cw.name, w.name)) {
+                            _ = parseInto(alloc, rep, fl, w.name, invSource(&node.invocation), fields, false);
+                        }
+                    }
+                }
+            },
+            .facet_decl => |*fd| {
+                // A canonical facet left by an earlier std/refine
+                // transform — typed fields, folded straight onto the
+                // meet. No text is parsed. Scoped to its target.
+                if (!contributes(fd.target, scope)) continue;
+                if (!std.mem.eql(u8, fd.module, w.home) or !std.mem.eql(u8, fd.name, w.name)) continue;
+                for (fd.fields) |ff| {
+                    var idx_opt: ?usize = null;
+                    for (fields.items, 0..) |f, i| {
+                        if (std.mem.eql(u8, f.name, ff.name)) {
+                            idx_opt = i;
+                            break;
+                        }
+                    }
+                    const idx = idx_opt orelse blk: {
+                        fields.append(alloc, .{ .name = ff.name, .base = ff.type }) catch unreachable;
+                        break :blk fields.items.len - 1;
+                    };
+                    const f = &fields.items[idx];
+                    if (!std.mem.eql(u8, f.base, ff.type)) continue;
+                    if (ff.eq) |b| {
+                        const esrc = std.fmt.allocPrint(alloc, "=={d}", .{b.value}) catch unreachable;
+                        if (f.eq) |e| {
+                            // A landed facet is a contributor like any
+                            // other: two equalities that disagree meet to
+                            // nothing, and the fold says so rather than
+                            // letting declaration order pick a winner.
+                            if (e.value != b.value) f.eq_conflict = .{ esrc, e.src };
+                        } else {
+                            f.eq = .{ .value = b.value, .exclusive = false, .src = esrc };
+                        }
+                    } else {
+                        if (ff.lo) |b| {
+                            if (f.lo == null or b.value > f.lo.?.value or
+                                (b.value == f.lo.?.value and b.exclusive and !f.lo.?.exclusive))
+                            {
+                                f.lo = .{ .value = b.value, .exclusive = b.exclusive, .src = std.fmt.allocPrint(alloc, "{s}{d}", .{ if (b.exclusive) ">" else ">=", b.value }) catch unreachable };
+                            }
+                        }
+                        if (ff.hi) |b| {
+                            if (f.hi == null or b.value < f.hi.?.value or
+                                (b.value == f.hi.?.value and b.exclusive and !f.hi.?.exclusive))
+                            {
+                                f.hi = .{ .value = b.value, .exclusive = b.exclusive, .src = std.fmt.allocPrint(alloc, "{s}{d}", .{ if (b.exclusive) "<" else "<=", b.value }) catch unreachable };
+                            }
+                        }
+                    }
+                    if (ff.clamp) |c| {
+                        const csrc = std.fmt.allocPrint(alloc, "clamp({d},{d})", .{ c.lo, c.hi }) catch unreachable;
+                        if (f.clamp) |fc| {
+                            const mlo = @max(fc.lo, c.lo);
+                            const mhi = @min(fc.hi, c.hi);
+                            if (mlo > mhi) f.clamp_conflict = .{ csrc, fc.src };
+                            f.clamp = .{ .lo = mlo, .hi = mhi, .src = csrc };
+                        } else {
+                            f.clamp = .{ .lo = c.lo, .hi = c.hi, .src = csrc };
+                        }
+                    }
+                    if (ff.alts) |set| {
+                        const src = altsSrc(alloc, set, ff.alt_default);
+                        if (f.alts) |prev| {
+                            var keep = std.ArrayList(i64).initCapacity(alloc, set.len) catch unreachable;
+                            for (set) |v| {
+                                if (containsInt(prev, v)) keep.append(alloc, v) catch unreachable;
+                            }
+                            if (keep.items.len == 0) {
+                                f.alts_conflict = .{ src, f.alts_src orelse src };
+                            }
+                            f.alts = keep.toOwnedSlice(alloc) catch unreachable;
+                            if (f.alts.?.len > 0) f.alts_src = altsSrc(alloc, f.alts.?, f.alt_default);
+                        } else {
+                            f.alts = alloc.dupe(i64, set) catch unreachable;
+                            f.alts_src = src;
+                            f.alt_default = ff.alt_default;
+                        }
+                        if (ff.alt_default) |d| {
+                            if (f.alt_default) |existing| {
+                                if (existing != d) f.alts_conflict = .{ starSrc(alloc, d), starSrc(alloc, existing) };
+                            } else {
+                                f.alt_default = d;
+                            }
+                        }
+                    }
+                }
+            },
+            .module_decl => |module| {
+                walkRefine(alloc, rep, fl, module.items, module.logical_name, w, scope, fields, skip);
+            },
+            else => {},
+        }
+    }
+}
+
+// One canonical facet per (home, name, scope): true when a sibling block
+// already left its facet_decl in the tree for this target.
+fn facetExists(items: []const ast.Item, home: []const u8, name: []const u8, scope: ?[]const u8) bool {
+    for (items) |entry| {
+        switch (entry) {
+            .facet_decl => |*fd| {
+                const scope_match = if (scope) |s|
+                    fd.target != null and std.mem.eql(u8, fd.target.?, s)
+                else
+                    fd.target == null;
+                if (scope_match and std.mem.eql(u8, fd.module, home) and std.mem.eql(u8, fd.name, name)) return true;
+            },
+            .module_decl => |module| {
+                if (facetExists(module.items, home, name, scope)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+
+// One addressed (home, name, scope) target and the number of `std/refine`
+// blocks folding into it — a `|variant` tag on the block scopes it, so
+// `std/refine(S)` and `std/refine(S)|fpga` report as separate facets.
+// Universal (unscoped) blocks count toward every scope's fold.
+const Target = struct { want: Want, scope: ?[]const u8, contributors: usize };
+const Block = struct { want: Want, scope: ?[]const u8 };
+
+fn scopeEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn collectBlocks(alloc: std.mem.Allocator, items: []const ast.Item, scope_home: []const u8, out: *std.ArrayList(Block)) void {
+    for (items) |entry| {
+        switch (entry) {
+            .flow => |fl| {
+                if (fl.body.node) |*node| {
+                    if (node.* == .invocation and isRefineDoor(&node.invocation)) {
+                        out.append(alloc, .{
+                            .want = invWant(alloc, &node.invocation, scope_home),
+                            .scope = node.invocation.variant,
+                        }) catch unreachable;
+                    }
+                }
+            },
+            .module_decl => |m| collectBlocks(alloc, m.items, m.logical_name, out),
+            else => {},
+        }
+    }
+}
+
+// Distinct (want, scope) pairs become targets; a block counts toward a
+// target iff it folds into that scope — universal blocks feed every scope
+// of the same (home, name), regardless of declaration order.
+fn collectTargets(alloc: std.mem.Allocator, items: []const ast.Item, scope_home: []const u8, out: *std.ArrayList(Target)) void {
+    var blocks = std.ArrayList(Block).initCapacity(alloc, 8) catch unreachable;
+    collectBlocks(alloc, items, scope_home, &blocks);
+    for (blocks.items) |b| {
+        var seen = false;
+        for (out.items) |*t| {
+            if (std.mem.eql(u8, t.want.home, b.want.home) and std.mem.eql(u8, t.want.name, b.want.name) and scopeEql(t.scope, b.scope)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) out.append(alloc, .{ .want = b.want, .scope = b.scope, .contributors = 0 }) catch unreachable;
+    }
+    for (out.items) |*t| {
+        for (blocks.items) |b| {
+            if (std.mem.eql(u8, t.want.home, b.want.home) and std.mem.eql(u8, t.want.name, b.want.name) and contributes(b.scope, t.scope)) {
+                t.contributors += 1;
+            }
+        }
+    }
+}
+
+// The fold as refine's comptime API: a consumer's explainer (std/list,
+// std/store, a JSON decoder) asks "what does this type's facet meet to"
+// and gets the SAME []Field the transform would emit — one producer,
+// several sinks, no drift. Not pub: same-emitted-file access only.
+fn metFields(alloc: std.mem.Allocator, prog: *const ast.Program, home: []const u8, name: []const u8, scope: ?[]const u8) []const Field {
+    var meet = std.ArrayList(Field).initCapacity(alloc, 8) catch unreachable;
+    walkRefine(alloc, null, null, prog.items, prog.main_module_name, .{ .home = home, .name = name }, scope, &meet, null);
+    return meet.items;
+}

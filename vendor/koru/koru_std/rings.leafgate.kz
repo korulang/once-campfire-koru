@@ -1,0 +1,136 @@
+// Koru Standard Library: the `leafgate` part of rings.kz — proto-leaf
+// reading for `new`. Joined via `~part leafgate` in rings.kz; merged into
+// the rings module at load.
+//
+// The proto door's two forms (live `std/proto(Name)` decl, erased
+// `// proto Name: ...` marker), the flattening walk, the host-type lower,
+// and the emitted-struct dedup — everything `new` needs to read an
+// element proto's leaves.
+
+const RL = struct {
+
+    // ---- Proto resolution — channel.kz's two-form read -----------------
+    // The live `std/proto(Name)`/`std/types:proto(Name)` decl flow (source
+    // arg text) or the erased `// proto Name: f: t, g: u` marker.
+
+    fn isProtoDoor(inv: *const ast.Invocation) bool {
+        if (inv.path.segments.len != 1) return false;
+        const verb = inv.path.segments[0];
+        const mq = inv.path.module_qualifier orelse return false;
+        const types_door = (std.mem.eql(u8, verb, "proto") or std.mem.eql(u8, verb, "default")) and
+            (std.mem.eql(u8, mq, "std.types") or std.mem.eql(u8, mq, "std/types"));
+        const default_door = (std.mem.eql(u8, verb, "default") or std.mem.eql(u8, verb, "proto")) and
+            (std.mem.eql(u8, mq, "std.proto") or std.mem.eql(u8, mq, "std/proto"));
+        return types_door or default_door;
+    }
+
+    fn protoSourceText(prog: *const ast.Program, name: []const u8) ?[]const u8 {
+        const W = struct {
+            fn find(its: []const ast.Item, want: []const u8) ?[]const u8 {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .flow => |*f| {
+                            if (f.body.node) |*n| {
+                                if (n.* == .invocation and isProtoDoor(&n.invocation)) {
+                                    const inv = &n.invocation;
+                                    if (std.mem.eql(u8, RH.declEntryName(inv), want)) {
+                                        for (inv.args) |a| {
+                                            if (a.source_value) |sv| return sv.text;
+                                        }
+                                        return "";
+                                    }
+                                }
+                            }
+                        },
+                        .inline_code => |*ic| {
+                            var lines = std.mem.splitScalar(u8, ic.code, '\n');
+                            while (lines.next()) |raw| {
+                                const line = std.mem.trimLeft(u8, raw, " \t");
+                                const prefix = "// proto ";
+                                if (!std.mem.startsWith(u8, line, prefix)) continue;
+                                const colon = std.mem.indexOfScalar(u8, line[prefix.len..], ':') orelse continue;
+                                const nm = std.mem.trim(u8, line[prefix.len .. prefix.len + colon], " \t");
+                                if (std.mem.eql(u8, nm, want)) return line[prefix.len + colon + 1 ..];
+                            }
+                        },
+                        .module_decl => |*md| {
+                            if (find(md.items, want)) |hit| return hit;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            }
+        };
+        return W.find(prog.items, name);
+    }
+
+    const FieldPair = struct { name: []const u8, ftype: []const u8 };
+
+    // The entry's fields, nested compounds flattened to `a_b` leaf pairs.
+    fn protoFields(alloc: std.mem.Allocator, prog: *const ast.Program, name: []const u8) ?[]const FieldPair {
+        var out = std.ArrayList(FieldPair).initCapacity(alloc, 8) catch unreachable;
+        if (!expandInto(alloc, prog, "", name, &out, 0)) return null;
+        return out.toOwnedSlice(alloc) catch unreachable;
+    }
+
+    fn expandInto(alloc: std.mem.Allocator, prog: *const ast.Program, prefix: []const u8, name: []const u8, out: *std.ArrayList(FieldPair), depth: usize) bool {
+        if (depth > 8) return false;
+        const text = protoSourceText(prog, name) orelse return false;
+        var lines = std.mem.tokenizeAny(u8, text, "\n,");
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r,");
+            if (line.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const fname = std.mem.trim(u8, line[0..colon], " \t");
+            const ftype = std.mem.trim(u8, line[colon + 1 ..], " \t,");
+            if (fname.len == 0 or ftype.len == 0) continue;
+            const full = if (prefix.len == 0)
+                alloc.dupe(u8, fname) catch unreachable
+            else
+                std.fmt.allocPrint(alloc, "{s}_{s}", .{ prefix, fname }) catch unreachable;
+            if (protoSourceText(prog, ftype) != null) {
+                if (!expandInto(alloc, prog, full, ftype, out, depth + 1)) return false;
+            } else {
+                out.append(alloc, .{ .name = full, .ftype = alloc.dupe(u8, ftype) catch unreachable }) catch unreachable;
+            }
+        }
+        return true;
+    }
+
+    // The Zig material for a field type — `string` lowers at the emission
+    // boundary; a proto name stands as the emitted struct's name.
+    fn zigFieldType(alloc: std.mem.Allocator, ftype: []const u8) []const u8 {
+        const t = std.mem.trim(u8, ftype, " \t");
+        if (std.mem.eql(u8, t, "string")) return alloc.dupe(u8, "[]const u8") catch unreachable;
+        if (t.len > 5 and std.mem.startsWith(u8, t, "ref(") and t[t.len - 1] == ')')
+            return alloc.dupe(u8, "i64") catch unreachable;
+        return alloc.dupe(u8, t) catch unreachable;
+    }
+
+    // True when some emitted item already derives `<Name>`'s layout —
+    // one name, one layout; whoever derives first owns the emission.
+    fn structAlreadyEmitted(alloc: std.mem.Allocator, prog: *const ast.Program, name: []const u8) bool {
+        const needle = std.fmt.allocPrint(alloc, "const {s} = struct", .{name}) catch unreachable;
+        const W = struct {
+            fn scan(its: []const ast.Item, w: []const u8) bool {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .inline_code => |*ic| {
+                            if (std.mem.indexOf(u8, ic.code, w) != null) return true;
+                        },
+                        .host_line => |*hl| {
+                            if (std.mem.indexOf(u8, hl.content, w) != null) return true;
+                        },
+                        .module_decl => |*md| {
+                            if (scan(md.items, w)) return true;
+                        },
+                        else => {},
+                    }
+                }
+                return false;
+            }
+        };
+        return W.scan(prog.items, needle);
+    }
+};

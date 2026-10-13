@@ -1,0 +1,124 @@
+// Koru Standard Library: the `run-exec` part of bridge — the `run` verb's
+// Zig impl. Joined via `~part run-exec` in bridge.kz; merged into the
+// bridge module at load. The tor decl rides in the `run` part.
+
+~proc run|zig {
+    br.touch();
+
+    // SEQUENCING (frag-partial-programs): a turn is a run of items, each
+    // routed by the same rules below. One item takes the exact historical
+    // path (discrimination, wire gate, single dispatch) — every current
+    // caller is a one-item turn and observes zero change. Several items
+    // each run through their existing single path in order and the turn
+    // reports one structured line per step under `partial`, continuing
+    // past refusal: a partial program RUNS, and the model learns every
+    // step's outcome in one observation instead of discovering failures
+    // one turn at a time. Mis-segmentation below can only fail LOUD —
+    // every slice still passes the single paths' validators.
+    const seg = segmentTurn(br.allocator, source) catch {
+        return .{ .parse_error = .{ .message = "OOM segmenting turn", .line = 0, .column = 0 } };
+    };
+    defer br.allocator.free(seg);
+    const items = splitNoteTails(br, source, seg) orelse seg;
+    defer if (items.ptr != seg.ptr) br.allocator.free(items);
+    if (items.len < 2) {
+        // RUN DISCRIMINATION (the REPL rule): a declaration is not a dispatch.
+        // If the source is a subflow definition (`tor name { args }` +
+        // `name = <body>`, identifiable by its leading `tor`), install it into
+        // the session's durable defined-flows table and report `defined <name>`
+        // instead of routing it into the dispatcher where it would parse-error
+        // as an invocation. One verb, two meanings — exactly as a REPL's def.
+        // This is the R1 rung of KOPIUM_RUNTIME.md: the bridge run loop is a REPL.
+        {
+            const trimmed = std.mem.trim(u8, source, " \t\r\n");
+            if (std.mem.startsWith(u8, trimmed, "tor ")) {
+                return switch (installDefine(br, source)) {
+                    .defined => |d| .{ .defined = d },
+                    .parse_error => |e| .{ .parse_error = .{
+                        .message = e.message,
+                        .line = e.line,
+                        .column = e.column,
+                    } },
+                };
+            }
+        }
+
+        // THE SINGLE-ITEM WIRE GATE: a one-item turn is ONE invocation and
+        // nothing else. `std/runtime:parse.wire` is the strict grammar —
+        // prose, chains, trailing text and truncated strings are refused
+        // here as parse-error ("that was not Koru"), before the dispatcher
+        // ever sees them. What passes still runs the full path below: scope
+        // membership (event-denied), field shapes (validation-error),
+        // possession, budget.
+        if (wireGate(br, source)) |e| {
+            // RESIDUE: prose is not an invocation, but it is not garbage
+            // either — bind the refused text and hand the turn back to the
+            // agent as `residue`, so the model can re-emit it through a real
+            // verb. Nothing strands: the value, the handle, and the outcome
+            // all survive.
+            if (e.not_invocation or isNoteAttempt(br, source)) {
+                const prose = std.mem.trim(u8, source, " \t\r\n");
+                const rn = bindResidue(br, prose);
+                if (rn.len > 0) return .{ .residue = .{ .report = residueNote(rn, prose),
+                    .observer = !e.not_invocation, .bound = rn, .text = prose } };
+            }
+            return .{ .parse_error = .{
+                .message = e.message, .line = e.line, .column = e.column,
+            } };
+        }
+
+        const result = dispatchThroughScope(br, source);
+
+        return switch (result) {
+            .result => |r| .{ .result = .{
+                .value = r.value, .used = r.used, .handles = r.handles,
+                // The terminal dispatch bound itself via the trace; a turn
+                // that dispatched nothing (pure flow) still needs a name.
+                .bound = if (r.bound.len > 0) r.bound else bindResult(br, r.value),
+                .trace = r.trace,
+            } },
+            .unhandled_branch => |u| .{ .unhandled_branch = .{ .branch = u.branch, .payload = u.payload, .handles = u.handles } },
+            .exhausted => |e| .{ .exhausted = .{ .used = e.used, .last_event = e.last_event, .handles = e.handles } },
+            .parse_error => |e| .{ .parse_error = .{ .message = e.message, .line = e.line, .column = e.column } },
+            .validation_error => |e| .{ .validation_error = e },
+            .shape_error => |e| .{ .shape_error = .{ .branch = e.branch, .field = e.field, .message = e.message } },
+            .event_denied => |e| .{ .event_denied = e },
+            .dispatch_error => |e| .{ .dispatch_error = .{ .event_name = e.event_name, .message = e.message, .trace = e.trace } },
+            .scope_not_found => |e| .{ .scope_not_found = e },
+        };
+    }
+
+    // ALL-PROSE FAST PATH: a turn of pure prose is ONE message, not N items —
+    // the model meant one utterance. Scan first: if every item refuses as
+    // not_invocation, bind the whole reply as a single residue value and
+    // hand the turn back as `residue`. Per-item splintering (r8, r9, r10…)
+    // would demand N say() calls to redeliver one message.
+    var all_prose = true;
+    for (items) |it| {
+        const item = std.mem.trim(u8, source[it.start..it.end], " \t\r\n");
+        if (isDefineItem(item)) { all_prose = false; break; }
+        const e = wireGate(br, item) orelse { all_prose = false; break; };
+        if (!e.not_invocation) { all_prose = false; break; }
+    }
+    if (all_prose) {
+        const trimmed = std.mem.trim(u8, source, " \t\r\n");
+        const rn = bindResidue(br, trimmed);
+        if (rn.len > 0) return .{ .residue = .{ .report = residueNote(rn, trimmed),
+            .observer = isNoteAttempt(br, trimmed), .bound = rn, .text = trimmed } };
+        // Bind failed — fall through to the per-item loop, which reports
+        // per-step refusals instead of lying about a single binding.
+    }
+
+    const steps = runSteps(br, source, items);
+    if (steps.all_residue) return .{ .residue = .{
+        .report = steps.report, .observer = isNoteAttempt(br, source), .bound = "", .text = "" } };
+    return .{ .partial = .{
+        .ran = steps.total,
+        .total = steps.total,
+        .used = steps.used,
+        .handles = br.getHandleCount(),
+        .report = steps.report,
+        .wire_failures = steps.wire_failures,
+    } };
+}
+

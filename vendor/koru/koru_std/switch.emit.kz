@@ -1,0 +1,74 @@
+// Dispatch emission for std/switch:char. The transform splices host text
+// into the emitted program — zig gets a `switch` prong table; cs gets the
+// semantically identical if/else-if chain (first match wins, same
+// contract). C# pattern syntax would carry `and`/`when` words that the
+// host-text lowerer rewrites; the chain needs neither.
+
+// Emit a Zig char literal for `ch`, escaping the characters that must not
+// appear raw inside a char literal (' and \) and common control chars.
+fn charLiteral(allocator: std.mem.Allocator, ch: u8) []const u8 {
+    return switch (ch) {
+        '\'' => std.fmt.allocPrint(allocator, "'\\''", .{}) catch unreachable,
+        '\\' => std.fmt.allocPrint(allocator, "'\\\\'", .{}) catch unreachable,
+        '\n' => std.fmt.allocPrint(allocator, "'\\n'", .{}) catch unreachable,
+        '\t' => std.fmt.allocPrint(allocator, "'\\t'", .{}) catch unreachable,
+        '\r' => std.fmt.allocPrint(allocator, "'\\r'", .{}) catch unreachable,
+        else => {
+            if (ch < 32 or ch == 127) {
+                return std.fmt.allocPrint(allocator, "'\\x{x:0>2}'", .{ch}) catch unreachable;
+            }
+            return std.fmt.allocPrint(allocator, "'{c}'", .{ch}) catch unreachable;
+        },
+    };
+}
+
+// The dispatch head: binds the value expression to the site-unique name.
+// zig declares `const <v>: u8 = <expr>; switch (<v>) {`; cs declares
+// `var <v> = <expr>;` and the arms carry the comparisons.
+fn appendSwitchHead(allocator: std.mem.Allocator, dispatch: *std.ArrayList(u8), value_expr: []const u8, value_name: []const u8, host_is_cs: bool) void {
+    const head = if (host_is_cs)
+        std.fmt.allocPrint(allocator, "//@koru:inline_stmt\n{{ var {s} = ", .{value_name})
+    else
+        std.fmt.allocPrint(allocator, "//@koru:inline_stmt\n{{ const {s}: u8 = ", .{value_name});
+    dispatch.appendSlice(allocator, head catch unreachable) catch unreachable;
+    dispatch.appendSlice(allocator, value_expr) catch unreachable;
+    if (host_is_cs) {
+        dispatch.appendSlice(allocator, "; ") catch unreachable;
+    } else {
+        dispatch.appendSlice(allocator, "; switch (") catch unreachable;
+        dispatch.appendSlice(allocator, value_name) catch unreachable;
+        dispatch.appendSlice(allocator, ") { ") catch unreachable;
+    }
+}
+
+// One cs prong: `if`/`else if (V <cmp>) { <marker> }`. Range and set share
+// the shape — single char is a one-disjunct set. Ranges arrive validated
+// (the transform checks lo <= hi before the host fork).
+fn appendCsArm(allocator: std.mem.Allocator, dispatch: *std.ArrayList(u8), name: []const u8, i: usize, value_name: []const u8, first_arm: *bool) void {
+    dispatch.appendSlice(allocator, if (first_arm.*) "if (" else "else if (") catch unreachable;
+    if (name.len == 3 and name[1] == '-') {
+        const lo = name[0];
+        const hi = name[2];
+        const cond = std.fmt.allocPrint(allocator, "{s} >= {s} && {s} <= {s}", .{ value_name, charLiteral(allocator, lo), value_name, charLiteral(allocator, hi) }) catch unreachable;
+        dispatch.appendSlice(allocator, cond) catch unreachable;
+    } else {
+        for (name, 0..) |ch, k| {
+            if (k > 0) dispatch.appendSlice(allocator, " || ") catch break;
+            const cond = std.fmt.allocPrint(allocator, "{s} == {s}", .{ value_name, charLiteral(allocator, ch) }) catch unreachable;
+            dispatch.appendSlice(allocator, cond) catch unreachable;
+        }
+    }
+    const arm = std.fmt.allocPrint(allocator, ") {{ __koru_inline_{d}({s}) }} ", .{ i, value_name }) catch unreachable;
+    dispatch.appendSlice(allocator, arm) catch unreachable;
+    first_arm.* = false;
+}
+
+// The cs tail: route the `no-match` continuation through a trailing else,
+// or close the chain bare.
+fn appendCsTail(allocator: std.mem.Allocator, dispatch: *std.ArrayList(u8), nomatch_idx: ?usize, first_arm: bool) void {
+    if (nomatch_idx) |ni| {
+        const tail = std.fmt.allocPrint(allocator, "{s} {{ __koru_continue_{d} }} ", .{ if (first_arm) "" else "else ", ni }) catch unreachable;
+        dispatch.appendSlice(allocator, tail) catch unreachable;
+    }
+    dispatch.appendSlice(allocator, "}") catch unreachable;
+}

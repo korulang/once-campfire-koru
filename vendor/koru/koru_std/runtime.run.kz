@@ -1,0 +1,89 @@
+// Koru Standard Library: the `run` part of runtime.kz — the scoped
+// run / run-cached tors. Joined via `~part run` in runtime.kz.
+~[retain]pub tor run {
+    source: string,
+    scope: string,
+    budget: ?u64 = null,
+    handle_pool: ?*@import("root").koru_std.koru_interpreter.HandlePool = null,
+    fail_fast: bool = true,
+    auto_discharge: bool = true,
+    shape: ?string = null,
+    defined: ?*@import("root").koru_std.koru_interpreter.DefinedFlows = null,
+    lenient: bool = false,  // 430_056: under-handling hands back `unhandled-branch` instead of refusing
+    host_dispatch: ?@import("root").koru_std.koru_interpreter.HostDispatchFn = null,
+    session_env: ?*@import("root").koru_std.koru_interpreter.Environment = null,
+    session_bind_fn: ?@import("root").koru_std.koru_interpreter.SessionBindFn = null,
+    session_bind_env: ?*@import("root").koru_std.koru_interpreter.Environment = null,
+    session_bind_counter: ?*u64 = null
+}
+| result { value: @import("root").koru_std.koru_interpreter.Value, used: u64, handles: u32, bound: string, trace: string }
+| unhandled-branch { branch: string, payload: string, handles: string }
+| exhausted { used: u64, last_event: string, handles: u32 }
+| parse-error { message: string, line: u32, column: u32 }
+| validation-error string
+| shape-error { branch: string, field: ?string, message: string }
+| event-denied string
+| dispatch-error { event_name: string, message: string, trace: string }
+| scope-not-found string
+
+// `run-cached` is `run` with parse reuse — identical contract, cached
+// parsing for repeated source. Its proc rides in the `runcached` part.
+~pub tor run-cached {
+    source: string,
+    scope: string,
+    budget: ?u64 = null,
+    handle_pool: ?*@import("root").koru_std.koru_interpreter.HandlePool = null,
+    fail_fast: bool = true,
+    auto_discharge: bool = true,
+    shape: ?string = null,
+    lenient: bool = false,
+    host_dispatch: ?@import("root").koru_std.koru_interpreter.HostDispatchFn = null,
+    session_env: ?*@import("root").koru_std.koru_interpreter.Environment = null,
+    session_bind_fn: ?@import("root").koru_std.koru_interpreter.SessionBindFn = null,
+    session_bind_env: ?*@import("root").koru_std.koru_interpreter.Environment = null,
+    session_bind_counter: ?*u64 = null
+}
+| result { value: @import("root").koru_std.koru_interpreter.Value, used: u64, handles: u32, bound: string, trace: string }
+| unhandled-branch { branch: string, payload: string, handles: string }
+| exhausted { used: u64, last_event: string, handles: u32 }
+| parse-error { message: string, line: u32, column: u32 }
+| validation-error string
+| shape-error { branch: string, field: ?string, message: string }
+| event-denied string
+| dispatch-error { event_name: string, message: string, trace: string }
+| scope-not-found string
+
+~proc run|zig {
+    const interpreter_mod = @import("root").koru_std.koru_interpreter;
+
+    const scope_result = get_scope_event.handler(.{ .name = scope });
+    switch (scope_result) {
+        .scope => |s| {
+            const result = interpreter_mod.run_event.handler(.{
+                .source = source,
+                .dispatcher = s.dispatcher,
+                .cost_fn = s.cost_fn,
+                .creates_obligations_fn = s.creates_obligations_fn,
+                .discharges_obligations_fn = s.discharges_obligations_fn,
+                .discharge_event_fn = s.discharge_event_fn,
+                .creates_spec_fn = s.creates_spec_fn,
+                .discharges_spec_fn = s.discharges_spec_fn,
+                .budget = budget,
+                .handle_pool = handle_pool,
+                .fail_fast = fail_fast,
+                .scope_name = scope,  // Pass actual scope name for handle isolation
+                .auto_discharge = auto_discharge,
+                .defined = defined, .input_fn = s.input_fn,
+                .lenient = lenient,
+                .host_dispatch = host_dispatch,
+                .session_env = session_env,
+                .session_bind_fn = session_bind_fn,
+                .session_bind_env = session_bind_env,
+                .session_bind_counter = session_bind_counter,
+            });
+            return relayRunOutcome(result, scope, shape);
+        },
+        .not_found => return .{ .scope_not_found = scope },
+    }
+}
+

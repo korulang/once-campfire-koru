@@ -1,0 +1,904 @@
+// @koru/sqlite - SQLite bindings for Koru
+//
+// First official Koru library package.
+// Demonstrates: phantom obligations, auto-dispose, ~std/build:requires
+
+~import std/build
+~import std/deps
+
+// System dependency: libsqlite3 must be installed
+~std/deps:requires.system {
+    "name": "sqlite3",
+    "check": "pkg-config --modversion sqlite3",
+    "brew": "sqlite3",
+    "apt": "libsqlite3-dev",
+    "dnf": "sqlite-devel",
+    "pacman": "sqlite",
+    "apk": "sqlite-dev"
+}
+
+// Build requirements: link against libsqlite3
+~std/build:requires {
+    exe.linkSystemLibrary("sqlite3");
+    exe.linkLibC();
+}
+
+const std = @import("std");
+pub const c = @cImport({
+    @cInclude("sqlite3.h");
+});
+
+pub const Connection = struct {
+    handle: ?*c.sqlite3,
+    // Prepared-statement cache, keyed by static SQL text. The `default`
+    // transform emits get-or-prepare + reset/clear instead of prepare +
+    // finalize, so a program's compile-time-known SQL pays prepare once per
+    // connection, ever. `cache_mu` guards the map only — a statement is
+    // still per-connection state, so keep one connection per thread.
+    cache_mu: std.Thread.Mutex = .{},
+    stmt_cache: std.StringHashMapUnmanaged(?*c.sqlite3_stmt) = .{},
+    // The path the connection was opened with — duped, owned by the
+    // wrapper. Only `open.pooled` sets it: check-in keys the idle map by
+    // it. "" on a plain `open` connection.
+    path: []const u8 = "",
+};
+
+pub const Statement = struct {
+    handle: ?*c.sqlite3_stmt,
+};
+
+/// Generic value binder for `{{...}}` interpolation — the transforms emit
+/// `bindValue(stmt, n, expr)` and Zig's type system picks the SQLite bind,
+/// so `{{uid}}` needs no `:d`/`:s` hint. ints → int64, floats → double,
+/// bool → int, optional/null → NULL, text → bind_text with TRANSIENT
+/// (interpolated temporaries may not outlive the statement).
+// SQLITE_TRANSIENT is a pointer-sized sentinel (-1), not a callable fn —
+// so the bind_text extern declares its destructor param usize and no cast
+// ever happens. Every fn-pointer spelling (@ptrFromInt, @bitCast,
+// translate-c's own c_translation.cast) hits Zig's alignment checks.
+const bind_text = @extern(*const fn (?*c.sqlite3_stmt, c_int, [*c]const u8, c_int, usize) callconv(.c) c_int, .{ .name = "sqlite3_bind_text" });
+
+pub fn bindValue(stmt: ?*c.sqlite3_stmt, index: c_int, value: anytype) c_int {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .comptime_int, .int => return c.sqlite3_bind_int64(stmt, index, @intCast(value)),
+        .comptime_float, .float => return c.sqlite3_bind_double(stmt, index, @floatCast(value)),
+        .bool => return c.sqlite3_bind_int(stmt, index, @intFromBool(value)),
+        .null => return c.sqlite3_bind_null(stmt, index),
+        .optional => {
+            if (value) |v| return bindValue(stmt, index, v);
+            return c.sqlite3_bind_null(stmt, index);
+        },
+        .pointer => |p| {
+            const is_text = p.child == u8 or (@typeInfo(p.child) == .array and @typeInfo(p.child).array.child == u8);
+            if (!is_text) @compileError("sqlite3 {{...}} interpolation: " ++ @typeName(T) ++ " is not bindable (want int/float/bool/text/optional)");
+            const s8: []const u8 = value;
+            return bind_text(stmt, index, s8.ptr, @intCast(s8.len), std.math.maxInt(usize));
+        },
+        else => @compileError("sqlite3 {{...}} interpolation: " ++ @typeName(T) ++ " is not bindable (want int/float/bool/text/optional)"),
+    }
+}
+
+// ============================================================================
+// Connection Management
+// ============================================================================
+
+~pub tor open { path: string }
+| db *Connection<opened!>
+| err { code: i32, msg: string }
+
+~proc open|zig {
+    var db: ?*c.sqlite3 = null;
+    const rc = c.sqlite3_open(path.ptr, &db);
+    if (rc != c.SQLITE_OK) {
+        const msg = c.sqlite3_errmsg(db);
+        _ = c.sqlite3_close(db);
+        return .{ .err = .{ .code = rc, .msg = std.mem.span(msg) } };
+    }
+    // Rails-adapter default (database.yml timeout): retry a contended lock
+    // for 5s instead of answering SQLITE_BUSY on the spot. A WAL file under
+    // many short-lived per-request connections hits the wal-index attach /
+    // checkpoint-on-close race — without the timeout a *read* returns BUSY
+    // to a server that then has to pick between lying and leaking.
+    _ = c.sqlite3_busy_timeout(db, 5000);
+    const conn = std.heap.page_allocator.create(Connection) catch unreachable;
+    conn.* = Connection{ .handle = db };
+    return .{ .db = conn };
+}
+
+~pub tor close { conn: *Connection<!opened> }
+~proc close|zig {
+    if (conn.handle) |h| {
+        var it = conn.stmt_cache.iterator();
+        while (it.next()) |e| {
+            _ = c.sqlite3_finalize(e.value_ptr.*.?);
+        }
+        conn.stmt_cache.deinit(std.heap.page_allocator);
+        _ = c.sqlite3_close(h);
+    }
+    if (conn.path.len > 0) std.heap.page_allocator.free(conn.path);
+    std.heap.page_allocator.destroy(conn);
+}
+
+// ============================================================================
+// Per-worker pooled variants — the request-path shape
+// ============================================================================
+// One idle connection per (thread, path): `open.pooled` checks it out,
+// `close.pooled` parks it back. A server doing per-request open+query+close
+// pays sqlite3_open + wal-index attach + busy_timeout + first-prepare on
+// EVERY request — measured ~90µs of the ~102µs authed-route floor on
+// once-campfire-koru. Pooled, a request pays checkout + cached-stmt reset:
+// microseconds, and the statement cache survives across requests because
+// it lives on the wrapper.
+//
+// The obligation contract is identical to plain open/close: `db` mints
+// `<opened!>`, `close.pooled` settles `<!opened>` — the pool boundary is
+// invisible to the checker, which is the point: a caller cannot tell
+// checkout from open, so it cannot forget release either.
+//
+// Rules of the pool:
+//   - threadlocal — no mutex; sqlite serializes per connection, and the
+//     statement cache already assumes one conn per thread.
+//   - one idle conn per path: a second live conn to the same path gets a
+//     real open, and its close falls through to real close.
+//   - `:memory:` never pools — callers expect a fresh database per open.
+//   - idle conns live for the thread's life: a leak at exit, deliberate.
+//
+// RULED 2026-10-06 (Lars): explicit pooled verbs, not pool-by-default —
+// the dotted-variant convention already rules (query.literal,
+// finalize.stmt, col.text), and distinct spellings let a pooled conn
+// later carry *Connection<pooled!> and refuse plain close outright.
+threadlocal var pool: std.StringHashMapUnmanaged(*Connection) = .{};
+
+~pub tor open.pooled { path: string }
+| db *Connection<opened!>
+| err { code: i32, msg: string }
+
+~proc open.pooled|zig {
+    if (pool.fetchRemove(path)) |kv| {
+        return .{ .db = kv.value };
+    }
+    var db: ?*c.sqlite3 = null;
+    const rc = c.sqlite3_open(path.ptr, &db);
+    if (rc != c.SQLITE_OK) {
+        const msg = c.sqlite3_errmsg(db);
+        _ = c.sqlite3_close(db);
+        return .{ .err = .{ .code = rc, .msg = std.mem.span(msg) } };
+    }
+    _ = c.sqlite3_busy_timeout(db, 5000);
+    const conn = std.heap.page_allocator.create(Connection) catch unreachable;
+    conn.* = Connection{ .handle = db };
+    if (!std.mem.eql(u8, path, ":memory:")) {
+        conn.path = std.heap.page_allocator.dupe(u8, path) catch unreachable;
+    }
+    return .{ .db = conn };
+}
+
+~pub tor close.pooled { conn: *Connection<!opened> }
+~proc close.pooled|zig {
+    if (conn.path.len > 0) {
+        const gop = pool.getOrPut(std.heap.page_allocator, conn.path) catch unreachable;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = conn;
+            return;
+        }
+    }
+    // No idle slot — second live conn to one path, or a plain-opened conn
+    // closed through the pooled verb: tear down for real.
+    if (conn.handle) |h| {
+        var it = conn.stmt_cache.iterator();
+        while (it.next()) |e| {
+            _ = c.sqlite3_finalize(e.value_ptr.*.?);
+        }
+        conn.stmt_cache.deinit(std.heap.page_allocator);
+        _ = c.sqlite3_close(h);
+    }
+    if (conn.path.len > 0) std.heap.page_allocator.free(conn.path);
+    std.heap.page_allocator.destroy(conn);
+}
+
+// ============================================================================
+// Query Execution
+// ============================================================================
+
+// `exec` only READS the connection to run SQL — it never closes it — so it
+// BORROWS `<opened>` rather than consuming and re-minting. The caller keeps its
+// live `opened!` obligation across the call and still owes exactly one `close`.
+~pub tor exec { conn: *Connection<opened>, sql: string }
+| ok
+| err { code: i32, msg: string }
+
+~proc exec|zig {
+    var errmsg: [*c]u8 = null;
+    const rc = c.sqlite3_exec(conn.handle, sql.ptr, null, null, &errmsg);
+    if (rc != c.SQLITE_OK) {
+        const msg = if (errmsg) |e| std.mem.span(e) else "unknown error";
+        if (errmsg) |e| c.sqlite3_free(e);
+        return .{ .err = .{ .code = rc, .msg = msg } };
+    }
+    return .{ .ok = .{} };
+}
+
+// Literal SQL query - takes a runtime SQL string
+// For compile-time parameterized queries, use ~query { ... } with Source block
+~pub tor query.literal { conn: *Connection<!opened>, sql: string }
+! row *Statement<row!>
+| done *Connection<opened!>
+| err { conn: *Connection<opened!>, code: i32, msg: string }
+
+~proc query.literal|zig {
+    // Effect-branch proc: this body inlines into the consumer's frame, where
+    // the module's bare names (`c`, `Statement`) don't exist. `$mod.` is the
+    // compiler-provided spelling for the declaring module's own scope
+    // (koru 400_155) — never reach through emitter-internal naming.
+    var stmt: ?*$mod.c.sqlite3_stmt = null;
+    const rc = $mod.c.sqlite3_prepare_v2(conn.handle, sql.ptr, @intCast(sql.len), &stmt, null);
+    if (rc != $mod.c.SQLITE_OK) {
+        const msg = $mod.c.sqlite3_errmsg(conn.handle);
+        return .{ .err = .{ .conn = conn, .code = rc, .msg = std.mem.span(msg) } };
+    }
+
+    // Per-row iteration: the `! row` effect branch fires once per row, its body
+    // inlined here. The row handle is a BORROW (<row!>) auto-released at each
+    // row-body boundary; the statement is finalized exactly ONCE, below, by the
+    // engine — so the user never finalizes and cannot leak it (safe by
+    // construction, enforced by the phantom checker at compile time).
+    var __row = $mod.Statement{ .handle = stmt };
+    var __rc = $mod.c.sqlite3_step(stmt);
+    while (__rc == $mod.c.SQLITE_ROW) : (__rc = $mod.c.sqlite3_step(stmt)) {
+        row(&__row);
+    }
+    _ = $mod.c.sqlite3_finalize(stmt);
+    if (__rc != $mod.c.SQLITE_DONE) {
+        const msg = $mod.c.sqlite3_errmsg(conn.handle);
+        return .{ .err = .{ .conn = conn, .code = __rc, .msg = std.mem.span(msg) } };
+    }
+    return .{ .done = conn };
+}
+
+// No-op consumer of the per-row borrow. The compiler auto-inserts this to
+// release `<row!>` at each row-body boundary; the user never calls it. Its
+// existence is what lets the phantom checker prove the row borrow is scoped —
+// escape it (capture past the row body) and the build fails with KORU030.
+// Pure Koru impl: consume the `<row!>` obligation, hand back the dead `<row>`
+// borrow (carries no obligation — a bare borrow is a free alias).
+~pub tor release.row { row: *Statement<!row> } -> *Statement<row>
+~release.row -> row
+
+// ============================================================================
+// default — the module's voice: `libs/sqlite3 { SQL }`
+// ============================================================================
+// The default-event rule rewrites a bare `libs/sqlite3 { ... }` call to
+// `libs/sqlite3:default { ... }` — but only at flow-root position today
+// (koru gap: the rewrite doesn't recurse into continuations). The explicit
+// `:default` spelling works everywhere now.
+//
+// Semantics: per-row iteration. `! row` fires once per result row (the row
+// handle is a scoped borrow, auto-released at the row-body boundary); the
+// statement is finalized exactly once. `{{name:hint}}` interpolation binds
+// scope variables — :d = int64, :f = float64, :s = text (default).
+//
+//   libs/sqlite3:default(conn: d) { SELECT id, name FROM users }
+//   ! row r |> libs/sqlite3:col.int(stmt: r, index: 0): id |> ...
+//   | done d2 |> libs/sqlite3:close(conn: d2)
+//   | err e |> libs/sqlite3:close(e.conn)
+
+~[comptime|transform]pub tor default {
+    source: Source,
+    invocation: *const Invocation,
+    item: *const Item,
+    program: *const Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+// Runtime impl event for shape-checking (never actually runs - inline code
+// does). The proc body is unreachable by construction but must exist: an
+// event without a proc emits no handler, and its decl is dropped from the
+// emitted program — the emitter's effect-branch lookup then misses `! row`.
+~pub tor default.impl { conn: *Connection<!opened> }
+! ?row *Statement<row!>
+| done *Connection<opened!>
+| err { conn: *Connection<opened!>, code: i32, msg: string }
+
+~proc default.impl|zig {
+    _ = conn;
+    unreachable;
+}
+
+~proc default|zig {
+    const ast = @import("ast");
+
+    if (item.* != .flow) @panic("default transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    const sql_text = source.text;
+
+    var conn_var: []const u8 = "conn";
+    var have_conn_arg = false;
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "conn")) {
+            conn_var = arg.value;
+            have_conn_arg = true;
+            break;
+        }
+    }
+    if (!have_conn_arg) {
+        // Auto-conn: `libs/sqlite3 { SQL }` with no conn: reads its site's
+        // enclosing scope (item.flow.site_of — the runner's back-pointer into
+        // the real program) for the one live `*Connection<opened>` binding.
+        const emitter_helpers = @import("emitter_helpers");
+        var found: ?[]const u8 = null;
+        var found_count: usize = 0;
+        if (item.* == .flow) {
+            if (item.flow.site_of) |site| {
+                const scope = emitter_helpers.scopeAtSite(allocator, program.items, site) catch unreachable;
+                for (scope) |b| {
+                    // Scope types carry the phantom: "*Connection<opened!>"
+                    // is a live obligation ("<!opened>" would be consumed).
+                    if (std.mem.indexOf(u8, b.type, "*Connection<opened") != null) {
+                        found = b.value_ref;
+                        found_count += 1;
+                    }
+                }
+            }
+        }
+        if (found_count == 1) {
+            conn_var = found.?;
+        } else if (found_count > 1) {
+            @panic("libs/sqlite3 { } without conn: is ambiguous - more than one *Connection<opened> in scope; name it with conn:");
+        } else {
+            @panic("libs/sqlite3 { } without conn: has no *Connection<opened> in scope - open one first (| db d), or pass conn: explicitly");
+        }
+    }
+
+    // Parse {{var:type}} interpolations → ? placeholders + bind list
+    var sql_buf = std.ArrayList(u8).initCapacity(allocator, sql_text.len) catch unreachable;
+    var bindings: [64]struct { name: []const u8, type_hint: u8 } = undefined;
+    var binding_count: usize = 0;
+
+    var i: usize = 0;
+    while (i < sql_text.len) {
+        if (i + 1 < sql_text.len and sql_text[i] == '{' and sql_text[i + 1] == '{') {
+            var start = i + 2;
+            while (start < sql_text.len and (sql_text[start] == ' ' or sql_text[start] == '\t')) : (start += 1) {}
+
+            var end = start;
+            while (end < sql_text.len and !(end + 1 < sql_text.len and sql_text[end] == '}' and sql_text[end + 1] == '}')) {
+                end += 1;
+            }
+
+            if (end >= sql_text.len) {
+                sql_buf.append(allocator, sql_text[i]) catch unreachable;
+                i += 1;
+                continue;
+            }
+
+            var trim_end = end;
+            while (trim_end > start and (sql_text[trim_end - 1] == ' ' or sql_text[trim_end - 1] == '\t')) : (trim_end -= 1) {}
+
+            const binding_str = sql_text[start..trim_end];
+            var colon_pos: ?usize = null;
+            for (binding_str, 0..) |ch, j| {
+                if (ch == ':') {
+                    colon_pos = j;
+                    break;
+                }
+            }
+
+            if (colon_pos) |cp| {
+                bindings[binding_count] = .{
+                    .name = binding_str[0..cp],
+                    .type_hint = if (cp + 1 < binding_str.len) binding_str[cp + 1] else 's',
+                };
+            } else {
+                bindings[binding_count] = .{ .name = binding_str, .type_hint = 's' };
+            }
+            binding_count += 1;
+            sql_buf.append(allocator, '?') catch unreachable;
+
+            i = end + 2;
+        } else {
+            sql_buf.append(allocator, sql_text[i]) catch unreachable;
+            i += 1;
+        }
+    }
+
+    // Emitted in the consumer's frame — see the `query` transform for why the
+    // module path is computed rather than spelled.
+    const codegen_utils = @import("codegen_utils");
+    const mod_path = codegen_utils.buildKoruModulePath(
+        allocator,
+        invocation.path.module_qualifier orelse "libs.sqlite3",
+    ) catch unreachable;
+
+    // Locate the site's branches by index — __koru_inline_<idx>(arg) splices an
+    // effect-branch body in-scope (payload arg bound to the branch's name);
+    // __koru_continue_<idx> runs a terminal body inline. Both resolve via
+    // emitInlineCodeResolvingSplices regardless of whether the emitter's
+    // decl lookup finds default.impl — the markers are the mechanism.
+    var row_idx: ?usize = null;
+    var done_idx: ?usize = null;
+    var err_idx: ?usize = null;
+    var done_binding: ?[]const u8 = null;
+    var err_binding: ?[]const u8 = null;
+    for (flow.body.continuations, 0..) |*cont, ci| {
+        if (std.mem.eql(u8, cont.branch, "row")) {
+            row_idx = ci;
+        } else if (std.mem.eql(u8, cont.branch, "done")) {
+            done_idx = ci;
+            done_binding = cont.binding;
+        } else if (std.mem.eql(u8, cont.branch, "err")) {
+            err_idx = ci;
+            err_binding = cont.binding;
+        }
+    }
+
+    const px = std.fmt.allocPrint(allocator, "_{d}_{d}", .{ flow.location.line, flow.location.column }) catch unreachable;
+    const MSG = std.fmt.allocPrint(allocator, "__msg{s}", .{px}) catch unreachable;
+    const err_branch = struct {
+        fn emit(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, conn: []const u8, code_expr: []const u8, msg_name: []const u8, binding: ?[]const u8, idx: usize) void {
+            buf.appendSlice(alloc, "        { ") catch unreachable;
+            if (binding) |b| {
+                if (!std.mem.eql(u8, b, "_")) {
+                    const w2 = buf.writer(alloc);
+                    w2.print("const {s} = .{{ .conn = {s}, .code = {s}, .msg = @import(\"std\").mem.span({s}) }}; ", .{ b, conn, code_expr, msg_name }) catch unreachable;
+                }
+            }
+            buf.appendSlice(alloc, "__koru_continue_") catch unreachable;
+            buf.appendSlice(alloc, std.fmt.allocPrint(alloc, "{d}", .{idx}) catch unreachable) catch unreachable;
+            buf.appendSlice(alloc, " }\n") catch unreachable;
+        }
+    }.emit;
+
+    // Site-unique suffix on every emitted local: Zig forbids shadowing even
+    // across nested blocks, so two `default` sites in one scope (chained under
+    // `| done`, or nested inside `! row`) would collide on `__sqlite3`, `c`,
+    // `stmt_handle`… without it. Same technique as the emitter's own
+    // `__koru_dst_{line}_{col}`.
+    const SQ = std.fmt.allocPrint(allocator, "__sq{s}", .{px}) catch unreachable;
+    const C = std.fmt.allocPrint(allocator, "__c{s}", .{px}) catch unreachable;
+    const STMT = std.fmt.allocPrint(allocator, "__stmt{s}", .{px}) catch unreachable;
+    const RC = std.fmt.allocPrint(allocator, "__rc{s}", .{px}) catch unreachable;
+    const ROW = std.fmt.allocPrint(allocator, "__row{s}", .{px}) catch unreachable;
+
+    var code_buf = std.ArrayList(u8).initCapacity(allocator, 2048) catch unreachable;
+    const w = code_buf.writer(allocator);
+    // The SQL lives in a named const so the emitted code can use it both as
+    // the statement-cache key and the prepare argument. The cache lives on
+    // the connection: compile-time SQL (a Source block — always a literal)
+    // is prepared once per connection, ever. On a hit we skip prepare
+    // entirely; on a miss we prepare then get-or-put under the map mutex —
+    // a lost race finalizes our copy and takes the winner's.
+    w.print("//@koru:inline_stmt\n{{\n    const {s} = @import(\"root\").{s};\n    const {s} = {s}.c;\n    const __sql{s} = \"", .{ SQ, mod_path, C, SQ, px }) catch unreachable;
+    for (sql_buf.items) |ch| {
+        switch (ch) {
+            '"' => code_buf.appendSlice(allocator, "\\\"") catch unreachable,
+            '\\' => code_buf.appendSlice(allocator, "\\\\") catch unreachable,
+            '\n' => code_buf.appendSlice(allocator, "\\n") catch unreachable,
+            '\r' => code_buf.appendSlice(allocator, "\\r") catch unreachable,
+            '\t' => code_buf.appendSlice(allocator, "\\t") catch unreachable,
+            else => code_buf.append(allocator, ch) catch unreachable,
+        }
+    }
+    w.print("\";\n    var {s}: ?*{s}.sqlite3_stmt = null;\n    {s}.cache_mu.lock();\n    if ({s}.stmt_cache.get(__sql{s})) |cs| {{ {s} = cs; }}\n    {s}.cache_mu.unlock();\n    var {s}_prep: c_int = {s}.SQLITE_OK;\n    if ({s} == null) {{\n        {s}_prep = {s}.sqlite3_prepare_v2({s}.handle, __sql{s}, -1, &{s}, null);\n        if ({s}_prep == {s}.SQLITE_OK) {{\n            {s}.cache_mu.lock();\n            if ({s}.stmt_cache.get(__sql{s})) |cs| {{\n                _ = {s}.sqlite3_finalize({s});\n                {s} = cs;\n            }} else {{\n                {s}.stmt_cache.put(@import(\"std\").heap.page_allocator, __sql{s}, {s}) catch {{}};\n            }}\n            {s}.cache_mu.unlock();\n        }}\n    }}\n    if ({s} == null) {{\n        const {s} = {s}.sqlite3_errmsg({s}.handle);\n",
+        .{ STMT, C, conn_var, conn_var, px, STMT, conn_var, RC, C, STMT, RC, C, conn_var, px, STMT, RC, C, conn_var, conn_var, px, C, STMT, STMT, conn_var, px, STMT, conn_var, STMT, MSG, C, conn_var }) catch unreachable;
+    if (err_idx) |ei| {
+        err_branch(&code_buf, allocator, conn_var, std.fmt.allocPrint(allocator, "{s}_prep", .{RC}) catch unreachable, MSG, err_binding, ei);
+    }
+    code_buf.appendSlice(allocator, "    } else {\n") catch unreachable;
+
+    // Bind interpolated scope values — bindValue picks the sqlite3_bind_* by
+    // the value's own type, so `{{uid}}` needs no hint (legacy `:d`/`:f`/`:s`
+    // suffixes are still parsed but ignored).
+    for (bindings[0..binding_count], 0..) |binding, idx| {
+        w.print("        _ = {s}.bindValue({s}, {d}, {s});\n", .{ SQ, STMT, idx + 1, binding.name }) catch unreachable;
+    }
+
+    // Per-row iteration: the ! row body splices at the marker once per
+    // SQLITE_ROW. The statement is cached, not finalized — reset + clear
+    // return it ready for the next call with this SQL; `close` finalizes
+    // every cached statement exactly once. No `! row` branch → statement
+    // semantics (exec): rows are stepped through and dropped.
+    w.print("        var {s} = {s}.sqlite3_step({s});\n", .{ RC, C, STMT }) catch unreachable;
+    if (row_idx) |ri| {
+        w.print("        var {s} = {s}.Statement{{ .handle = {s} }};\n        while ({s} == {s}.SQLITE_ROW) : ({s} = {s}.sqlite3_step({s})) {{\n            __koru_inline_{d}(&{s})\n        }}\n", .{ ROW, SQ, STMT, RC, C, RC, C, STMT, ri, ROW }) catch unreachable;
+    } else {
+        w.print("        while ({s} == {s}.SQLITE_ROW) : ({s} = {s}.sqlite3_step({s})) {{}}\n", .{ RC, C, RC, C, STMT }) catch unreachable;
+    }
+    w.print("        _ = {s}.sqlite3_reset({s});\n        _ = {s}.sqlite3_clear_bindings({s});\n        if ({s} != {s}.SQLITE_DONE) {{\n            const {s} = {s}.sqlite3_errmsg({s}.handle);\n", .{ C, STMT, C, STMT, RC, C, MSG, C, conn_var }) catch unreachable;
+    if (err_idx) |ei| {
+        err_branch(&code_buf, allocator, conn_var, RC, MSG, err_binding, ei);
+    }
+    code_buf.appendSlice(allocator, "        } else {\n") catch unreachable;
+    if (done_idx) |di| {
+        code_buf.appendSlice(allocator, "            { ") catch unreachable;
+        if (done_binding) |b| {
+            if (!std.mem.eql(u8, b, "_")) {
+                w.print("const {s} = {s}; ", .{ b, conn_var }) catch unreachable;
+            }
+        }
+        w.print("__koru_continue_{d} }}\n", .{di}) catch unreachable;
+    }
+    code_buf.appendSlice(allocator, "        }\n    }\n}\n") catch unreachable;
+
+    const inline_code = code_buf.items;
+
+    const impl_segments = allocator.alloc([]const u8, 2) catch unreachable;
+    impl_segments[0] = allocator.dupe(u8, "default") catch unreachable;
+    impl_segments[1] = allocator.dupe(u8, "impl") catch unreachable;
+    const impl_path = ast.DottedPath{
+        .module_qualifier = invocation.path.module_qualifier,
+        .segments = impl_segments,
+    };
+
+    const new_inv_marks = allocator.alloc([]const u8, invocation.marks.len + 1) catch unreachable;
+    for (invocation.marks, 0..) |m, idx| {
+        new_inv_marks[idx] = m;
+    }
+    new_inv_marks[invocation.marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_args = allocator.alloc(ast.Arg, 1) catch unreachable;
+    // Auto-conn synthesizes the arg so the REWRITTEN site carries the consume
+    // — the phantom checker only sees declared args, and without this the
+    // connection would stay "live" after the impl ate it.
+    new_args[0] = ast.Arg{ .name = "conn", .value = conn_var };
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "conn")) {
+            new_args[0] = arg;
+            break;
+        }
+    }
+
+    const new_invocation = ast.Invocation{
+        .path = impl_path,
+        .args = new_args,
+        .annotations = invocation.annotations,
+        .marks = new_inv_marks,
+        .inline_body = inline_code,
+        .inserted_by_tap = invocation.inserted_by_tap,
+        .from_opaque_tap = invocation.from_opaque_tap,
+    };
+
+    var new_flow = flow.*;
+    new_flow.body = ast.rootSite(new_invocation, flow.body.continuations, flow.location);
+    return .{ .replacement = ast.Item{ .flow = new_flow } };
+}
+
+// ============================================================================
+// Parameterized Query - Compile-time SQL with type-safe bindings
+// ============================================================================
+// Usage:
+//   ~libs/sqlite3:query(conn: db) {
+//       SELECT * FROM users WHERE id = {{user_id:d}} AND name = {{name:s}}
+//   }
+//   | row r |> ...
+//   | empty |> ...
+//   | err e |> ...
+//
+// Type hints: :d = int64, :s = text, :f = float64
+// Variables are captured from scope - no need to pass them as parameters
+
+~[comptime|transform]pub tor query {
+    source: Source,
+    invocation: *const Invocation,  // The specific invocation being transformed
+    item: *const Item,
+    program: *const Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+// Runtime impl event for shape-checking (never actually runs - inline code does)
+// conn comes from invocation args, captured in generated code
+~[norun]pub tor query.impl { conn: *Connection<!opened> }
+| row { conn: *Connection<opened!>, stmt: *Statement<prepared!>, row: *Statement<row!> }
+| empty *Connection<opened!>
+| err { conn: *Connection<opened!>, code: i32, msg: string }
+
+~proc query|zig {
+    const ast = @import("ast");
+
+    // The walker hands transforms the containing item of the matched
+    // invocation; a query invocation always lives in a flow. A non-flow
+    // item means the dispatch contract broke upstream — crash loudly.
+    if (item.* != .flow) @panic("query transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    const sql_text = source.text;
+
+    // Get conn variable name from the SPECIFIC invocation's args (not flow.invocation!)
+    var conn_var: []const u8 = "conn";
+    var have_conn_arg = false;
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "conn")) {
+            conn_var = arg.value;
+            have_conn_arg = true;
+            break;
+        }
+    }
+    if (!have_conn_arg) {
+        // Auto-conn — same rule as `default`: the one *Connection<opened> in
+        // the site's enclosing scope (item.flow.site_of).
+        const emitter_helpers = @import("emitter_helpers");
+        var found: ?[]const u8 = null;
+        var found_count: usize = 0;
+        if (item.* == .flow) {
+            if (item.flow.site_of) |site| {
+                const scope = emitter_helpers.scopeAtSite(allocator, program.items, site) catch unreachable;
+                for (scope) |b| {
+                    // Scope types carry the phantom: "*Connection<opened!>"
+                    // is a live obligation ("<!opened>" would be consumed).
+                    if (std.mem.indexOf(u8, b.type, "*Connection<opened") != null) {
+                        found = b.value_ref;
+                        found_count += 1;
+                    }
+                }
+            }
+        }
+        if (found_count == 1) {
+            conn_var = found.?;
+        } else if (found_count > 1) {
+            @panic("libs/sqlite3:query without conn: is ambiguous - more than one *Connection<opened> in scope; name it with conn:");
+        } else {
+            @panic("libs/sqlite3:query without conn: has no *Connection<opened> in scope - open one first (| db d), or pass conn: explicitly");
+        }
+    }
+
+    // Parse {{var:type}} patterns and build SQL with ? placeholders
+    var sql_buf = std.ArrayList(u8).initCapacity(allocator, sql_text.len) catch unreachable;
+    var bindings: [64]struct { name: []const u8, type_hint: u8 } = undefined;
+    var binding_count: usize = 0;
+
+    var i: usize = 0;
+    while (i < sql_text.len) {
+        if (i + 1 < sql_text.len and sql_text[i] == '{' and sql_text[i + 1] == '{') {
+            // Found interpolation start - skip whitespace
+            var start = i + 2;
+            while (start < sql_text.len and (sql_text[start] == ' ' or sql_text[start] == '\t')) : (start += 1) {}
+
+            var end = start;
+            while (end < sql_text.len and !(end + 1 < sql_text.len and sql_text[end] == '}' and sql_text[end + 1] == '}')) {
+                end += 1;
+            }
+
+            if (end >= sql_text.len) {
+                // Unclosed {{ - just copy literally
+                sql_buf.append(allocator, sql_text[i]) catch unreachable;
+                i += 1;
+                continue;
+            }
+
+            // Trim trailing whitespace
+            var trim_end = end;
+            while (trim_end > start and (sql_text[trim_end - 1] == ' ' or sql_text[trim_end - 1] == '\t')) : (trim_end -= 1) {}
+
+            // Parse "var:type"
+            const binding_str = sql_text[start..trim_end];
+            var colon_pos: ?usize = null;
+            for (binding_str, 0..) |ch, j| {
+                if (ch == ':') {
+                    colon_pos = j;
+                    break;
+                }
+            }
+
+            if (colon_pos) |cp| {
+                const var_name = binding_str[0..cp];
+                const type_hint = if (cp + 1 < binding_str.len) binding_str[cp + 1] else 's';
+
+                bindings[binding_count] = .{ .name = var_name, .type_hint = type_hint };
+                binding_count += 1;
+
+                // Replace with ?
+                sql_buf.append(allocator, '?') catch unreachable;
+            } else {
+                // No type hint - default to string
+                bindings[binding_count] = .{ .name = binding_str, .type_hint = 's' };
+                binding_count += 1;
+                sql_buf.append(allocator, '?') catch unreachable;
+            }
+
+            i = end + 2; // Skip }}
+        } else {
+            sql_buf.append(allocator, sql_text[i]) catch unreachable;
+            i += 1;
+        }
+    }
+
+    // Build inline Zig code
+    var code_buf = std.ArrayList(u8).initCapacity(allocator, 2048) catch unreachable;
+
+    // The inline body is emitted in the CONSUMER's frame, where this module's
+    // bare names don't exist. `$mod.` is not rewritten inside inline_body, so
+    // compute the declaring module's emitted path ourselves — the same
+    // `koru_`-prefix rule the emitter applies (`libs.sqlite3` →
+    // `koru_libs.koru_sqlite3`), keyed off how the site invoked us.
+    const codegen_utils = @import("codegen_utils");
+    const mod_path = codegen_utils.buildKoruModulePath(
+        allocator,
+        invocation.path.module_qualifier orelse "libs.sqlite3",
+    ) catch unreachable;
+
+    // Header: declare stmt and prepare
+    // Use labeled block with break :blk for return values (since this runs as an expression)
+    // Use the library's existing c import to avoid type mismatches
+    code_buf.appendSlice(allocator, "blk: {\n") catch unreachable;
+    code_buf.appendSlice(allocator, "    const __sqlite3 = @import(\"root\").") catch unreachable;
+    code_buf.appendSlice(allocator, mod_path) catch unreachable;
+    code_buf.appendSlice(allocator, ";\n    const c = __sqlite3.c;\n") catch unreachable;
+    code_buf.appendSlice(allocator, "    const Result = union(enum) { row: struct { conn: *__sqlite3.Connection, stmt: *__sqlite3.Statement, row: *__sqlite3.Statement }, empty: *__sqlite3.Connection, err: struct { conn: *__sqlite3.Connection, code: i32, msg: []const u8 } };\n") catch unreachable;
+    code_buf.appendSlice(allocator, "    var stmt_handle: ?*c.sqlite3_stmt = null;\n") catch unreachable;
+    code_buf.appendSlice(allocator, "    const rc = c.sqlite3_prepare_v2(") catch unreachable;
+    code_buf.appendSlice(allocator, conn_var) catch unreachable;
+    code_buf.appendSlice(allocator, ".handle, \"") catch unreachable;
+    // Escape SQL for Zig string
+    for (sql_buf.items) |ch| {
+        switch (ch) {
+            '"' => code_buf.appendSlice(allocator, "\\\"") catch unreachable,
+            '\\' => code_buf.appendSlice(allocator, "\\\\") catch unreachable,
+            '\n' => code_buf.appendSlice(allocator, "\\n") catch unreachable,
+            '\r' => code_buf.appendSlice(allocator, "\\r") catch unreachable,
+            '\t' => code_buf.appendSlice(allocator, "\\t") catch unreachable,
+            else => code_buf.append(allocator, ch) catch unreachable,
+        }
+    }
+    code_buf.appendSlice(allocator, "\", -1, &stmt_handle, null);\n") catch unreachable;
+
+    // Check prepare result
+    code_buf.appendSlice(allocator, "    if (rc != c.SQLITE_OK) {\n") catch unreachable;
+    code_buf.appendSlice(allocator, "        const msg = c.sqlite3_errmsg(") catch unreachable;
+    code_buf.appendSlice(allocator, conn_var) catch unreachable;
+    code_buf.appendSlice(allocator, ".handle);\n") catch unreachable;
+    code_buf.appendSlice(allocator, "        break :blk @as(Result, .{ .err = .{ .conn = ") catch unreachable;
+    code_buf.appendSlice(allocator, conn_var) catch unreachable;
+    code_buf.appendSlice(allocator, ", .code = rc, .msg = @import(\"std\").mem.span(msg) } });\n") catch unreachable;
+    code_buf.appendSlice(allocator, "    }\n") catch unreachable;
+
+    // Generate bind calls — bindValue dispatches on the value's own type,
+    // so scope values interpolate hint-free (`{{uid}}`, not `{{uid:d}}`).
+    for (bindings[0..binding_count], 0..) |binding, idx| {
+        code_buf.writer(allocator).print("    _ = __sqlite3.bindValue(stmt_handle, {d}, {s});\n", .{ idx + 1, binding.name }) catch unreachable;
+    }
+
+    // Step and return
+    code_buf.appendSlice(allocator, "    const step_rc = c.sqlite3_step(stmt_handle);\n") catch unreachable;
+    code_buf.appendSlice(allocator, "    if (step_rc == c.SQLITE_ROW) {\n") catch unreachable;
+    code_buf.appendSlice(allocator, "        const s = @import(\"std\").heap.page_allocator.create(__sqlite3.Statement) catch unreachable;\n") catch unreachable;
+    code_buf.appendSlice(allocator, "        s.* = .{ .handle = stmt_handle };\n") catch unreachable;
+    code_buf.appendSlice(allocator, "        break :blk @as(Result, .{ .row = .{ .conn = ") catch unreachable;
+    code_buf.appendSlice(allocator, conn_var) catch unreachable;
+    code_buf.appendSlice(allocator, ", .stmt = s, .row = s } });\n") catch unreachable;
+    code_buf.appendSlice(allocator, "    } else if (step_rc == c.SQLITE_DONE) {\n") catch unreachable;
+    code_buf.appendSlice(allocator, "        _ = c.sqlite3_finalize(stmt_handle);\n") catch unreachable;
+    code_buf.appendSlice(allocator, "        break :blk @as(Result, .{ .empty = ") catch unreachable;
+    code_buf.appendSlice(allocator, conn_var) catch unreachable;
+    code_buf.appendSlice(allocator, " });\n") catch unreachable;
+    code_buf.appendSlice(allocator, "    } else {\n") catch unreachable;
+    code_buf.appendSlice(allocator, "        const msg = c.sqlite3_errmsg(") catch unreachable;
+    code_buf.appendSlice(allocator, conn_var) catch unreachable;
+    code_buf.appendSlice(allocator, ".handle);\n") catch unreachable;
+    code_buf.appendSlice(allocator, "        _ = c.sqlite3_finalize(stmt_handle);\n") catch unreachable;
+    code_buf.appendSlice(allocator, "        break :blk @as(Result, .{ .err = .{ .conn = ") catch unreachable;
+    code_buf.appendSlice(allocator, conn_var) catch unreachable;
+    code_buf.appendSlice(allocator, ", .code = step_rc, .msg = @import(\"std\").mem.span(msg) } });\n") catch unreachable;
+    code_buf.appendSlice(allocator, "    }\n") catch unreachable;
+    code_buf.appendSlice(allocator, "}") catch unreachable;
+
+    const inline_code = code_buf.items;
+
+    // Create impl path for shape checking
+    const impl_segments = allocator.alloc([]const u8, 2) catch unreachable;
+    impl_segments[0] = allocator.dupe(u8, "query") catch unreachable;
+    impl_segments[1] = allocator.dupe(u8, "impl") catch unreachable;
+    const impl_path = ast.DottedPath{
+        .module_qualifier = invocation.path.module_qualifier,
+        .segments = impl_segments,
+    };
+
+    // Build new invocation with @pass_ran annotation (use the actual invocation, not flow.invocation!)
+    const new_inv_marks = allocator.alloc([]const u8, invocation.marks.len + 1) catch unreachable;
+    for (invocation.marks, 0..) |m, idx| {
+        new_inv_marks[idx] = m;
+    }
+    new_inv_marks[invocation.marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    // Keep only conn arg for the impl event
+    const new_args = allocator.alloc(ast.Arg, 1) catch unreachable;
+    // Auto-conn synthesizes the arg so the REWRITTEN site carries the consume
+    // — the phantom checker only sees declared args, and without this the
+    // connection would stay "live" after the impl ate it.
+    new_args[0] = ast.Arg{ .name = "conn", .value = conn_var };
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "conn")) {
+            new_args[0] = arg;
+            break;
+        }
+    }
+
+    const new_invocation = ast.Invocation{
+        .path = impl_path,
+        .args = new_args,
+        .annotations = invocation.annotations,
+        .marks = new_inv_marks,
+        .inline_body = inline_code,
+        .inserted_by_tap = invocation.inserted_by_tap,
+        .from_opaque_tap = invocation.from_opaque_tap,
+    };
+
+    // Site-local write-back: the runner owns ALL placement. The replacement
+    // flow's body is a fresh root site wrapping the query.impl invocation —
+    // which carries inline_body (the canonical Invocation slot, honored at
+    // both flow-root and nested-continuation emission) — and the site's own
+    // continuations ride along unchanged as its branches. Root site: the
+    // whole Item is swapped for this one. Nested: the runner splices the
+    // invocation node + children into the holding continuation.
+    var new_flow = flow.*;
+    new_flow.body = ast.rootSite(new_invocation, flow.body.continuations, flow.location);
+    return .{ .replacement = ast.Item{ .flow = new_flow } };
+}
+
+// Get next row from statement. `stmt` is the statement's lifetime handle
+// (still needs finalize); `row` is the live row borrow — stepping consumes
+// it (the step IS the release). `| row` re-issues both on the same object:
+// `col.*` borrows `row`, `next`/`finalize.stmt` consume `stmt`.
+~pub tor next { conn: *Connection<!opened>, stmt: *Statement<!prepared>, row: *Statement<!row> }
+| row { conn: *Connection<opened!>, stmt: *Statement<prepared!>, row: *Statement<row!> }
+| done *Connection<opened!>
+| err { conn: *Connection<opened!>, code: i32, msg: string }
+
+~proc next|zig {
+    _ = &row;
+    const rc = c.sqlite3_step(stmt.handle);
+    if (rc == c.SQLITE_ROW) {
+        return .{ .row = .{ .conn = conn, .stmt = stmt, .row = stmt } };
+    } else if (rc == c.SQLITE_DONE) {
+        _ = c.sqlite3_finalize(stmt.handle);
+        std.heap.page_allocator.destroy(stmt);
+        return .{ .done = conn };
+    } else {
+        const msg = c.sqlite3_errmsg(conn.handle);
+        _ = c.sqlite3_finalize(stmt.handle);
+        std.heap.page_allocator.destroy(stmt);
+        return .{ .err = .{ .conn = conn, .code = rc, .msg = std.mem.span(msg) } };
+    }
+}
+
+// Finalize text - acknowledges we're done with borrowed text pointer
+// Must be called BEFORE finalize.stmt (text becomes invalid after stmt finalize)
+~pub tor finalize.text { text: string<!text> }
+
+~proc finalize.text|zig {
+    _ = &text;
+}
+
+// Finalize statement - releases the prepared statement
+~pub tor finalize.stmt { stmt: *Statement<!prepared> }
+
+~proc finalize.stmt|zig {
+    if (stmt.handle) |h| {
+        _ = c.sqlite3_finalize(h);
+    }
+    std.heap.page_allocator.destroy(stmt);
+}
+
+// ============================================================================
+// Column Access (within row context)
+// ============================================================================
+
+~pub tor col.int { stmt: *Statement<row>, index: i32 } -> i64
+~proc col.int|zig {
+    return c.sqlite3_column_int64(stmt.handle, index);
+}
+
+// NOTE: text is a ROW-SCOPED borrow (valid only within the `! row` body, like
+// std/fs:read-lines' `! line`). Pristine-later: hand back an owned copy so it's
+// safe to capture across rows. For now it matches the stdlib borrow idiom.
+~pub tor col.text { stmt: *Statement<row>, index: i32 } -> string
+~proc col.text|zig {
+    const ptr = c.sqlite3_column_text(stmt.handle, index);
+    const len = c.sqlite3_column_bytes(stmt.handle, index);
+    return if (ptr) |p| p[0..@intCast(len)] else "";
+}
+
+~pub tor col.real { stmt: *Statement<row>, index: i32 } -> f64
+~proc col.real|zig {
+    return c.sqlite3_column_double(stmt.handle, index);
+}

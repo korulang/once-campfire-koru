@@ -1,0 +1,60 @@
+// Koru Standard Library: Reactive Stores — the `refs` part.
+// Joined via `~part refs` in store.kz; merged into the store module at load.
+//
+// `ref(X)` leaf columns (the proto.OOP rung): the material is i64 — the
+// column IS the row handle — and the declared target is validated here
+// and persisted on the create-site marker (`; ref col->Target`) so the
+// typed edge survives the seed's self-erase. Pinned: 698_009 (insert a
+// minted handle, follow it cross-store, write through), 698_011 (an
+// unknown seed target refuses at this gate).
+
+const StoreRefs = struct {
+    const ast = @import("ast");
+    const struct_literal = @import("struct_literal");
+
+    /// The `ref(X)` inner name, or null for a non-ref leaf type.
+    fn inner(ftype: []const u8) ?[]const u8 {
+        const t = std.mem.trim(u8, ftype, " \t");
+        if (t.len > 5 and std.mem.startsWith(u8, t, "ref(") and t[t.len - 1] == ')')
+            return std.mem.trim(u8, t[4 .. t.len - 1], " \t");
+        return null;
+    }
+
+    /// A `ref(X)` leaf must name a declared compound — bare names answer
+    /// to the store's home, `a/b:C` to the named home (the same
+    /// canonicalization proto.resolve's splitWant uses). Returns the
+    /// refusal item, or null when the leaf is not a ref or resolves.
+    fn checkTarget(alloc: std.mem.Allocator, prog: *const ast.Program, reporter: anytype, flow: *const ast.Flow, store_name: []const u8, fname: []const u8, ftype: []const u8, scope_home: []const u8) ?ast.Item {
+        const t = inner(ftype) orelse return null;
+        var home = scope_home;
+        var name = t;
+        if (std.mem.lastIndexOfScalar(u8, t, ':')) |ci| {
+            const qual = std.mem.trim(u8, t[0..ci], " \t");
+            name = std.mem.trim(u8, t[ci + 1 ..], " \t");
+            const dotted = alloc.dupe(u8, qual) catch unreachable;
+            for (dotted) |*c| {
+                if (c.* == '/') c.* = '.';
+            }
+            home = dotted;
+        }
+        if (name.len == 0 or home.len == 0 or SL.MemberRef.fieldsOf(prog, name, home) == null) {
+            return ast.refusal(alloc, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): field '{s}' names unknown ref target '{s}' — ref() takes a declared compound of its home, or a qualified name from another home", .{ store_name, fname, t });
+        }
+        return null;
+    }
+
+    /// `; ref col->Target, ...` for the create-site marker — "" when no
+    /// seed leaf carries a ref. Scans the (post-expansion) cell fields so
+    /// proto-member refs and direct-seed refs both land.
+    fn suffix(alloc: std.mem.Allocator, cell_fields: []const struct_literal.StructField) []const u8 {
+        var sb = std.ArrayList(u8){};
+        for (cell_fields) |cf| {
+            const peeled = struct_literal.peelBaseType(cf.value);
+            const ftype = if (peeled.type.len != 0) peeled.type else std.mem.trim(u8, cf.value, " ");
+            const t = inner(ftype) orelse continue;
+            sb.appendSlice(alloc, if (sb.items.len == 0) "; ref " else ", ") catch unreachable;
+            sb.appendSlice(alloc, std.fmt.allocPrint(alloc, "{s}->{s}", .{ cf.name, t }) catch unreachable) catch unreachable;
+        }
+        return sb.items;
+    }
+};

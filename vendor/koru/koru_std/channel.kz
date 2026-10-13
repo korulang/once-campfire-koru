@@ -1,0 +1,1447 @@
+// Koru Standard Library: Channels — bounded MPMC channels over proto elements.
+//
+//   std/channel:new(inbox, capacity: 256) { reading: Reading }   // declare
+//
+//   std/channel(inbox)                          // program-wide consumer join
+//   ! reading r |> handle(r)                    //   competing consumer arm
+//   ! closed |> shutdown()                      //   close arm (reserved word)
+//
+//   std/channel:send(inbox, r) | ok |> .. | full |> .. | closed |> ..
+//   std/channel:send(inbox, reading: r) | ..    // kind-labeled form (multi-kind)
+//   std/channel:recv(inbox) | some v |> .. | none |> .. | closed |> ..
+//   std/channel:close(inbox) | ok |> ..
+//
+// THE SHAPE (docs/CHANNEL.md, ruled 2026-09-24): the `{ }` body is a BRANCH
+// TABLE — each `name: Proto` entry is one message kind: the arm word plus
+// the proto its payload carries. Multi-kind is legal
+// (`{ reading: Reading, alert: Alert }` → `! reading` + `! alert`); each
+// kind gets its own ring — one firing carries one kind, and a value of a
+// kind never queues behind another kind. `capacity:` is required, a power
+// of two above zero; `capacity: 0` is the rendezvous spelling — deferred,
+// refused with teaching.
+//
+// `std/channel(name)` is the bare-reference JOIN (the `default` tor, a [pre]
+// rewrite to `consume` — the store `default`→`watch` pattern): `!` arms on
+// it attach program-wide and are COLLECTED BY `new`, which splices them into
+// the generated drain — consumers are statically enumerable, one value goes
+// to one unit, join order. Arms under `channel:new` itself refuse.
+//
+// What the declaration emits into the channel's home module:
+//   - `pub const <Proto> = struct { ... }` per kind's proto — skipped when
+//     another consumer (std/list:new) already derived it.
+//   - `__koru_chan_<n>_<kind>_ring: MpmcRing(<Proto>, cap)` per kind, plus
+//     one `__koru_chan_<n>_closed` atomic — rings.kz carries no close bit;
+//     closed is channel semantics, not queue mechanics.
+//   - `__channel_send_<n>_<kind>` { value: Proto } | ok | full | closed —
+//     one send tor per kind.
+//   - `__channel_recv_<n>` {} | some Proto | none | closed — single-kind
+//     channels only (recv can't spell one payload type on a multi-kind
+//     channel; it refuses with teaching at the site).
+//   - `__channel_close_<n>` {} | ok — sets the bit, fires every `! closed`
+//     unit in join order.
+//   - `__channel_<n>_<kind>_<i>` / `__channel_<n>_closed_<i>` — one generated
+//     unit per `!` arm, the emitVerbUnit convention.
+//   - `<n>-step` / `<n>-live` / `<n>-wait` — the pump participant verbs, the
+//     same names a `! step` store exposes, so a channel joins a pump by name:
+//
+//       std/pump(main)
+//       ! step |> inbox-step()
+//       ! live |> inbox-live()
+//       ! wait i |> inbox-wait(i: i)
+//
+//   step: one drain pass — for each kind, each of that kind's consumer units
+//   attempts one dequeue in join order (competing: first pop wins the value);
+//   returns items moved. live: 0 once closed AND every kind's ring is drained.
+//   wait: `-> i128`, 1ms — a same-thread re-poll interest (a scalar IS a
+//   deadline); the cross-thread eventfd rung is deliberately unbuilt.
+//
+// `closed`-arm timing: the units fire inside `std/channel:close` — the
+// transition point — so a channel never joined to a pump still runs them.
+//
+// Ordering law (same as pump/store): the declaration precedes its uses in
+// document order — transforms run in source order and the chain steps find
+// the channel by its emitted marker.
+
+const std = @import("std");
+const ast = @import("ast");
+
+// The Vyukov ring is the data plane — imported at module scope so it rides
+// this module's own import graph into every program that channels.
+~import std/rings
+~part custody
+~part transit
+~part home
+~part leaves
+~part units
+
+// ============================================================================
+// Helpers — pump.kz's PH and list.protos' field reader, restated: a module
+// cannot call another module's private fns.
+// ============================================================================
+
+const CH = struct {
+    const KindEntry = struct { name: []const u8, proto: []const u8 };
+    // One collected `!` arm — kind name, the arm continuation, its join flow.
+    const Arm = struct { kind: []const u8, cont: *const ast.Continuation, at: *const ast.Flow };
+
+    fn mkPath(alloc: std.mem.Allocator, module: []const u8, name: []const u8) ast.DottedPath {
+        const segs = alloc.alloc([]const u8, 1) catch unreachable;
+        segs[0] = alloc.dupe(u8, name) catch unreachable;
+        return ast.DottedPath{ .module_qualifier = alloc.dupe(u8, module) catch unreachable, .segments = segs };
+    }
+
+    fn stripQuotes(n: []const u8) []const u8 {
+        if (n.len >= 2 and n[0] == '"' and n[n.len - 1] == '"') return n[1 .. n.len - 1];
+        return n;
+    }
+
+    // The decl marker is a host_line comment — `__channel_decl_<name>` (the
+    // join site ran). Zero emission surface, found by content scan — pump.kz's
+    // markerExists verbatim. The same line carries ` vocab=k:P,k2:P2 cap=N`
+    // so chain steps can validate kinds without re-reading the decl.
+    fn markerExists(prog: *const ast.Program, marker: []const u8) bool {
+        const W = struct {
+            fn scan(its: []const ast.Item, w: []const u8) bool {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .host_line => |*hl| {
+                            if (std.mem.indexOf(u8, hl.content, w) != null) return true;
+                        },
+                        .module_decl => |*md| {
+                            if (scan(md.items, w)) return true;
+                        },
+                        else => {},
+                    }
+                }
+                return false;
+            }
+        };
+        return W.scan(prog.items, marker);
+    }
+
+    fn declMarker(alloc: std.mem.Allocator, name: []const u8) []const u8 {
+        return std.fmt.allocPrint(alloc, "__channel_decl_{s}", .{name}) catch unreachable;
+    }
+
+    fn markerItem(alloc: std.mem.Allocator, flow: *const ast.Flow, text: []const u8) ast.Item {
+        return ast.Item{ .host_line = ast.HostLine{
+            .content = std.fmt.allocPrint(alloc, "// {s}", .{text}) catch unreachable,
+            .location = flow.location,
+            .module = alloc.dupe(u8, flow.module) catch unreachable,
+        } };
+    }
+
+    // The marker line's vocabulary: `kind:Proto` pairs, in declaration order.
+    fn vocabOf(alloc: std.mem.Allocator, prog: *const ast.Program, name: []const u8) ?[]const KindEntry {
+        const needle = std.fmt.allocPrint(alloc, "__channel_decl_{s} vocab=", .{name}) catch unreachable;
+        const W = struct {
+            fn scan(its: []const ast.Item, w: []const u8) ?[]const u8 {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .host_line => |*hl| {
+                            if (std.mem.indexOf(u8, hl.content, w)) |at| {
+                                return hl.content[at + w.len ..];
+                            }
+                        },
+                        .module_decl => |*md| {
+                            if (scan(md.items, w)) |hit| return hit;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            }
+        };
+        const tail = W.scan(prog.items, needle) orelse return null;
+        const end = std.mem.indexOf(u8, tail, " cap=") orelse tail.len;
+        var kinds = std.ArrayList(KindEntry).initCapacity(alloc, 4) catch unreachable;
+        var it = std.mem.splitScalar(u8, tail[0..end], ',');
+        while (it.next()) |raw| {
+            const pair = std.mem.trim(u8, raw, " \t");
+            if (pair.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, pair, ':') orelse continue;
+            kinds.append(alloc, .{
+                .name = std.mem.trim(u8, pair[0..colon], " \t"),
+                .proto = std.mem.trim(u8, pair[colon + 1 ..], " \t"),
+            }) catch unreachable;
+        }
+        return kinds.toOwnedSlice(alloc) catch unreachable;
+    }
+
+    // A live (not yet transformed) `std/channel:new` flow declaring `name`.
+    // Present only when a use precedes its declaration in document order —
+    // the diagnostic that teaches ordering, not the check.
+    fn liveDeclFlow(prog: *const ast.Program, name: []const u8) ?*const ast.Flow {
+        const W = struct {
+            fn scan(its: []const ast.Item, want: []const u8) ?*const ast.Flow {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .flow => |*f| {
+                            if (f.body.node) |*n| {
+                                if (n.* == .invocation) {
+                                    const inv = &n.invocation;
+                                    if (CHM.isChannelInv(inv, "new") and declSubject(inv, want)) return f;
+                                }
+                            }
+                        },
+                        .module_decl => |*md| {
+                            if (scan(md.items, want)) |hit| return hit;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            }
+        };
+        return W.scan(prog.items, name);
+    }
+
+    // The channel name a `new`/`consume` invocation declares — the `expr`
+    // arg (renamed positional) or a raw first positional.
+    fn declSubject(inv: *const ast.Invocation, want: []const u8) bool {
+        for (inv.args) |a| {
+            if (std.mem.eql(u8, std.mem.trim(u8, a.name, " \t"), "expr") and
+                std.mem.eql(u8, stripQuotes(std.mem.trim(u8, a.value, " \t")), want)) return true;
+        }
+        if (inv.args.len > 0 and !isLabelled(inv.args[0]) and inv.args[0].source_value == null) {
+            if (std.mem.eql(u8, stripQuotes(std.mem.trim(u8, inv.args[0].value, " \t")), want)) return true;
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Proto entry lookup — list.protos.kz's two-form read, restated
+    // smaller: the live `std/proto(Name)`/`std/types:proto(Name)` decl flow
+    // (source arg text) or the erased `// proto Name: f: t, g: u` marker.
+
+    // `had_explicit_label` does not survive the ast_json round-trip into the
+    // backend where transform procs run — the serializer writes it, the
+    // deserializer drops it (compiler gap; the flag is parse-faithful until
+    // the binary hand-off). The detectable differences that survive: the
+    // parser PUNS positional args (name == value, "main"→{"main","main"}),
+    // and the first positional that matches no declared field is renamed
+    // "expr" with `expression_value` captured — while a `label: value` pair
+    // keeps name != value and no expression capture.
+    fn isLabelled(a: ast.Arg) bool {
+        if (a.expression_value != null) return false;
+        return !std.mem.eql(u8, std.mem.trim(u8, a.name, " \t"), std.mem.trim(u8, a.value, " \t"));
+    }
+
+    fn declEntryName(inv: *const ast.Invocation) []const u8 {
+        if (inv.args.len == 0) return "";
+        const a0 = inv.args[0];
+        if (isLabelled(a0)) {
+            const label = std.mem.trim(u8, a0.name, " \t");
+            if (std.mem.endsWith(u8, label, "<"))
+                return std.mem.trim(u8, label[0 .. label.len - 1], " \t");
+            return label;
+        }
+        return stripQuotes(a0.value);
+    }
+
+    fn isProtoDoor(inv: *const ast.Invocation) bool {
+        if (inv.path.segments.len != 1) return false;
+        const verb = inv.path.segments[0];
+        const mq = inv.path.module_qualifier orelse return false;
+        const types_door = (std.mem.eql(u8, verb, "proto") or std.mem.eql(u8, verb, "default")) and
+            (std.mem.eql(u8, mq, "std.types") or std.mem.eql(u8, mq, "std/types"));
+        const default_door = (std.mem.eql(u8, verb, "default") or std.mem.eql(u8, verb, "proto")) and
+            (std.mem.eql(u8, mq, "std.proto") or std.mem.eql(u8, mq, "std/proto"));
+        return types_door or default_door;
+    }
+
+    // True when some emitted item already derives `<Name>`'s layout —
+    // std/list:new's `pub const <Name> = struct {` is the one to share.
+    // Proto's affinity ruling: one name, one layout; whoever derives first
+    // owns the emission.
+    fn structAlreadyEmitted(alloc: std.mem.Allocator, prog: *const ast.Program, name: []const u8) bool {
+        const needle = std.fmt.allocPrint(alloc, "const {s} = struct", .{name}) catch unreachable;
+        const W = struct {
+            fn scan(its: []const ast.Item, w: []const u8) bool {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .inline_code => |*ic| {
+                            if (std.mem.indexOf(u8, ic.code, w) != null) return true;
+                        },
+                        .host_line => |*hl| {
+                            if (std.mem.indexOf(u8, hl.content, w) != null) return true;
+                        },
+                        .module_decl => |*md| {
+                            if (scan(md.items, w)) return true;
+                        },
+                        else => {},
+                    }
+                }
+                return false;
+            }
+        };
+        return W.scan(prog.items, needle);
+    }
+
+    // Identifier check — kind words and channel names mint decls.
+    fn identOk(name: []const u8) bool {
+        if (name.len == 0) return false;
+        var first = true;
+        for (name) |c| {
+            const legal = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+                (c == '_') or (c == '-') or (!first and c >= '0' and c <= '9');
+            first = false;
+            if (!legal) return false;
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------------------
+    // The store-name rewrite for transplanted arm bodies — pump.kz's
+    // storeHomes/storeRefsText/rewriteCont, restated. A consumer arm that
+    // reads `tick.hp` must emit `__koru_store_tick.hp`; without this walk
+    // the transplanted text names a cell that does not exist.
+    // ------------------------------------------------------------------
+
+    fn storeHomes(alloc: std.mem.Allocator, prog: *const ast.Program) []const []const u8 {
+        var names = std.ArrayList([]const u8).initCapacity(alloc, 4) catch unreachable;
+        const W = struct {
+            fn items(ns: *std.ArrayList([]const u8), al: std.mem.Allocator, its: []const ast.Item) void {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .event_decl => |*ed| {
+                            if (ed.path.segments.len == 1 and std.mem.startsWith(u8, ed.path.segments[0], "__store_apply_")) {
+                                ns.append(al, ed.path.segments[0]["__store_apply_".len..]) catch unreachable;
+                            }
+                        },
+                        .module_decl => |*md| items(ns, al, md.items),
+                        else => {},
+                    }
+                }
+            }
+        };
+        W.items(&names, alloc, prog.items);
+        return names.toOwnedSlice(alloc) catch unreachable;
+    }
+
+    fn storeRefsText(alloc: std.mem.Allocator, text: []const u8, names: []const []const u8) []const u8 {
+        var t = text;
+        for (names) |n| {
+            t = oneStore(alloc, t, n);
+        }
+        return t;
+    }
+
+    fn oneStore(alloc: std.mem.Allocator, text: []const u8, name: []const u8) []const u8 {
+        var out = std.ArrayList(u8).initCapacity(alloc, text.len + 32) catch unreachable;
+        var i: usize = 0;
+        while (i < text.len) {
+            const at_boundary = ast.identBoundaryBefore(text, i);
+            if (at_boundary and i + name.len < text.len and
+                std.mem.startsWith(u8, text[i..], name) and text[i + name.len] == '.')
+            {
+                out.appendSlice(alloc, "__koru_store_") catch unreachable;
+                out.appendSlice(alloc, name) catch unreachable;
+                i += name.len;
+            } else {
+                out.append(alloc, text[i]) catch unreachable;
+                i += 1;
+            }
+        }
+        return out.toOwnedSlice(alloc) catch unreachable;
+    }
+
+    fn rewriteCont(alloc: std.mem.Allocator, cont: *ast.Continuation, names: []const []const u8) void {
+        if (cont.condition) |c| {
+            const casted = @constCast(cont);
+            casted.condition = storeRefsText(alloc, c, names);
+        }
+        if (cont.node) |*n| {
+            const cn = @constCast(n);
+            switch (cn.*) {
+                .invocation => |*iv| {
+                    for (@constCast(iv.args)) |*a| {
+                        a.value = storeRefsText(alloc, a.value, names);
+                        if (a.expression_value) |ev| {
+                            @constCast(ev).text = storeRefsText(alloc, ev.text, names);
+                        }
+                        if (a.source_value) |sv| {
+                            @constCast(sv).text = storeRefsText(alloc, sv.text, names);
+                        }
+                    }
+                },
+                .inline_code => |*ic| {
+                    ic.* = storeRefsText(alloc, ic.*, names);
+                },
+                .branch_constructor => |*bc| {
+                    if (bc.plain_value) |pv| bc.plain_value = storeRefsText(alloc, pv, names);
+                },
+                else => {},
+            }
+        }
+        for (cont.continuations) |*cc| {
+            rewriteCont(alloc, @constCast(cc), names);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Emission helpers.
+    // ------------------------------------------------------------------
+
+    // A generated tor + `|zig` proc — list.free.kz's synthOp, restated.
+    fn synthOp(
+        allocator: std.mem.Allocator,
+        prog: *const ast.Program,
+        flow: *const ast.Flow,
+        name: []const u8,
+        input_fields: []const ast.Field,
+        branches: []const ast.Branch,
+        return_type: ?[]const u8,
+        return_phantom: ?[]const u8,
+        proc_body: []const u8,
+        appended: *std.ArrayList(ast.Item),
+    ) void {
+        const retain_ann = blk_ra: {
+            const anns = allocator.alloc([]const u8, 1) catch unreachable;
+            anns[0] = allocator.dupe(u8, "retain") catch unreachable;
+            break :blk_ra anns;
+        };
+        const path = mkPath(allocator, ast_functional.moduleHome(prog, flow) orelse flow.module, name);
+        appended.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+            .path = path,
+            .input = ast.Shape{ .fields = input_fields },
+            .branches = branches,
+            .return_type = if (return_type) |rt| allocator.dupe(u8, rt) catch unreachable else null,
+            .return_phantom = if (return_phantom) |rp| allocator.dupe(u8, rp) catch unreachable else null,
+            .is_public = false,
+            .is_implicit_flow = false,
+            .annotations = retain_ann,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+        appended.append(allocator, ast.Item{ .proc_decl = ast.ProcDecl{
+            .path = path,
+            .body = ast.Source{ .text = allocator.dupe(u8, proc_body) catch unreachable, .location = flow.location, .scope = .{ .bindings = &[_]ast.ScopeBinding{} }, .phantom_type = null },
+            .annotations = &[_][]const u8{},
+            .target = allocator.dupe(u8, "zig") catch unreachable,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+    }
+
+    fn emptyBranch(allocator: std.mem.Allocator, name: []const u8) ast.Branch {
+        return ast.Branch{
+            .name = allocator.dupe(u8, name) catch unreachable,
+            .payload = ast.Shape{ .fields = &.{} },
+            .kind = .terminal,
+            .annotations = &.{},
+        };
+    }
+
+    fn identityBranch(allocator: std.mem.Allocator, name: []const u8, t: []const u8, phantom: ?[]const u8) ast.Branch {
+        const f = allocator.alloc(ast.Field, 1) catch unreachable;
+        f[0] = ast.Field{
+            .name = allocator.dupe(u8, "__type_ref") catch unreachable,
+            .type = allocator.dupe(u8, t) catch unreachable,
+            .phantom = if (phantom) |p| allocator.dupe(u8, p) catch unreachable else null,
+        };
+        return ast.Branch{
+            .name = allocator.dupe(u8, name) catch unreachable,
+            .payload = ast.Shape{ .fields = f },
+            .kind = .terminal,
+            .annotations = &.{},
+        };
+    }
+
+    // Is `name` a channel declared by a transform already run — the marker is
+    // the whole answer (the live-decl scan exists only for the diagnostic).
+    fn declared(prog: *const ast.Program, alloc: std.mem.Allocator, name: []const u8) bool {
+        return markerExists(prog, declMarker(alloc, name));
+    }
+
+    // The ring is module surface, not a call site: nothing in the program
+    // INVOKES `std/rings:enqueue`, so dead-strip retires rings' tors, the
+    // emit walk finds `std.rings` empty, and `koru_std.koru_rings` never
+    // lands — while the generated inline_code references `MpmcRing`. The fix
+    // is not an import (appended import_decls never reach the pipeline); it
+    // is an ANCHOR: a [retain] event spliced into the rings module_decl keeps
+    // the module emittable, and emission carries the host surface with it.
+    // Idempotent — a second channel in the same program sees the anchor.
+    fn anchorModule(allocator: std.mem.Allocator, prog: *const ast.Program, module_name: []const u8, flow: *const ast.Flow) void {
+        const W = struct {
+            fn find(its: []const ast.Item, want: []const u8) ?*const ast.ModuleDecl {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .module_decl => |*md| {
+                            if (std.mem.eql(u8, md.logical_name, want)) return md;
+                            if (find(md.items, want)) |hit| return hit;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            }
+        };
+        const mod = W.find(prog.items, module_name) orelse return;
+        for (mod.items) |*pi| {
+            if (pi.* == .event_decl) {
+                const ed = &pi.event_decl;
+                if (ed.path.segments.len == 1 and std.mem.eql(u8, ed.path.segments[0], "__channel_anchor")) return;
+            }
+        }
+        const retain_ann = blk_ra: {
+            const anns = allocator.alloc([]const u8, 1) catch unreachable;
+            anns[0] = allocator.dupe(u8, "retain") catch unreachable;
+            break :blk_ra anns;
+        };
+        const anchor = ast.Item{ .event_decl = ast.EventDecl{
+            .path = mkPath(allocator, module_name, "__channel_anchor"),
+            .input = ast.Shape{ .fields = &.{} },
+            .branches = &[_]ast.Branch{},
+            .is_public = false,
+            .is_implicit_flow = false,
+            .annotations = retain_ann,
+            .location = flow.location,
+            .module = allocator.dupe(u8, module_name) catch unreachable,
+        } };
+        const grown = allocator.alloc(ast.Item, mod.items.len + 1) catch unreachable;
+        @memcpy(grown[0..mod.items.len], mod.items);
+        grown[mod.items.len] = anchor;
+        @constCast(mod).items = grown;
+    }
+
+    // The join items naming `name`: untransformed `std/channel:consume`
+    // flows — `default`'s [pre] rewrite already ran, so every
+    // `std/channel(name) ! ...` in the program reads as one of these,
+    // wherever it sits in document order.
+    fn consumeFlows(alloc: std.mem.Allocator, prog: *const ast.Program, name: []const u8) []const *const ast.Flow {
+        var out = std.ArrayList(*const ast.Flow).initCapacity(alloc, 4) catch unreachable;
+        const W = struct {
+            fn scan(its: []const ast.Item, want: []const u8, out_: *std.ArrayList(*const ast.Flow), al: std.mem.Allocator) void {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .flow => |*f| {
+                            if (f.body.node) |*n| {
+                                if (n.* == .invocation) {
+                                    const inv = &n.invocation;
+                                    if (CHM.isChannelInv(inv, "consume") and declSubject(inv, want)) {
+                                        out_.append(al, f) catch unreachable;
+                                    }
+                                }
+                            }
+                        },
+                        .module_decl => |*md| scan(md.items, want, out_, al),
+                        else => {},
+                    }
+                }
+            }
+        };
+        W.scan(prog.items, name, &out, alloc);
+        return out.toOwnedSlice(alloc) catch unreachable;
+    }
+};
+
+// ============================================================================
+// CHANNEL.NEW — `std/channel:new(<name>, capacity: N) { kind: Proto, ... }`:
+// declare the channel, then collect every `consume` join in the program and
+// splice its `!` arms into the generated drain.
+// ============================================================================
+
+~[keyword|comptime|transform]pub tor new {
+    expr: Expression,
+    source: ?Source,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc new|zig {
+    if (item.* != .flow) @panic("channel:new transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+    const struct_literal = @import("struct_literal");
+
+    if (std.mem.eql(u8, CompilerEnv.lang, "js")) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel: channels are a native-runtime construct this rung — the Vyukov ring and its atomics have no JS lowering yet", .{}) } };
+    }
+
+    if (invocation != flow.inv()) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new: a channel declaration is a top-level item", .{}) } };
+    }
+
+    // ---- Args: `expr` carries the name, `capacity:` is named, the `{ }`
+    // body arrives as a source_value. Positional tails are refused by the
+    // pun law before we run; anything else unknown is named here. ----
+    var chan_name: []const u8 = "";
+    var cap_text: ?[]const u8 = null;
+    var body_text: ?[]const u8 = null;
+    for (invocation.args) |a| {
+        if (a.source_value) |sv| {
+            body_text = sv.text;
+            continue;
+        }
+        const an = std.mem.trim(u8, a.name, " \t");
+        if (std.mem.eql(u8, an, "expr")) {
+            chan_name = CH.stripQuotes(std.mem.trim(u8, a.value, " \t"));
+            continue;
+        }
+        if (std.mem.eql(u8, an, "capacity")) {
+            cap_text = std.mem.trim(u8, a.value, " \t");
+            continue;
+        }
+        if (a.expression_value == null and std.mem.eql(u8, an, std.mem.trim(u8, a.value, " \t"))) {
+            // A bare positional: the name if it leads, else a stray tail.
+            if (chan_name.len == 0) {
+                chan_name = CH.stripQuotes(an);
+                continue;
+            }
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): '{s}' is a bare positional — capacity is named: `capacity: N`", .{ chan_name, an }) } };
+        }
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new: unknown argument '{s}' — the head is `std/channel:new(name, capacity: N) {{ kind: Proto }}`", .{an}) } };
+    }
+    if (chan_name.len == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new needs the channel name — `std/channel:new(inbox, capacity: N) {{ kind: Proto }}`", .{}) } };
+    }
+
+    // ---- Arms on the DECL itself are refused — consumers attach at the
+    // bare-reference join `std/channel(name) ! <kind> ...` so the consumer
+    // set has one place to be read. The `std/channel:new(<name>):` prefix is
+    // load-bearing: declarationRefused silences downstream sites on it. ----
+    for (flow.body.continuations) |*c| {
+        const cb = std.mem.trim(u8, c.branch, " ");
+        if (cb.len == 0) continue;
+        if (c.kind == .effect) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): `! {s}` attaches at the join, not the declaration — `std/channel({s}) ! {s} v |> ...` collects consumers program-wide", .{ chan_name, cb, chan_name, cb }) } };
+        }
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): `| {s}` doesn't parse on a declaration — the declaration takes only the branch-table body; consumers are `!` arms on `std/channel({s})`", .{ chan_name, cb, chan_name }) } };
+    }
+    if (!CH.identOk(chan_name)) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new: the channel name '{s}' is not usable — it must be an identifier (a-z, A-Z, 0-9, '_', '-'; no leading digit)", .{chan_name}) } };
+    }
+    if (CH.markerExists(program, CH.declMarker(allocator, chan_name))) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): a channel named '{s}' already exists — one declaration per name", .{ chan_name, chan_name }) } };
+    }
+
+    const cap_raw = cap_text orelse {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): a channel is sized at the declaration — `capacity: N`, a power of two above zero", .{chan_name}) } };
+    };
+    const capacity = std.fmt.parseInt(usize, cap_raw, 10) catch {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): capacity '{s}' is not a comptime integer — the ring is sized at the declaration", .{ chan_name, cap_raw }) } };
+    };
+    if (capacity == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): capacity 0 is rendezvous — a send whose ok fires on the consumer's take — and that spelling is deferred (docs/CHANNEL.md). Buffered channels take a power of two above zero", .{chan_name}) } };
+    }
+    if (capacity & (capacity - 1) != 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): capacity {d} is not a power of two — the Vyukov ring masks by cap-1", .{ chan_name, capacity }) } };
+    }
+
+    // ---- The branch table: `{ kind: Proto, ... }` — the channel's arm
+    // vocabulary. Each name is an arm word; each proto is the payload type. ----
+    const raw_body = body_text orelse {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): a channel declares its vocabulary — `std/channel:new({s}, capacity: {d}) {{ reading: Reading }}`", .{ chan_name, chan_name, capacity }) } };
+    };
+    const body_norm = if (std.mem.indexOfScalar(u8, raw_body, '{') == null)
+        std.fmt.allocPrint(allocator, "{{ {s} }}", .{raw_body}) catch unreachable
+    else
+        raw_body;
+    const table = struct_literal.parseFields(allocator, body_norm) catch |err| {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): {s}", .{ chan_name, struct_literal.describeErrorIn(allocator, err, body_norm) }) } };
+    };
+    if (table.len == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): the branch table is empty — a channel needs at least one message kind (`{{ reading: Reading }}`)", .{chan_name}) } };
+    }
+
+    var kinds = std.ArrayList(CH.KindEntry).initCapacity(allocator, table.len) catch unreachable;
+    for (table) |f| {
+        const kname = std.mem.trim(u8, f.name, " \t");
+        const kproto = CH.stripQuotes(std.mem.trim(u8, f.value, " \t"));
+        if (kname.len == 0 or kproto.len == 0) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): each entry is `kind: Proto` — the arm word and the payload type it carries", .{chan_name}) } };
+        }
+        if (!CH.identOk(kname)) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): '{s}' is not usable as an arm word — it must be an identifier", .{ chan_name, kname }) } };
+        }
+        if (std.mem.eql(u8, kname, "closed")) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): `closed` is channel state, not a message kind — the `! closed` arm is the close transition; pick another word", .{chan_name}) } };
+        }
+        for (kinds.items) |k| {
+            if (std.mem.eql(u8, k.name, kname)) {
+                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): kind '{s}' is declared twice — the vocabulary takes each name once", .{ chan_name, kname }) } };
+            }
+        }
+        // The proto must be in the registry — the ring's element layout is
+        // derived from its fields.
+        _ = CL.protoFields(allocator, program, kproto) orelse {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): '{s}' names no proto entry — the payload type is a registry name (std/proto({s}) {{ ... }})", .{ chan_name, kproto, kproto }) } };
+        };
+        kinds.append(allocator, .{ .name = kname, .proto = kproto }) catch unreachable;
+    }
+
+    // ---- Custody scan — which kinds transit obligations? Lives in
+    // channel.custody.kz (CC); a conflict comes back as a ready refusal. ----
+    const custody = switch (CC.scanCustody(allocator, program, reporter, flow, chan_name, kinds.items)) {
+        .ok => |c| c,
+        .refuse => |r| return .{ .transformed = .{ .replacement = r } },
+    };
+
+    // Composite custody (699_031): a kind whose proto declares owned leaves
+    // (`r1: *mod:Type<state!>`) transits one obligation per leaf — no send-
+    // site scan needed, the debt lives in the registered shape itself.
+    const kind_leaves = allocator.alloc([]const CL.OwnedLeaf, kinds.items.len) catch unreachable;
+    for (kinds.items, 0..) |k, ki| {
+        kind_leaves[ki] = CL.ownedLeavesOf(allocator, program, k.proto);
+    }
+
+    // ---- Collect the program-wide joins: every `std/channel:consume(<name>)`
+    // flow's `!` arms, validated against the vocabulary. The [pre] rewrite
+    // already ran, so position never hides one. ----
+    var kind_arms = std.ArrayList(CH.Arm).initCapacity(allocator, 8) catch unreachable;
+    var closed_arms = std.ArrayList(CH.Arm).initCapacity(allocator, 2) catch unreachable;
+    for (CH.consumeFlows(allocator, program, chan_name)) |cf| {
+        for (cf.body.continuations) |*c| {
+            const cb = std.mem.trim(u8, c.branch, " ");
+            if (cb.len == 0) continue;
+            if (c.kind != .effect) continue; // `|` arms were refused at the [pre] rewrite
+            // `=>`/`->` in a consumer arm is uncrossable — the arm mints into a drained void unit.
+            if (ast.refuseUncrossable(allocator, reporter, "channel", chan_name, cb, c, cf.module)) |r| return .{ .transformed = r };
+            if (std.mem.eql(u8, cb, "closed")) {
+                closed_arms.append(allocator, .{ .kind = "closed", .cont = c, .at = cf }) catch unreachable;
+                continue;
+            }
+            var found = false;
+            for (kinds.items) |k| {
+                if (std.mem.eql(u8, k.name, cb)) found = true;
+            }
+            if (!found) {
+                var vocab = std.ArrayList(u8).initCapacity(allocator, 32) catch unreachable;
+                for (kinds.items, 0..) |k, i| {
+                    if (i > 0) vocab.appendSlice(allocator, ", ") catch unreachable;
+                    vocab.appendSlice(allocator, k.name) catch unreachable;
+                }
+                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, cf.location, cf.module, "std/channel:new({s}): join arm `! {s}` names no kind — {s} carries {s} (and `closed`)", .{ chan_name, cb, chan_name, vocab.items }) } };
+            }
+            if (c.binding == null) {
+                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, cf.location, cf.module, "std/channel:new({s}): join arm `! {s}` binds the message — spell it `! {s} v |> <body>`", .{ chan_name, cb, cb }) } };
+            }
+            if (c.node == null) {
+                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, cf.location, cf.module, "std/channel:new({s}): join arm `! {s} {s}` needs a body (`|> <call>({s})`)", .{ chan_name, cb, c.binding.?, c.binding.? }) } };
+            }
+            if (c.node.? != .invocation and c.node.? != .inline_code) {
+                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, cf.location, cf.module, "std/channel:new({s}): join arm `! {s}` needs a call body — it runs at the delivery point, where a bare `.branch` has no flow to answer", .{ chan_name, cb }) } };
+            }
+            kind_arms.append(allocator, .{ .kind = cb, .cont = c, .at = cf }) catch unreachable;
+        }
+    }
+    for (closed_arms.items) |ca| {
+        if (ca.cont.binding != null) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, ca.at.location, ca.at.module, "std/channel:new({s}): join arm `! closed` binds nothing — the arm fires on the close transition, there is no value to name", .{chan_name}) } };
+        }
+        if (ca.cont.node == null) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, ca.at.location, ca.at.module, "std/channel:new({s}): join arm `! closed` needs a body (`|> <call>`)", .{chan_name}) } };
+        }
+        if (ca.cont.node.? != .invocation and ca.cont.node.? != .inline_code) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, ca.at.location, ca.at.module, "std/channel:new({s}): join arm `! closed` needs a call body — it runs at the close transition", .{chan_name}) } };
+        }
+    }
+
+    var appended = std.ArrayList(ast.Item).initCapacity(allocator, 16) catch unreachable;
+
+    // ---- The decl marker carries the vocabulary so chain steps validate
+    // kinds without re-reading this item. ----
+    {
+        var mb = std.ArrayList(u8).initCapacity(allocator, 64 + kinds.items.len * 24) catch unreachable;
+        mb.appendSlice(allocator, std.fmt.allocPrint(allocator, "__channel_decl_{s} vocab=", .{chan_name}) catch unreachable) catch unreachable;
+        for (kinds.items, 0..) |k, i| {
+            if (i > 0) mb.appendSlice(allocator, ",") catch unreachable;
+            mb.appendSlice(allocator, std.fmt.allocPrint(allocator, "{s}:{s}", .{ k.name, k.proto }) catch unreachable) catch unreachable;
+        }
+        mb.appendSlice(allocator, std.fmt.allocPrint(allocator, " cap={d}", .{capacity}) catch unreachable) catch unreachable;
+        appended.append(allocator, CH.markerItem(allocator, flow, mb.items)) catch unreachable;
+    }
+    CH.anchorModule(allocator, program, "std.rings", flow);
+
+    // ---- Proto layouts + per-kind ring cells + the close bit ----
+    {
+        var sb = std.ArrayList(u8).initCapacity(allocator, 256) catch unreachable;
+        for (kinds.items) |k| {
+            if (CH.structAlreadyEmitted(allocator, program, k.proto)) continue;
+            const fields = CL.protoFields(allocator, program, k.proto).?;
+            sb.appendSlice(allocator, "pub const ") catch unreachable;
+            sb.appendSlice(allocator, k.proto) catch unreachable;
+            sb.appendSlice(allocator, " = struct {\n") catch unreachable;
+            for (fields) |p| {
+                sb.appendSlice(allocator, std.fmt.allocPrint(allocator, "    {s}: {s},\n", .{ p.name, CL.zigFieldType(allocator, p.ftype) }) catch unreachable) catch unreachable;
+            }
+            sb.appendSlice(allocator, "};\n") catch unreachable;
+        }
+        for (kinds.items) |k| {
+            sb.appendSlice(allocator, std.fmt.allocPrint(allocator,
+                "const __KoruChanT_{s}_{s} = koru_std.koru_rings.MpmcRing({s}, {d});\nvar __koru_chan_{s}_{s}_ring: __KoruChanT_{s}_{s} = __KoruChanT_{s}_{s}.init();\n",
+                .{ chan_name, k.name, k.proto, capacity, chan_name, k.name, chan_name, k.name, chan_name, k.name },
+            ) catch unreachable) catch unreachable;
+        }
+        sb.appendSlice(allocator, std.fmt.allocPrint(allocator,
+            "var __koru_chan_{s}_closed = @import(\"std\").atomic.Value(bool).init(false);\n",
+            .{chan_name},
+        ) catch unreachable) catch unreachable;
+        appended.append(allocator, ast.Item{ .inline_code = ast.InlineCode{
+            .code = sb.toOwnedSlice(allocator) catch unreachable,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+    }
+
+    const closed_flag = std.fmt.allocPrint(allocator, "__koru_chan_{s}_closed", .{chan_name}) catch unreachable;
+
+    // ---- `__channel_send_<n>_<kind>` { value: Proto } | ok | full | closed ----
+    for (kinds.items) |k| {
+        const in = allocator.alloc(ast.Field, 1) catch unreachable;
+        in[0] = ast.Field{
+            .name = allocator.dupe(u8, "value") catch unreachable,
+            .type = allocator.dupe(u8, k.proto) catch unreachable,
+            .phantom = "*",
+        };
+        const brs = allocator.alloc(ast.Branch, 3) catch unreachable;
+        brs[0] = CH.emptyBranch(allocator, "ok");
+        brs[1] = CH.emptyBranch(allocator, "full");
+        brs[2] = CH.emptyBranch(allocator, "closed");
+        const ring = std.fmt.allocPrint(allocator, "__koru_chan_{s}_{s}_ring", .{ chan_name, k.name }) catch unreachable;
+        const body = std.fmt.allocPrint(allocator,
+            "if ({s}.load(.acquire)) return .closed;\nif ({s}.tryEnqueue(value)) return .ok;\nreturn .full;",
+            .{ closed_flag, ring },
+        ) catch unreachable;
+        CH.synthOp(allocator, program, flow, std.fmt.allocPrint(allocator, "__channel_send_{s}_{s}", .{ chan_name, k.name }) catch unreachable, in, brs, null, null, body, &appended);
+    }
+
+    // ---- Custody transit ops per custodial kind (channel.transit.kz):
+    // `take` consumes under `| ok`; `obligate` mints at the consumer arm. ----
+    CT.emitCustodyOps(allocator, program, flow, chan_name, kinds.items, custody, kind_leaves, &appended);
+
+    // ---- `__channel_recv_<n>` {} | some Proto | none | closed — the
+    // imperative take; single-kind only (a multi-kind channel can't spell
+    // one payload type — consume by `!` arms). ----
+    if (kinds.items.len == 1) {
+        const k = kinds.items[0];
+        const brs = allocator.alloc(ast.Branch, 3) catch unreachable;
+        const some_phantom = if (custody[0]) |st|
+            std.fmt.allocPrint(allocator, "{s}!", .{st}) catch unreachable
+        else
+            null;
+        brs[0] = CH.identityBranch(allocator, "some", k.proto, some_phantom);
+        brs[1] = CH.emptyBranch(allocator, "none");
+        brs[2] = CH.emptyBranch(allocator, "closed");
+        const ring = std.fmt.allocPrint(allocator, "__koru_chan_{s}_{s}_ring", .{ chan_name, k.name }) catch unreachable;
+        const body = std.fmt.allocPrint(allocator,
+            "if ({s}.tryDequeue()) |__v| return .{{ .some = __v }};\nif ({s}.load(.acquire)) return .closed;\nreturn .none;",
+            .{ ring, closed_flag },
+        ) catch unreachable;
+        CH.synthOp(allocator, program, flow, std.fmt.allocPrint(allocator, "__channel_recv_{s}", .{chan_name}) catch unreachable, &.{}, brs, null, null, body, &appended);
+    }
+
+    // ---- `__channel_close_<n>` {} | ok — sets the bit, then fires every
+    // `! closed` unit in join order. The transition point is the call. ----
+    {
+        const brs = allocator.alloc(ast.Branch, 1) catch unreachable;
+        brs[0] = CH.emptyBranch(allocator, "ok");
+        var cb = std.ArrayList(u8).initCapacity(allocator, 64 + closed_arms.items.len * 96) catch unreachable;
+        cb.appendSlice(allocator, std.fmt.allocPrint(allocator, "{s}.store(true, .release);\n", .{closed_flag}) catch unreachable) catch unreachable;
+        for (closed_arms.items, 0..) |_, ci| {
+            cb.appendSlice(allocator, std.fmt.allocPrint(allocator, "__channel_{s}_closed_{d}_event.handler(.{{}});\n", .{ chan_name, ci }) catch unreachable) catch unreachable;
+        }
+        cb.appendSlice(allocator, "return .ok;") catch unreachable;
+        CH.synthOp(allocator, program, flow, std.fmt.allocPrint(allocator, "__channel_close_{s}", .{chan_name}) catch unreachable, &.{}, brs, null, null, cb.toOwnedSlice(allocator) catch unreachable, &appended);
+    }
+
+    // ---- The `!` arms as generated units — kind arms carry the message,
+    // closed arms carry nothing. Custodial units mint the obligation at the
+    // arm head (channel.transit.kz). ----
+    CU.emitConsumerUnits(allocator, &appended, program, flow, chan_name, kind_arms.items, closed_arms.items, kinds.items, custody, kind_leaves);
+
+    // ---- The pump verbs: `<n>-step` / `<n>-live` / `<n>-wait` ----
+    {
+        var sb = std.ArrayList(u8).initCapacity(allocator, 128 + kind_arms.items.len * 160) catch unreachable;
+        if (kind_arms.items.len == 0) {
+            sb.appendSlice(allocator, "const __moved: i32 = 0;\n") catch unreachable;
+        } else {
+            sb.appendSlice(allocator, "var __moved: i32 = 0;\n") catch unreachable;
+        }
+        // Competing drain: for each kind, each of that kind's units attempts
+        // one dequeue in join order — first pop wins the value.
+        for (kind_arms.items, 0..) |arm, ai| {
+            const ring = std.fmt.allocPrint(allocator, "__koru_chan_{s}_{s}_ring", .{ chan_name, arm.kind }) catch unreachable;
+            const field_name = CT.stepFieldName(kinds.items, custody, kind_leaves, arm.kind, arm.cont.binding.?);
+            sb.appendSlice(allocator, std.fmt.allocPrint(allocator,
+                "if ({s}.tryDequeue()) |__v| {{\n    __channel_{s}_{s}_{d}_event.handler(.{{ .{s} = __v }});\n    __moved += 1;\n}}\n",
+                .{ ring, chan_name, arm.kind, ai, field_name },
+            ) catch unreachable) catch unreachable;
+        }
+        sb.appendSlice(allocator, "return __moved;") catch unreachable;
+        CH.synthOp(allocator, program, flow, std.fmt.allocPrint(allocator, "{s}-step", .{chan_name}) catch unreachable, &.{}, &.{}, "i32", null, sb.toOwnedSlice(allocator) catch unreachable, &appended);
+    }
+    {
+        var sb = std.ArrayList(u8).initCapacity(allocator, 96 + kinds.items.len * 80) catch unreachable;
+        sb.appendSlice(allocator, std.fmt.allocPrint(allocator, "const __closed = {s}.load(.acquire);\n", .{closed_flag}) catch unreachable) catch unreachable;
+        for (kinds.items, 0..) |k, i| {
+            const ring = std.fmt.allocPrint(allocator, "__koru_chan_{s}_{s}_ring", .{ chan_name, k.name }) catch unreachable;
+            sb.appendSlice(allocator, std.fmt.allocPrint(allocator,
+                "const __drained_{d} = {s}.tail.load(.acquire) == {s}.head.load(.acquire);\n",
+                .{ i, ring, ring },
+            ) catch unreachable) catch unreachable;
+        }
+        sb.appendSlice(allocator, "return if (__closed") catch unreachable;
+        for (kinds.items, 0..) |_, i| {
+            sb.appendSlice(allocator, std.fmt.allocPrint(allocator, " and __drained_{d}", .{i}) catch unreachable) catch unreachable;
+        }
+        sb.appendSlice(allocator, ") 0 else 1;") catch unreachable;
+        CH.synthOp(allocator, program, flow, std.fmt.allocPrint(allocator, "{s}-live", .{chan_name}) catch unreachable, &.{}, &.{}, "i64", null, sb.toOwnedSlice(allocator) catch unreachable, &appended);
+    }
+    {
+        const wf = allocator.alloc(ast.Field, 1) catch unreachable;
+        wf[0] = ast.Field{
+            .name = allocator.dupe(u8, "i") catch unreachable,
+            .type = allocator.dupe(u8, "i64") catch unreachable,
+            .phantom = null,
+        };
+        CH.synthOp(allocator, program, flow, std.fmt.allocPrint(allocator, "{s}-wait", .{chan_name}) catch unreachable, wf, &.{}, "i128", null, "_ = i;\nreturn 1_000_000;", &appended);
+    }
+
+    const marker = std.fmt.allocPrint(allocator, "// std/channel: '{s}' declared ({d} kinds, cap {d}; {d} consumers, {d} close arms)", .{ chan_name, kinds.items.len, capacity, kind_arms.items.len, closed_arms.items.len }) catch unreachable;
+    return .{ .transformed = .{ .replacement = ast.Item{ .host_line = ast.HostLine{
+        .content = marker,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } }, .appended = appended.toOwnedSlice(allocator) catch unreachable } };
+}
+
+// ============================================================================
+// CHANNEL.DEFAULT — the bare-reference join `std/channel(<name>) ! arms`.
+// A [pre]-phase rewrite to the internal `consume` verb — the store
+// `default`→`watch` pattern — so `new` collects every join program-wide
+// before the main phase runs.
+// ============================================================================
+
+~[keyword|comptime|transform|pre]pub tor default {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc default|zig {
+
+    if (item.* != .flow) @panic("channel:default transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    // A bare `std/channel(name)` nested mid-flow is not a join site — the
+    // rewrite replaces the whole item, so nested placement would clobber
+    // the enclosing chain. Wall it rather than guess.
+    if (invocation != flow.inv()) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel: the bare reference is the consumer join — it is a top-level item, not a mid-chain step; consumers attach as `std/channel(name) ! <kind> v |> ...`", .{}) } };
+    }
+
+    if (invocation.args.len == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel(name): the join needs the channel name", .{}) } };
+    }
+    const chan_name = invocation.args[0].value;
+    if (invocation.args.len > 1) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel({s}): the join takes only the name — vocabulary and capacity live on `std/channel:new`", .{chan_name}) } };
+    }
+
+    // `|` arms don't parse on a join — consumers are `!` arms.
+    for (flow.body.continuations) |*c| {
+        const cb = std.mem.trim(u8, c.branch, " ");
+        if (cb.len == 0) continue;
+        if (c.kind != .effect) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel({s}): `| {s}` doesn't parse on the join — consumers are `! <kind> <bind> |> ...` arms; the chain steps (`std/channel:send/recv/close`) carry the `|` branches", .{ chan_name, cb }) } };
+        }
+    }
+
+    // Rename the invocation default → consume, carrying the channel name as
+    // `expr` and the same `!` arm continuations.
+    const segs = allocator.alloc([]const u8, 1) catch unreachable;
+    segs[0] = allocator.dupe(u8, "consume") catch unreachable;
+    const consume_args = allocator.alloc(ast.Arg, 1) catch unreachable;
+    consume_args[0] = ast.Arg{ .name = allocator.dupe(u8, "expr") catch unreachable, .value = allocator.dupe(u8, chan_name) catch unreachable };
+    const consume_inv = ast.Invocation{
+        .path = ast.DottedPath{ .module_qualifier = allocator.dupe(u8, "std.channel") catch unreachable, .segments = segs },
+        .args = consume_args,
+    };
+    const conts = allocator.alloc(ast.Continuation, flow.body.continuations.len) catch unreachable;
+    for (flow.body.continuations, 0..) |*c, i| {
+        conts[i] = ast_functional.cloneContinuation(allocator, c) catch unreachable;
+    }
+    return .{ .transformed = .{ .replacement = ast.Item{ .flow = ast.Flow{
+        .body = ast.rootSite(consume_inv, conts, flow.location),
+        .pre_label = null,
+        .impl_of = flow.impl_of,
+        .super_shape = null,
+        .inline_body = null,
+        .preamble_code = invocation.preamble_code,
+        .is_pure = false,
+        .is_transitively_pure = false,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } } } };
+}
+
+// ============================================================================
+// CHANNEL.CONSUME — the join site's own transform (internal verb; also the
+// literal spelling). By the time this fires on a well-formed program, `new`
+// has already collected the arms — the site self-erases. Firing with the
+// decl still untransformed means the join precedes it (rung-one ordering);
+// no decl anywhere is a plain unknown-channel diagnostic.
+// ============================================================================
+
+~[keyword|comptime|transform]pub tor consume {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc consume|zig {
+    if (item.* != .flow) @panic("channel:consume transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    var chan_name: []const u8 = "";
+    for (invocation.args) |arg| {
+        if (arg.source_value != null) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:consume: a {{ }} block has no meaning on the join — the vocabulary lives on `std/channel:new`", .{}) } };
+        }
+        if (std.mem.eql(u8, arg.name, "expr") or !CH.isLabelled(arg)) {
+            if (chan_name.len == 0) chan_name = CH.stripQuotes(arg.value);
+        }
+    }
+    if (chan_name.len == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:consume requires a channel name: consume(name)", .{}) } };
+    }
+
+    // ------------------------------------------------------------------
+    // TRANSPLANT PURITY — the store-watch rule (690_006), same reason: a
+    // consumer arm executes at the channel's DELIVERY points, not at its
+    // lexical position. Free names must be the arm's own bindings or
+    // comptime-known names (stores, channels; qualified calls live in node
+    // paths, not arg text).
+    // ------------------------------------------------------------------
+    const Purity = struct {
+        const Ctx = struct {
+            scope: *std.ArrayList([]const u8),
+            allocator: std.mem.Allocator,
+            names: []const []const u8,
+            violation: ?[]const u8 = null,
+        };
+        fn isIdentStart(ch: u8) bool {
+            return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or ch == '_';
+        }
+        fn isIdent(ch: u8) bool {
+            return isIdentStart(ch) or (ch >= '0' and ch <= '9') or ch == '-';
+        }
+        fn rootAllowed(ctx: *const Ctx, root: []const u8) bool {
+            if (std.mem.startsWith(u8, root, "__koru_")) return true;
+            const keywords = [_][]const u8{ "and", "or", "not", "true", "false", "_" };
+            for (keywords) |k| if (std.mem.eql(u8, root, k)) return true;
+            for (ctx.scope.items) |a| if (std.mem.eql(u8, root, a)) return true;
+            for (ctx.names) |s| if (std.mem.eql(u8, root, s)) return true;
+            return false;
+        }
+        fn scanText(ctx: *Ctx, text: []const u8) void {
+            var i: usize = 0;
+            var in_str = false;
+            var in_hole = false;
+            var hole_past_colon = false;
+            while (i < text.len) {
+                const c = text[i];
+                if (!in_str) {
+                    if (c == '"') {
+                        in_str = true;
+                        i += 1;
+                        continue;
+                    }
+                    if (isIdentStart(c)) {
+                        i = checkIdent(ctx, text, i);
+                        if (ctx.violation != null) return;
+                        continue;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if (in_hole) {
+                    if (i + 1 < text.len and text[i] == '}' and text[i + 1] == '}') {
+                        in_hole = false;
+                        hole_past_colon = false;
+                        i += 2;
+                        continue;
+                    }
+                    if (c == ':') {
+                        hole_past_colon = true;
+                        i += 1;
+                        continue;
+                    }
+                    if (!hole_past_colon and isIdentStart(c)) {
+                        i = checkIdent(ctx, text, i);
+                        if (ctx.violation != null) return;
+                        continue;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if (i + 1 < text.len and text[i] == '{' and text[i + 1] == '{') {
+                    in_hole = true;
+                    i += 2;
+                    continue;
+                }
+                if (c == '"') in_str = false;
+                i += 1;
+            }
+        }
+        fn checkIdent(ctx: *Ctx, text: []const u8, start: usize) usize {
+            var j = start;
+            while (j < text.len and isIdent(text[j])) j += 1;
+            const root = text[start..j];
+            while (j + 1 < text.len and text[j] == '.' and isIdentStart(text[j + 1])) {
+                j += 1;
+                while (j < text.len and isIdent(text[j])) j += 1;
+            }
+            if (!rootAllowed(ctx, root)) ctx.violation = root;
+            return j;
+        }
+        fn scanCont(ctx: *Ctx, cont: *const ast.Continuation) void {
+            if (ctx.violation != null) return;
+            const base = ctx.scope.items.len;
+            if (cont.binding) |b| ctx.scope.append(ctx.allocator, b) catch unreachable;
+            for (cont.destructure) |df| ctx.scope.append(ctx.allocator, df.name) catch unreachable;
+
+            if (cont.condition) |cond| scanText(ctx, cond);
+            if (cont.node) |n| {
+                switch (n) {
+                    .invocation => |inv| {
+                        for (inv.args) |a| {
+                            scanText(ctx, a.value);
+                            if (a.expression_value) |ev| scanText(ctx, ev.text);
+                            if (a.source_value) |sv| scanText(ctx, sv.text);
+                            if (ctx.violation != null) break;
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            if (ctx.violation == null) {
+                if (cont.node) |n| switch (n) {
+                    .invocation => |inv| {
+                        if (inv.return_binding) |rb| ctx.scope.append(ctx.allocator, rb) catch unreachable;
+                        for (inv.return_destructure) |df| ctx.scope.append(ctx.allocator, df.name) catch unreachable;
+                    },
+                    else => {},
+                };
+                for (cont.continuations) |*c| scanCont(ctx, c);
+            }
+
+            ctx.scope.shrinkRetainingCapacity(base);
+        }
+    };
+
+    // Comptime-known names a consumer body may reference: every store and
+    // every declared channel.
+    var known_names = std.ArrayList([]const u8).initCapacity(allocator, 8) catch unreachable;
+    for (CH.storeHomes(allocator, program)) |s| known_names.append(allocator, s) catch unreachable;
+    {
+        const W = struct {
+            fn scan(its: []const ast.Item, out: *std.ArrayList([]const u8), al: std.mem.Allocator) void {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .flow => |*f| {
+                            if (f.body.node) |*n| {
+                                if (n.* == .invocation and CHM.isChannelInv(&n.invocation, "new")) {
+                                    for (n.invocation.args) |a| {
+                                        if (std.mem.eql(u8, a.name, "expr")) out.append(al, CH.stripQuotes(a.value)) catch unreachable;
+                                    }
+                                }
+                            }
+                        },
+                        .host_line => |*hl| {
+                            // `// __channel_decl_<name> vocab=...`
+                            var at: usize = 0;
+                            while (std.mem.indexOfPos(u8, hl.content, at, "__channel_decl_")) |p| {
+                                const start = p + "__channel_decl_".len;
+                                var end = start;
+                                while (end < hl.content.len) : (end += 1) {
+                                    const ch = hl.content[end];
+                                    const ident_char = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+                                        (ch >= '0' and ch <= '9') or ch == '_' or ch == '-';
+                                    if (!ident_char) break;
+                                }
+                                if (end > start) out.append(al, hl.content[start..end]) catch unreachable;
+                                at = end;
+                            }
+                        },
+                        .module_decl => |*md| scan(md.items, out, al),
+                        else => {},
+                    }
+                }
+            }
+        };
+        W.scan(program.items, &known_names, allocator);
+    }
+
+    for (flow.body.continuations) |*wc| {
+        var scope = std.ArrayList([]const u8).initCapacity(allocator, 8) catch unreachable;
+        var pctx = Purity.Ctx{ .scope = &scope, .allocator = allocator, .names = known_names.items };
+        Purity.scanCont(&pctx, wc);
+        if (pctx.violation) |name| {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel: consumer body references '{s}', runtime state of the enclosing flow — a `!` arm executes at '{s}'s delivery points, not here; bind it through a store or send on a channel", .{ name, chan_name }) } };
+        }
+    }
+
+    // A join nested mid-flow is walled rather than silently dropped — same
+    // as store:watch's top-level rule.
+    if (invocation != flow.inv()) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel({s}): the consumer join is a top-level item — attach it beside the declaration, not inside a flow", .{chan_name}) } };
+    }
+
+    // Did the coordinator already run? Its decl marker is the proof.
+    if (CH.declared(program, allocator, chan_name)) {
+        const consumed = std.fmt.allocPrint(allocator, "// std/channel: consume({s}) spliced into the drain", .{chan_name}) catch unreachable;
+        return .{ .transformed = .{ .replacement = ast.Item{ .host_line = ast.HostLine{
+            .content = consumed,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } } } };
+    }
+
+    // Not collected: is there an untransformed decl later in the program?
+    if (CH.liveDeclFlow(program, chan_name) != null) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel({s}): the join precedes its channel's declaration in source — declare the channel first (rung-one ordering)", .{chan_name}) } };
+    }
+    // The channel's OWN declaration was already refused; that diagnostic is
+    // the true one and this lookup can only ever fail. Staying silent here
+    // is what keeps one mistake to one error.
+    if (ast.declarationRefused(allocator, program, flow.module, "std/channel:new({s}):", .{chan_name})) return .{ .transformed = .{} };
+    return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel({s}): unknown channel — no std/channel:new({s}) found", .{ chan_name, chan_name }) } };
+}
+
+// ============================================================================
+// Chain steps — `std/channel:send/recv/close(<name>, ...)`. Each rewrites its
+// site into the generated tor the declaration emitted; the site's own `|`
+// continuations ride along untouched.
+// ============================================================================
+
+fn chanStep(
+    allocator: std.mem.Allocator,
+    program: *const ast.Program,
+    flow: *const ast.Flow,
+    invocation: *const ast.Invocation,
+    reporter: anytype,
+    verb: []const u8,
+) ast.SiteResult {
+
+    // Positional args in order: the channel name, then (send only, single
+    // kind) the bare value. Labeled args name a kind: `send(inbox, kind: v)`.
+    var chan_name: []const u8 = "";
+    var bare_value: ?[]const u8 = null;
+    var kind_label: []const u8 = "";
+    var kind_value: []const u8 = "";
+    var extra_labels = std.ArrayList([]const u8).initCapacity(allocator, 2) catch unreachable;
+    for (invocation.args) |a| {
+        if (a.source_value != null) continue;
+        if (CH.isLabelled(a)) {
+            if (kind_label.len == 0) {
+                kind_label = std.mem.trim(u8, a.name, " \t");
+                kind_value = std.mem.trim(u8, a.value, " \t");
+            } else {
+                extra_labels.append(allocator, a.name) catch unreachable;
+            }
+        } else if (chan_name.len == 0) {
+            chan_name = CH.stripQuotes(std.mem.trim(u8, a.value, " \t"));
+        } else if (bare_value == null) {
+            bare_value = std.mem.trim(u8, a.value, " \t");
+        }
+    }
+    if (chan_name.len == 0) {
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:{s} needs the channel name — `std/channel:{s}(<name>)`", .{ verb, verb }) };
+    }
+    if (!CH.declared(program, allocator, chan_name)) {
+        if (CH.liveDeclFlow(program, chan_name) != null) {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:{s}({s}): '{s}' is declared BELOW this step — a channel's declaration precedes its uses in document order", .{ verb, chan_name, chan_name }) };
+        }
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:{s}: no channel named '{s}' — `std/channel:new({s}, capacity: N) {{ kind: Proto }}` declares it", .{ verb, chan_name, chan_name }) };
+    }
+
+    const vocab = CH.vocabOf(allocator, program, chan_name) orelse &[_]CH.KindEntry{};
+    if (vocab.len == 0) {
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:{s}({s}): the declaration ran but its vocabulary marker is unreadable — internal gap, please report", .{ verb, chan_name }) };
+    }
+
+    // The kind this step addresses: recv/close have none; send takes the
+    // `kind: value` label, or the bare value iff the channel is single-kind.
+    var kind: ?CH.KindEntry = null;
+    if (kind_label.len != 0) {
+        for (vocab) |k| {
+            if (std.mem.eql(u8, k.name, kind_label)) kind = k;
+        }
+        if (kind == null) {
+            var vn = std.ArrayList(u8).initCapacity(allocator, 32) catch unreachable;
+            for (vocab, 0..) |k, i| {
+                if (i > 0) vn.appendSlice(allocator, ", ") catch unreachable;
+                vn.appendSlice(allocator, k.name) catch unreachable;
+            }
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:{s}({s}): '{s}' names no kind — {s} carries {s}", .{ verb, chan_name, kind_label, chan_name, vn.items }) };
+        }
+    }
+    if (extra_labels.items.len > 0) {
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:{s}({s}): one message per send — '{s}' is a second kind label", .{ verb, chan_name, extra_labels.items[0] }) };
+    }
+
+    var call_args: []ast.Arg = &.{};
+    var target: []const u8 = "";
+
+    if (std.mem.eql(u8, verb, "send")) {
+        if (kind != null and bare_value != null) {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:send({s}): one message per send — the bare value and `{s}: …` both name one", .{ chan_name, kind_label }) };
+        }
+        var value = bare_value;
+        if (kind == null) {
+            if (vocab.len != 1) {
+                return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:send({s}): a multi-kind channel can't infer the kind — name it: `send({s}, {s}: v)`", .{ chan_name, chan_name, vocab[0].name }) };
+            }
+            kind = vocab[0];
+        }
+        if (value == null and kind_label.len != 0) value = kind_value;
+        if (value == null) {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:send({s}) needs the value — `send({s}, {s}: reading)`", .{ chan_name, chan_name, kind.?.name }) };
+        }
+        const ca = allocator.alloc(ast.Arg, 1) catch unreachable;
+        ca[0] = ast.Arg{
+            .name = allocator.dupe(u8, "value") catch unreachable,
+            .value = allocator.dupe(u8, value.?) catch unreachable,
+            .had_explicit_label = true,
+        };
+        call_args = ca;
+        target = std.fmt.allocPrint(allocator, "__channel_send_{s}_{s}", .{ chan_name, kind.?.name }) catch unreachable;
+    } else if (std.mem.eql(u8, verb, "recv")) {
+        if (vocab.len != 1) {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:recv({s}): recv can't spell one payload type on a multi-kind channel — consume by `!` arms: `std/channel({s}) ! {s} v |> ...`", .{ chan_name, chan_name, vocab[0].name }) };
+        }
+        // A composite kind (owned leaves in the proto) mints one debt PER
+        // PATH at delivery — the mint lives in the `!` arm's obligate step;
+        // `| some v` binds the bare payload with nothing minted, a custody
+        // hole. Refuse recv; arms are the composite spelling.
+        if (CL.ownedLeavesOf(allocator, program, vocab[0].proto).len > 0) {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:recv({s}): kind '{s}' carries owned leaves ('{s}' fields carry obligations) — `| some v` can't mint per-path debts; consume by `!` arms: `std/channel({s}) ! {s} v |> ...`", .{ chan_name, vocab[0].name, vocab[0].proto, chan_name, vocab[0].name }) };
+        }
+        if (kind_label.len != 0 or bare_value != null) {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:recv({s}) takes no value — `recv({s}) | some v |> ...`", .{ chan_name, chan_name }) };
+        }
+        target = std.fmt.allocPrint(allocator, "__channel_recv_{s}", .{chan_name}) catch unreachable;
+    } else {
+        if (kind_label.len != 0 or bare_value != null) {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/channel:close({s}) takes no value — `close({s}) | ok |> ...`", .{ chan_name, chan_name }) };
+        }
+        target = std.fmt.allocPrint(allocator, "__channel_close_{s}", .{chan_name}) catch unreachable;
+    }
+
+    const segs = allocator.alloc([]const u8, 1) catch unreachable;
+    segs[0] = target;
+    const call_inv = ast.Invocation{
+        .path = ast.DottedPath{
+            .module_qualifier = allocator.dupe(u8, CHM.chanHome(allocator, program, chan_name) orelse flow.module) catch unreachable,
+            .segments = segs,
+        },
+        .args = call_args,
+    };
+
+    // CUSTODY TRANSIT (concepts/frag-custody-transit-is-an-edge-contract): a
+    // send of an issued-obligation value moves custody on `| ok` only — the
+    // generated `__channel_take` consumes the binding there; `full`/`closed`
+    // retain it. The consumer-side mint is the declaration's job — `new`
+    // emitted the take/obligate pair when it saw this edge is custodial.
+    var take_node: ?ast.Node = null;
+    if (std.mem.eql(u8, verb, "send")) {
+        var sent_value: ?[]const u8 = null;
+        if (bare_value) |bv| sent_value = bv;
+        if (sent_value == null and kind_label.len != 0) sent_value = kind_value;
+        if (sent_value) |sv| {
+            take_node = CT.takeNode(allocator, program, flow, chan_name, kind.?, sv);
+        }
+    }
+
+    // The site's `|` arms: under a site view `flow.body` IS the holding
+    // continuation, so its continuations are the arms. `holdingCont` covers
+    // the hypothetical of a real containing flow being handed over instead.
+    const site_arms = if (CC.holdingCont(flow, invocation)) |hc| hc.continuations else flow.body.continuations;
+
+    // Mid-chain site: swap this continuation's node for the generated call;
+    // the site's `|` arms ride untouched — except the custodial `| ok`,
+    // which gains the take step as its head.
+    if (invocation != flow.inv()) {
+        var children: ?[]const ast.Continuation = null;
+        if (take_node) |tn| {
+            children = CC.injectTake(allocator, site_arms, tn);
+        }
+        return .{ .replacement_node = .{ .node = ast.Node{ .invocation = call_inv }, .children = children } };
+    }
+
+    const conts = if (take_node) |tn|
+        CC.injectTake(allocator, site_arms, tn)
+    else blk: {
+        const c2 = allocator.alloc(ast.Continuation, flow.body.continuations.len) catch unreachable;
+        for (flow.body.continuations, 0..) |*c, i| {
+            c2[i] = ast_functional.cloneContinuation(allocator, c) catch unreachable;
+        }
+        break :blk c2;
+    };
+    return .{ .replacement = ast.Item{ .flow = ast.Flow{
+        .body = ast.rootSite(call_inv, conts, flow.location),
+        .pre_label = null,
+        .impl_of = flow.impl_of,
+        .super_shape = null,
+        .inline_body = null,
+        .preamble_code = null,
+        .is_pure = false,
+        .is_transitively_pure = false,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } } };
+}
+
+~[keyword|comptime|transform]pub tor send {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc send|zig {
+    if (item.* != .flow) @panic("channel:send transform: containing item is not a flow - walker dispatch contract broken");
+    return .{ .transformed = chanStep(allocator, program, &item.flow, invocation, reporter, "send") };
+}
+
+~[keyword|comptime|transform]pub tor recv {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc recv|zig {
+    if (item.* != .flow) @panic("channel:recv transform: containing item is not a flow - walker dispatch contract broken");
+    return .{ .transformed = chanStep(allocator, program, &item.flow, invocation, reporter, "recv") };
+}
+
+~[keyword|comptime|transform]pub tor close {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc close|zig {
+    if (item.* != .flow) @panic("channel:close transform: containing item is not a flow - walker dispatch contract broken");
+    return .{ .transformed = chanStep(allocator, program, &item.flow, invocation, reporter, "close") };
+}

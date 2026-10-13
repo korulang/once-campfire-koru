@@ -1,0 +1,47 @@
+// Koru Standard Library: the `terminal` part of proto — scalar terminal
+// minting. Joined via `~part terminal` in proto.kz; merged into the
+// proto module.
+
+// Declare a nominal scalar type through the proto door. The verb IS the
+// host scalar — `std/proto:i64(Port)` mints `const Port = i64` — one tor
+// per scalar in the field vocabulary (af.scalars). The marker ahead of the
+// alias records the identity so compounds and consumers resolve `Port`
+// without repeating the declaration. Keyword absent: terminal identity is
+// module-spaced (`std/proto:i64`), not a bare global.
+fn mintTerminal(allocator: std.mem.Allocator, item: *const astz.Item, expr: []const u8, scalar: []const u8) SiteResult {
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    var type_name = expr;
+    if (type_name.len >= 2 and type_name[0] == '"' and type_name[type_name.len - 1] == '"') {
+        type_name = type_name[1 .. type_name.len - 1];
+    }
+
+    var is_pub = false;
+    for (flow.annotations) |ann| {
+        if (std.mem.eql(u8, ann, "pub")) {
+            is_pub = true;
+            break;
+        }
+    }
+    const pub_prefix = if (is_pub) "pub " else "";
+
+    // The marker records the vocabulary scalar the user spelled; the const
+    // lowers to the host type — `string` is a scalar name, not a Zig type.
+    // On JS and C# the alias has no runtime content, so the marker alone lands.
+    const host = if (std.mem.eql(u8, scalar, "string")) "[]const u8" else scalar;
+    const code = if (std.mem.eql(u8, CompilerEnv.lang, "js") or std.mem.eql(u8, CompilerEnv.lang, "cs"))
+        std.fmt.allocPrint(allocator, "// proto-terminal {s}: {s}", .{ type_name, scalar }) catch unreachable
+    else
+        std.fmt.allocPrint(allocator, "// proto-terminal {s}: {s}\n{s}const {s} = {s};", .{ type_name, scalar, pub_prefix, type_name, host }) catch unreachable;
+
+    return .{ .replacement = astz.Item{
+        .inline_code = .{
+            .code = code,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        },
+    } };
+}

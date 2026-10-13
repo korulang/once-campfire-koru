@@ -1,0 +1,52 @@
+// Koru Standard Library: the `arms` part of interpreter.kz — the arm
+// judgment: which siblings can ever fire. Joined via `~part arms` in
+// interpreter.kz; merged into the interpreter module at load.
+//
+// ============================================================================
+// ARM REACHABILITY — a second unguarded handler for a branch an earlier
+// sibling already answers is dead text
+// ============================================================================
+//
+// Selection is first-match (the `select` part): on an outcome the first
+// unguarded arm naming it fires, and every later same-name sibling can
+// never run — dead text a writer believes executed. Compiled flows refuse
+// the shape as SHAPE002 (branch_checker's `firstDuplicateSibling` is the
+// single source of truth this mirrors); an interpreted flow now meets the
+// same judge. `when` narrows rather than duplicates, `!` links compose
+// (every link fires during the tor), `|?` is the fallback — none of
+// them shadow. A transformed subtree's synthesized children are exempt —
+// the same carve-out the compiled checkers take.
+//
+// The message teaches the spelling the writer usually meant: an arm that
+// follows a STEP is indented under that step's line — flat `|` lines are
+// siblings of the head call.
+pub fn checkShadowedArms(
+    conts: []const ast.Continuation,
+    allocator: std.mem.Allocator,
+) ?ValidationError {
+    for (conts, 0..) |*arm, i| {
+        if (arm.is_transformed_subtree) continue;
+        if (armShadowable(arm)) {
+            for (conts[0..i]) |*prior| {
+                if (!armShadowable(prior)) continue;
+                if (!namesEql(prior.branch, arm.branch)) continue;
+                return .{
+                    .message = if (arm.branch.len == 0)
+                        "unreachable '|>' step — an earlier unguarded unnamed step at this level always fires first; consecutive '|>' lines continue one chain only when nothing sits between them"
+                    else
+                        std.fmt.allocPrint(allocator, "unreachable '{s}' arm — an earlier unguarded '{s}' sibling answers that outcome and first match wins; indent the arm under the step it follows to chain deeper, or 'when'-guard all but one same-branch arm", .{ arm.branch, arm.branch }) catch "unreachable arm",
+                    .binding_name = arm.branch,
+                };
+            }
+        }
+        if (checkShadowedArms(arm.continuations, allocator)) |e| return e;
+    }
+    return null;
+}
+
+/// Unguarded terminal handlers are the arms that shadow and are shadowed —
+/// `when` narrows, `!` links compose. (Mirror of branch_checker's
+/// HandledBranch predicates.)
+fn armShadowable(arm: *const ast.Continuation) bool {
+    return arm.condition == null and arm.kind == .terminal;
+}

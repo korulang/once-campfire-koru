@@ -1,0 +1,145 @@
+// Koru Standard Library: Liquid Templating
+// =========================================
+//
+// Provides Liquid template rendering for code generation.
+// The first argument is the template, additional args become context.
+//
+// Syntax:
+//   {{ variable }}              - Output value from context
+//   {% if key %}...{% endif %}  - Conditional block
+//   {% unless key %}...{% endunless %} - Inverted conditional
+//
+// Usage:
+//   emit("Hello {{ name }}!", name: "Alice")
+//
+// Output: Hello Alice!
+
+~[comptime|runtime]
+
+const std = @import("std");
+
+// Emit template output at runtime (prints rendered template)
+// First positional arg is the template string, named args are context
+~[keyword|comptime|transform]pub tor emit {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+// Internal tor for shape checking (never runs)
+~[norun]pub tor emit.impl {
+    text: string,
+}
+
+~proc emit|zig {
+    const ast = @import("ast");
+    const liquid = @import("liquid");
+
+    // Get the flow from the item
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Build Liquid context from named tor arguments (skip expr)
+    var ctx = liquid.Context.init(allocator);
+
+    for (flow.inv().args) |arg| {
+        // Skip the expr argument (template)
+        if (std.mem.eql(u8, arg.name, "expr")) continue;
+
+        // Strip quotes from string values
+        var value = arg.value;
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+            value = value[1 .. value.len - 1];
+        }
+        ctx.put(arg.name, .{ .string = value }) catch continue;
+    }
+
+    // Get template from expr (strip quotes)
+    var tpl = expr;
+    if (tpl.len >= 2 and tpl[0] == '"' and tpl[tpl.len - 1] == '"') {
+        tpl = tpl[1 .. tpl.len - 1];
+    }
+
+    // Render the Liquid template
+    const rendered = liquid.render(allocator, tpl, &ctx) catch |err| {
+        std.debug.print("Liquid template error: {}\n", .{err});
+        return .{};
+    };
+
+    // Escape the rendered output for use in a host string literal. The five
+    // escapes below mean the same thing in Zig and in JavaScript, so this half is
+    // target-neutral.
+    var escaped = std.ArrayList(u8).initCapacity(allocator, rendered.len * 2) catch unreachable;
+    for (rendered) |c| {
+        switch (c) {
+            '"' => escaped.appendSlice(allocator, "\\\"") catch unreachable,
+            '\\' => escaped.appendSlice(allocator, "\\\\") catch unreachable,
+            '\n' => escaped.appendSlice(allocator, "\\n") catch unreachable,
+            '\r' => escaped.appendSlice(allocator, "\\r") catch unreachable,
+            '\t' => escaped.appendSlice(allocator, "\\t") catch unreachable,
+            else => escaped.append(allocator, c) catch unreachable,
+        }
+    }
+
+    // Generate the inline print statement, IN THE BUILD LANGUAGE. This is the
+    // whole target-dependent surface of the transform: one statement, two
+    // spellings, chosen the way `capture`'s cell preamble is chosen
+    // (koru_std/control.kz) and `cond`'s `{{ binds }}` before it. Emitting the Zig
+    // call unconditionally put `@import("std").debug.print(…)` into the JS output,
+    // which the emitter correctly refused (380_001, 380_002).
+    const inline_code = if (std.mem.eql(u8, @import("root").CompilerEnv.lang, "js"))
+        std.fmt.allocPrint(
+            allocator,
+            "process.stdout.write(\"{s}\\n\");",
+            .{escaped.items},
+        ) catch unreachable
+    else
+        std.fmt.allocPrint(
+            allocator,
+            "@import(\"std\").debug.print(\"{s}\\n\", .{{}});",
+            .{escaped.items},
+        ) catch unreachable;
+
+    // Create impl path for shape checking
+    const impl_segments = allocator.alloc([]const u8, 2) catch unreachable;
+    impl_segments[0] = allocator.dupe(u8, "emit") catch unreachable;
+    impl_segments[1] = allocator.dupe(u8, "impl") catch unreachable;
+    const impl_path = ast.DottedPath{
+        .module_qualifier = flow.inv().path.module_qualifier,
+        .segments = impl_segments,
+    };
+
+    // Build new invocation with @pass_ran annotation
+    const new_marks = allocator.alloc([]const u8, flow.inv().marks.len + 1) catch unreachable;
+    for (flow.inv().marks, 0..) |m, idx| new_marks[idx] = m;
+    new_marks[flow.inv().marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_invocation = ast.Invocation{
+        .path = impl_path,
+        .args = flow.inv().args,
+        .annotations = flow.inv().annotations,
+        .marks = new_marks,
+        .inserted_by_tap = flow.inv().inserted_by_tap,
+        .from_opaque_tap = flow.inv().from_opaque_tap,
+    };
+
+    const transformed_flow = ast.Flow{
+        .body = ast.rootSite(new_invocation, flow.body.continuations, flow.location),
+        .annotations = flow.annotations,
+        .pre_label = flow.pre_label,
+        .super_shape = flow.super_shape,
+        .inline_body = inline_code,
+        .is_pure = flow.is_pure,
+        .is_transitively_pure = flow.is_transitively_pure,
+        .impl_of = flow.impl_of,
+        .location = flow.location,
+        .module = flow.module,
+    };
+
+    const new_item = ast.Item{ .flow = transformed_flow };
+
+    return .{ .replacement = new_item };
+}

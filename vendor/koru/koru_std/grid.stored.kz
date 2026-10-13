@@ -1,0 +1,240 @@
+// Koru Standard Library: the `stored` part of grid.kz.
+// Joined via `~part stored` in grid.kz; merged into the grid module at load.
+
+// There is no write EVENT and no envelope. The store routes every write through
+// one centralizing subflow because that is where reactivity splices; a grid has
+// nothing to splice, so a write is a write and lowers to an assignment.
+
+~[keyword|comptime|transform]pub tor stored {
+    source: Source,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc stored|zig {
+    const ast = @import("ast");
+    const struct_literal = @import("struct_literal");
+
+    if (item.* != .flow) @panic("grid:stored transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    var block: ?[]const u8 = null;
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "source")) block = arg.value;
+    }
+    const btext = block orelse {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/grid:stored requires a write block: stored {{ grid[index].field: expr }}", .{}) };
+    };
+
+    var names = std.ArrayList(grid_read.GridRef).initCapacity(allocator, 4) catch unreachable;
+    grid_read.collect(allocator, program, &names);
+    if (names.items.len == 0) {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/grid:stored: no grid is declared in this program - declare one with `std/grid:new(name, size: N) {{ ... }}`", .{}) };
+    }
+
+    const braced = std.fmt.allocPrint(allocator, "{{{s}}}", .{btext}) catch unreachable;
+    const pairs = struct_literal.parseFields(allocator, braced) catch |err| {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/grid:stored: {s}", .{struct_literal.describeErrorIn(allocator, err, braced)}) };
+    };
+
+    // THE OPERANDS ARE EVALUATED AT THE SITE, not pasted into the unit.
+    //
+    // The first cut inlined the whole assignment into the unit's `|zig` body,
+    // which works for exactly the programs whose indices are literals. The
+    // moment a write sits under a loop — `! each i |> stored { g[i].on: i * 2 }`
+    // — the body names `i`, the unit has no inputs, and `i` reaches the host as
+    // an undeclared identifier. Every real grid workload writes under a loop,
+    // so that shape was the whole point and it did not work.
+    //
+    // So the index and the value ride as ARGUMENTS: they stay Koru expressions
+    // in the caller's scope, exactly where the binding lives, and the unit
+    // receives values. This is the store's de-bundled write (690_064) — thread
+    // the operand, never the expression — and it is why the unit's body is
+    // three names rather than a transplanted fragment.
+    var body = std.ArrayList(u8).initCapacity(allocator, 256) catch unreachable;
+    var inputs = std.ArrayList(ast.Field).initCapacity(allocator, 4) catch unreachable;
+    var args = std.ArrayList(ast.Arg).initCapacity(allocator, 4) catch unreachable;
+    for (pairs, 0..) |pr, n| {
+        const raw_target = std.mem.trim(u8, pr.name, " ");
+        const t = grid_read.parseTarget(raw_target, names.items) orelse {
+            return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/grid:stored: '{s}' does not address a grid cell - the target is `<grid>[<index>].<field>`, and a store row is written with std/store:stored instead", .{pr.name}) };
+        };
+        const col_ty = grid_read.columnType(allocator, program.items, t.grid, t.field) orelse {
+            return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/grid:stored: grid '{s}' has no column '{s}'", .{ t.grid, t.field }) };
+        };
+
+        const xn = std.fmt.allocPrint(allocator, "__koru_gwx{d}", .{n}) catch unreachable;
+        const yn = std.fmt.allocPrint(allocator, "__koru_gwy{d}", .{n}) catch unreachable;
+        const vn = std.fmt.allocPrint(allocator, "__koru_gwv{d}", .{n}) catch unreachable;
+
+        // The target is lowered by RE-SPELLING it with the parameter names in
+        // the index and handing it to the same `lower` every read goes through.
+        // An lvalue and an rvalue are the same text here, so there is still
+        // only one lowering — the alternative was a second copy of it that
+        // agreed by coincidence, which is the defect this file keeps finding.
+        const respelled = if (t.y != null)
+            std.fmt.allocPrint(allocator, "{s}[{s}, {s}].{s}", .{ t.grid, xn, yn, t.field }) catch unreachable
+        else
+            std.fmt.allocPrint(allocator, "{s}[{s}].{s}", .{ t.grid, xn, t.field }) catch unreachable;
+        const lvalue = grid_read.lower(allocator, respelled, names.items);
+        const line = std.fmt.allocPrint(allocator, "{s} = {s};\n", .{ lvalue, vn }) catch unreachable;
+        body.appendSlice(allocator, line) catch unreachable;
+
+        // AN INDEX ARRIVES AS WHATEVER THE PROGRAM COMPUTED. A `for` binding is
+        // `usize`, a regex named group is `usize`, a cell read is `i64`, a
+        // literal is `comptime_int` — and Zig coerces none of those into an
+        // `i64` struct field. The input is typed `i64` (a grid index is a
+        // number, and the trap is written against a signed one so a negative
+        // index is caught rather than wrapped into the far end of the grid), so
+        // the SITE widens, through the grid's own `__koru_wide` — the same
+        // widening the read path uses, not a second spelling of it.
+        const widen = struct {
+            fn at(alloc: std.mem.Allocator, ns: []const u8, grid: []const u8, text: []const u8) []const u8 {
+                return std.fmt.allocPrint(alloc, "{s}__KoruGridT_{s}.__koru_wide({s})", .{ ns, grid, text }) catch unreachable;
+            }
+        };
+        inputs.append(allocator, ast.Field{ .name = xn, .type = allocator.dupe(u8, "i64") catch unreachable }) catch unreachable;
+        args.append(allocator, ast.Arg{ .name = xn, .value = widen.at(allocator, (grid_read.find(names.items, t.grid) orelse unreachable).ns, t.grid, grid_read.lower(allocator, t.x, names.items)) }) catch unreachable;
+        if (t.y) |ytext| {
+            inputs.append(allocator, ast.Field{ .name = yn, .type = allocator.dupe(u8, "i64") catch unreachable }) catch unreachable;
+            args.append(allocator, ast.Arg{ .name = yn, .value = widen.at(allocator, (grid_read.find(names.items, t.grid) orelse unreachable).ns, t.grid, grid_read.lower(allocator, ytext, names.items)) }) catch unreachable;
+        }
+        inputs.append(allocator, ast.Field{ .name = vn, .type = allocator.dupe(u8, col_ty) catch unreachable }) catch unreachable;
+        args.append(allocator, ast.Arg{ .name = vn, .value = grid_read.lower(allocator, pr.value, names.items) }) catch unreachable;
+    }
+
+    // A top-level write is a STATEMENT in the program's flow, so the replacement
+    // has to be executable — raw code, whether host_line or inline_code, lands at
+    // module scope where an assignment is not a legal declaration.
+    //
+    // The callable is an EVENT plus a same-named `|zig` proc that implements it;
+    // a proc on its own is not invocable and resolves as an unknown tor. This is
+    // the store's own unit shape, minus everything a grid does not need: no
+    // inputs, no branches, no row argument, no envelope.
+    //
+    // KEYED PER SITE, and the flow's line alone is not that: every chained write
+    // in one flow shares it, so `a |> std/grid:stored {..} |> std/grid:stored
+    // {..}` minted one name twice and the backend rejected the program with
+    // `duplicate struct member name` — an internal leak with no Koru-level
+    // diagnostic.
+    //
+    // ORDER MATTERED HERE. Uniquifying this key was tried FIRST, while the chain
+    // tail was still being discarded (see the replacement below), and it made
+    // things worse: the loop shape then compiled and silently printed the wrong
+    // answer, because the collision had been the only thing making the drop
+    // loud anywhere. The drop is fixed now, so a unique key hides nothing.
+    //
+    // The block's TEXT is what distinguishes two links of a chain. Two
+    // byte-identical writes chained at one site still collide, and that is left
+    // alone deliberately: it is a redundant duplicate, and a blunt error is a
+    // fair report of it where a counter would silently accept the second.
+    //
+    // The store never had either problem: it mints ONE unit per store and passes
+    // the field as an argument, so chained store writes are ordinary calls to a
+    // shared tor. A grid's unit carries the assignment itself.
+    const unit = std.fmt.allocPrint(allocator, "__grid_write_L{d}_{x}", .{ flow.location.line, std.hash.Wyhash.hash(0, btext) & 0xffff }) catch unreachable;
+
+    // THE NAMESPACE IS IMPORT-DERIVED, NOT FILE-DERIVED. `flow.module` is the
+    // file name (`lib`); every cross-module path in the program resolves through
+    // the module's logical name (`app.lib`). Minting the unit off `flow.module`
+    // puts it in a namespace nothing looks up, and the failure is
+    // `unknown tor 'lib:__grid_write_L8'` — the same fault 115_018 recorded for
+    // the store's forty-odd paths. The entry file collapses the two names into
+    // one, so only a cross-module mirror (115_045) can tell a correct qualifier
+    // from a lucky one.
+    const home_ns = blk_home: {
+        const Find = struct {
+            fn in(its: []const ast.Item, want: []const u8, enclosing: ?[]const u8) ?[]const u8 {
+                for (its) |pi| {
+                    switch (pi) {
+                        .flow => |f| {
+                            if (std.mem.eql(u8, f.module, want)) return enclosing;
+                        },
+                        .module_decl => |m| {
+                            if (in(m.items, want, m.logical_name)) |hit| return hit;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            }
+        };
+        break :blk_home Find.in(program.items, flow.module, null) orelse flow.module;
+    };
+    const mk = struct {
+        fn path(alloc: std.mem.Allocator, module: []const u8, name: []const u8) ast.DottedPath {
+            const segs = alloc.alloc([]const u8, 1) catch unreachable;
+            segs[0] = alloc.dupe(u8, name) catch unreachable;
+            return ast.DottedPath{ .module_qualifier = alloc.dupe(u8, module) catch unreachable, .segments = segs };
+        }
+    };
+
+    const appended = allocator.alloc(ast.Item, 2) catch unreachable;
+    appended[0] = ast.Item{ .event_decl = ast.EventDecl{
+        .path = mk.path(allocator, home_ns, unit),
+        .input = ast.Shape{ .fields = inputs.toOwnedSlice(allocator) catch unreachable },
+        .branches = &[_]ast.Branch{},
+        .is_public = false,
+        .is_implicit_flow = false,
+        .annotations = &[_][]const u8{},
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } };
+    appended[1] = ast.Item{ .proc_decl = ast.ProcDecl{
+        .path = mk.path(allocator, home_ns, unit),
+        .body = ast.Source{ .text = body.toOwnedSlice(allocator) catch unreachable, .location = flow.location, .scope = .{ .bindings = &[_]ast.ScopeBinding{} }, .phantom_type = null },
+        .annotations = &[_][]const u8{},
+        // The body (`<lvalue> = <param>;`) is the same statement on both
+        // targets once `grid_read.lower` drops the `&` for JS — only the
+        // proc's TARGET tag selects which emitter owns it.
+        .target = allocator.dupe(u8, if (std.mem.eql(u8, CompilerEnv.lang, "js")) "js" else "zig") catch unreachable,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } };
+
+    const call = ast.Invocation{ .path = mk.path(allocator, home_ns, unit), .args = args.toOwnedSlice(allocator) catch unreachable };
+    return .{ .transformed = .{
+        .replacement = ast.Item{ .flow = ast.Flow{
+            // CARRY THE CHAIN. A write is one link, not the whole flow: in
+            // `std/grid:stored {..} |> next()` the `|> next()` lives in
+            // `flow.body.continuations`, and handing `rootSite` an empty slice
+            // here discarded it — the write landed and everything after it
+            // vanished, silently, with no diagnostic (697_012).
+            //
+            // A write has NO BRANCHES of its own, so every continuation on the
+            // original flow is a chain step and all of them belong on the
+            // replacement. That is the difference from `sweep` below, whose
+            // continuations include the `! sweep` arm it has already consumed
+            // into the emitted loop.
+            //
+            // Every rootSite call in store.kz passes real continuations; these
+            // two in grid.kz were the only ones passing nothing.
+            .body = ast.rootSite(call, flow.body.continuations, flow.location),
+            .pre_label = null,
+            .impl_of = flow.impl_of,
+            .annotations = &[_][]const u8{},
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } },
+        .appended = appended,
+    } };
+}
+
+// ============================================================================
+// GRID.SWEEP — visit every cell
+// ============================================================================
+//
+//   std/grid:sweep(cells)
+//   ! sweep c when c.count > 0 |> std/store:stored { acc.n: acc.n + 1 }
+//
+// NO BOUNDS CHECK. The loop constructs the index from `0..size`, so validating
+// it would be re-establishing a fact from one line above — the same
+// floor-then-prove-away arc the store's handle check follows, and the reason the
+// grid's trap is a floor rather than a tax.
+//
+// This lowers to an ordinary `for(0..size) ! each <i>`, with every `c.<field>`
+// in the body rewritten to a direct cell read. It mints no tor and transplants
+// no body: `for` already knows how to inline effect handlers, so reusing it

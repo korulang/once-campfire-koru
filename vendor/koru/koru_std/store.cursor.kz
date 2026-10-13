@@ -1,0 +1,38 @@
+// Koru Standard Library: the `cursor` part of store.kz.
+// Joined via `~part cursor` in store.kz; merged into the module at load.
+
+// The sweep cursor's spellings and cursor-derived captures — lifted out of
+// store.qrewrite.kz so both parts stay under their line baselines.
+// Self-contained: every dependency arrives as a parameter or a module-scope
+// name. A dense cursor is `usize` end to end, so a column read indexes with
+// it directly.
+const SCursor = struct {
+    /// A dense cursor used as a column-read index. A sweep cursor is `usize`
+    /// already, so a `.live` read indexes with it directly; any other
+    /// spelling keeps the per-use cast.
+    fn liveIndex(alloc: std.mem.Allocator, cursor: []const u8) []const u8 {
+        if (std.mem.startsWith(u8, cursor, "__koru_sdix_"))
+            return alloc.dupe(u8, cursor) catch unreachable;
+        return codegen_utils_store.HostShape.asIndex(alloc, storeHostTarget(), cursor);
+    }
+    /// The sweep's cursor-derived captures: `[ordinal]` when asked for.
+    fn threadCursorCaptures(allocator: std.mem.Allocator, captures: *std.ArrayList(Cap.Bind), req_ordinal: ?[]const u8) void {
+        // `[ordinal]n` rides the capture threading. The cursor is already computed
+        // by the loop and already handed to the body as `srow_name`; asking for it
+        // by an author's name needs no new channel, only one more threaded value —
+        // which is why this request costs a line rather than a mechanism.
+        //
+        // Synthesized ONLY when asked for: an arm that never writes `[ordinal]`
+        // adds no field and threads nothing, the same demand-driven rule an unread
+        // aggregate materializes no column under. `[ordinal]` is author-facing
+        // `i64`, so it keeps its cast even though the cursor itself is `usize`.
+        if (req_ordinal) |on| {
+            captures.append(allocator, .{
+                .name = allocator.dupe(u8, on) catch unreachable,
+                .type = allocator.dupe(u8, "i64") catch unreachable,
+                .value = allocator.dupe(u8, if (storeHostTarget() == .cs) "(long)(__koru_si)" else "@as(i64, @intCast(__koru_si))") catch unreachable, // cs: the cursor is `long` already
+                .lexical = false,
+            }) catch unreachable;
+        }
+    }
+};

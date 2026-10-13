@@ -1,0 +1,34 @@
+// Koru Standard Library: the `validate` part of interpreter.kz —
+// pre-execution flow validation (shadowing; the arg judgment lives in
+// the `args` part). Joined via `~part validate` in interpreter.kz;
+// merged into the interpreter module at load.
+
+// ============================================================================
+// AST VALIDATION - Pre-execution validation
+// ============================================================================
+
+pub const ValidationError = struct {
+    message: []const u8,
+    binding_name: []const u8,
+};
+
+/// Validates a flow AST before execution.
+/// Checks for shadowing (duplicate bindings), unreachable arms (a second
+/// unguarded handler for a branch first-match selection already answers),
+/// field membership (a named field the verb's signature does not declare),
+/// and bound references (a bare identifier no arm on this path binds).
+/// Returns null if valid, or ValidationError if invalid.
+pub fn validateFlow(
+    flow: *const ast.Flow,
+    allocator: std.mem.Allocator,
+    input_fn: ?InputLookupFn,
+    defined: ?*DefinedFlows,
+    session_env: ?*Environment,
+) ?ValidationError {
+    var seen_bindings = std.StringHashMap(void).init(allocator);
+    defer seen_bindings.deinit();
+    if (validateFlowRecursive(flow, &seen_bindings)) |e| return e;
+    if (checkShadowedArms(flow.body.continuations, allocator)) |e| return e;
+    return checkFlowArgs(flow, input_fn, defined, allocator, session_env);
+}
+

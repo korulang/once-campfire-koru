@@ -1,0 +1,15 @@
+// Koru Standard Library: the `directives` part of compiler.kz — frontend-read
+// compiler directives. Joined via `~part directives` in compiler.kz; merged
+// into the compiler module at load.
+//
+// These tors are never dispatched: [norun] prevents auto-execution and the
+// FRONTEND reads the invocation from the AST — discovered by parsing, not
+// hardcoded. `requires` declares backend build requirements (build.zig
+// generation is metacircular this way); `use` pins the backend itself to a
+// minted compiler — it is consumed and stripped before backend emission, so
+// the mint name never reaches the closure it selects.
+~[comptime|norun]pub tor requires { source: Source }
+
+// Pin the backend to a minted compiler: `std/compiler:use(my-compiler)`.
+// `expr` resolves in the mint store; `hash` pins binary identity.
+~[comptime|norun]pub tor use { expr: Expression, hash: ?string }

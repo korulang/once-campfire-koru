@@ -1,0 +1,281 @@
+// Koru Standard Library: Reactive Stores — the `cols` part.
+// Joined via `~part cols` in store.kz; merged into the store module at load.
+
+// ============================================================================
+// STORE.COLS — who is this store, column-wise, and how does a cell read
+// ============================================================================
+//
+// One family of questions, all answered transform-order tolerantly — the
+// coordinator may have run already (read the generated declarations) or not
+// (read the untransformed create's seed block):
+//
+//   storeMemberColumns  — name/type/module_path/phantom per column
+//   storeFieldOrder     — every SoA column, declaration order (incl. parent)
+//   storeInsertOrder    — the insert surface (excl. a [tree] parent)
+//   charCap             — is a column `char[N]`, and what is N
+//   cellRead            — one column's projected read at `__koru_si`
+//   bareBindEnd         — is a query's row binding in VALUE position here
+//   fireRow             — the shared row-answer emit both query drivers land on
+
+const StoreColInfo = struct {
+    name: []const u8,
+    type: []const u8,
+    module_path: ?[]const u8,
+    phantom: ?[]const u8,
+};
+
+fn storeMemberColumns(alloc: std.mem.Allocator, prog: *const ast_find.Program, store: []const u8) ?[]const StoreColInfo {
+    const insert_name = std.fmt.allocPrint(alloc, "__store_insert_{s}", .{store}) catch unreachable;
+    if (findSynthDecl(prog.items, insert_name)) |ed| {
+        var count: usize = 0;
+        for (ed.input.fields) |f| {
+            if (std.mem.eql(u8, f.name, "__site_line")) continue;
+            if (std.mem.eql(u8, f.name, "kind")) continue;
+            count += 1;
+        }
+        const cols = alloc.alloc(StoreColInfo, count) catch unreachable;
+        var idx: usize = 0;
+        for (ed.input.fields) |f| {
+            if (std.mem.eql(u8, f.name, "__site_line")) continue;
+            if (std.mem.eql(u8, f.name, "kind")) continue;
+            cols[idx] = .{
+                .name = f.name,
+                .type = f.type,
+                .module_path = f.module_path,
+                .phantom = f.phantom,
+            };
+            idx += 1;
+        }
+        return cols;
+    }
+    return null;
+}
+/// A store's COLUMNS, in declaration order — every column the SoA cell holds,
+/// including a `[tree]`-synthesized `parent`. Answers under any transform
+/// order: the generated apply tor's branches when the coordinator has run,
+/// else the untransformed create's seed block.
+///
+/// NOT the same question as `storeInsertOrder`, and the two were briefly merged
+/// here on the strength of matching names and shapes. They differ by exactly
+/// one column: the insert SURFACE excludes `parent`, because a tree row's
+/// parent is set by reparenting and never by the insert. Merging them broke all
+/// five 695_STORE_TREE tests, which is this concept's own half-rule tell caught
+/// in the act — two functions correct in their own scope, one name apart.
+fn storeFieldOrder(alloc: std.mem.Allocator, prog: *const ast_find.Program, store: []const u8) ?[]const []const u8 {
+    if (storeViewMembers(alloc, prog, store)) |mems| {
+        var names = std.ArrayList([]const u8).initCapacity(alloc, 8) catch unreachable;
+        for (mems) |m| {
+            if (storeMemberColumns(alloc, prog, m)) |cols| {
+                for (cols) |c| {
+                    var seen = false;
+                    for (names.items) |prev| {
+                        if (std.mem.eql(u8, prev, c.name)) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (!seen) names.append(alloc, c.name) catch unreachable;
+                }
+            }
+        }
+        names.append(alloc, "kind") catch unreachable;
+        return names.toOwnedSlice(alloc) catch unreachable;
+    }
+    const struct_literal = @import("struct_literal");
+    const apply_name = std.fmt.allocPrint(alloc, "__store_apply_{s}", .{store}) catch unreachable;
+    if (findSynthDecl(prog.items, apply_name)) |ed| {
+        const names = alloc.alloc([]const u8, ed.branches.len) catch unreachable;
+        for (ed.branches, 0..) |b, i| names[i] = b.name;
+        return names;
+    }
+    for (flatItems(alloc, prog.items)) |pi| {
+        if (pi.* != .flow) continue;
+        const f = &pi.flow;
+        const inv = f.inv();
+        if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "new")) continue;
+        const mq = inv.path.module_qualifier orelse continue;
+        if (!std.mem.eql(u8, mq, "std.store")) continue;
+        var name_matches = false;
+        var seed: ?[]const u8 = null;
+        for (inv.args) |a| {
+            if (std.mem.eql(u8, a.name, "expr")) {
+                name_matches = std.mem.eql(u8, storeStripQuotes(a.value), store);
+            } else if (std.mem.eql(u8, a.name, "source")) {
+                seed = a.value;
+            }
+        }
+        if (!name_matches or seed == null) continue;
+        const braced = std.fmt.allocPrint(alloc, "{{{s}}}", .{seed.?}) catch unreachable;
+        const cf = struct_literal.parseFields(alloc, braced) catch &[_]struct_literal.StructField{};
+        if (cf.len == 0) return null;
+        const names = alloc.alloc([]const u8, cf.len) catch unreachable;
+        for (cf, 0..) |c, i| names[i] = c.name;
+        return names;
+    }
+    return null;
+}
+
+/// The INSERT SURFACE's column order — the columns an `insert(s) { … }` site
+/// may name. Preferred source is the generated `__store_insert_<s>` event's
+/// input shape, whose fields ARE the insert contract (user columns + a trailing
+/// synthetic `__site_line`), and which EXCLUDES a `[tree]`-synthesized `parent`:
+/// a tree row's parent is set by reparenting, never at insert.
+///
+/// Falls back to `storeFieldOrder` — pre-tree stores where the insert surface
+/// and the column set coincide.
+fn storeInsertOrder(alloc: std.mem.Allocator, prog: *const ast_find.Program, store: []const u8) ?[]const []const u8 {
+    const insert_ev_name = std.fmt.allocPrint(alloc, "__store_insert_{s}", .{store}) catch unreachable;
+    for (flatItems(alloc, prog.items)) |pi| {
+        if (pi.* != .event_decl) continue;
+        const ed = &pi.event_decl;
+        if (ed.path.segments.len == 1 and std.mem.eql(u8, ed.path.segments[0], insert_ev_name)) {
+            const flds = ed.input.fields;
+            if (flds.len == 0) return null;
+            // The trailing field is the synthetic __site_line arg.
+            var end: usize = flds.len - 1;
+            // A synthesized kind tag (second-to-last) is NOT insert-surface:
+            // it travels via the `kind:` head arg, never the row block. A
+            // hand-written user column named kind (no members) stays.
+            if (end > 0 and std.mem.eql(u8, flds[end - 1].name, "kind")) {
+                if (storeKindMembers(alloc, prog, store)) |mm| {
+                    if (mm.len > 0) end -= 1;
+                }
+            }
+            const names = alloc.alloc([]const u8, end) catch unreachable;
+            for (flds[0..end], 0..) |f2, i| names[i] = f2.name;
+            return names;
+        }
+    }
+    return storeFieldOrder(alloc, prog, store);
+}
+
+/// Is `col` a fixed-char column, and how many bytes does it hold?
+/// (690_052 — the comptime-literal overflow check needs N at the insert
+/// site; the query road needs to know a char cell reads as a NUL-sliced
+/// view, not a [N]u8.) Sources, mirroring storeInsertOrder's
+/// transform-order tolerance: the generated SoA cell host_line when create
+/// already ran (`<col>: [CAP][N]u8` — store.kz owns both the writer and
+/// this reader), else the untransformed create's seed block (`char[N]`).
+fn charCap(alloc: std.mem.Allocator, prog: *const ast_find.Program, store: []const u8, col: []const u8) ?usize {
+    const stripQuotes = @import("emitter_helpers").stripQuotes;
+    const struct_literal = @import("struct_literal");
+    const marker = std.fmt.allocPrint(alloc, "const __KoruStoreT_{s} = struct {{", .{store}) catch unreachable;
+    for (flatItems(alloc, prog.items)) |pi| {
+        if (pi.* != .host_line) continue;
+        const t = pi.host_line.content;
+        if (std.mem.indexOf(u8, t, marker) == null) continue;
+        const fkey = std.fmt.allocPrint(alloc, "\n    {s}: [", .{col}) catch unreachable;
+        const fpos = std.mem.indexOf(u8, t, fkey) orelse return null;
+        const rest = t[fpos + fkey.len ..];
+        // scalar: `8]i64 = undefined`; fixed-char: `8][16]u8 = undefined`
+        const close = std.mem.indexOfScalar(u8, rest, ']') orelse return null;
+        const after = rest[close + 1 ..];
+        if (after.len == 0 or after[0] != '[') return null;
+        const close2 = std.mem.indexOfScalar(u8, after, ']') orelse return null;
+        if (!std.mem.startsWith(u8, after[close2 + 1 ..], "u8")) return null;
+        return std.fmt.parseInt(usize, after[1..close2], 10) catch null;
+    }
+    // create not yet transformed: read the raw seed block.
+    for (flatItems(alloc, prog.items)) |pi| {
+        if (pi.* != .flow) continue;
+        const f = &pi.flow;
+        const inv = f.inv();
+        if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "new")) continue;
+        const mq = inv.path.module_qualifier orelse continue;
+        if (!std.mem.eql(u8, mq, "std.store")) continue;
+        var name_matches = false;
+        var seed: ?[]const u8 = null;
+        for (inv.args) |a| {
+            if (std.mem.eql(u8, a.name, "expr")) {
+                name_matches = std.mem.eql(u8, stripQuotes(a.value), store);
+            } else if (std.mem.eql(u8, a.name, "source")) {
+                seed = a.value;
+            }
+        }
+        if (!name_matches or seed == null) continue;
+        const braced = std.fmt.allocPrint(alloc, "{{{s}}}", .{seed.?}) catch unreachable;
+        const cf = struct_literal.parseFields(alloc, braced) catch return null;
+        for (cf) |c| {
+            if (!std.mem.eql(u8, c.name, col)) continue;
+            const v = std.mem.trim(u8, c.value, " ");
+            if (std.mem.startsWith(u8, v, "char[") and v.len > "char[".len and v[v.len - 1] == ']') {
+                return std.fmt.parseInt(usize, std.mem.trim(u8, v["char[".len .. v.len - 1], " "), 10) catch null;
+            }
+            return null;
+        }
+        return null;
+    }
+    return null;
+}
+
+
+/// The query rewriter's one adjacency rule: is `bind` at `i` a VALUE-position
+/// use — not a name? `.bind` is a field of some other expression (690_363),
+/// `#bind` a label, `@bind` a builtin, `?bind` an arm head; `bind`
+/// mid-identifier or opening a `bind.` field path isn't bare either. `bind:`
+/// names (690_362) only in expression context — inside `{{ n:d }}` the colon
+/// is the mask's spec delimiter and `n` IS the value (690_100/271/294).
+/// Returns the end index on a bare hit.
+fn bareBindEnd(text: []const u8, i: usize, bind: []const u8, expr_ctx: []const bool) ?usize {
+    const isIdentCh = @import("emitter_helpers").isKebabIdentChar;
+    if (i > 0) {
+        const p = text[i - 1];
+        if (p == '.' or p == '#' or p == '@' or p == '?') return null;
+    }
+    if (!std.mem.startsWith(u8, text[i..], bind)) return null;
+    const after = i + bind.len;
+    if (after < text.len) {
+        const n = text[after];
+        if (isIdentCh(n) or n == '.') return null;
+        if (n == ':' and expr_ctx[after]) return null;
+    }
+    return after;
+}
+
+/// The row-answer emit both query drivers share — the sweep's loop and the
+/// lookup's handle-resolve both land on "project the row's columns into the
+/// projection bindings, mark `__koru_found`, open the sweepbody call".
+/// `scan_guard` lowers a `continue`-guard for the sweep and is null on the
+/// index path, where the lookup IS the guard. Returns false with `bad_op`
+/// set when the guard names an unlowering `@` op — the caller writes the
+/// refusal.
+fn fireRow(
+    alloc: std.mem.Allocator,
+    loop: *std.ArrayList(u8),
+    host_target: codegen_utils_store.HostTarget,
+    prog: *const ast_find.Program,
+    proj_names: []const []const u8,
+    proj_cols: []const usize,
+    col_names: []const []const u8,
+    cellq: []const u8,
+    store_name: []const u8,
+    scan_guard: ?[]const u8,
+    removal_tolerant: bool,
+    mark_found: bool,
+    home_ns: []const u8,
+    sbody_name: []const u8,
+    main_module_name: []const u8,
+    argb: []const u8,
+    bad_op: *[]const u8,
+) bool {
+    for (proj_names, proj_cols) |pn, ci| {
+        const esc_cn = codegen_utils_store.escapeZigIdentifier(alloc, col_names[ci]) catch col_names[ci];
+        const read = cellRead(alloc, host_target, prog, cellq, store_name, col_names[ci], esc_cn);
+        loop.appendSlice(alloc, codegen_utils_store.HostShape.constBind(alloc, host_target, pn, read)) catch unreachable;
+    }
+    if (scan_guard) |cond| {
+        const lowered_c = storeLowerExpr(alloc, cond, bad_op) orelse return false;
+        const gz = if (removal_tolerant)
+            std.fmt.allocPrint(alloc, "if (!({s})) {{ __koru_si += 1; continue; }}\n", .{lowered_c}) catch unreachable
+        else
+            std.fmt.allocPrint(alloc, "if (!({s})) continue;\n", .{lowered_c}) catch unreachable;
+        loop.appendSlice(alloc, gz) catch unreachable;
+    }
+    if (mark_found) loop.appendSlice(alloc, "__koru_found = true;\n") catch unreachable;
+    const callq = storeEventQualifier(alloc, home_ns, main_module_name);
+    loop.appendSlice(alloc, callq) catch unreachable;
+    loop.appendSlice(alloc, sbody_name) catch unreachable;
+    loop.appendSlice(alloc, "_event.handler(") catch unreachable;
+    loop.appendSlice(alloc, codegen_utils_store.HostShape.callArg(alloc, host_target, callq, sbody_name, argb)) catch unreachable;
+    return true;
+}

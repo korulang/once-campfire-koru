@@ -1,0 +1,169 @@
+// Koru Standard Library: the `sites` part of store — joined via
+// `~part sites` in store.kz; members land in koru_store.
+//
+// The site fold shared by `store.explain.kz`'s explainer — a counted row's
+// `at` witnesses are the sites it counted (`inserts = 1 [deadb]`).
+
+const SX = struct {
+    const struct_literal = @import("struct_literal");
+
+    const Member = struct { spelled: []const u8, owned: bool };
+    const Arm = struct { name: []const u8, bind: []const u8 };
+    // A query/stripe site: witness pointer, the continuations carrying the
+    // `! query`/`! first` arms (nested: the holding continuation's own —
+    // the arms the transform's siteView sees), and the claiming door.
+    const QSite = struct { ptr: usize, conts: []const ast_find.Continuation, door: []const u8 };
+
+    const Store = struct {
+        name: []const u8,
+        home: []const u8,
+        declared: bool = false,
+        capacity: ?i64 = null,
+        members: std.ArrayList(Member),
+        arms: std.ArrayList(Arm),
+        new_inv: ?*const ast_find.Invocation = null,
+        new_flow: ?*const ast_find.Flow = null,
+        // Counted rows keep the pointers they counted — count and witnesses
+        // are the same list, so `inserts = 1 [deadb]` can't disagree.
+        inserts: std.ArrayList(usize),
+        queries: std.ArrayList(QSite),
+        watches: std.ArrayList(usize),
+        takes: std.ArrayList(usize),
+        clears: std.ArrayList(usize),
+        has_step: bool = false,
+        has_wait: bool = false,
+    };
+
+    fn blank(alloc: std.mem.Allocator, name: []const u8, home: []const u8) Store {
+        const List = std.ArrayList(usize);
+        return .{ .name = name, .home = home, .members = std.ArrayList(Member).initCapacity(alloc, 4) catch unreachable, .arms = std.ArrayList(Arm).initCapacity(alloc, 4) catch unreachable, .inserts = List.initCapacity(alloc, 4) catch unreachable, .queries = std.ArrayList(QSite).initCapacity(alloc, 4) catch unreachable, .watches = List.initCapacity(alloc, 2) catch unreachable, .takes = List.initCapacity(alloc, 2) catch unreachable, .clears = List.initCapacity(alloc, 2) catch unreachable };
+    }
+
+    fn isStoreDoor(inv: *const ast_find.Invocation) ?[]const u8 {
+        const mq = inv.path.module_qualifier orelse return null;
+        if (!std.mem.eql(u8, mq, "std.store") and !std.mem.eql(u8, mq, "std/store")) return null;
+        if (inv.path.segments.len != 1) return null;
+        return inv.path.segments[0];
+    }
+
+    fn siteName(inv: *const ast_find.Invocation) []const u8 {
+        for (inv.args) |a| {
+            if (a.source_value != null) continue;
+            if (a.value.len > 0) return a.value;
+        }
+        return "";
+    }
+
+    // The labeled `capacity: N` arg, or null — absence is reported, not guessed.
+    fn siteCapacity(inv: *const ast_find.Invocation) ?i64 {
+        for (inv.args) |a| {
+            if (!a.had_explicit_label or !std.mem.eql(u8, a.name, "capacity")) continue;
+            return std.fmt.parseInt(i64, std.mem.trim(u8, a.value, " \t"), 10) catch null;
+        }
+        return null;
+    }
+
+    // The `{ members }` block — same parseFields the new transform runs;
+    // the owned-column spelling (`*Task<live!>`) takes a bare comma split.
+    fn siteMembers(alloc: std.mem.Allocator, inv: *const ast_find.Invocation, out: *std.ArrayList(Member)) void {
+        for (inv.args) |a| {
+            const sv = a.source_value orelse continue;
+            const braced = std.fmt.allocPrint(alloc, "{{ {s} }}", .{sv.text}) catch unreachable;
+            if (struct_literal.parseFields(alloc, braced)) |fields| {
+                for (fields) |f| {
+                    const spelled = if (f.name.len == 0)
+                        alloc.dupe(u8, std.mem.trim(u8, f.value, " ")) catch unreachable
+                    else
+                        std.fmt.allocPrint(alloc, "{s}: {s}", .{ f.name, std.mem.trim(u8, f.value, " ") }) catch unreachable;
+                    // The `*` of an owned column lands on the name side of
+                    // the parse (`*mod:Task<live!>` → name `*mod`, value
+                    // `Task<live!>`), so the mark reads the spelled text.
+                    out.append(alloc, .{ .spelled = spelled, .owned = std.mem.startsWith(u8, spelled, "*") }) catch unreachable;
+                }
+            } else |_| {
+                var it = std.mem.splitScalar(u8, sv.text, ',');
+                while (it.next()) |piece| {
+                    const p = std.mem.trim(u8, piece, " \t\n");
+                    if (p.len == 0) continue;
+                    out.append(alloc, .{ .spelled = alloc.dupe(u8, p) catch unreachable, .owned = std.mem.startsWith(u8, p, "*") }) catch unreachable;
+                }
+            }
+        }
+    }
+
+    // A member's bare type name for the facet probe — `*T<state>` and
+    // `name: Qual:Type` both reduce to the proto name; empty otherwise.
+    fn memberTypeName(alloc: std.mem.Allocator, spelled: []const u8) ?[]const u8 {
+        var t = spelled;
+        if (std.mem.indexOfScalar(u8, t, ':')) |ci| t = std.mem.trim(u8, t[ci + 1 ..], " ");
+        if (std.mem.startsWith(u8, t, "*")) t = std.mem.trim(u8, t[1..], " ");
+        if (std.mem.indexOfScalar(u8, t, '<')) |lt| t = t[0..lt];
+        if (std.mem.indexOfScalar(u8, t, ':')) |ci| t = t[ci + 1 ..];
+        if (t.len == 0) return null;
+        for (t) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_') return null;
+        }
+        return alloc.dupe(u8, t) catch unreachable;
+    }
+
+    fn find(stores: *std.ArrayList(Store), name: []const u8) ?*Store {
+        for (stores.items) |*s| {
+            if (std.mem.eql(u8, s.name, name)) return s;
+        }
+        return null;
+    }
+
+    // A site naming a store without creating one: counted when it exists.
+    fn touch(alloc: std.mem.Allocator, stores: *std.ArrayList(Store), name: []const u8, home: []const u8) *Store {
+        if (find(stores, name)) |s| return s;
+        stores.append(alloc, blank(alloc, name, home)) catch unreachable;
+        return &stores.items[stores.items.len - 1];
+    }
+
+    fn foldSites(alloc: std.mem.Allocator, items: []const ast_find.Item, stores: *std.ArrayList(Store)) void {
+        // Pointer-walk: the invocation pointers become site-hash witnesses, so
+        // they must address the real tree, not a per-iteration copy.
+        for (items) |*entry| {
+            switch (entry.*) {
+                .flow => |*fl| {
+                    if (fl.body.node) |*node| {
+                        if (node.* != .invocation) continue;
+                        const inv = &node.invocation;
+                        const door = isStoreDoor(inv) orelse continue;
+                        const name = siteName(inv);
+                        if (std.mem.eql(u8, door, "new")) {
+                            var s = blank(alloc, name, fl.module);
+                            s.declared = true;
+                            s.new_inv = inv;
+                            s.new_flow = fl;
+                            s.capacity = siteCapacity(inv);
+                            siteMembers(alloc, inv, &s.members);
+                            for (fl.body.continuations) |*c| {
+                                if (c.kind != .effect) continue;
+                                const bname = std.mem.trim(u8, c.branch, " ");
+                                if (bname.len == 0) continue;
+                                s.arms.append(alloc, .{ .name = bname, .bind = c.binding orelse "" }) catch unreachable;
+                                if (std.mem.eql(u8, bname, "step")) s.has_step = true;
+                                if (std.mem.eql(u8, bname, "wait")) s.has_wait = true;
+                            }
+                            stores.append(alloc, s) catch unreachable;
+                        } else if (std.mem.eql(u8, door, "insert")) {
+                            touch(alloc, stores, name, fl.module).inserts.append(alloc, @intFromPtr(inv)) catch unreachable;
+                        } else if (std.mem.eql(u8, door, "query") or std.mem.eql(u8, door, "stripe")) {
+                            touch(alloc, stores, name, fl.module).queries.append(alloc, .{ .ptr = @intFromPtr(inv), .conts = fl.body.continuations, .door = door }) catch unreachable;
+                        } else if (std.mem.eql(u8, door, "take")) {
+                            touch(alloc, stores, name, fl.module).takes.append(alloc, @intFromPtr(inv)) catch unreachable;
+                        } else if (std.mem.eql(u8, door, "clear")) {
+                            touch(alloc, stores, name, fl.module).clears.append(alloc, @intFromPtr(inv)) catch unreachable;
+                        } else if (std.mem.eql(u8, door, "default")) {
+                            touch(alloc, stores, name, fl.module).watches.append(alloc, @intFromPtr(inv)) catch unreachable;
+                        }
+                    }
+                    SPlan.foldNestedSites(alloc, stores, fl.body.continuations, fl.module);
+                },
+                .module_decl => |*m| foldSites(alloc, m.items, stores),
+                else => {},
+            }
+        }
+    }
+};

@@ -1,0 +1,133 @@
+// Koru Standard Library: the `wait` part of store.kz.
+// Joined via `~part wait` in store.kz; merged into the module at load.
+//
+// The store's `! wait` arm — the pump-participant interest contract.
+// Where `! step` ASKS ("advance this row once"), `! wait` ANSWERS
+// ("what would you block on"): the callee's RETURN TYPE is the
+// vocabulary — `-> i32` is a descriptor to poll, `-> i128` a relative
+// re-poll duration in ns, `-> { fd: i32, wait_ns: i128 }` both; an
+// interest not declared means none (no sentinels to write). A pump
+// that ends a pass all-idle collects one record per live row and
+// blocks ONCE on the union — one poll over every fd, capped by the
+// nearest wait_ns — instead of spinning or letting a single
+// participant's sleep own the thread.
+//
+// `collect` runs the arm's contract checks and classifies which field
+// sources the generated `__store_waitone_<s>` unit forwards into its
+// normalized `{ fd, wait_ns }`; the refusal item on failure, or null
+// with `wait_arm`/`wait_src` filled.
+
+const PWait = struct {
+    const ast = @import("ast");
+    const ast_functional = @import("ast_functional");
+
+    // `fd`/`wait_ns` count only as field NAMES on a `-> { ... }` return
+    // text — an unrelated `fd`-substring can't satisfy the contract.
+    fn recordHasField(rt: []const u8, name: []const u8) bool {
+        var it = std.mem.splitScalar(u8, rt, ',');
+        while (it.next()) |piece_raw| {
+            const piece = std.mem.trim(u8, piece_raw, " \t\r\n{}");
+            const colon = std.mem.indexOfScalar(u8, piece, ':') orelse continue;
+            if (std.mem.eql(u8, std.mem.trim(u8, piece[0..colon], " \t\r\n"), name)) return true;
+        }
+        return false;
+    }
+
+    // The field sources the waitone unit forwards into its normalized
+    // `{ fd, wait_ns }` — absent interests arrive as the internal
+    // sentinels -1 / maxInt. null = the callee declared no interest.
+    fn sources(wret: []const u8) ?[2][]const u8 {
+        const t = std.mem.trim(u8, wret, " \t\r\n");
+        if (std.mem.eql(u8, t, "i32")) return .{ "__koru_w", "@import(\"std\").math.maxInt(i128)" };
+        if (std.mem.eql(u8, t, "i128")) return .{ "-1", "__koru_w" };
+        const src = [2][]const u8{
+            if (recordHasField(wret, "fd")) "__koru_w.fd" else "-1",
+            if (recordHasField(wret, "wait_ns")) "__koru_w.wait_ns" else "@import(\"std\").math.maxInt(i128)",
+        };
+        if (std.mem.eql(u8, src[0], "-1") and std.mem.indexOf(u8, src[1], "maxInt") != null) return null;
+        return src;
+    }
+
+    fn collect(
+        allocator: std.mem.Allocator,
+        program: *const ast.Program,
+        flow: *const ast.Flow,
+        reporter: anytype,
+        store_name: []const u8,
+        field_names: []const []const u8,
+        field_owned_info: anytype,
+        ic: *const ast.Continuation,
+        wait_arm: *?ast.Continuation,
+        wait_src: *[2][]const u8,
+    ) ?ast.Item {
+        if (storeHostTarget() == .js) {
+            return ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! wait` is a native-runtime contract this rung - the pump's union wait polls OS descriptors, which a browser loop cannot block on", .{store_name});
+        }
+        if (wait_arm.* != null) {
+            return ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): one `! wait` handler per store - a pass asks each row for its interest once", .{store_name});
+        }
+        if (!(field_names.len == 1 and field_owned_info[0] != null)) {
+            return ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! wait` this rung lives on a one-owned-column store - the row IS its obligation; rows of several columns declare interests later", .{store_name}) ;
+        }
+        if (ic.destructure.len != 0 or ic.binding == null) {
+            return ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! wait` binds the row itself - spell it `! wait s |> <module>:<interest>(s)`", .{store_name});
+        }
+        const wbind = ic.binding.?;
+        const wnode = ic.node orelse {
+            return ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): the `! wait` handler needs a body - the interest call itself (`|> <module>:<interest>({s})`) returning `i32` (fd), `i128` (re-poll ns), or `{{ fd, wait_ns }}`", .{ store_name, wbind });
+        };
+        if (wnode != .invocation) {
+            return ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): the `! wait` body starts with the interest call this rung", .{store_name});
+        }
+        for (ic.continuations) |*cc| {
+            if (cc.kind == .terminal) {
+                return ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `| {s}` under `! wait` has nothing to answer - the interest call RETURNS the interest (`i32`/`i128`/`{{ fd, wait_ns }}`), it does not branch; the arm carries `!` effects only", .{ store_name, cc.branch }) ;
+            }
+        }
+        if (!Usage.inCont(ic, wbind, program)) {
+            return ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! wait` binds '{s}' but never asks it - the body is the interest call (`|> <module>:<interest>({s})`)", .{ store_name, wbind, wbind });
+        }
+        // The interest callee must return a declared interest. Find
+        // its declaration (same lookup `! step` runs) and check the
+        // `->` text: a bare `i32`/`i128` is a scalar interest (fd /
+        // re-poll ns), a record declares `fd` and/or `wait_ns`.
+        const wait_decl = blk_wd: {
+            const wq = wnode.invocation.path.module_qualifier;
+            var found: ?*const ast.EventDecl = null;
+            for (program.items) |*pi| {
+                if (pi.* == .module_decl) {
+                    const md = &pi.module_decl;
+                    if (wq) |q| {
+                        if (!PVerbs.modNameEq(md.logical_name, q)) continue;
+                    } else if (!PVerbs.modNameEq(md.logical_name, flow.module)) {
+                        continue;
+                    }
+                    for (md.items) |*mi| {
+                        if (mi.* != .event_decl) continue;
+                        const ed = &mi.event_decl;
+                        if (PVerbs.segsEq(ed.path.segments, wnode.invocation.path.segments)) {
+                            found = ed;
+                            break;
+                        }
+                    }
+                } else if (pi.* == .event_decl and wq == null) {
+                    const ed = &pi.event_decl;
+                    if (PVerbs.segsEq(ed.path.segments, wnode.invocation.path.segments)) found = ed;
+                }
+                if (found != null) break;
+            }
+            break :blk_wd found;
+        };
+        const wed = wait_decl orelse {
+            return ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! wait` cannot see the interest tor's contract - its `-> i32`/`i128`/`{{ fd, wait_ns }}` return must be in scope", .{store_name});
+        };
+        const wret = wed.return_type orelse {
+            return ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! wait`'s callee returns nothing - the interest contract is `-> i32` (fd), `-> i128` (re-poll ns), or `-> {{ fd: i32, wait_ns: i128 }}` (both)", .{store_name});
+        };
+        wait_src.* = sources(wret) orelse {
+            return ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! wait`'s callee returns `{s}` - the interest contract is `-> i32` (fd), `-> i128` (re-poll ns), or `-> {{ fd: i32, wait_ns: i128 }}` (both)", .{ store_name, wret });
+        };
+        wait_arm.* = ast_functional.cloneContinuation(allocator, ic) catch unreachable;
+        return null;
+    }
+};

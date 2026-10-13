@@ -1,0 +1,70 @@
+// Koru Standard Library: the `bulkdetect` part of store.kz.
+// Joined via `~part bulkdetect` in store.kz; merged into the module at load.
+
+/// Does any leaf column carry a std/refine met (bounds or clamp)?
+/// The same fold the emit prelude runs — refine's own metFields —
+/// so gate and guard cannot disagree about what a facet says.
+fn bulkHasFacets(alloc: std.mem.Allocator, prog: *const ast_find.Program, provs: []const SL.ColProv) bool {
+    if (!@hasDecl(koru_std, "koru_refine")) return false;
+    for (provs) |pv| {
+        const met = koru_std.koru_refine.metFields(alloc, prog, pv.scope, pv.proto, null);
+        for (met) |*mf| {
+            if (!std.mem.eql(u8, mf.name, pv.field)) continue;
+            if (ast_functional_store.facets.hasTerms(mf) or mf.clamp != null) return true;
+        }
+    }
+    return false;
+}
+
+/// The counted `for` site: `std/control:for` with exactly an `expr`
+/// arg spelling one top-level `lo..hi` range. A `keep` arg, a
+/// variant, a return binding, a frozen template body — all decline.
+fn bulkRangeOf(alloc: std.mem.Allocator, iv: *const ast_find.Invocation) ?Bulk.Range {
+    const mq = iv.path.module_qualifier orelse return null;
+    if (!std.mem.eql(u8, mq, "std.control") and !std.mem.eql(u8, mq, "std/control")) return null;
+    if (iv.path.segments.len != 1 or !std.mem.eql(u8, iv.path.segments[0], "for")) return null;
+    if (iv.variant != null or iv.return_binding != null or iv.return_destructure.len != 0 or
+        iv.preamble_code != null) return null;
+    // A nested `for` (inside a `|>` chain) already carries its
+    // template's RENDER in `inline_body` — renderNestedTemplates
+    // fills the slot before `new` walks. That render is still a
+    // pending splice: it contains `__koru_inline_*` markers the
+    // emitter resolves against the continuation list. Overwriting
+    // it is safe — the markers die with the text and the arms
+    // stay. Anything else in the slot is not ours to replace.
+    if (iv.inline_body) |ib| {
+        if (std.mem.indexOf(u8, ib, "__koru_inline_") == null and
+            std.mem.indexOf(u8, ib, "__koru_continue_") == null) return null;
+    }
+    var expr: ?[]const u8 = null;
+    for (iv.args) |a| {
+        if (std.mem.eql(u8, a.name, "expr")) {
+            expr = a.value;
+            continue;
+        }
+        return null;
+    }
+    const t = expr orelse return null;
+    const mask = ast_find.expressionMask(alloc, t);
+    var at: ?usize = null;
+    var depth: i32 = 0;
+    var i: usize = 0;
+    while (i + 1 < t.len) : (i += 1) {
+        if (!mask[i]) continue;
+        switch (t[i]) {
+            '(', '[', '{' => depth += 1,
+            ')', ']', '}' => depth -= 1,
+            '.' => if (depth == 0 and t[i + 1] == '.') {
+                if (at != null) return null;
+                if (i + 2 < t.len and t[i + 2] == '.') return null;
+                at = i;
+            },
+            else => {},
+        }
+    }
+    const j = at orelse return null;
+    const lo = std.mem.trim(u8, t[0..j], " \t\n\r");
+    const hi = std.mem.trim(u8, t[j + 2 ..], " \t\n\r");
+    if (lo.len == 0 or hi.len == 0) return null;
+    return .{ .lo = lo, .hi = hi };
+}

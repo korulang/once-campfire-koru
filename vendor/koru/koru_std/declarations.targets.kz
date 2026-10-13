@@ -1,0 +1,25 @@
+// Koru Standard Library: the `targets` part of declarations.kz.
+// Joined via `~part targets` in declarations.kz; merged into the module at load.
+//
+// The non-zig template bodies of `const` — same home-for-the-variants
+// doctrine as control.targets.kz. The |zig original stays in
+// declarations.kz beside the tor it spells.
+
+~[template]proc const|js {
+{% const fields = parse_fields(source) %}{% for f in fields %}const {{ f.name }} = {{ f.value }};
+{% endfor %}
+}
+
+// CS variant of const — the K# vertical. The splice lands INSIDE
+// `static class main_module` (cs_emitter Phase 0.5), so each field must
+// be a class member: `static readonly dynamic` is the spike spelling —
+// `dynamic` because the type annotation is optional (`name: "World"`
+// carries none) and `readonly` because the Koru const is immutable.
+// `f.value` is the peeled literal (the `[i32]` type annotation is
+// dropped the way |js drops it; a typed-const lowering is the later
+// design talk). cs_lower on the name applies the @verbatim mangle for
+// C#-reserved words — the same lowering references elsewhere take.
+~[template]proc const|cs {
+{% const fields = parse_fields(source) %}{% for f in fields %}{% const n = cs_lower(f.name) %}public static readonly dynamic {{ n }} = {{ f.value }};
+{% endfor %}
+}

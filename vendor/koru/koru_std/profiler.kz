@@ -1,0 +1,283 @@
+// Chrome Tracing Profiler - Proof-of-Concept Timeline Profiler
+// ==================================================================
+// Usage:
+//   [profile]import std/profiler
+//   koruc my_app.kz --profile
+//
+// Result: Program generates /tmp/koru_profile.json in Chrome Tracing Format
+// View in Chrome: chrome://tracing
+//
+// Architecture:
+// - Universal tap (* -> *) captures all event transitions (lane tid=0)
+// - Meta-events (koru:start, koru:end) are the program ENVELOPE, not
+//   transitions: they emit as ph:"i" instant anchors plus one synthesized
+//   ph:"X" "program" span between them, on their own named lane (tid=1)
+// - Zero-cost when disabled (dead-strips at compile time)
+// - Self-governing: requires both import AND --PROFILE flag
+//
+// CURRENT STATUS: Single-threaded
+// -------------------------------
+// ❌ TODO: Thread safety (needs mutex for concurrent transitions)
+// ❌ TODO: Per-thread buffering for zero-contention profiling
+// ❌ TODO: Dynamic pid/tid tracking for multi-threaded programs
+
+const std = @import("std");
+~import std/taps
+
+// File handle state - mutable globals for profiler state
+// WARNING: NOT THREAD-SAFE! Will corrupt with concurrent writes.
+var profile_file: ?std.fs.File = null;
+var first_event: bool = true;
+var previous_timestamp_ns: i128 = 0;
+var previous_event_name: []const u8 = "";
+var profiler_finished: bool = false;  // Prevents write-event from creating new file after footer
+var program_start_ns: i128 = 0;       // Envelope open (koru:start anchor); footer synthesizes the span from it
+
+// Tor: Write Chrome Tracing header
+~tor write-header {}
+
+~proc write-header|zig {
+    // Only create file if not already created by write-event
+    // (write-event runs BEFORE write-header due to universal tap ordering)
+    if (profile_file == null) {
+        profile_file = std.fs.cwd().createFile("/tmp/koru_profile.json", .{}) catch {
+            std.debug.print("ERROR: Failed to create profile file\n", .{});
+            return;
+        };
+
+        // Write Chrome Tracing JSON header
+        const header = "{\"traceEvents\":[\n";
+        profile_file.?.writeAll(header) catch {
+            std.debug.print("ERROR: Failed to write profile header\n", .{});
+        };
+    }
+
+    // Initialize profiler state for new trace (only if not already started)
+    // Don't reset if previous_timestamp_ns is set - that means we already buffered an tor
+    // (the universal tap wraps koru:start -> done BEFORE write-header fires)
+    if (previous_timestamp_ns == 0) {
+        first_event = true;
+        previous_event_name = "";
+    }
+
+    // Open the program envelope. If a transition was already buffered (the
+    // auto-create race above), the envelope opens at that earlier timestamp so
+    // the span always contains its first tor.
+    program_start_ns = std.time.nanoTimestamp();
+    if (previous_timestamp_ns != 0 and previous_timestamp_ns < program_start_ns) {
+        program_start_ns = previous_timestamp_ns;
+    }
+
+    // Name the two lanes (ph:"M" metadata), then drop the koru:start anchor
+    // (ph:"i" global instant) on the envelope lane.
+    const file = profile_file orelse return;
+    var buffer: [1024]u8 = undefined;
+    var pos: usize = 0;
+    if (!first_event) {
+        buffer[pos] = ',';
+        pos += 1;
+        buffer[pos] = '\n';
+        pos += 1;
+    }
+    first_event = false;
+    const start_us = @divFloor(program_start_ns, 1000);
+    const json = std.fmt.bufPrint(buffer[pos..],
+        "{{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":0,\"tid\":0,\"args\":{{\"name\":\"transitions\"}}}},\n" ++
+        "{{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":0,\"tid\":1,\"args\":{{\"name\":\"program\"}}}},\n" ++
+        "{{\"name\":\"koru:start\",\"cat\":\"meta\",\"ph\":\"i\",\"s\":\"g\",\"ts\":{d},\"pid\":0,\"tid\":1}}",
+        .{start_us}
+    ) catch {
+        std.debug.print("ERROR: Failed to format envelope anchors\n", .{});
+        return;
+    };
+    pos += json.len;
+    file.writeAll(buffer[0..pos]) catch {
+        std.debug.print("ERROR: Failed to write envelope anchors\n", .{});
+    };
+    return;
+}
+
+// Tor: Write a profile tor
+~tor write-event {
+    source: string,
+    timestamp_ns: i128,
+}
+
+~proc write-event|zig {
+    // Don't create new file after profiler has finished (prevents truncating data)
+    if (profiler_finished) {
+        return;
+    }
+
+    // Auto-create file if needed (handles case where universal tap's write-event
+    // fires BEFORE koru:start tap's write-header)
+    if (profile_file == null) {
+        profile_file = std.fs.cwd().createFile("/tmp/koru_profile.json", .{}) catch {
+            std.debug.print("ERROR: Failed to create profile file in write-event\n", .{});
+            return;
+        };
+        // Write JSON header
+        const header = "{\"traceEvents\":[\n";
+        profile_file.?.writeAll(header) catch {
+            std.debug.print("ERROR: Failed to write profile header\n", .{});
+            return;
+        };
+        first_event = true;
+    }
+    const file = profile_file orelse return;
+
+    // First tor: just buffer it, don't write yet
+    if (previous_timestamp_ns == 0) {
+        previous_timestamp_ns = timestamp_ns;
+        previous_event_name = source;
+        return;
+    }
+
+    // We have a previous tor buffered - write it now with duration to current tor
+    const duration_ns = timestamp_ns - previous_timestamp_ns;
+    const start_us = @divFloor(previous_timestamp_ns, 1000);
+    const duration_us = @divFloor(duration_ns, 1000);
+
+    // Build JSON manually (fast, no allocations)
+    var buffer: [8192]u8 = undefined;
+    var pos: usize = 0;
+
+    // Add comma separator if not first tor
+    if (!first_event) {
+        buffer[pos] = ',';
+        pos += 1;
+        buffer[pos] = '\n';
+        pos += 1;
+    }
+    first_event = false;
+
+    // Build JSON: Complete tor (ph: "X") with duration
+    // Format: {"name":"tor","cat":"transition","ph":"X","ts":start,"dur":duration,"pid":0,"tid":0}
+    // - ph: "X" = complete tor (shows as horizontal bar with duration)
+    // - ts: when the PREVIOUS tor fired
+    // - dur: how long from previous tor until THIS tor
+    // - name: the PREVIOUS tor name
+    // This shows "time spent in previous state" and makes all bars visible!
+    const json = std.fmt.bufPrint(buffer[pos..],
+        "{{\"name\":\"{s}\",\"cat\":\"transition\",\"ph\":\"X\",\"ts\":{d},\"dur\":{d},\"pid\":0,\"tid\":0}}",
+        .{previous_event_name, start_us, duration_us}
+    ) catch return;
+    pos += json.len;
+
+    file.writeAll(buffer[0..pos]) catch {
+        std.debug.print("ERROR: Failed to write profile event\n", .{});
+    };
+
+    // Buffer current tor for next write
+    previous_timestamp_ns = timestamp_ns;
+    previous_event_name = source;
+
+    return;
+}
+
+// Tor: Write Chrome Tracing footer and close file
+~tor write-footer {}
+
+~proc write-footer|zig {
+    const file = profile_file orelse return;
+
+    // Write the final buffered tor (if any) with small duration
+    if (previous_timestamp_ns != 0) {
+        var buffer: [8192]u8 = undefined;
+        var pos: usize = 0;
+
+        // Add comma separator if not first tor
+        if (!first_event) {
+            buffer[pos] = ',';
+            pos += 1;
+            buffer[pos] = '\n';
+            pos += 1;
+        }
+
+        // Emit final tor with 1 microsecond duration (tiny but visible)
+        const start_us = @divFloor(previous_timestamp_ns, 1000);
+        const json = std.fmt.bufPrint(buffer[pos..],
+            "{{\"name\":\"{s}\",\"cat\":\"transition\",\"ph\":\"X\",\"ts\":{d},\"dur\":1,\"pid\":0,\"tid\":0}}",
+            .{previous_event_name, start_us}
+        ) catch {
+            std.debug.print("ERROR: Failed to format final event\n", .{});
+            return;
+        };
+        pos += json.len;
+
+        file.writeAll(buffer[0..pos]) catch {
+            std.debug.print("ERROR: Failed to write final event\n", .{});
+        };
+        first_event = false;
+    }
+
+    // Close the program envelope: koru:end anchor (ph:"i" global instant) and
+    // the synthesized "program" span between the two anchors, both on the
+    // envelope lane. Skipped if the envelope never opened (no write-header).
+    if (program_start_ns != 0) {
+        const end_ns = std.time.nanoTimestamp();
+        var abuffer: [1024]u8 = undefined;
+        var apos: usize = 0;
+        if (!first_event) {
+            abuffer[apos] = ',';
+            apos += 1;
+            abuffer[apos] = '\n';
+            apos += 1;
+        }
+        first_event = false;
+        const env_start_us = @divFloor(program_start_ns, 1000);
+        const end_us = @divFloor(end_ns, 1000);
+        const dur_us = end_us - env_start_us;
+        // A format failure skips the emission but must never skip the
+        // file close/reset below — no early return in the footer.
+        if (std.fmt.bufPrint(abuffer[apos..],
+            "{{\"name\":\"koru:end\",\"cat\":\"meta\",\"ph\":\"i\",\"s\":\"g\",\"ts\":{d},\"pid\":0,\"tid\":1}},\n" ++
+            "{{\"name\":\"program\",\"cat\":\"meta\",\"ph\":\"X\",\"ts\":{d},\"dur\":{d},\"pid\":0,\"tid\":1}}",
+            .{end_us, env_start_us, dur_us}
+        )) |ajson| {
+            apos += ajson.len;
+            file.writeAll(abuffer[0..apos]) catch {
+                std.debug.print("ERROR: Failed to write envelope close\n", .{});
+            };
+        } else |_| {
+            std.debug.print("ERROR: Failed to format envelope close\n", .{});
+        }
+    }
+
+    // Write closing bracket for tors array and closing brace for JSON
+    const footer = "\n]}\n";
+    file.writeAll(footer) catch {
+        std.debug.print("ERROR: Failed to write profile footer\n", .{});
+    };
+
+    file.close();
+
+    // Mark profiler as finished FIRST - prevents write-event from creating new file
+    // (universal tap will fire for write-footer's completion after this returns)
+    profiler_finished = true;
+
+    // Reset profiler state
+    profile_file = null;
+    first_event = true;
+    previous_timestamp_ns = 0;
+    previous_event_name = "";
+    program_start_ns = 0;
+
+    return;
+}
+
+// TAP: Program start - write header
+// [opaque]: invocations this tap inserts are invisible to other taps,
+// so the profiler never observes itself
+~[opaque]tap(koru:start -> *)
+| done |> write-header()
+
+// TAP: Program end - write footer and close
+// NOTE: This tap MUST come BEFORE the universal tap so write-footer gets profiled
+~[opaque]tap(koru:end -> *)
+| done |> write-footer()
+
+// TAP: Every transition - write tor
+// NOTE: Universal tap runs LAST so it wraps all other tap-inserted calls (like write-footer)
+~[opaque]tap(* -> *)
+| Profile p |> write-event(p.source, p.timestamp_ns)

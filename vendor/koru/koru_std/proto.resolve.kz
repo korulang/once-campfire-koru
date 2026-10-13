@@ -1,0 +1,451 @@
+// Koru Standard Library: proto compound-resolution machinery — joined
+// via `~part resolve` in proto.kz; members land in koru_proto.
+//
+// TerminalRef resolves field types against scalars, terminals, compounds
+// and `ref()` targets; GraphWalk (nested) owns the compound graph walk;
+// the extension merge (entryName/parentSpec/findCompound/expandParents)
+// lives here too — the `<:` field-set union, 698_OOP.
+
+const TerminalRef = struct {
+    const ast = @import("ast");
+
+        fn isTerminalVerb(verb: []const u8) bool {
+            // The terminal verbs ARE the scalar vocabulary —
+            // `std/proto:i64(Port)` mints `const Port = i64`; `std/types:enum` mints terminal-shaped too.
+            return af.isScalar(verb) or std.mem.eql(u8, verb, "enum");
+        }
+
+        fn isCompoundDoor(inv: *const ast.Invocation) bool {
+            if (inv.path.segments.len != 1) return false;
+            const verb = inv.path.segments[0];
+            const mq = inv.path.module_qualifier orelse return false;
+            const types_door = std.mem.eql(u8, verb, "proto") and
+                (std.mem.eql(u8, mq, "std.types") or std.mem.eql(u8, mq, "std/types"));
+            const default_door = std.mem.eql(u8, verb, "default") and
+                (std.mem.eql(u8, mq, "std.proto") or std.mem.eql(u8, mq, "std/proto"));
+            return types_door or default_door;
+        }
+
+        /// The entry name a compound door declares. `<:` extension rides the
+        /// labeled-arg split — `proto(Dog <: Animal)` arrives as
+        /// (name: "Dog <", value: "Animal") — so the entry is the label
+        /// minus '<', not the value. A plain value is a plain name.
+        fn entryName(inv: *const ast.Invocation) []const u8 {
+            if (inv.args.len == 0) return "";
+            const a0 = inv.args[0];
+            if (a0.had_explicit_label) {
+                const label = std.mem.trim(u8, a0.name, " \t");
+                if (std.mem.endsWith(u8, label, "<"))
+                    return std.mem.trim(u8, label[0 .. label.len - 1], " \t");
+                return label;
+            }
+            return bareName(a0.value);
+        }
+
+        /// The parent spec of an extending declaration — "Animal + Pet" —
+        /// or null for a plain entry.
+        fn parentSpec(inv: *const ast.Invocation) ?[]const u8 {
+            if (inv.args.len == 0) return null;
+            const a0 = inv.args[0];
+            if (!a0.had_explicit_label) return null;
+            const label = std.mem.trim(u8, a0.name, " \t");
+            if (!std.mem.endsWith(u8, label, "<")) return null;
+            const v = std.mem.trim(u8, a0.value, " \t");
+            return if (v.len > 0) v else null;
+        }
+
+        /// `ref(X)` — a typed row reference: the field lowers to the store's
+        /// i64 handle material while X names the target compound for
+        /// checkers. A ref is a REFERENCE, not containment — it joins no
+        /// cycle walk (`next: ref(Node)` is legal by design).
+        fn isRefType(ftype: []const u8) bool {
+            const t = std.mem.trim(u8, ftype, " \t");
+            return t.len > 5 and std.mem.startsWith(u8, t, "ref(") and t[t.len - 1] == ')';
+        }
+
+        fn refInner(ftype: []const u8) []const u8 {
+            const t = std.mem.trim(u8, ftype, " \t");
+            return std.mem.trim(u8, t[4 .. t.len - 1], " \t");
+        }
+
+        // Owned leaves — `*mod:Type<state!>` — are gated in
+        // proto.ownedleaf.kz (`parseOwnedLeaf`, `isOwnedLeaf`); a pointer is
+        // a reference, not containment, and its debt is the receiver's.
+
+        fn liveDeclarationIsCompound(inv: *const ast.Invocation, want: []const u8) bool {
+            if (!isCompoundDoor(inv)) return false;
+            if (inv.args.len == 0) return false;
+            return std.mem.eql(u8, entryName(inv), want);
+        }
+
+        fn bareName(value: []const u8) []const u8 {
+            var text = std.mem.trim(u8, value, " \t");
+            if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') {
+                text = text[1 .. text.len - 1];
+            }
+            return std.mem.trim(u8, text, " \t");
+        }
+
+        fn liveDeclarationIsTerminal(inv: *const ast.Invocation, want: []const u8) bool {
+            if (inv.path.segments.len != 1) return false;
+            if (!isTerminalVerb(inv.path.segments[0])) return false;
+            if (inv.path.module_qualifier) |mq| {
+                const known_home = std.mem.eql(u8, mq, "std.types") or
+                    std.mem.eql(u8, mq, "std/types") or
+                    std.mem.eql(u8, mq, "std.proto") or
+                    std.mem.eql(u8, mq, "std/proto");
+                if (!known_home) return false;
+            }
+            if (inv.args.len == 0) return false;
+            return std.mem.eql(u8, bareName(inv.args[0].value), want);
+        }
+
+        // `// proto`/`// proto-terminal` marker scanning lives in
+        // proto.markers.kz (markerDeclaresTerminal/Compound(+Line)).
+
+        fn scanItems(items: []const ast.Item, scope_home: []const u8, want: []const u8, want_home: []const u8, compounds: bool) bool {
+            for (items) |entry| {
+                switch (entry) {
+                    .flow => |candidate| {
+                        if (candidate.body.node) |*node| {
+                            if (node.* == .invocation and std.mem.eql(u8, scope_home, want_home)) {
+                                if (liveDeclarationIsTerminal(&node.invocation, want)) return true;
+                                if (compounds and liveDeclarationIsCompound(&node.invocation, want)) return true;
+                            }
+                        }
+                    },
+                    .inline_code => |inline_code| {
+                        if (std.mem.eql(u8, scope_home, want_home)) {
+                            if (markerDeclaresTerminal(inline_code.code, want)) return true;
+                            if (compounds and markerDeclaresCompound(inline_code.code, want)) return true;
+                        }
+                    },
+                    .module_decl => |module| {
+                        if (scanItems(module.items, module.logical_name, want, want_home, compounds)) return true;
+                    },
+                    else => {},
+                }
+            }
+            return false;
+        }
+
+        /// The scope owning a declaration flow: the enclosing module's logical
+        /// name, or the entry module for top-level flows. Falls back to the
+        /// entry scope — a miss then refuses loudly, never resolves elsewhere.
+        fn scopeOfFlow(prog: *const ast.Program, target: *const ast.Flow) []const u8 {
+            const Finder = struct {
+                fn find(items: []const ast.Item, needle: *const ast.Flow, scope: []const u8) ?[]const u8 {
+                    for (items) |*entry| {
+                        switch (entry.*) {
+                            .flow => |*f| {
+                                if (f == needle) return scope;
+                            },
+                            .module_decl => |*m| {
+                                if (find(m.items, needle, m.logical_name)) |s| return s;
+                            },
+                            else => {},
+                        }
+                    }
+                    return null;
+                }
+            };
+            return Finder.find(prog.items, target, prog.main_module_name) orelse prog.main_module_name;
+        }
+
+        const WantRef = struct { home: []const u8, name: []const u8 };
+
+        fn splitWant(alloc: std.mem.Allocator, ftype: []const u8, scope_home: []const u8) WantRef {
+            const trimmed = std.mem.trim(u8, ftype, " \t");
+            var want_home: []const u8 = scope_home;
+            var want: []const u8 = bareName(ftype);
+            if (std.mem.lastIndexOfScalar(u8, trimmed, ':')) |ci| {
+                const qual = std.mem.trim(u8, trimmed[0..ci], " \t");
+                const nm = std.mem.trim(u8, trimmed[ci + 1 ..], " \t");
+                if (qual.len > 0 and nm.len > 0) {
+                    const dotted = alloc.dupe(u8, qual) catch unreachable;
+                    for (dotted) |*c| {
+                        if (c.* == '/') c.* = '.';
+                    }
+                    want_home = dotted;
+                    want = nm;
+                }
+            }
+            return .{ .home = want_home, .name = want };
+        }
+
+        fn isDeclared(prog: *const ast.Program, alloc: std.mem.Allocator, ftype: []const u8, scope_home: []const u8) bool {
+            const w = splitWant(alloc, ftype, scope_home);
+            return scanItems(prog.items, prog.main_module_name, w.name, w.home, false);
+        }
+
+        fn isDeclaredCompound(prog: *const ast.Program, alloc: std.mem.Allocator, ftype: []const u8, scope_home: []const u8) bool {
+            const w = splitWant(alloc, ftype, scope_home);
+            return scanItems(prog.items, prog.main_module_name, w.name, w.home, true);
+        }
+        const CompoundNode = struct { home: []const u8, name: []const u8, ftypes: []const []const u8 };
+        const CompoundRef = struct { home: []const u8, name: []const u8 };
+
+        fn isScalarWord(ftype: []const u8) bool {
+            const scalars = [_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "bool", "string" };
+            const t = std.mem.trim(u8, ftype, " \t");
+            for (scalars) |s| {
+                if (std.mem.eql(u8, t, s)) return true;
+            }
+            return false;
+        }
+        /// Field types of one field-block text, split on newlines AND commas
+        /// (the erased marker is one comma-joined line). Slices into the
+        /// given text — no ownership, transform lifetime.
+        fn parseFieldTypes(alloc: std.mem.Allocator, text: []const u8, out: *std.ArrayList([]const u8)) void {
+            var toks = std.mem.tokenizeAny(u8, text, "\n,");
+            while (toks.next()) |raw| {
+                const line = std.mem.trim(u8, raw, " \t\r,");
+                if (line.len == 0) continue;
+                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                const ftype = std.mem.trim(u8, line[colon + 1 ..], " \t,");
+                if (ftype.len == 0) continue;
+                out.append(alloc, ftype) catch unreachable;
+            }
+        }
+
+        const GraphWalk = struct {
+            fn walk(alloc: std.mem.Allocator, items: []const ast.Item, home: []const u8, nodes: *std.ArrayList(CompoundNode)) void {
+                for (items) |entry| {
+                    switch (entry) {
+                        .flow => |candidate| {
+                            if (candidate.body.node) |*node| {
+                                if (node.* == .invocation and isCompoundDoor(&node.invocation)) {
+                                    if (node.invocation.args.len == 0) continue;
+                                    const nm = entryName(&node.invocation);
+                                    if (nm.len == 0) continue;
+                                    var src: ?[]const u8 = null;
+                                    for (node.invocation.args) |a| {
+                                        if (a.source_value) |sv| {
+                                            src = sv.text;
+                                            break;
+                                        }
+                                    }
+                                    var ftypes = std.ArrayList([]const u8).initCapacity(alloc, 4) catch unreachable;
+                                    parseFieldTypes(alloc, src orelse "", &ftypes);
+                                    nodes.append(alloc, .{ .home = home, .name = nm, .ftypes = ftypes.toOwnedSlice(alloc) catch unreachable }) catch unreachable;
+                                }
+                            }
+                        },
+                        .inline_code => |ic| {
+                            var lines = std.mem.splitScalar(u8, ic.code, '\n');
+                            while (lines.next()) |raw| {
+                                const line = std.mem.trimLeft(u8, raw, " \t");
+                                const prefix = "// proto ";
+                                if (!std.mem.startsWith(u8, line, prefix)) continue;
+                                const colon = std.mem.indexOfScalar(u8, line[prefix.len..], ':') orelse continue;
+                                const nm = std.mem.trim(u8, line[prefix.len .. prefix.len + colon], " \t");
+                                if (nm.len == 0) continue;
+                                var ftypes = std.ArrayList([]const u8).initCapacity(alloc, 4) catch unreachable;
+                                parseFieldTypes(alloc, line[prefix.len + colon + 1 ..], &ftypes);
+                                nodes.append(alloc, .{ .home = home, .name = nm, .ftypes = ftypes.toOwnedSlice(alloc) catch unreachable }) catch unreachable;
+                            }
+                        },
+                        .module_decl => |module| {
+                            walk(alloc, module.items, module.logical_name, nodes);
+                        },
+                        else => {},
+                    }
+                }
+            }
+        };
+
+        fn dfsVisit(alloc: std.mem.Allocator, prog: *const ast.Program, nodes: []const CompoundNode, stack: *std.ArrayList(CompoundRef), home: []const u8, node_name: []const u8) ?[]const u8 {
+            var node: ?CompoundNode = null;
+            for (nodes) |n| {
+                if (std.mem.eql(u8, n.home, home) and std.mem.eql(u8, n.name, node_name)) {
+                    node = n;
+                    break;
+                }
+            }
+            const nd = node orelse return null;
+            for (nd.ftypes) |ftype| {
+                if (isScalarWord(ftype)) continue;
+                if (isRefType(ftype)) continue;
+                if (isOwnedLeaf(ftype)) continue; // a pointer is a reference, not containment
+                if (isDeclared(prog, alloc, ftype, home)) continue;
+                const w = splitWant(alloc, ftype, home);
+                for (stack.items, 0..) |s, si| {
+                    if (std.mem.eql(u8, s.home, w.home) and std.mem.eql(u8, s.name, w.name)) {
+                        var chain = std.ArrayList(u8).initCapacity(alloc, 32) catch unreachable;
+                        for (stack.items[si..]) |c| {
+                            if (chain.items.len > 0) chain.appendSlice(alloc, " -> ") catch unreachable;
+                            chain.appendSlice(alloc, c.name) catch unreachable;
+                        }
+                        chain.appendSlice(alloc, " -> ") catch unreachable;
+                        chain.appendSlice(alloc, w.name) catch unreachable;
+                        return chain.toOwnedSlice(alloc) catch unreachable;
+                    }
+                }
+                stack.append(alloc, .{ .home = w.home, .name = w.name }) catch unreachable;
+                if (dfsVisit(alloc, prog, nodes, stack, w.home, w.name)) |found| return found;
+                _ = stack.pop();
+            }
+            return null;
+        }
+
+        /// The compound graph reachable from (root_home, root_name): every
+        /// compound-typed edge walked, terminals and scalars skipped. Returns
+        /// the cycle chain ("A -> B -> A") when the root reaches itself, null
+        /// otherwise. Unresolvable hops are skipped — the owning entry's gate
+        /// refuses those, never this walk. `root_ftypes`, when given,
+        /// overrides the root's edges: an extending entry's effective fields
+        /// are its MERGED set, which the live block under-reports.
+        fn findCycle(alloc: std.mem.Allocator, prog: *const ast.Program, root_name: []const u8, root_home: []const u8, root_ftypes: ?[]const []const u8) ?[]const u8 {
+            var nodes = std.ArrayList(CompoundNode).initCapacity(alloc, 8) catch unreachable;
+            GraphWalk.walk(alloc, prog.items, prog.main_module_name, &nodes);
+            if (root_ftypes) |mt| {
+                // dfsVisit takes the FIRST (home, name) match — prepend the
+                // override so the merged edges win over the live block's.
+                nodes.insert(alloc, 0, .{ .home = root_home, .name = root_name, .ftypes = mt }) catch unreachable;
+            }
+            var stack = std.ArrayList(CompoundRef).initCapacity(alloc, 8) catch unreachable;
+            stack.append(alloc, .{ .home = root_home, .name = root_name }) catch unreachable;
+            return dfsVisit(alloc, prog, nodes.items, &stack, root_home, root_name);
+        }
+
+        const FieldPair = struct { name: []const u8, ftype: []const u8, home: []const u8, origin: []const u8 };
+
+        /// The identity a field type carries for merge decisions: scalars key
+        /// on their word (same material in any home), refs on the resolved
+        /// target, everything else on the resolved (home, name) concept.
+        fn fieldTypeKey(alloc: std.mem.Allocator, ftype: []const u8, home: []const u8) []const u8 {
+            const t = std.mem.trim(u8, ftype, " \t");
+            if (isRefType(t)) {
+                const w = splitWant(alloc, refInner(t), home);
+                return std.fmt.allocPrint(alloc, "ref:{s}:{s}", .{ w.home, w.name }) catch unreachable;
+            }
+            // Owned leaves key on the whole spelling — `*mod:Type<open!>` and
+            // `*mod:Type<closed!>` under one field name are different concepts
+            // and refuse to merge, not dedup.
+            if (isOwnedLeaf(t)) return alloc.dupe(u8, t) catch unreachable;
+            if (isScalarWord(t)) return alloc.dupe(u8, t) catch unreachable;
+            const w = splitWant(alloc, t, home);
+            return std.fmt.allocPrint(alloc, "{s}:{s}", .{ w.home, w.name }) catch unreachable;
+        }
+
+        /// Merge one field into a field set: same name + same concept dedups
+        /// (doubling is waste, not truth), same name + different concept
+        /// refuses — the refusal text is returned, the caller wraps it.
+        fn appendMerged(alloc: std.mem.Allocator, merged: *std.ArrayList(FieldPair), pair: FieldPair, entry: []const u8) ?[]const u8 {
+            const key = fieldTypeKey(alloc, pair.ftype, pair.home);
+            for (merged.items) |m| {
+                if (!std.mem.eql(u8, m.name, pair.name)) continue;
+                if (std.mem.eql(u8, fieldTypeKey(alloc, m.ftype, m.home), key)) return null;
+                return std.fmt.allocPrint(alloc, "std/proto({s}): field '{s}' conflicts — '{s}' on {s} vs '{s}' on {s}; the merge dedups only what a shared name proves identical", .{ entry, pair.name, m.ftype, m.origin, pair.ftype, pair.origin }) catch unreachable;
+            }
+            merged.append(alloc, pair) catch unreachable;
+            return null;
+        }
+
+        const FoundCompound = struct {
+            fields_text: []const u8,
+            parents: ?[]const u8,
+            scope: []const u8,
+        };
+
+        /// A compound's declaration in whichever form the walker's fixed
+        /// point left: the live flow (field text + its own parent spec) or
+        /// the erased marker (already flat — parents are baked in).
+        fn findCompound(prog: *const ast.Program, want: []const u8, want_home: []const u8) ?FoundCompound {
+            const Finder = struct {
+                fn scan(items: []const ast.Item, scope: []const u8, w: []const u8, wh: []const u8) ?FoundCompound {
+                    for (items) |entry| {
+                        switch (entry) {
+                            .flow => |candidate| {
+                                if (!std.mem.eql(u8, scope, wh)) continue;
+                                if (candidate.body.node) |*node| {
+                                    if (node.* == .invocation and isCompoundDoor(&node.invocation)) {
+                                        if (!std.mem.eql(u8, entryName(&node.invocation), w)) continue;
+                                        var text: []const u8 = "";
+                                        for (node.invocation.args) |a| {
+                                            if (a.source_value) |sv| {
+                                                text = sv.text;
+                                                break;
+                                            }
+                                        }
+                                        return .{ .fields_text = text, .parents = parentSpec(&node.invocation), .scope = scope };
+                                    }
+                                }
+                            },
+                            .inline_code => |ic| {
+                                if (!std.mem.eql(u8, scope, wh)) continue;
+                                var lines = std.mem.splitScalar(u8, ic.code, '\n');
+                                while (lines.next()) |raw| {
+                                    const line = std.mem.trimLeft(u8, raw, " \t");
+                                    const prefix = "// proto ";
+                                    if (!std.mem.startsWith(u8, line, prefix)) continue;
+                                    const colon = std.mem.indexOfScalar(u8, line[prefix.len..], ':') orelse continue;
+                                    const nm = std.mem.trim(u8, line[prefix.len .. prefix.len + colon], " \t");
+                                    if (!std.mem.eql(u8, nm, w)) continue;
+                                    return .{ .fields_text = line[prefix.len + colon + 1 ..], .parents = null, .scope = scope };
+                                }
+                            },
+                            .module_decl => |module| {
+                                if (scan(module.items, module.logical_name, w, wh)) |f| return f;
+                            },
+                            else => {},
+                        }
+                    }
+                    return null;
+                }
+            };
+            return Finder.scan(prog.items, prog.main_module_name, want, want_home);
+        }
+
+        /// Expand a parent spec ("Animal + Pet") into the entry's merged
+        /// field set — grandparents' fields land ahead of their child's.
+        /// `stack` is the extension chain, the extending entry at the
+        /// bottom, so `A <: B <: A` names itself. Returns the refusal text
+        /// on a cycle or an unknown parent.
+        fn expandParents(
+            alloc: std.mem.Allocator,
+            prog: *const ast.Program,
+            spec: []const u8,
+            scope_home: []const u8,
+            entry: []const u8,
+            stack: *std.ArrayList(CompoundRef),
+            merged: *std.ArrayList(FieldPair),
+        ) ?[]const u8 {
+            var toks = std.mem.tokenizeScalar(u8, spec, '+');
+            while (toks.next()) |raw| {
+                const tok = std.mem.trim(u8, raw, " \t");
+                if (tok.len == 0) continue;
+                const w = splitWant(alloc, tok, scope_home);
+                for (stack.items, 0..) |s, si| {
+                    if (std.mem.eql(u8, s.home, w.home) and std.mem.eql(u8, s.name, w.name)) {
+                        var chain = std.ArrayList(u8).initCapacity(alloc, 32) catch unreachable;
+                        for (stack.items[si..]) |c| {
+                            if (chain.items.len > 0) chain.appendSlice(alloc, " <: ") catch unreachable;
+                            chain.appendSlice(alloc, c.name) catch unreachable;
+                        }
+                        chain.appendSlice(alloc, " <: ") catch unreachable;
+                        chain.appendSlice(alloc, w.name) catch unreachable;
+                        return std.fmt.allocPrint(alloc, "std/proto({s}): extension cycle detected: {s} — '<:' unions field sets; a cycle would expand forever", .{ entry, chain.items }) catch unreachable;
+                    }
+                }
+                const found = findCompound(prog, w.name, w.home) orelse
+                    return std.fmt.allocPrint(alloc, "std/proto({s}): '<:' names unknown proto '{s}' — extension composes declared field sets; declare the parent first", .{ entry, tok }) catch unreachable;
+                stack.append(alloc, .{ .home = w.home, .name = w.name }) catch unreachable;
+                if (found.parents) |pspec| {
+                    if (expandParents(alloc, prog, pspec, found.scope, entry, stack, merged)) |m| return m;
+                }
+                // Parent text may still be LIVE, so this re-parses author
+                // text through the same block gate the doors hold.
+                switch (protoFieldBlock(alloc, found.fields_text, true)) {
+                    .entries => |es| {
+                        for (es) |e| {
+                            if (appendMerged(alloc, merged, .{ .name = e.fname, .ftype = e.ftype, .home = found.scope, .origin = w.name }, entry)) |m| return m;
+                        }
+                    },
+                    .fault => |m| return std.fmt.allocPrint(alloc, "std/proto({s}): parent '{s}': {s}", .{ entry, w.name, m }) catch unreachable,
+                }
+                _ = stack.pop();
+            }
+            return null;
+        }
+};

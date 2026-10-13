@@ -1,0 +1,2667 @@
+const std = @import("std");
+const errors = @import("errors");
+const glob_pattern_matcher = @import("glob_pattern_matcher");
+
+/// Deinit every element of an owned slice, then free the slice — the
+/// teardown idiom every AST container shares (items, branches, args,
+/// fields). Elements arrive const while deinit mutates, so each is
+/// copied onto the stack first.
+fn deinitSliceItems(items: anytype, allocator: std.mem.Allocator) void {
+    for (items) |*item| {
+        var mutable_item = item.*;
+        mutable_item.deinit(allocator);
+    }
+    allocator.free(@constCast(items));
+}
+
+// Core AST node types
+
+// Expression types for when clauses and proc arguments
+pub const Expression = struct {
+    node: ExprNode,
+
+    pub fn deinit(self: *Expression, allocator: std.mem.Allocator) void {
+        self.node.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
+pub const ExprNode = union(enum) {
+    literal: Literal,
+    identifier: []const u8,
+    binary: BinaryOp,
+    unary: UnaryOp,
+    field_access: FieldAccess,
+    grouped: *Expression,
+    builtin_call: BuiltinCall,
+    array_index: ArrayIndex,
+    conditional: Conditional,
+    function_call: FunctionCall,
+
+    pub fn deinit(self: *ExprNode, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .literal => |*l| l.deinit(allocator),
+            .identifier => |id| allocator.free(id),
+            .binary => |*b| b.deinit(allocator),
+            .unary => |*u| u.deinit(allocator),
+            .field_access => |*f| f.deinit(allocator),
+            .grouped => |g| {
+                g.deinit(allocator);
+            },
+            .builtin_call => |*bc| bc.deinit(allocator),
+            .array_index => |*ai| ai.deinit(allocator),
+            .conditional => |*c| c.deinit(allocator),
+            .function_call => |*fc| fc.deinit(allocator),
+        }
+    }
+};
+
+pub const Literal = union(enum) {
+    number: []const u8,
+    string: []const u8,
+    boolean: bool,
+
+    pub fn deinit(self: *Literal, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .number => |n| allocator.free(n),
+            .string => |s| allocator.free(s),
+            .boolean => {},
+        }
+    }
+};
+
+pub const BinaryOp = struct {
+    op: BinaryOperator,
+    left: *Expression,
+    right: *Expression,
+
+    pub fn deinit(self: *BinaryOp, allocator: std.mem.Allocator) void {
+        self.left.deinit(allocator);
+        self.right.deinit(allocator);
+    }
+};
+
+pub const BinaryOperator = enum {
+    add,
+    subtract,
+    multiply,
+    divide,
+    modulo,
+    equal,
+    not_equal,
+    less,
+    less_equal,
+    greater,
+    greater_equal,
+    and_op,
+    or_op,
+    string_concat,
+};
+
+pub const UnaryOp = struct {
+    op: UnaryOperator,
+    operand: *Expression,
+
+    pub fn deinit(self: *UnaryOp, allocator: std.mem.Allocator) void {
+        self.operand.deinit(allocator);
+    }
+};
+
+pub const UnaryOperator = enum {
+    not,
+    negate,
+};
+
+pub const FieldAccess = struct {
+    object: *Expression,
+    field: []const u8,
+
+    pub fn deinit(self: *FieldAccess, allocator: std.mem.Allocator) void {
+        self.object.deinit(allocator);
+        allocator.free(self.field);
+    }
+};
+
+pub const BuiltinCall = struct {
+    name: []const u8, // "as", "intCast", etc.
+    args: []const *Expression,
+
+    pub fn deinit(self: *BuiltinCall, allocator: std.mem.Allocator) void {
+        for (self.args) |arg| {
+            arg.deinit(allocator);
+        }
+        allocator.free(self.args);
+        allocator.free(self.name);
+    }
+};
+
+pub const ArrayIndex = struct {
+    object: *Expression,
+    index: *Expression,
+
+    pub fn deinit(self: *ArrayIndex, allocator: std.mem.Allocator) void {
+        self.object.deinit(allocator);
+        self.index.deinit(allocator);
+    }
+};
+
+pub const Conditional = struct {
+    condition: *Expression,
+    then_expr: *Expression,
+    else_expr: *Expression,
+
+    pub fn deinit(self: *Conditional, allocator: std.mem.Allocator) void {
+        self.condition.deinit(allocator);
+        self.then_expr.deinit(allocator);
+        self.else_expr.deinit(allocator);
+    }
+};
+
+pub const FunctionCall = struct {
+    callee: *Expression,
+    args: []const *Expression,
+
+    pub fn deinit(self: *FunctionCall, allocator: std.mem.Allocator) void {
+        self.callee.deinit(allocator);
+        for (self.args) |arg| {
+            arg.deinit(allocator);
+        }
+        allocator.free(self.args);
+    }
+};
+
+// EventRef represents a deferred event value
+pub const EventRef = struct {
+    // The finite set of possible events this ref could be
+    candidates: []const DottedPath,
+    // The input shape all candidates must accept
+    input_shape: Shape,
+    // The super-shape (union of all candidate outputs)
+    output_shape: SuperShape,
+};
+
+// SuperShape represents the union of multiple event output shapes
+pub const SuperShape = struct {
+    branches: []const BranchVariant,
+
+    pub const BranchVariant = struct {
+        name: []const u8,
+        payload: Shape,
+        // Which candidate events have this branch
+        sources: []const DottedPath,
+    };
+};
+
+/// A `part <tag>` declaration in a module file: names the sibling file group
+/// `stem.tag.<ext>` (all Koru host views) that joins this module. Parts live
+/// in this slice — NOT in `items` — so no downstream pass ever sees one: the
+/// loader consumes the slice, merges the part files' items, and the merged
+/// program carries an empty `parts`. The declaration's only job is to make
+/// sibling discovery LOUD (a tag with no file is KORU201, never a silent
+/// miss). Flat by ruling: only a module's own file may declare parts.
+pub const PartDecl = struct {
+    tag: []const u8, // kebab identifier; joins `stem.tag.<ext>` siblings
+    location: errors.SourceLocation,
+};
+
+pub const Program = struct {
+    items: []const Item,
+    module_annotations: []const []const u8 = &.{}, // Module-level annotations (e.g., ~[compiler])
+    main_module_name: []const u8 = "", // Canonical name of the main module (e.g., "input" from input.kz)
+    parts: []PartDecl = &.{}, // Part declarations; consumed by the loader at merge
+    allocator: std.mem.Allocator,
+
+    /// TypeRegistry for this program (opaque to avoid circular import with type_registry.zig)
+    /// Cast to *TypeRegistry when needed. Enables transforms to do supplemental parsing.
+    type_registry: ?*anyopaque = null,
+
+    pub fn deinit(self: *Program) void {
+        deinitSliceItems(self.items, self.allocator);
+        // Free module annotations
+        for (self.module_annotations) |annotation| {
+            self.allocator.free(annotation);
+        }
+        self.allocator.free(@constCast(self.module_annotations));
+        // Free part declarations (tags are the only owned member)
+        for (self.parts) |part| {
+            self.allocator.free(@constCast(part.tag));
+        }
+        self.allocator.free(@constCast(self.parts));
+        // Free main module name
+        if (self.main_module_name.len > 0) {
+            self.allocator.free(@constCast(self.main_module_name));
+        }
+    }
+
+    /// Check if this AST contains any parse errors
+    /// Used to determine if the AST can be compiled or is IDE-only
+    pub fn hasParseErrors(self: *const Program) bool {
+        for (self.items) |*item| {
+            if (item.* == .parse_error) return true;
+        }
+        return false;
+    }
+};
+
+pub const SourceFile = Program;
+
+pub const HostLine = struct {
+    content: []const u8,
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    module: []const u8 = "",
+
+    pub fn deinit(self: *HostLine, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+        if (self.module.len > 0) allocator.free(self.module);
+    }
+};
+
+pub const ModuleDecl = struct {
+    logical_name: []const u8, // The name used in code (e.g., "io", "math")
+    canonical_path: []const u8, // Full resolved path to the module file
+    items: []const Item, // All items in this module
+    is_system: bool, // True for compiler/stdlib modules (skip in user code generation)
+    annotations: []const []const u8 = &[_][]const u8{}, // Module annotations (e.g., [comptime|runtime])
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    // Note: ModuleDecl uses canonical_path as its "module" identifier
+
+    pub fn deinit(self: *ModuleDecl, allocator: std.mem.Allocator) void {
+        allocator.free(self.logical_name);
+        allocator.free(self.canonical_path);
+        deinitSliceItems(self.items, allocator);
+        // Free module annotations
+        for (self.annotations) |annotation| {
+            allocator.free(annotation);
+        }
+        allocator.free(@constCast(self.annotations));
+    }
+};
+
+/// ParseErrorNode represents a parse error embedded in the AST
+/// This allows lenient parsing mode to continue past errors while preserving
+/// the error location and context for IDE tooling
+pub const ParseErrorNode = struct {
+    error_code: errors.ErrorCode,
+    message: []const u8,
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    raw_text: []const u8, // The source text that failed to parse
+    hint: ?[]const u8,
+
+    pub fn deinit(self: *ParseErrorNode, allocator: std.mem.Allocator) void {
+        allocator.free(self.message);
+        allocator.free(self.raw_text);
+        if (self.hint) |h| allocator.free(h);
+    }
+};
+
+/// Replace a nested site's holding continuation with a raw node + children,
+/// for handlers that swap an invocation for a non-flow node (e.g. a `foreach`
+/// loop or an inline statement carrying its own continuations). Nested sites
+/// only — a bare node cannot replace a top-level Item.
+pub const NodeReplacement = struct {
+    node: Node,
+    /// null = keep the site's existing children (replace the node only);
+    /// non-null = replace the children too (including with an empty slice).
+    children: ?[]const Continuation = null,
+    /// false = replace the site's own `|>` invocation (the default);
+    /// true = replace the PRODUCING call instead — the invocation whose
+    /// continuations hold the site arm. A branch-arm transform rerouting
+    /// its producer (e.g. `supervised` rewriting `dial(port)` into a
+    /// `#`-labeled fold over a generated step tor, so the sibling arms
+    /// dispatch on the step's outcome vocabulary) needs this: the runner
+    /// locates the producer in the real program — site-view items are
+    /// shallow copies, so a handler-forged pointer to a flow head would
+    /// never be found — and `children` replaces its handler list wholesale.
+    /// `label_with_invocation` at a flow head lifts to `flow.pre_label`
+    /// (the parser's own spelling of `#label` in root position).
+    retarget_producer: bool = false,
+};
+
+/// The site-local write-back ABI: what a transform handler decides at one
+/// site. The runner owns ALL placement — handlers describe their change as a
+/// value and never touch the whole program. This is what `| transformed
+/// SiteResult` carries. At most one of `replacement`/`replacement_node` is set:
+/// - `replacement`     — replace the site with this Item (root: the whole Item;
+///                       nested: the Item's body node, via the runner).
+/// - `replacement_node`— nested only: replace the holding continuation's node
+///                       and children directly.
+/// - `appended`        — new top-level items to add to the program.
+/// All-null/empty is the no-op signal (handler declined / already processed).
+pub const SiteResult = struct {
+    replacement: ?Item = null,
+    replacement_node: ?NodeReplacement = null,
+    appended: []const Item = &.{},
+    /// Escape hatch for transforms that are genuinely WHOLE-PROGRAM, not
+    /// site-local — e.g. `tap`, which removes its own declaration AND wraps
+    /// matching continuations scattered across the program. Such a handler
+    /// returns the fully-rewritten program here and the runner uses it
+    /// verbatim. Reserve this for transforms that are irreducibly global; the
+    /// site-local fields above are the default and the right tool for the rest.
+    whole_program: ?*const Program = null,
+};
+
+/// ExplainReport — what a library's `[explainer]` returns to the `explain`
+/// command's walk. The explain-world analogue of `SiteResult`: the explainer is
+/// a near-pure function (program AST in, ExplainReport out), and the `explain`
+/// command aggregates the returned reports in its OWN call-frame, then renders
+/// them to text / json / html. Libraries never format — they emit typed entries
+/// and the command's renderer owns all three formats. Because reports flow back
+/// as return values, nothing is threaded through CompilerContext (the
+/// tap-registry anti-pattern can't arise).
+///
+/// Machinable data is a flat bag of PROPERTIES — a "symbol catalog". A property
+/// is one `key → value` symbol whose value is a TYPED scalar (int / float / bool
+/// / string), so `explain json` emits correct JSON (`7`, not `"7"`) while
+/// text/html stringify at the render boundary. A counter is just a property with
+/// an `.integer` value the library carried straight through — no early
+/// stringification. Keeping the shape uniform lets the `explain` command GATHER
+/// every property across every report into one table — the free-form symbol
+/// catalog — namespacing each key under its report `title`
+/// (`std/store.users.listeners = 7`) and rendering three ways. New value kinds
+/// and new Entry variants are pure additions.
+pub const ExplainReport = struct {
+    /// The library/facility this report is about, e.g. "std/store".
+    title: []const u8,
+    sections: []const Section = &.{},
+
+    pub const Section = struct {
+        heading: []const u8,
+        entries: []const Entry = &.{},
+    };
+
+    pub const Entry = union(enum) {
+        /// Prose — the human story a machine reader ignores.
+        note: []const u8,
+        /// One symbol: `key → value`, both strings. The machinable primitive. A
+        /// counter is a property whose value is an int the library stringified;
+        /// a choice ("SoA"), a path, a version are all just properties too. The
+        /// command gathers every property across all reports into the catalog.
+        property: Property,
+
+        pub const Property = struct {
+            /// Library-local key, e.g. "users.listeners". Namespaced under the
+            /// report `title` when gathered into the catalog.
+            key: []const u8,
+            /// The value, carrying its own type so `explain json` emits correct
+            /// JSON. The library keeps its i64 all the way to here as `.integer`.
+            value: Value,
+
+            /// Witness site hashes — canonical site_hash coordinates of the
+            /// sites this row was decided at or counted from. `inserts = 1
+            /// [deadb]` is a number AND its witnesses. Rendered as ` [h]`
+            /// suffixes in text (shortest-unique prefix), a `"<key>$at"` list
+            /// in json, links in html. Empty for derived or prose values.
+            at: []const []const u8 = &.{},
+
+            /// A machinable scalar that knows its JSON type — the same tag set as
+            /// Zig's own `std.json.Value`, minus the composite/null cases we don't
+            /// need yet. json honors the type (`7` / `7.5` / `true` / `"SoA"`);
+            /// text/html stringify every variant. Grows like any other union.
+            pub const Value = union(enum) {
+                integer: i64,
+                float: f64,
+                bool: bool,
+                string: []const u8,
+            };
+        };
+    };
+};
+
+pub const Item = union(enum) {
+    // === SOURCE-LEVEL NODES (created by parser) ===
+    module_decl: ModuleDecl,
+    event_decl: EventDecl,
+    proc_decl: ProcDecl,
+    flow: Flow,
+    event_tap: EventTap,
+    label_decl: LabelDecl,
+    immediate_impl: ImmediateImpl,
+    import_decl: ImportDecl,
+    host_line: HostLine,
+    host_type_decl: HostTypeDecl,
+    parse_error: ParseErrorNode,
+
+    // === IR NODES (created by optimizer/transforms - backend agnostic!) ===
+    native_loop: NativeLoop, // Recursive events → native for/while loops
+    fused_event: FusedEvent, // Pure event chains → single fused handler
+    inlined_event: InlinedEvent, // Small events → inlined at callsite
+    inline_code: InlineCode, // Template-generated code → emit verbatim at call site
+    facet_decl: FacetDecl, // std/refine facet → typed declaration left for later transforms
+
+    pub fn deinit(self: *Item, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .module_decl => |*m| m.deinit(allocator),
+            .host_line => |*line| line.deinit(allocator),
+            .event_decl => |*e| e.deinit(allocator),
+            .proc_decl => |*p| p.deinit(allocator),
+            .flow => |*f| f.deinit(allocator),
+            .event_tap => |*t| t.deinit(allocator),
+            .label_decl => |*l| l.deinit(allocator),
+            .immediate_impl => |*ii| ii.deinit(allocator),
+            .import_decl => |*i| i.deinit(allocator),
+            .host_type_decl => |*h| h.deinit(allocator),
+            .parse_error => |*pe| pe.deinit(allocator),
+
+            // IR nodes
+            .native_loop => |*nl| nl.deinit(allocator),
+            .fused_event => |*fe| fe.deinit(allocator),
+            .inlined_event => |*ie| ie.deinit(allocator),
+            .inline_code => |*ic| ic.deinit(allocator),
+            .facet_decl => |*fd| fd.deinit(allocator),
+        }
+    }
+};
+
+pub const EventDecl = struct {
+    path: DottedPath,
+    input: Shape,
+    branches: []const Branch,
+    // `-> T` return: the event's SINGLE unnamed output, the one-arm sugar that
+    // replaces a redundant single named payload-branch (`| doubled i32`). Emitted
+    // as a bare value (no tagged union); the call site binds it with `-> name`.
+    // Symmetric with `Branch.resume_type` (an effect's single output). An event
+    // has EITHER `return_type` OR named `branches`, never both.
+    return_type: ?[]const u8 = null,
+    return_phantom: ?[]const u8 = null, // Obligation/phantom on the return type, e.g. `-> *R<active!>` → "active!"
+    is_public: bool = false, // Whether this event is public (can be imported)
+    is_implicit_flow: bool = false, // Whether this event uses implicit flow parameter
+    annotations: []const []const u8 = &[_][]const u8{}, // Event annotations like [pure|fusible|abstract]
+    /// Rationale prose from a vertical annotation block — the non-bullet lines,
+    /// trimmed and newline-joined. Addressed to the reader, never evaluated by
+    /// the frontend; a consumer that reads it owns what it means. Empty when the
+    /// block was inline or carried bullets only.
+    prose: []const u8 = "",
+
+    // Purity tracking (computed from proc implementations)
+    is_pure: bool = false, // True if ALL proc implementations are pure
+    is_transitively_pure: bool = false, // True if ALL proc implementations are transitively pure
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    module: []const u8 = "", // Canonical module path (e.g., "input", "lib/fs")
+
+    /// Returns true if this event is comptime-only (should not be emitted to backend)
+    /// Comptime-only events have Program, Source, or Expression parameters
+    pub fn isComptimeOnly(self: *const EventDecl) bool {
+        for (self.input.fields) |field| {
+            if (field.is_source) {
+                return true;
+            }
+            if (field.is_expression) {
+                return true;
+            }
+            // Check for Program type (which is an alias for Program)
+            if (std.mem.eql(u8, field.type, "Program") or
+                std.mem.eql(u8, field.type, "Program"))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Returns true if this event has a specific annotation
+    /// Example: event.hasAnnotation("norun") checks for ~[norun] annotation
+    pub fn hasAnnotation(self: *const EventDecl, annotation: []const u8) bool {
+        for (self.annotations) |ann| {
+            if (std.mem.eql(u8, ann, annotation)) return true;
+        }
+        return false;
+    }
+
+    pub fn deinit(self: *EventDecl, allocator: std.mem.Allocator) void {
+        self.path.deinit(allocator);
+        self.input.deinit(allocator);
+        deinitSliceItems(self.branches, allocator);
+        if (self.return_type) |rt| allocator.free(rt);
+        if (self.return_phantom) |rp| allocator.free(rp);
+        for (self.annotations) |ann| {
+            allocator.free(ann);
+        }
+        allocator.free(@constCast(self.annotations));
+        if (self.prose.len > 0) allocator.free(self.prose);
+        if (self.module.len > 0) allocator.free(self.module);
+    }
+};
+
+pub const HostTypeDecl = struct {
+    name: []const u8, // e.g., "Transition", "CustomMetrics"
+    shape: Shape, // Fields of the type
+
+    /// The module this type declares itself INTO, as the import-derived
+    /// `logical_name` (`app.lib`). Empty means the program's own top level.
+    ///
+    /// Every other appendable item carries this, and it is what the transform
+    /// runner routes on: a synthesized declaration with no module lands at
+    /// program top level, and position in the item tree is what the emitter
+    /// and the host-type-home registry both read. A type synthesized for a
+    /// flow inside a library therefore emitted into `main_module` while the
+    /// code referring to it emitted into the library's struct — Zig gives a
+    /// sibling struct no path to the entry struct, so the reference simply
+    /// did not resolve (115_005).
+    module: []const u8 = "",
+
+    pub fn deinit(self: *HostTypeDecl, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.shape.deinit(allocator);
+        if (self.module.len > 0) allocator.free(self.module);
+    }
+};
+
+/// A refinement declaration left in the program tree by `std/refine`.
+///
+/// Typed inter-transform state: a transform writes the node, later
+/// transforms match the union variant and read `fields` — no comment text
+/// is ever parsed as data. The emitter may *render* the node as a
+/// `// refine …` comment in generated output for debugging; that direction
+/// is write-only.
+///
+/// Bounds are structured, not text: a refined `port: i64 & >1024 &
+/// <=65535` lands as `FacetField{ .name = "port", .type = "i64",
+/// .lo = .{ .value = 1024, .exclusive = true },
+/// .hi = .{ .value = 65535, .exclusive = false } }`.
+pub const FacetBound = struct {
+    value: i64,
+    exclusive: bool, // `>` vs `>=`, `<` vs `<=`
+};
+
+/// A normalizer term — `& clamp(lo, hi)`. Unlike a bound (a claim a
+/// consumer TESTS, producing `.violated`), a clamp is a claim about the
+/// representation: the boundary REWRITES the value into `[lo, hi]` —
+/// saturating, silently, because the declaration spells the policy.
+/// Bounds on the same field judge the post-clamp value.
+pub const FacetClamp = struct {
+    lo: i64,
+    hi: i64,
+};
+
+pub const FacetField = struct {
+    name: []const u8,
+    type: []const u8, // base type, e.g. "i64"
+    lo: ?FacetBound = null,
+    hi: ?FacetBound = null,
+    eq: ?FacetBound = null,
+    clamp: ?FacetClamp = null,
+    /// A disjunction's reachable values — ascending, deduplicated. The
+    /// singleton case is canonicalized into `eq`, so a landed facet carries
+    /// either an `eq` or two-or-more `alts`, never both.
+    alts: ?[]const i64 = null,
+    /// The alternative marked `*`: the value a decode boundary falls back to
+    /// when nothing else decides. Meaningful only while `alts` is set, and
+    /// never part of the predicate — a boundary that JUDGES a value tests
+    /// membership; only a boundary that SUPPLIES one reads the default.
+    alt_default: ?i64 = null,
+
+    pub fn deinit(self: *FacetField, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.type);
+    }
+};
+
+pub const FacetDecl = struct {
+    name: []const u8, // e.g., "Server"
+    /// The logical home the facet refines (`app.test_lib.defs`), matching
+    /// the home semantics of `HostTypeDecl.module`. Empty = own top level.
+    module: []const u8 = "",
+    /// Target scope from the call-site `|variant` (`std/refine(S)|fpga`) —
+    /// null is the universal facet; a named scope's facet carries the
+    /// materialized meet of universal + scoped blocks.
+    target: ?[]const u8 = null,
+    fields: []const FacetField,
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+
+    pub fn deinit(self: *FacetDecl, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.module.len > 0) allocator.free(self.module);
+        if (self.target) |t| allocator.free(t);
+        deinitSliceItems(self.fields, allocator);
+    }
+};
+
+pub const ProcDecl = struct {
+    path: DottedPath,
+    body: Source, // Opaque code as a typed Source (text + location + scope + phantom_type).
+    // Carrying location/phantom_type lets filter-based parsing of the body
+    // (e.g. parse_fields) report diagnostics at real .kz line:col and stay target-aware.
+    inline_flows: []const Flow = &.{}, // Flows extracted from host-language proc bodies
+    annotations: []const []const u8 = &[_][]const u8{}, // Proc annotations like [pure|async]
+    /// Rationale prose from a vertical annotation block. Same contract as
+    /// `EventDecl.prose`: a claim on a proc is about THIS implementation, where
+    /// a claim on the event is about the contract.
+    prose: []const u8 = "",
+    target: ?[]const u8 = null, // Language target: "gpu", "js", "python", null = Zig
+    is_impl: bool = false, // True if event_path has module qualifier (cross-module implementation)
+    is_public: bool = false, // True if declared with ~pub proc
+
+    // Purity tracking
+    is_pure: bool = false, // True if marked ~[pure] or inline-only pattern
+    is_transitively_pure: bool = false, // True if pure AND all called events are transitively pure
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    module: []const u8 = "",
+
+    pub fn deinit(self: *ProcDecl, allocator: std.mem.Allocator) void {
+        self.path.deinit(allocator);
+        self.body.deinit(allocator);
+        if (self.inline_flows.len > 0) {
+            deinitSliceItems(self.inline_flows, allocator);
+        }
+        for (self.annotations) |ann| {
+            allocator.free(ann);
+        }
+        allocator.free(@constCast(self.annotations));
+        if (self.prose.len > 0) allocator.free(self.prose);
+        if (self.target) |t| allocator.free(t);
+        if (self.module.len > 0) allocator.free(self.module);
+    }
+};
+
+/// Source represents captured source code with location and scope
+/// This is the foundation for universal metaprogramming in Koru
+/// Used for tests, macros, templates, embedded DSLs, etc.
+pub const Source = struct {
+    text: []const u8, // Raw source text
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 }, // Where this Source started in original file
+    scope: CapturedScope, // Available bindings at invocation site
+    phantom_type: ?[]const u8 = null, // Phantom type annotation from call site (e.g., "HTML", "SQL")
+
+    pub fn deinit(self: *Source, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        self.scope.deinit(allocator);
+        if (self.phantom_type) |pt| {
+            allocator.free(pt);
+        }
+    }
+};
+
+/// InvocationMeta provides metadata about an invocation for comptime introspection
+/// This allows comptime procs to inspect their call site (annotations, location, etc.)
+/// Used for conditional compilation, build configurations, and meta-programming
+pub const InvocationMeta = struct {
+    path: []const u8, // Full path like "std.build:variants"
+    module: ?[]const u8, // Module qualifier "std.build" or null
+    event_name: []const u8, // Just the event name "variants"
+    annotations: []const []const u8, // Flow annotations like ["release"], ["debug"]
+    location: errors.SourceLocation, // Where it was invoked
+
+    pub fn deinit(self: *InvocationMeta, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.module) |m| allocator.free(m);
+        allocator.free(self.event_name);
+        for (self.annotations) |ann| {
+            allocator.free(ann);
+        }
+        allocator.free(@constCast(self.annotations));
+    }
+};
+
+/// CapturedExpression represents a captured Zig expression with its scope
+/// Used for Expression parameters that need access to bindings at the call site
+pub const CapturedExpression = struct {
+    text: []const u8, // The expression text (e.g., "data.value > 10")
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 }, // Where this expression appeared in source
+    scope: CapturedScope, // Available bindings at invocation site
+
+    pub fn deinit(self: *CapturedExpression, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        self.scope.deinit(allocator);
+    }
+};
+
+/// CapturedScope represents bindings available at a Source block invocation
+/// Enables lexical capture for metaprogramming
+pub const CapturedScope = struct {
+    bindings: []const ScopeBinding,
+
+    pub fn deinit(self: *CapturedScope, allocator: std.mem.Allocator) void {
+        deinitSliceItems(self.bindings, allocator);
+    }
+};
+
+/// ScopeBinding represents a single captured variable/binding
+///
+/// IMPORTANT: The `type` field is set to "unknown" by the parser.
+/// To resolve the actual type, use ast_functional.resolveBindingType()
+/// which walks the AST to find the event+branch that produced this binding.
+///
+/// Type resolution must happen via AST-walking because:
+/// 1. The type depends on what event+branch produced the value
+/// 2. That event might itself be a transform that modifies the AST
+/// 3. Transforms run in source order, so we see the transformed AST
+///
+/// Example:
+///   ~getUserData() | data u |> renderHTML [HTML]{ $[u.name] }
+///
+///   The binding "u" has type="unknown" at parse time.
+///   At transform time, call resolveBindingType() to discover:
+///   - event_name: "getUserData"
+///   - branch_name: "data"
+///   - fields: [{ name: "name", type: "[]const u8" }, { name: "age", type: "i32" }]
+pub const ScopeBinding = struct {
+    name: []const u8, // Variable name (e.g., "userName", "u")
+    type: []const u8, // Type string - set to "unknown" by parser, resolve via ast_functional.resolveBindingType()
+    value_ref: []const u8, // How to reference it (e.g., "userName", "u")
+
+    pub fn deinit(self: *ScopeBinding, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.type);
+        allocator.free(self.value_ref);
+    }
+};
+
+/// A comptime transform's refusal, said TWICE from ONE format string: to the
+/// compilation's reporter as a located Koru diagnostic the author reads, and as
+/// the injected `@compileError` that stops the build.
+///
+/// Both, not either. The reporter sentence is the message; the injected error is
+/// the stop signal, and it stays because a refusal must halt even on a path the
+/// transform-phase drain does not reach. Threading one `fmt` through both makes
+/// the two copies impossible to drift apart — which they had already done where
+/// a transform wrote its sentence out by hand twice.
+///
+/// `rep` is `anytype` so this carries no hard dependency on the reporter's type,
+/// and it is named `rep` rather than `reporter` because the generated transform
+/// stub already binds `const reporter = __koru_event_input.reporter` in the
+/// enclosing proc — a parameter of that name shadows it and Zig refuses.
+/// Every flow in the program, including flows inside IMPORTED modules.
+///
+/// `program.items` is one level deep: an imported module arrives as a single
+/// `.module_decl` item carrying its own `items`. A pass that writes the obvious
+/// `for (program.items) |item| if (item == .flow)` therefore sees only the entry
+/// file and silently ignores every library the program imports.
+///
+/// That is not a hypothetical. It is what made `koruc downloads.k deps` list one
+/// dependency: `koru/curl` declares `requires.system` in `curl/index.kz`, and the
+/// declaration was never reachable. Any pass that collects top-level declarations
+/// — `std/deps`, `std/package`, `std/vendor` — wants THIS, not `program.items`.
+///
+/// System modules are included: `koru_std/compiler.kz` declares the `zig` system
+/// dependency, and a caller that wants only user libraries should filter on
+/// `is_system` itself rather than have the walk decide.
+pub fn allFlows(alloc: std.mem.Allocator, program: *const Program) []const Flow {
+    var out = std.ArrayListUnmanaged(Flow){};
+    collectFlows(alloc, program.items, &out);
+    return out.toOwnedSlice(alloc) catch &.{};
+}
+
+fn collectFlows(alloc: std.mem.Allocator, items: []const Item, out: *std.ArrayListUnmanaged(Flow)) void {
+    for (items) |item| {
+        switch (item) {
+            .flow => |f| out.append(alloc, f) catch return,
+            .module_decl => |m| collectFlows(alloc, m.items, out),
+            else => {},
+        }
+    }
+}
+
+/// The IMPORT-DERIVED logical name of the module an item lives in — `app.lib`
+/// — or null when the item is a top-level item of the entry file.
+///
+/// A program carries TWO names for the same library and they are not
+/// interchangeable. `Flow.module` / `EventDecl.module` is FILE-DERIVED: `lib`,
+/// from `lib.k`. The `.module_decl` wrapping that flow carries the
+/// IMPORT-DERIVED `logical_name`: `app.lib`, from `import app/lib`. Every path
+/// that has to RESOLVE across a module boundary is spelled in the second
+/// domain; the first is only ever a comparison key against another flow.
+///
+/// In the entry file the two collapse into one word, so a transform that mints
+/// a name out of `flow.module` works for months and then addresses its own
+/// synthesized declaration into a namespace that does not exist the first time
+/// its subject is declared inside a library (115_005: `unknown tor
+/// 'lib:kernel_init_…'`, with the declaration sitting right there under
+/// `app.lib`).
+///
+/// Identity is by POINTER: `item` must be a pointer into the program's own
+/// item arrays, which is what a transform's `item: *const Item` parameter is.
+/// A transform that has rebuilt its item first has nothing to look up.
+pub fn homeModule(program: *const Program, item: *const Item) ?[]const u8 {
+    return homeModuleIn(program.items, item, null);
+}
+
+fn homeModuleIn(items: []const Item, needle: *const Item, enclosing: ?[]const u8) ?[]const u8 {
+    for (items) |*it| {
+        if (it == needle) return enclosing;
+        if (it.* == .module_decl) {
+            if (homeModuleIn(it.module_decl.items, needle, it.module_decl.logical_name)) |m| return m;
+        }
+    }
+    return null;
+}
+
+pub fn refusal(
+    alloc: std.mem.Allocator,
+    rep: anytype,
+    code: errors.ErrorCode,
+    loc: errors.SourceLocation,
+    module: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) Item {
+    rep.addErrorAtLocation(code, loc, fmt, args) catch {};
+    const inner = std.fmt.allocPrint(alloc, fmt, args) catch unreachable;
+    const msg = std.fmt.allocPrint(alloc, "comptime {{ @compileError(\"{s}\"); }}", .{inner}) catch unreachable;
+    return Item{ .inline_code = InlineCode{ .code = msg, .location = loc, .module = module } };
+}
+
+/// `refusal` with the teaching half attached. A transform that refuses AND has
+/// somewhere to send the author had to make two calls before this existed —
+/// one to `addErrorAtLocationWithHint` for the sentence, one to `refusal` for
+/// the abort node — and the author read the same fault twice, in two wordings
+/// that could drift apart (690_104: "cannot be auto-discharged" beside "has 0
+/// dischargers (ambiguous)").
+pub fn refusalWithHint(
+    alloc: std.mem.Allocator,
+    rep: anytype,
+    code: errors.ErrorCode,
+    loc: errors.SourceLocation,
+    module: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+    comptime hint_fmt: []const u8,
+    hint_args: anytype,
+) Item {
+    rep.addErrorAtLocationWithHint(code, loc, fmt, args, hint_fmt, hint_args) catch {};
+    const inner = std.fmt.allocPrint(alloc, fmt, args) catch unreachable;
+    const msg = std.fmt.allocPrint(alloc, "comptime {{ @compileError(\"{s}\"); }}", .{inner}) catch unreachable;
+    return Item{ .inline_code = InlineCode{ .code = msg, .location = loc, .module = module } };
+}
+
+/// The refusal envelope's payload: report the diagnostic and produce the
+/// SiteResult a transform returns as `.transformed = ast.refuse(...)`.
+/// Was `.{ .transformed = .{ .replacement = ast.refusal(...) } }` spelled
+/// longhand at ~480 sites across koru_std — the `.transformed` variant is
+/// the proc-local `Output` union, so the liftable unit is the payload.
+pub fn refuse(
+    alloc: std.mem.Allocator,
+    rep: anytype,
+    code: errors.ErrorCode,
+    loc: errors.SourceLocation,
+    module: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) SiteResult {
+    return .{ .replacement = refusal(alloc, rep, code, loc, module, fmt, args) };
+}
+
+/// `refuse` with the teaching half — the `refusalWithHint` envelope.
+pub fn refuseWithHint(
+    alloc: std.mem.Allocator,
+    rep: anytype,
+    code: errors.ErrorCode,
+    loc: errors.SourceLocation,
+    module: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+    comptime hint_fmt: []const u8,
+    hint_args: anytype,
+) SiteResult {
+    return .{ .replacement = refusalWithHint(alloc, rep, code, loc, module, fmt, args, hint_fmt, hint_args) };
+}
+
+/// A `=>`/`->` step inside a body a transform grafts into a VOID synthesized
+/// unit can never be satisfied — the unit declares no branches to construct.
+/// Post-graft the body rides under `is_transformed_subtree`, which every
+/// checker walk skips (transformed subtrees are compiler-owned, already
+/// validated), so the refusal has to happen pre-graft, while the
+/// user-authored body is still legible — kopium wired/holes/10 measured the
+/// alternative: `=>` sailed through checking and died in emitted Zig. The
+/// walk covers nested bodies (conditional / foreach / switch-result), not
+/// just the arm's top level.
+/// `site` is the dotted verb spelling (`store:query`, `grid:sweep`,
+/// `channel`), `name` the named instance, `arm` the arm's own name.
+/// Returns the refusal, or null when clean.
+pub fn refuseUncrossable(
+    alloc: std.mem.Allocator,
+    rep: anytype,
+    site: []const u8,
+    name: []const u8,
+    arm: []const u8,
+    c: *const Continuation,
+    module: []const u8,
+) ?SiteResult {
+    const bad = findUncrossableCtor(c) orelse return null;
+    const bc = bad.node.?.branch_constructor;
+    const glyph: []const u8 = if (bc.is_bare_return) "->" else "=>";
+    return refuse(alloc, rep, .KORU102, bad.location, module, "std/{s}({s}): `{s}` inside a `! {s}` arm has nothing to construct — the arm body grafts into a void synthesized unit, so a branch of the enclosing tor cannot be produced from in there. Hand the verdict out through the enclosing surface and branch after it returns.", .{ site, name, glyph, arm });
+}
+
+fn findUncrossableCtor(c: *const Continuation) ?*const Continuation {
+    if (c.node) |*n| {
+        if (n.* == .branch_constructor) return c;
+        switch (n.*) {
+            .conditional => |cb| for (cb.branches) |*b| {
+                if (findUncrossableCtorSlice(b.body)) |hit| return hit;
+            },
+            .foreach => |fb| for (fb.branches) |*b| {
+                if (findUncrossableCtorSlice(b.body)) |hit| return hit;
+            },
+            .switch_result => |sb| for (sb.branches) |*b| {
+                if (findUncrossableCtorSlice(b.body)) |hit| return hit;
+            },
+            else => {},
+        }
+    }
+    return findUncrossableCtorSlice(c.continuations);
+}
+
+fn findUncrossableCtorSlice(conts: []const Continuation) ?*const Continuation {
+    for (conts) |*c| {
+        if (findUncrossableCtor(c)) |h| return h;
+    }
+    return null;
+}
+
+/// Which byte positions of `text` are EXPRESSION context rather than literal
+/// prose. Inside a string, only a `{{ … }}` interpolation is an expression.
+///
+/// This did not matter while every store reference was dotted — `n.v` seldom
+/// occurs in a sentence — but a ONE-column store is referenced BARE, and a lone
+/// `n` occurs in prose constantly. `"n {{ n:d }}"` must rewrite the second `n`
+/// and leave the first alone; without this, it printed
+/// `__koru_srf___koru_value 7`.
+///
+/// Shared because both store rewriters need it: the plural row rewriter and the
+/// singleton store-path rewriter.
+pub fn expressionMask(alloc: std.mem.Allocator, text: []const u8) []bool {
+    const mask = alloc.alloc(bool, text.len) catch unreachable;
+    var in_str = false;
+    var in_tick = false;
+    var in_char = false;
+    var in_interp = false;
+    var interp_spec = false;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        // `{{ }}` is interpolation whether it sits inside a quoted string or
+        // in bare source (a fmt.blk block) — an unquoted `{{ }}` carries the
+        // same `:spec` tail, and masking it only inside strings is what left
+        // `{{ s.ip:s }}`'s spec reachable by the row rewriter (690_361).
+        if (!in_interp and c == '{' and i + 1 < text.len and text[i + 1] == '{') {
+            in_interp = true;
+            interp_spec = false;
+        }
+        if (in_interp and c == '}' and i + 1 < text.len and text[i + 1] == '}') {
+            in_interp = false;
+            interp_spec = false;
+        }
+        // `{{ expr:spec }}` — the io transform splits the placeholder at the
+        // FIRST ':', so everything after it is format-spec text, never an
+        // expression. Without this a rewriter will happily rewrite a spec
+        // char that collides with a binding — `{{ d.id:d }}` emitted the
+        // row's `__koru_handle_of` mint INTO the format placeholder
+        // (690_122/124/192).
+        if (in_interp and !interp_spec and c == ':') interp_spec = true;
+        if (c == '"' and (i == 0 or text[i - 1] != '\\') and !in_interp and !in_tick and !in_char) {
+            in_str = !in_str;
+            mask[i] = false;
+            continue;
+        }
+        // Backtick-quoted names (switch arm heads, regex literals) and char
+        // literals are literal text too — a bare ` or ' opens one wherever a
+        // literal can matter: outside strings, or inside a {{ }} hole. A
+        // stray ' in a comment closes at end of line rather than masking the
+        // rest of the body.
+        if (c == '`' and (!in_str or in_interp) and !in_char) {
+            in_tick = !in_tick;
+            mask[i] = false;
+            continue;
+        }
+        if (c == '\'' and (!in_str or in_interp) and !in_tick) {
+            in_char = !in_char;
+            mask[i] = false;
+            continue;
+        }
+        if (in_char and c == '\n') in_char = false;
+        mask[i] = (in_interp or (!in_str and !in_tick and !in_char)) and !interp_spec;
+    }
+    return mask;
+}
+
+/// Is a token that starts at `i` at a real boundary — i.e. is it its own
+/// identifier rather than the tail of a longer one?
+///
+/// The naive test is "the byte before is not an identifier character", and in
+/// Koru that test is WRONG, because kebab-case makes `-` an identifier
+/// character. In `-r.v` the `-` is a unary minus and `r` starts a token, but
+/// the naive test reads it as the interior of a kebab name like `foo-r` and
+/// declines to touch it. The store's row rewriter therefore emitted `-r.v`
+/// verbatim into the generated host source, where `r` does not exist — the
+/// only spelling of the negation that survived was `- r.v`, with a space
+/// (690_244).
+///
+/// The disambiguation is local and total: **a `-` belongs to an identifier
+/// only when it sits BETWEEN two identifier characters.** Leading a token, or
+/// after a space, an operator, `(` or `,`, it is arithmetic and joins nothing.
+///
+/// Shared here, beside `expressionMask`, for the reason that one is: every
+/// text rewriter in the compiler needs it and there are a dozen private
+/// `isIdentChar` helpers to get it wrong in a dozen ways.
+pub fn identBoundaryBefore(text: []const u8, i: usize) bool {
+    if (i == 0) return true;
+    const prev = text[i - 1];
+    if (!isKebabIdentChar(prev)) return true;
+    if (prev != '-') return false;
+    return i < 2 or !isKebabIdentChar(text[i - 2]);
+}
+
+/// Which parameter INDEX does this call-site argument bind?
+///
+/// A bare pun (`x` — name==value, no written label) binds the field it NAMES,
+/// never the slot its index happens to land on: `desugarBindingPuns` appends
+/// pun fills at the END of the arg list, so index resolution rebinds `x` to
+/// whatever field sits at that position (style_reuse.k's `write-styled` —
+/// `style` appended at index 3 bound `style` only by luck; `write-at`'s `x`
+/// appended at index 2 rebound to `text` and died KORU080). Index is the
+/// fallback for a bare arg whose name is no field — transform-emitted
+/// positionals like the dock child's prepended `win`. An explicit
+/// `name: value` binds `name` regardless.
+pub fn resolveArgFieldIndex(arg: Arg, index: usize, fields: []const Field) ?usize {
+    if (!arg.had_explicit_label and std.mem.eql(u8, arg.name, arg.value)) {
+        for (fields, 0..) |f, fi| {
+            if (std.mem.eql(u8, f.name, arg.name)) return fi;
+        }
+        return if (index < fields.len) index else null;
+    }
+    // A label ending in '<' is micro-syntax, not a name: `Dog <: Animal`
+    // splits at ':' into (name "Dog <", value "Animal") for the transform's
+    // own grammar (proto field-set extension). It can never name a field —
+    // '<' is no identifier char — so it binds positionally like a bare arg.
+    {
+        const label = std.mem.trim(u8, arg.name, " \t");
+        if (label.len > 0 and label[label.len - 1] == '<')
+            return if (index < fields.len) index else null;
+    }
+    for (fields, 0..) |f, fi| {
+        if (std.mem.eql(u8, f.name, arg.name)) return fi;
+    }
+    return null;
+}
+
+/// The parameter NAME this arg binds — `resolveArgFieldIndex` lifted to names,
+/// with `arg.name` (possibly not a field at all) as the unresolved answer.
+pub fn resolveArgParamName(arg: Arg, index: usize, fields: []const Field) []const u8 {
+    const fi = resolveArgFieldIndex(arg, index, fields) orelse return arg.name;
+    return fields[fi].name;
+}
+
+/// An identifier byte in Koru's kebab-case surface. `-` is included: `set-x`
+/// is ONE name. See `identBoundaryBefore` for why that makes the left-hand
+/// boundary test subtler than a single predicate can express.
+pub fn isKebabIdentChar(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+        (ch >= '0' and ch <= '9') or ch == '_' or ch == '-';
+}
+
+/// The column name a one-column store's synthesized single column carries.
+///
+/// A store declaring `{ 0[i64] }` names no field — the store's own name is the
+/// name — but everything downstream (SoA cells, insert params, apply branches,
+/// sweep projections) addresses columns BY name. So the bare form synthesizes
+/// exactly one, under a name no author can write. Unspellable is the point: a
+/// reachable name would put the author right back to writing `counter.v`.
+///
+/// It lives here rather than in one transform's local helper struct because
+/// `new` mints it and `stored`, `insert` and `sweep` all have to recognise it —
+/// four transforms, one spelling, and `ast` is the vocabulary they already share.
+pub const STORE_IDENTITY_COLUMN = "__koru_value";
+
+/// Does this watch arm name a ONE-column store's only column?
+///
+/// `watch`'s arm names the thing being watched, and it names a COLUMN only
+/// because a multi-column store forces the author to choose one. With one
+/// column there is nothing to choose, so the name collapses to the store's —
+/// the same rule the declaration, `stored` and the row bindings carry. It is
+/// the only store construct whose arm is a column name rather than a fixed
+/// word (`sweep`, `item`, `full`, `row`, `inserted`, …), which is why it is
+/// the only one that needed teaching.
+pub fn watchesIdentityColumn(field_names: []const []const u8, branch: []const u8, store: []const u8) bool {
+    if (field_names.len != 1) return false;
+    if (!std.mem.eql(u8, field_names[0], STORE_IDENTITY_COLUMN)) return false;
+    return std.mem.eql(u8, std.mem.trim(u8, branch, " "), store);
+}
+
+/// Was a declaration this site depends on ALREADY refused?
+///
+/// `refusal` above replaces the refused item with inline code, which means the
+/// declaration it stood for stops existing for every later lookup in the same
+/// pass. Those lookups then refuse too, and the author gets N diagnostics for one
+/// mistake — the true one plus N-1 telling them something they can see in front
+/// of them does not exist. Every transform in a pass runs before the drain checks
+/// the reporter, so nothing stops the pile-up on its own.
+///
+/// The reader lives next to the writer deliberately: `refusal` owns the shape of
+/// the marker, so only this file needs to know it.
+///
+/// Matches PREFIX-ANCHORED on the message, not by substring, and that is
+/// load-bearing. A downstream refusal reads "unknown store 'x' - no
+/// std/store:new(x) found" — it CONTAINS the declaration's own spelling. A
+/// substring test would let one ghost silence the next, and a genuine
+/// unknown-store would go quiet because an unrelated site had already complained.
+/// Scoped to `module`, because a name alone is not an identity. Stores are
+/// module-private by default, so two modules may each declare `items`; matching
+/// on the name across the whole program would let a refusal in one silence
+/// references to the other. A miss fails in the SAFE direction — the caller
+/// simply reports as it does today — so scoping can cost a redundant diagnostic
+/// but can never cost a real one.
+pub fn declarationRefused(
+    alloc: std.mem.Allocator,
+    prog: *const Program,
+    module: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) bool {
+    const prefix = std.fmt.allocPrint(alloc, fmt, args) catch return false;
+    const needle = std.fmt.allocPrint(alloc, "@compileError(\"{s}", .{prefix}) catch return false;
+    return itemsCarryRefusal(prog.items, needle, module);
+}
+
+fn itemsCarryRefusal(items: []const Item, needle: []const u8, module: []const u8) bool {
+    for (items) |it| {
+        switch (it) {
+            .inline_code => |ic| {
+                if (!std.mem.eql(u8, ic.module, module)) continue;
+                if (std.mem.indexOf(u8, ic.code, needle) != null) return true;
+            },
+            // A store may be declared inside a module (115_020), so the refusal
+            // that replaced it sits nested too.
+            .module_decl => |md| {
+                if (itemsCarryRefusal(md.items, needle, module)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Build a flow's root site: one Continuation whose node is the invocation
+/// and whose continuations are the branch handlers. The root is not a branch —
+/// header fields (branch name, binding, guard) are empty and are never read
+/// for a root site.
+pub fn rootSite(
+    invocation: Invocation,
+    continuations: []const Continuation,
+    location: errors.SourceLocation,
+) Continuation {
+    return .{
+        .branch = "",
+        .binding = null,
+        .condition = null,
+        .node = .{ .invocation = invocation },
+        .indent = 0,
+        .continuations = continuations,
+        .location = location,
+    };
+}
+
+pub const Flow = struct {
+    /// THE single recursive "invoke an event + handle its branches" core.
+    /// `body.node` is always an `.invocation` for a flow (the parser only
+    /// constructs flows that way — `inv()` asserts the guarantee), and
+    /// `body.continuations` are the branch handlers. The same Continuation
+    /// type encodes the identical shape at every nesting depth, so nothing
+    /// below the wrapper can ask "am I top-level?". Everything else on Flow
+    /// is a genuinely module-level wrapper concern: annotations (emit-mode/
+    /// filtering), labels, purity, impl_of/impl_variant/is_impl, module
+    /// membership, source location.
+    body: Continuation,
+    annotations: []const []const u8 = &[_][]const u8{}, // Flow annotations like [depends_on("a", "b")]
+    pre_label: ?[]const u8 = null, // Label before invocation (#label event)
+    super_shape: ?SuperShape = null, // For inline flows with branch constructors
+
+    // Zero-overhead control flow support:
+    // If set, emitter outputs this code directly instead of generating handler call + switch.
+    // Used by ~if, ~for transforms to emit literal Zig control flow.
+    // The invocation/continuations are still present for metadata but not used for emission.
+    inline_body: ?[]const u8 = null,
+
+    // Preamble code: emitted BEFORE processing continuations (does NOT skip continuations)
+    // Used by ~const to emit declaration while letting continuations be processed normally.
+    // Unlike inline_body which replaces everything, preamble_code is additive.
+    preamble_code: ?[]const u8 = null,
+
+    // Purity tracking
+    is_pure: bool = true, // Flows are always locally pure (just composition)
+    is_transitively_pure: bool = false, // Default false until purity checker walks and verifies
+
+    // Subflow implementation context (null for top-level flows)
+    // When set, this flow implements the named event.
+    impl_of: ?DottedPath = null,
+
+    // When set, this flow is the |variant arm of impl_of (e.g. ~greet|en = ... → "en").
+    // Symmetric with proc-side variants but lives here because subflow declarations
+    // produce Flow nodes, not Invocation nodes. Invocation.variant is for the OTHER
+    // direction (call-site selection).
+    impl_variant: ?[]const u8 = null,
+
+    // True if the source syntax had a colon (cross-module override: ~mod:event = ...).
+    // MUST be stored at parse time, before canonicalize_names adds module qualifiers
+    // to all paths (which would make impl_of.module_qualifier non-null for locals too).
+    is_impl: bool = false,
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    module: []const u8 = "",
+
+    /// Set only on a SYNTHETIC site-view flow (transform_pass_runner.siteView):
+    /// the real holding continuation this flow's body was copied from. Lets a
+    /// transform recover its nested site's enclosing scope — see
+    /// emitter_helpers.scopeAtSite. Null on every real flow.
+    site_of: ?*const Continuation = null,
+
+    /// Returns true if this flow is a cross-module implementation override.
+    /// Uses the stored is_impl flag set at parse time (pre-canonicalization).
+    pub fn isImpl(self: *const Flow) bool {
+        return self.is_impl;
+    }
+
+    /// The wrapper's structural guarantee: a flow's site head is always an
+    /// event invocation. Asserts (safe builds) if the invariant is violated —
+    /// a flow whose body head is not an invocation is a constructor bug.
+    pub fn inv(self: *const Flow) *const Invocation {
+        const n: *const Node = &self.body.node.?;
+        return &n.invocation;
+    }
+
+    /// Mutable variant of `inv()`.
+    pub fn invMut(self: *Flow) *Invocation {
+        const n: *Node = &self.body.node.?;
+        return &n.invocation;
+    }
+
+    pub fn deinit(self: *Flow, allocator: std.mem.Allocator) void {
+        self.body.deinit(allocator);
+        for (self.annotations) |ann| {
+            allocator.free(ann);
+        }
+        allocator.free(@constCast(self.annotations));
+        if (self.pre_label) |l| allocator.free(l);
+        if (self.inline_body) |ib| allocator.free(ib);
+        if (self.super_shape) |*ss| {
+            for (ss.branches) |*branch| {
+                allocator.free(branch.name);
+                var mutable_payload = branch.payload;
+                mutable_payload.deinit(allocator);
+                for (branch.sources) |source| {
+                    var mutable_source = source;
+                    mutable_source.deinit(allocator);
+                }
+                allocator.free(@constCast(branch.sources));
+            }
+            allocator.free(@constCast(ss.branches));
+        }
+        if (self.impl_of) |*io| {
+            var mutable_io = io.*;
+            mutable_io.deinit(allocator);
+        }
+        if (self.impl_variant) |v| allocator.free(v);
+        if (self.module.len > 0) allocator.free(self.module);
+    }
+};
+
+pub const EventTap = struct {
+    source: ?DottedPath, // null = wildcard (*)
+    destination: ?DottedPath, // null = wildcard (*)
+    continuations: []const Continuation,
+    is_input_tap: bool, // true = before event (input tap), false = after event (output tap)
+    annotations: []const []const u8 = &.{}, // Annotations like [debug], [trace], etc.
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    module: []const u8 = "",
+
+    pub fn deinit(self: *EventTap, allocator: std.mem.Allocator) void {
+        if (self.source) |*s| {
+            var mutable_s = s.*;
+            mutable_s.deinit(allocator);
+        }
+        if (self.destination) |*d| {
+            var mutable_d = d.*;
+            mutable_d.deinit(allocator);
+        }
+        deinitSliceItems(self.continuations, allocator);
+        for (self.annotations) |ann| {
+            allocator.free(ann);
+        }
+        allocator.free(@constCast(self.annotations));
+        if (self.module.len > 0) allocator.free(self.module);
+    }
+};
+
+pub const LabelDecl = struct {
+    name: []const u8,
+    continuations: []const Continuation,
+
+    pub fn deinit(self: *LabelDecl, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        deinitSliceItems(self.continuations, allocator);
+    }
+};
+
+// Immediate branch return for a subflow implementation (no flow body).
+// Used for constants, stubs, defaults — e.g. ~player:load = loaded { id: id, gold: 100 }
+// The flow-based case is now handled by Flow with impl_of set.
+pub const ImmediateImpl = struct {
+    event_path: DottedPath, // Which event this implements
+    value: BranchConstructor, // The immediate branch return value
+    annotations: []const []const u8 = &[_][]const u8{},
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    module: []const u8 = "",
+
+    // Stored at parse time: true if event_path had module qualifier before canonicalization
+    is_impl: bool = false,
+
+    pub fn isImpl(self: *const ImmediateImpl) bool {
+        return self.is_impl;
+    }
+
+    pub fn deinit(self: *ImmediateImpl, allocator: std.mem.Allocator) void {
+        self.event_path.deinit(allocator);
+        var mutable_value = self.value;
+        mutable_value.deinit(allocator);
+        for (self.annotations) |ann| {
+            allocator.free(ann);
+        }
+        allocator.free(@constCast(self.annotations));
+        if (self.module.len > 0) allocator.free(self.module);
+    }
+};
+
+pub const ImportDecl = struct {
+    path: []const u8, // The path to import (e.g., "std/io" or "lib/events")
+    local_name: ?[]const u8, // Dotted namespace derived from the path ("std/io" -> "std.io"); synthetic imports (auto-parent, auto-index) set it directly
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    module: []const u8,
+
+    pub fn deinit(self: *ImportDecl, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.local_name) |n| allocator.free(n);
+        if (self.module.len > 0) allocator.free(self.module);
+    }
+};
+
+pub const DottedPath = struct {
+    module_qualifier: ?[]const u8 = null, // "http" if http:foo, null if local
+    segments: []const []const u8,
+
+    pub fn deinit(self: *DottedPath, allocator: std.mem.Allocator) void {
+        if (self.module_qualifier) |mq| {
+            allocator.free(mq);
+        }
+        for (self.segments) |seg| {
+            allocator.free(seg);
+        }
+        allocator.free(@constCast(self.segments));
+    }
+
+    pub fn format(
+        self: DottedPath,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        if (self.module_qualifier) |mq| {
+            try writer.writeAll(mq);
+            try writer.writeAll(":");
+        }
+        for (self.segments, 0..) |seg, i| {
+            if (i > 0) try writer.writeAll(".");
+            try writer.writeAll(seg);
+        }
+    }
+
+    /// Append `a.b.c` (segments only, no qualifier) into `buf` at `pos`;
+    /// returns the end position. For callers assembling a larger name in a
+    /// pre-sized buffer — `format` covers the writer path.
+    pub fn writeSegments(self: DottedPath, buf: []u8, pos: usize) usize {
+        var p = pos;
+        for (self.segments, 0..) |seg, i| {
+            if (i > 0) {
+                buf[p] = '.';
+                p += 1;
+            }
+            @memcpy(buf[p .. p + seg.len], seg);
+            p += seg.len;
+        }
+        return p;
+    }
+
+    /// Append `mod:a.b.c` (qualifier when present, then segments) into `buf`
+    /// at `pos` — the buffer form of `format`.
+    pub fn writeQualified(self: DottedPath, buf: []u8, pos: usize) usize {
+        var p = pos;
+        if (self.module_qualifier) |mq| {
+            @memcpy(buf[p .. p + mq.len], mq);
+            p += mq.len;
+            buf[p] = ':';
+            p += 1;
+        }
+        return self.writeSegments(buf, p);
+    }
+
+    /// Byte length `writeQualified` produces — callers pre-size with it.
+    pub fn qualifiedLen(self: DottedPath) usize {
+        var n: usize = 0;
+        if (self.module_qualifier) |mq| n += mq.len + 1;
+        for (self.segments, 0..) |seg, i| {
+            n += seg.len;
+            if (i > 0) n += 1;
+        }
+        return n;
+    }
+
+    /// `mod:a.b.c` (or `a.b.c` when unqualified) as an owned slice — the
+    /// allocating form of `writeQualified`. Caller frees.
+    pub fn qualifiedAlloc(self: DottedPath, allocator: std.mem.Allocator) ![]u8 {
+        const buf = try allocator.alloc(u8, self.qualifiedLen());
+        _ = self.writeQualified(buf, 0);
+        return buf;
+    }
+};
+
+pub const Shape = struct {
+    fields: []const Field,
+    is_wildcard: bool = false, // bare `*` - has bindable payload, shape unspecified
+
+    pub fn deinit(self: *Shape, allocator: std.mem.Allocator) void {
+        // Note: For PROGRAM_AST, this will be called via ast_functional.maybeDeinit()
+        // which checks if this is the stack-allocated AST before calling deinit
+        deinitSliceItems(self.fields, allocator);
+    }
+};
+
+pub const Field = struct {
+    name: []const u8,
+    type: []const u8, // Zig type as string (phantom states/tags stripped)
+    module_path: ?[]const u8 = null, // Module path for cross-module types (e.g., "test_lib.user" from "test_lib.user:User")
+    phantom: ?[]const u8 = null, // Opaque phantom string - analyzers interpret
+    is_source: bool = false, // For Source type - captures raw syntax
+    is_file: bool = false, // For File type - compile-time file read (not embedded)
+    is_embed_file: bool = false, // For EmbedFile type - embeds file contents in binary
+    is_expression: bool = false, // For Expression type - captures Zig expressions verbatim
+    is_invocation_meta: bool = false, // For InvocationMeta type - provides call site metadata
+    expression: ?*Expression = null, // For branch constructors in procs - parsed expression value
+    expression_str: ?[]const u8 = null, // Raw expression string (before parsing)
+    owns_expression: bool = false, // Whether this field owns and should free the expression
+
+    /// The `= <expr>` tail of a shape field, as written, with the `=` and the
+    /// surrounding space stripped: `b: i32 = 5` gives `type = "i32"`,
+    /// `default = "5"`.
+    ///
+    /// It has to be split off, not left on the type, and that is the whole
+    /// reason this field exists. The surface parsed before it did — `Field.type`
+    /// was literally `"i32 = 5"` — and it appeared to WORK, because the emitter
+    /// pastes the type verbatim into the generated Zig `Input` struct and Zig
+    /// applies the default itself. Everything else that reads `field.type`
+    /// (optionality via a leading `?`, phantom parsing, the type registry, the
+    /// inline binder) was handed a string that is not a type. A bare-return
+    /// subflow, which never builds an Input struct, dropped the default
+    /// entirely (400_185).
+    default: ?[]const u8 = null,
+
+    pub fn deinit(self: *Field, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.type);
+        if (self.module_path) |mp| allocator.free(mp);
+        if (self.phantom) |p| allocator.free(p);
+        if (self.expression) |expr| {
+            if (self.owns_expression) {
+                expr.deinit(allocator);
+                allocator.destroy(expr);
+            }
+        }
+        if (self.expression_str) |expr_str| allocator.free(expr_str);
+        if (self.default) |d| allocator.free(d);
+    }
+};
+
+pub const BranchKind = enum { terminal, effect };
+
+/// One arm of an effect branch's multi-arm resume sum (`! ask i32 | halved i32 | timeout`).
+/// The effect's output generalizes from a single anonymous `-> T` to a flat sum of
+/// named arms; the handler resumes by constructing one (`=> halved n / 2`).
+/// Mutually exclusive with `Branch.resume_type` — an effect declares one or the other.
+pub const ResumeArm = struct {
+    name: []const u8,
+    type: ?[]const u8 = null, // null = arm carries no payload (`| timeout`)
+    phantom: ?[]const u8 = null, // per-arm obligation; same discharge-only rule as resume_phantom
+
+    pub fn deinit(self: *ResumeArm, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.type) |t| allocator.free(t);
+        if (self.phantom) |p| allocator.free(p);
+    }
+};
+
+pub const Branch = struct {
+    name: []const u8,
+    payload: Shape,
+    is_optional: bool = false, // Marks ?-branches that don't need to be handled
+    is_panic: bool = false, // Marks ?!-branches: unhandled => synthesized @panic(...) (UNSAFE to ignore)
+    kind: BranchKind = .terminal, // `|` = terminal (fires once, returns); `!` = effect (fires 0..N during proc run)
+    resume_type: ?[]const u8 = null, // Type after `->` on effect branches; null = -> void
+    resume_phantom: ?[]const u8 = null, // Phantom/obligation on the resume type, e.g. `-> *R<!state>` → "!state". Read from the effect-branch scope: `<!state>` discharges, `<state!>` would illegally escape.
+    resume_arms: ?[]const ResumeArm = null, // Multi-arm resume sum on effect branches; null = not multi-arm. Mutually exclusive with resume_type.
+    annotations: []const []const u8 = &[_][]const u8{}, // Branch annotations like [mutable]
+
+    pub fn deinit(self: *Branch, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.payload.deinit(allocator);
+        if (self.resume_type) |rt| allocator.free(rt);
+        if (self.resume_phantom) |rp| allocator.free(rp);
+        if (self.resume_arms) |arms| {
+            deinitSliceItems(arms, allocator);
+        }
+        for (self.annotations) |annotation| {
+            allocator.free(annotation);
+        }
+        allocator.free(self.annotations);
+    }
+};
+
+/// True when the decl's branch list holds at least one `|` outcome branch —
+/// the union variants a `|*` residual arm routes. Bare-return (`-> T`), void,
+/// and `!`-effect-only decls produce no outcome switch, so nothing can fall
+/// back to a residual arm written against them.
+pub fn hasTerminalBranch(branches: []const Branch, bare_return: bool) bool {
+    if (bare_return) return false;
+    for (branches) |*b| {
+        if (b.kind != .effect) return true;
+    }
+    return false;
+}
+
+/// A `|*` written against a callee with no `|` outcome branches: the dispatch
+/// has no outcome union to fall back from — emission drops the call or runs
+/// the arm's body on every fire. Returns the offending residual arm for the
+/// caller to refuse, or null when the site is legal.
+pub fn deadCatchall(
+    branches: []const Branch,
+    bare_return: bool,
+    continuations: []const Continuation,
+) ?*const Continuation {
+    if (hasTerminalBranch(branches, bare_return)) return null;
+    for (continuations) |*cont| {
+        if (cont.is_catchall) return cont;
+    }
+    return null;
+}
+
+/// NamedBranch - uniform structure for control flow branches in AST nodes
+///
+/// This type enables the shape checker to validate branches uniformly without
+/// node-type awareness. Instead of specialized fields like `then_body`, `else_body`,
+/// control flow nodes use `branches: []const NamedBranch` where the branch name
+/// is preserved and visible to validation.
+///
+/// Examples:
+///   - Conditional: branches = [{ name: "then", body: [...] }, { name: "else", body: [...] }]
+///   - Foreach: branches = [{ name: "each", body: [...] }, { name: "done", body: [...] }]
+///   - Capture: branches = [{ name: "as", body: [...] }, { name: "captured", body: [...] }]
+pub const NamedBranch = struct {
+    name: []const u8, // Branch name: "then", "else", "each", "done", "as", etc.
+    body: []const Continuation, // The continuations in this branch
+    binding: ?[]const u8 = null, // Optional binding for the branch (e.g., "item" in | each item |>)
+    is_optional: bool = false, // Marks branches that don't need to be handled (like `for`'s `done`)
+    annotations: []const []const u8 = &.{}, // Branch annotations (e.g., [mutable])
+    /// Compiler-internal marks (`@scope`, ...) — pass-produced only, never
+    /// parsed from surface syntax. The internal side-channel: opaque strings a
+    /// pass stamps and later passes honor.
+    marks: []const []const u8 = &.{},
+
+    pub fn deinit(self: *NamedBranch, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        deinitSliceItems(self.body, allocator);
+        if (self.binding) |b| allocator.free(b);
+        for (self.annotations) |ann| allocator.free(ann);
+        if (self.annotations.len > 0) allocator.free(@constCast(self.annotations));
+        for (self.marks) |mark| allocator.free(@constCast(mark));
+        if (self.marks.len > 0) allocator.free(@constCast(self.marks));
+    }
+
+    /// Check if this branch has a specific annotation
+    pub fn hasAnnotation(self: *const NamedBranch, annotation: []const u8) bool {
+        for (self.annotations) |ann| {
+            if (std.mem.eql(u8, ann, annotation)) return true;
+        }
+        return false;
+    }
+
+    /// Check if this branch carries a compiler mark (e.g., "@scope")
+    pub fn hasMark(self: *const NamedBranch, mark: []const u8) bool {
+        for (self.marks) |m| {
+            if (std.mem.eql(u8, m, mark)) return true;
+        }
+        return false;
+    }
+
+    /// Find a branch by name in a slice of NamedBranch
+    pub fn find(branches: []const NamedBranch, name: []const u8) ?*const NamedBranch {
+        for (branches) |*branch| {
+            if (std.mem.eql(u8, branch.name, name)) {
+                return branch;
+            }
+        }
+        return null;
+    }
+
+    /// Get the body of a named branch, or empty slice if not found
+    pub fn getBody(branches: []const NamedBranch, name: []const u8) []const Continuation {
+        if (find(branches, name)) |branch| {
+            return branch.body;
+        }
+        return &[_]Continuation{};
+    }
+
+    /// Get the binding of a named branch, or null if not found
+    pub fn getBinding(branches: []const NamedBranch, name: []const u8) ?[]const u8 {
+        if (find(branches, name)) |branch| {
+            return branch.binding;
+        }
+        return null;
+    }
+};
+
+pub const Invocation = struct {
+    path: DottedPath,
+    args: []const Arg,
+    annotations: []const []const u8 = &[_][]const u8{},
+    /// Compiler-internal marks (`@pass_ran("transform")`, `@shape_valid(...)`,
+    /// `@preamble_then_call`) — pass-produced only, never parsed from surface
+    /// syntax. Invocation-level side-channel between transforms and later
+    /// passes/emitters.
+    marks: []const []const u8 = &.{},
+    inserted_by_tap: bool = false, // Marks invocations inserted by tap transformation
+    from_opaque_tap: bool = false, // Marks steps from opaque taps (to skip nested tap observations)
+    source_module: []const u8 = "", // Module where this invocation appears
+    variant: ?[]const u8 = null, // Variant selector: "gpu", "naive", etc. for ~event|variant() calls
+    return_binding: ?[]const u8 = null, // `~double(a:21) -> d |> ...`: binds the event's single unnamed `-> T` return value to `d` for the following pipeline. Call-site twin of EventDecl.return_type.
+    return_binding_annotations: []const []const u8 = &[_][]const u8{}, // `~get-data(): r[mutable] |> ...`: annotations on the bare-return bind. Call-site twin of Branch.annotations; `[mutable]` makes the emitter bind `var` not `const`.
+    return_destructure: []const DestructureField = &.{}, // `~locate(): { pos: { x }, label } |> ...`: shape-destructure at the bind position. Bind-site twin of the branch-payload `Continuation.destructure`; the emitter binds the return to a temp and emits per-field consts (emitDestructureConsts). Mutually exclusive with a plain return_binding name.
+
+    // Transform replacement: if set, emitter outputs this code instead of calling the handler.
+    // The path is kept for shape validation (the shape checker uses it to verify branch coverage).
+    // This is the canonical location — Flow.inline_body delegates here.
+    inline_body: ?[]const u8 = null,
+
+    // Transform PREAMBLE: setup statements emitted in the enclosing scope BEFORE the
+    // handler call (unlike inline_body, which replaces it). Escape-driven allocation
+    // (field:new.on-stack) uses it to declare caller-frame stack vars and STILL make
+    // the routed call. Flow.preamble_code is the flow-level twin; this is the slot a
+    // NESTED site carries it in (transform_pass_runner.itemToNode), gated by the
+    // @preamble_then_call mark.
+    preamble_code: ?[]const u8 = null,
+
+    pub fn deinit(self: *Invocation, allocator: std.mem.Allocator) void {
+        var mutable_path = self.path;
+        mutable_path.deinit(allocator);
+        deinitSliceItems(self.args, allocator);
+        for (self.annotations) |annotation| {
+            allocator.free(@constCast(annotation));
+        }
+        allocator.free(@constCast(self.annotations));
+        for (self.marks) |mark| {
+            allocator.free(@constCast(mark));
+        }
+        allocator.free(@constCast(self.marks));
+        if (self.source_module.len > 0) {
+            allocator.free(@constCast(self.source_module));
+        }
+        if (self.variant) |v| {
+            allocator.free(@constCast(v));
+        }
+        if (self.return_binding) |rb| {
+            allocator.free(@constCast(rb));
+        }
+        for (self.return_binding_annotations) |annotation| {
+            allocator.free(@constCast(annotation));
+        }
+        allocator.free(@constCast(self.return_binding_annotations));
+        freeDestructure(allocator, self.return_destructure);
+        if (self.inline_body) |ib| {
+            allocator.free(ib);
+        }
+    }
+};
+
+pub const BindingType = enum {
+    branch_payload, // Normal: | ok o |> (o is branch payload)
+    transition, // Meta: | transition t |> (t is Transition struct)
+};
+
+/// One field of a shape-destructure at the binding position:
+/// `| found { name, age: i64, user: { city } } |> ...`
+/// Each field binds the payload's same-named field directly — by NAME, never
+/// by position. `type_text` is an optional representation annotation (a typed
+/// const in the emission; transforms like match may define it as conversion).
+/// `sub` is a nested destructure into that field (emission is just longer
+/// access paths; interiors may be host types — Zig validates at Stage D).
+pub const DestructureField = struct {
+    name: []const u8, // binding name, or "_" to discard the slot
+    type_text: ?[]const u8 = null,
+    sub: []const DestructureField = &.{},
+    /// PREFIX annotations on the entry: `{ [row]e, [ordinal]n }`. Prefix is the
+    /// language's annotation form (`[comptime]tor`, `[global(name)]`); the
+    /// postfix `r[mutable]` is postfix only because it hangs off a binding.
+    ///
+    /// A destructure entry is a REQUEST, and the annotation names what the
+    /// producer should synthesize for it. std/store's query arm is the first
+    /// consumer (`[row]` binds the visited row, `[ordinal]` its 0-based
+    /// cursor); the slot is general, but each consumer must REFUSE an
+    /// annotation it does not implement rather than ignore it.
+    annotations: []const []const u8 = &.{},
+
+    pub fn deinit(self: *const DestructureField, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.type_text) |t| allocator.free(t);
+        for (self.annotations) |a| allocator.free(@constCast(a));
+        if (self.annotations.len > 0) allocator.free(@constCast(self.annotations));
+        freeDestructure(allocator, self.sub);
+    }
+};
+
+pub fn freeDestructure(allocator: std.mem.Allocator, fields: []const DestructureField) void {
+    for (fields) |*f| f.deinit(allocator);
+    if (fields.len > 0) allocator.free(fields);
+}
+
+pub fn copyDestructure(allocator: std.mem.Allocator, fields: []const DestructureField) ![]const DestructureField {
+    if (fields.len == 0) return &.{};
+    const out = try allocator.alloc(DestructureField, fields.len);
+    for (fields, 0..) |f, i| {
+        out[i] = .{
+            .name = try allocator.dupe(u8, f.name),
+            .type_text = if (f.type_text) |t| try allocator.dupe(u8, t) else null,
+            .sub = try copyDestructure(allocator, f.sub),
+            .annotations = blk: {
+                if (f.annotations.len == 0) break :blk &.{};
+                const anns = try allocator.alloc([]const u8, f.annotations.len);
+                for (f.annotations, 0..) |a, ai| anns[ai] = try allocator.dupe(u8, a);
+                break :blk anns;
+            },
+        };
+    }
+    return out;
+}
+
+pub const Continuation = struct {
+    branch: []const u8,
+    binding: ?[]const u8,
+    binding_annotations: []const []const u8 = &[_][]const u8{}, // Annotations on binding (e.g., [mutable])
+    /// Compiler-internal marks on the binding (`@scope`) — pass-produced only,
+    /// never parsed from surface syntax. Scope boundaries for loops/taps are
+    /// stamped here by auto_discharge_inserter, template_processor, taps.kz.
+    binding_marks: []const []const u8 = &.{},
+    /// Shape-destructure at the binding position (empty = none). Mutually
+    /// exclusive with `binding`: a continuation binds the whole payload to
+    /// one name OR destructures it by field name.
+    destructure: []const DestructureField = &.{},
+    binding_type: BindingType = .branch_payload,
+    kind: BranchKind = .terminal, // `|` = terminal handler, `!` = effect handler
+    is_catchall: bool = false, // True for |* or !* residual continuations
+    catchall_metatype: ?[]const u8 = null, // "Transition", "Profile", or "Audit" for |* Transition t
+    condition: ?[]const u8, // When clause condition (e.g., "o.status == 200")
+    condition_expr: ?*Expression = null, // Parsed expression tree for when clause
+    node: ?Node, // The single node in this continuation (null for empty branches like | done |> _)
+    indent: usize, // Track indentation level
+    continuations: []const Continuation, // This node's branch continuations (e.g., | then |>, | else |>)
+
+    /// Marks this continuation as the head of a TRANSFORMED subtree grafted in
+    /// from a transform's lowered output (e.g. capture's `var <cell>` preamble +
+    /// its `''` void-chain continuations, spliced at a nested site by
+    /// transform_pass_runner). The subtree's children are synthesized, not
+    /// user-authored branches, so the structural branch-rules (SHAPE002
+    /// duplicate-handler, KORU050/051 when-clause exhaustiveness) do NOT apply —
+    /// the same exemption a transform FLOW carries at flow level via
+    /// `is_transformed`, propagated to the nested graft. Checkers short-circuit
+    /// the structural recursion when they descend into a flagged continuation.
+    /// Mistakes inside the subtree are caught downstream by the Zig backend.
+    is_transformed_subtree: bool = false,
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+
+    pub fn deinit(self: *Continuation, allocator: std.mem.Allocator) void {
+        allocator.free(self.branch);
+        if (self.binding) |b| allocator.free(b);
+        freeDestructure(allocator, self.destructure);
+        for (self.binding_annotations) |ann| {
+            allocator.free(ann);
+        }
+        if (self.binding_annotations.len > 0) {
+            allocator.free(self.binding_annotations);
+        }
+        for (self.binding_marks) |mark| {
+            allocator.free(@constCast(mark));
+        }
+        if (self.binding_marks.len > 0) {
+            allocator.free(@constCast(self.binding_marks));
+        }
+        if (self.catchall_metatype) |m| allocator.free(m);
+        if (self.condition) |c| allocator.free(c);
+        if (self.condition_expr) |e| e.deinit(allocator);
+        if (self.node) |*n| {
+            var mutable_node = n.*;
+            mutable_node.deinit(allocator);
+        }
+        deinitSliceItems(self.continuations, allocator);
+    }
+};
+
+// =============================================================================
+// Node - Unified execution type (formerly Step)
+// =============================================================================
+// All executable code in Koru flows through Node. This includes:
+// - Event invocations
+// - Control flow (foreach, conditional) with proper AST bodies
+// - Label jumps and anchors
+// - Branch constructors
+//
+// The key insight: Node represents "something that executes", while
+// declarations (events, procs, modules) are separate static structure.
+// =============================================================================
+pub const Node = union(enum) {
+    invocation: Invocation,
+    label_apply: []const u8, // Simple label without args (rare - mostly for compatibility)
+    label_with_invocation: struct { // Pattern: #label event(args) - DECLARATION ONLY
+        label: []const u8,
+        invocation: Invocation,
+        is_declaration: bool = false, // true for #label (anchor), false for @label (jump)
+    },
+    label_jump: struct { // Pattern: @label(args) - JUMP with args
+        label: []const u8,
+        args: []const Arg,
+    },
+    terminal, // The _ marker - flow terminates here
+    branch_constructor: BranchConstructor, // Inline branch construction
+    conditional_block: struct { // Conditional execution (for tap when clauses) - LEGACY
+        condition: ?[]const u8, // Condition string (e.g., "d.result > 50")
+        condition_expr: ?*Expression, // Parsed expression tree
+        nodes: []const Node, // Nodes to execute if condition is true
+        inserted_by_tap: bool = false, // Marks nodes inserted by tap transformation
+        from_opaque_tap: bool = false, // Marks nodes from opaque taps (to skip nested tap observations)
+    },
+    metatype_binding: struct { // Binds a metatype (Profile/Transition/Audit) with transition metadata
+        metatype: []const u8, // "Profile", "Transition", or "Audit"
+        binding: []const u8, // Variable name to bind to (e.g., "p" in "| Profile p |>")
+        source_event: []const u8, // Canonical source event (e.g., "main:http.request")
+        dest_event: ?[]const u8, // Canonical dest event (null for terminal)
+        branch: []const u8, // Branch name (e.g., "done")
+        inserted_by_tap: bool = false, // Marks nodes inserted by tap transformation
+        from_opaque_tap: bool = false, // Marks nodes from opaque taps (to skip nested tap observations)
+    },
+    inline_code: []const u8, // Verbatim Zig code to emit (from transforms like ~if, ~for) - LEGACY
+
+    /// Zig expression as a body-position node.
+    /// Produced by the parser when content at body position is an expression
+    /// rather than an invocation or branch_constructor (invocations always
+    /// have parens; bare identifiers, literals, and arithmetic are expressions).
+    /// Lowered by the emitter according to context:
+    /// - leaf of an effect-branch handler body with `! ask T -> U` resume type →
+    ///   `return EXPR;` so the comptime fn returns the resume value.
+    expression: []const u8,
+
+    // ==========================================================================
+    // NEW: Control flow nodes with proper AST bodies
+    // These replace inline_code for ~if, ~for, ~each etc.
+    // ==========================================================================
+
+    /// Foreach iteration over a collection
+    /// Used by std.seq:each and similar iteration constructs
+    /// Uses uniform branches structure: [{ name: "each", body: [...], binding: "item" }, { name: "done", body: [...] }]
+    foreach: struct {
+        iterable: []const u8, // Expression being iterated (e.g., "lines")
+        element_type: ?[]const u8, // Inferred element type (e.g., "[]const u8"), null if unknown
+        branches: []const NamedBranch, // Uniform branch structure ("each" with binding, optionally "done")
+    },
+
+    /// Conditional execution with proper AST bodies
+    /// Replaces inline_code for ~if construct
+    /// Uses uniform branches structure: [{ name: "then", body: [...] }, { name: "else", body: [...] }]
+    conditional: struct {
+        condition: []const u8, // Condition expression string
+        condition_expr: ?*Expression, // Parsed expression tree (optional)
+        branches: []const NamedBranch, // Uniform branch structure (typically "then" and optionally "else")
+    },
+
+    /// Union/result switch with proper AST bodies
+    /// Used by transforms like query for switching on union result types
+    /// Uses uniform branches structure: [{ name: "row", body: [...], binding: "r" }, { name: "empty", body: [...] }, ...]
+    switch_result: struct {
+        expression: []const u8, // Inline code block that produces the union value
+        branches: []const NamedBranch, // Uniform branch structure (one per union variant)
+    },
+
+    /// Assignment node - generated by capture transform from `captured { }` blocks
+    /// Represents "target = .{ .field1 = expr1, .field2 = expr2 }"
+    assignment: struct {
+        target: []const u8, // The capture binding being assigned to
+        fields: []const Field, // Fields and their expression values
+    },
+
+    // Backwards compatibility alias - will be removed after full migration
+    pub const Step = Node;
+
+    pub fn deinit(self: *Node, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .invocation => |*i| i.deinit(allocator),
+            .label_apply => |l| allocator.free(l),
+            .label_with_invocation => |*lwi| {
+                allocator.free(lwi.label);
+                lwi.invocation.deinit(allocator);
+            },
+            .label_jump => |*lj| {
+                allocator.free(lj.label);
+                deinitSliceItems(lj.args, allocator);
+            },
+            .terminal => {}, // Nothing to free
+            .branch_constructor => |*bc| bc.deinit(allocator),
+            .conditional_block => |*cb| {
+                if (cb.condition) |c| allocator.free(c);
+                if (cb.condition_expr) |e| e.deinit(allocator);
+                deinitSliceItems(cb.nodes, allocator);
+            },
+            .metatype_binding => |*mb| {
+                allocator.free(mb.metatype);
+                allocator.free(mb.binding);
+                allocator.free(mb.source_event);
+                if (mb.dest_event) |dest| allocator.free(dest);
+                allocator.free(mb.branch);
+            },
+            .inline_code => |code| allocator.free(code),
+            .expression => |code| allocator.free(code),
+            .foreach => |*fe| {
+                allocator.free(fe.iterable);
+                if (fe.element_type) |et| allocator.free(et);
+                deinitSliceItems(fe.branches, allocator);
+            },
+            .conditional => |*cond| {
+                allocator.free(cond.condition);
+                if (cond.condition_expr) |e| e.deinit(allocator);
+                deinitSliceItems(cond.branches, allocator);
+            },
+            .switch_result => |*sr| {
+                allocator.free(sr.expression);
+                deinitSliceItems(sr.branches, allocator);
+            },
+            .assignment => |*asgn| {
+                allocator.free(asgn.target);
+                deinitSliceItems(asgn.fields, allocator);
+            },
+        }
+    }
+};
+
+// Backwards compatibility alias - will be removed after full migration
+pub const Step = Node;
+
+pub const Arg = struct {
+    name: []const u8,
+    value: []const u8,
+    source_value: ?*const Source = null, // For Source arguments - holds text + location + scope (const in PROGRAM_AST)
+    expression_value: ?*const CapturedExpression = null, // For Expression arguments - holds text + location + scope
+    parsed_expression: ?*const Expression = null, // Value parsed through expression parser (when parseable)
+    /// Author-asserted phantom label on a literal or parenthesized expression
+    /// (e.g. `22.5<celsius>`, `"alice"<username>`, `(box.v)<celsius>`).
+    /// The suffix is stripped from `value`; the label name lives here. The
+    /// phantom checker trusts the assertion — author asserts, checker matches.
+    phantom_type: ?[]const u8 = null,
+    /// True when the author wrote an explicit `name: value` label (vs. a bare
+    /// punning arg). Lets diagnostics distinguish "bare arg needs a label" from
+    /// "explicit label names a parameter that doesn't exist" (PARSE006).
+    had_explicit_label: bool = false,
+
+    pub fn deinit(self: *Arg, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.value);
+        if (self.source_value) |source| {
+            // Cast away const for deallocation - safe because we allocated it
+            var mutable_source = @constCast(source);
+            mutable_source.deinit(allocator);
+            allocator.destroy(mutable_source);
+        }
+        if (self.expression_value) |expr| {
+            var mutable_expr = @constCast(expr);
+            mutable_expr.deinit(allocator);
+            allocator.destroy(mutable_expr);
+        }
+        if (self.parsed_expression) |parsed| {
+            var mutable_parsed = @constCast(parsed);
+            mutable_parsed.deinit(allocator);
+        }
+        if (self.phantom_type) |pt| allocator.free(pt);
+    }
+};
+
+pub const BranchConstructor = struct {
+    branch_name: []const u8,
+    fields: []const Field, // Reuse Field type from Shape
+    plain_value: ?[]const u8 = null, // For branches with a single plain value (not a struct)
+    has_expressions: bool = false, // True if any field contains an expression (for procs)
+    is_bare_return: bool = false, // `~event -> expr`: the `->` bare-return impl (twin of `=>` branch ctor). branch_name is empty; plain_value is the expression; the emitter returns it directly (no tag). Pairs with EventDecl.return_type.
+
+    pub fn deinit(self: *BranchConstructor, allocator: std.mem.Allocator) void {
+        allocator.free(self.branch_name);
+        if (self.plain_value) |pv| {
+            allocator.free(pv);
+        }
+        deinitSliceItems(self.fields, allocator);
+    }
+};
+
+// ============================================================
+// IR (Intermediate Representation) Nodes
+// ============================================================
+// These nodes are created by optimization passes and represent
+// backend-agnostic semantic constructs. They sit between the
+// source-level AST and target code generation.
+//
+// Why IR nodes?
+// - Backend agnostic: Same IR emits to Zig, GLSL, JS, Python, etc.
+// - Composable: Multiple optimization passes can operate on IR
+// - Debuggable: Can inspect what optimizations were applied
+// - Future-proof: New backends just need to emit IR nodes
+//
+// IR nodes are created by optimizer passes in koru_std/optimizations/
+
+/// NativeLoop - IR node for loops
+/// Represents a counted loop that can emit to any backend's loop syntax.
+/// Created by detecting recursive event patterns (checker + label jumps).
+pub const NativeLoop = struct {
+    event_path: DottedPath, // Which event does this implement?
+
+    // Loop structure (semantic, not syntax-specific)
+    variable: []const u8, // Loop variable name (e.g., "i")
+    start_expr: []const u8, // Start value (e.g., "0")
+    end_expr: []const u8, // End condition (e.g., "bodies.len")
+    step_expr: ?[]const u8 = null, // Step (e.g., "1", null = default increment)
+
+    // Loop body
+    body_code: []const u8, // Inlined body code (backend-specific for now)
+    body_source: ?DottedPath = null, // Original event/proc this was inlined from
+
+    // Done/exit branch information (for continuation emission)
+    // The branch name for the exit condition (e.g., "done", "finished", "complete")
+    exit_branch_name: []const u8,
+    // Maps exit branch fields to their values from the proc body
+    // Example: [{field_name: "result", value_expr: "sum"}]
+    done_field_values: []const FieldValue,
+
+    // Loop style hints for backend
+    style: LoopStyle,
+
+    // Provenance tracking
+    optimized_from: ?DottedPath = null, // Original subflow that was transformed (event name)
+    optimized_from_flow: ?*Flow = null, // THE ACTUAL FLOW that was optimized (full context!)
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    module: []const u8,
+
+    pub const FieldValue = struct {
+        field_name: []const u8,
+        value_expr: []const u8,
+
+        pub fn deinit(self: *FieldValue, allocator: std.mem.Allocator) void {
+            allocator.free(self.field_name);
+            allocator.free(self.value_expr);
+        }
+    };
+
+    pub fn deinit(self: *NativeLoop, allocator: std.mem.Allocator) void {
+        self.event_path.deinit(allocator);
+        allocator.free(self.variable);
+        allocator.free(self.start_expr);
+        allocator.free(self.end_expr);
+        if (self.step_expr) |step| allocator.free(step);
+        allocator.free(self.body_code);
+        if (self.body_source) |*bs| {
+            var mutable_bs = bs.*;
+            mutable_bs.deinit(allocator);
+        }
+        // Free exit_branch_name
+        allocator.free(self.exit_branch_name);
+        // Free done_field_values
+        deinitSliceItems(self.done_field_values, allocator);
+        if (self.optimized_from) |*of| {
+            var mutable_of = of.*;
+            mutable_of.deinit(allocator);
+        }
+        // Free the original Flow if we own it
+        if (self.optimized_from_flow) |flow_ptr| {
+            flow_ptr.deinit(allocator);
+            allocator.destroy(flow_ptr);
+        }
+        allocator.free(self.module);
+    }
+};
+
+/// Loop style hints for code generation
+pub const LoopStyle = enum {
+    counted_up, // for (start..end) |var|  (Zig) / for (int i = start; i < end; i++) (C)
+    counted_down, // Reverse iteration
+    triangular, // Nested loops with dependent bounds: for (i) for (i+1..n)
+    while_style, // Complex condition - emit as while loop
+};
+
+/// FusedEvent - IR node for event chain fusion
+/// Represents multiple pure events fused into a single handler.
+/// Created by detecting chains of pure event invocations.
+pub const FusedEvent = struct {
+    event_path: DottedPath, // The fused event name
+
+    // Fusion info
+    source_events: []DottedPath, // Original events that were fused [foo, bar, baz]
+    fused_body: []const u8, // The combined handler body
+
+    // Input/output shapes (same as original event)
+    input: Shape,
+    branches: []const Branch,
+
+    // Provenance
+    provenance: []const u8, // Human-readable: "fused from foo → bar → baz"
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    module: []const u8,
+
+    pub fn deinit(self: *FusedEvent, allocator: std.mem.Allocator) void {
+        self.event_path.deinit(allocator);
+        deinitSliceItems(self.source_events, allocator);
+        allocator.free(self.fused_body);
+        self.input.deinit(allocator);
+        deinitSliceItems(self.branches, allocator);
+        allocator.free(self.provenance);
+        allocator.free(self.module);
+    }
+};
+
+/// InlinedEvent - IR node for inlined events
+/// Represents a small event that should be inlined at callsites.
+/// Created by detecting small, pure events called from hot paths.
+pub const InlinedEvent = struct {
+    event_path: DottedPath, // The event being inlined
+
+    // Inline info
+    inline_body: []const u8, // The inlined code
+    original_proc: ?*const ProcDecl = null, // Pointer to original proc (if available)
+
+    // Provenance
+    inlined_from: DottedPath, // Original event that was inlined
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    module: []const u8,
+
+    pub fn deinit(self: *InlinedEvent, allocator: std.mem.Allocator) void {
+        self.event_path.deinit(allocator);
+        allocator.free(self.inline_body);
+        self.inlined_from.deinit(allocator);
+        allocator.free(self.module);
+    }
+};
+
+/// InlineCode - IR node for template-generated inline code
+/// Represents code that should be emitted verbatim at the call site.
+/// Created by transforms using template interpolation (e.g., ~if, ~for).
+/// This is the foundation for zero-overhead control flow and aggressive inlining.
+pub const InlineCode = struct {
+    code: []const u8, // The generated code to emit verbatim
+
+    // FOUNDATIONAL: Every item knows where it came from
+    location: errors.SourceLocation = .{ .file = "generated", .line = 0, .column = 0 },
+    module: []const u8,
+
+    pub fn deinit(self: *InlineCode, allocator: std.mem.Allocator) void {
+        allocator.free(self.code);
+        allocator.free(self.module);
+    }
+};
+
+// ============================================================
+// Build System Types (Polyglot Multi-Target Coordination)
+// ============================================================
+// These types allow compiler passes to declare their build requirements.
+// See docs/KORU-BUILD.md for complete architecture documentation.
+
+/// BuildStep represents a single step in the build process that the Koru
+/// coordinator needs to execute. Compiler passes return these to declare
+/// their build requirements (external compilers, libraries, runtime files).
+pub const BuildStep = union(enum) {
+    /// Execute an external command (e.g., glslangValidator for GPU shaders)
+    system_command: SystemCommand,
+
+    /// Link a system library (e.g., Vulkan, V8)
+    link_library: LinkLibrary,
+
+    /// Bundle a runtime file with the executable (e.g., .spv shaders, .wasm modules)
+    runtime_file: RuntimeFile,
+
+    /// Add an include path for C headers
+    include_path: IncludePath,
+
+    /// Add a compile flag to the Zig compiler
+    compile_flag: CompileFlag,
+
+    pub fn deinit(self: *BuildStep, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .system_command => |*cmd| cmd.deinit(allocator),
+            .link_library => |*lib| lib.deinit(allocator),
+            .runtime_file => |*file| file.deinit(allocator),
+            .include_path => |*path| path.deinit(allocator),
+            .compile_flag => |*flag| flag.deinit(allocator),
+        }
+    }
+};
+
+/// Execute an external program as part of the build
+/// Example: glslangValidator -V shader.glsl -o shader.spv
+pub const SystemCommand = struct {
+    /// Program name or path (e.g., "glslangValidator", "/usr/bin/tsc")
+    program: []const u8,
+
+    /// Arguments to pass (e.g., ["-V", "-O", "shader.glsl"])
+    args: []const []const u8,
+
+    /// Optional working directory (null = inherit from build)
+    cwd: ?[]const u8 = null,
+
+    pub fn deinit(self: *SystemCommand, allocator: std.mem.Allocator) void {
+        allocator.free(self.program);
+        for (self.args) |arg| {
+            allocator.free(arg);
+        }
+        allocator.free(self.args);
+        if (self.cwd) |cwd| {
+            allocator.free(cwd);
+        }
+    }
+};
+
+/// Link a system library into the final executable
+/// Example: Vulkan, CUDA, V8, QuickJS
+pub const LinkLibrary = struct {
+    /// Library name (e.g., "vulkan", "v8", "sqlite3")
+    name: []const u8,
+
+    /// If true, build succeeds even if library isn't available (graceful degradation)
+    /// If false, build fails if library is missing
+    optional: bool = false,
+
+    pub fn deinit(self: *LinkLibrary, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+    }
+};
+
+/// Bundle a runtime file with the executable
+/// Example: Compiled shaders (.spv), WASM modules (.wasm), JavaScript bundles (.js)
+pub const RuntimeFile = struct {
+    /// Source path (usually in zig-cache after external compilation)
+    source: []const u8,
+
+    /// Destination path relative to installation directory
+    /// Example: "shaders/" means installed to <install-dir>/shaders/
+    dest: []const u8,
+
+    pub fn deinit(self: *RuntimeFile, allocator: std.mem.Allocator) void {
+        allocator.free(self.source);
+        allocator.free(self.dest);
+    }
+};
+
+/// Add an include path for C headers
+/// Example: vendor/vulkan/include
+pub const IncludePath = struct {
+    /// Path to include directory
+    path: []const u8,
+
+    /// If true, use -isystem (system headers) instead of -I
+    system: bool = false,
+
+    pub fn deinit(self: *IncludePath, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+    }
+};
+
+/// Add a compiler flag
+/// Example: -DGPU_ENABLED, -march=native
+pub const CompileFlag = struct {
+    /// The flag to add (e.g., "-DGPU_ENABLED")
+    flag: []const u8,
+
+    pub fn deinit(self: *CompileFlag, allocator: std.mem.Allocator) void {
+        allocator.free(self.flag);
+    }
+};
+
+// ============================================================
+// Unified AST Node Type
+// ============================================================
+// ASTNode provides a unified way to reference any node in the AST.
+// This enables generic traversal, transforms that work on any node,
+// and a clean interface for comptime AST manipulation.
+//
+// Every major compiler has this: Go's ast.Node, Rust's NodeId,
+// TypeScript's ESTree Node, Python's AST base class, etc.
+
+/// ASTNode - unified type for any node in the AST
+/// Enables generic traversal and transformation without specialized code
+/// for each nesting level.
+pub const ASTNode = union(enum) {
+    program: *Program,
+    item: *Item,
+    flow: *Flow,
+    continuation: *Continuation,
+    node: *Node,
+    invocation: *Invocation,
+
+    /// Returns child nodes for traversal.
+    /// Caller is responsible for freeing the returned slice.
+    pub fn children(self: ASTNode, allocator: std.mem.Allocator) ![]ASTNode {
+        return switch (self) {
+            .program => |p| blk: {
+                var result = try allocator.alloc(ASTNode, p.items.len);
+                for (p.items, 0..) |*item, i| {
+                    result[i] = .{ .item = @constCast(item) };
+                }
+                break :blk result;
+            },
+            .item => |i| blk: {
+                switch (i.*) {
+                    .flow => |*f| {
+                        var result = try allocator.alloc(ASTNode, 1);
+                        result[0] = .{ .flow = @constCast(f) };
+                        break :blk result;
+                    },
+                    .module_decl => |*m| {
+                        var result = try allocator.alloc(ASTNode, m.items.len);
+                        for (m.items, 0..) |*item, idx| {
+                            result[idx] = .{ .item = @constCast(item) };
+                        }
+                        break :blk result;
+                    },
+                    // Leaf nodes (no children to traverse for transforms)
+                    .event_decl, .proc_decl, .event_tap, .label_decl, .immediate_impl, .import_decl, .host_line, .host_type_decl, .parse_error, .native_loop, .fused_event, .inlined_event, .inline_code, .facet_decl => {
+                        break :blk try allocator.alloc(ASTNode, 0);
+                    },
+                }
+            },
+            .flow => |f| blk: {
+                // A flow's single child is its root site (a Continuation).
+                // The continuation case below handles depth-first ordering
+                // (branch continuations before the node) uniformly for the
+                // root and every nested site.
+                var result = try allocator.alloc(ASTNode, 1);
+                result[0] = .{ .continuation = @constCast(&f.body) };
+                break :blk result;
+            },
+            .continuation => |c| blk: {
+                // Continuation has: optional step + branch continuations
+                // CRITICAL: Visit continuations FIRST for proper depth-first ordering!
+                // Branch continuations (| then |>, | else |>) may have inner transforms
+                // that must run BEFORE outer transforms.
+                const step_count: usize = if (c.node != null) 1 else 0;
+                const count = c.continuations.len + step_count;
+                var result = try allocator.alloc(ASTNode, count);
+                var idx: usize = 0;
+                // Visit branch continuations FIRST (inner transforms before outer)
+                for (c.continuations) |*cont| {
+                    result[idx] = .{ .continuation = @constCast(cont) };
+                    idx += 1;
+                }
+                // Then visit the step (if present)
+                if (c.node) |*s| {
+                    result[idx] = .{ .node = @constCast(s) };
+                }
+                break :blk result;
+            },
+            .node => |s| blk: {
+                switch (s.*) {
+                    .invocation => |*inv| {
+                        var result = try allocator.alloc(ASTNode, 1);
+                        result[0] = .{ .invocation = @constCast(inv) };
+                        break :blk result;
+                    },
+                    .conditional_block => |*cb| {
+                        var result = try allocator.alloc(ASTNode, cb.nodes.len);
+                        for (cb.nodes, 0..) |*step, i| {
+                            result[i] = .{ .node = @constCast(step) };
+                        }
+                        break :blk result;
+                    },
+                    // Leaf step types
+                    .label_apply, .label_with_invocation, .label_jump, .terminal, .branch_constructor, .metatype_binding, .inline_code, .expression => {
+                        break :blk try allocator.alloc(ASTNode, 0);
+                    },
+                    // Foreach, conditional, switch_result have bodies handled via continuation traversal
+                    // Assignment is a leaf node
+                    .foreach, .conditional, .switch_result, .assignment => {
+                        break :blk try allocator.alloc(ASTNode, 0);
+                    },
+                }
+            },
+            .invocation => blk: {
+                // Invocation is a leaf node (args are data, not traversable nodes)
+                break :blk try allocator.alloc(ASTNode, 0);
+            },
+        };
+    }
+
+    /// Returns true if this node matches the given invocation path.
+    /// Used by transform system to find transforms to apply.
+    /// Supports glob patterns: log.* matches log.info, log.error, etc.
+    pub fn matchesTransform(self: ASTNode, transform_name: []const u8) bool {
+        if (self != .invocation) return false;
+        const inv = self.invocation;
+
+        // Join path segments
+        if (inv.path.segments.len == 0) return false;
+
+        // Build invocation path from segments
+        var buf: [256]u8 = undefined;
+        var pos: usize = 0;
+        for (inv.path.segments, 0..) |seg, i| {
+            if (i > 0) {
+                buf[pos] = '.';
+                pos += 1;
+            }
+            if (pos + seg.len > buf.len) return false;
+            @memcpy(buf[pos..][0..seg.len], seg);
+            pos += seg.len;
+        }
+        const invocation_path = buf[0..pos];
+
+        return glob_pattern_matcher.matchSegment(transform_name, invocation_path);
+    }
+
+    /// Check if this invocation has already been transformed
+    pub fn isAlreadyTransformed(self: ASTNode) bool {
+        if (self != .invocation) return false;
+        const inv = self.invocation;
+        for (inv.marks) |mark| {
+            if (std.mem.eql(u8, mark, "@pass_ran(\"transform\")")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Find the containing Item for an invocation by walking the program.
+    /// Returns the Item that contains this invocation (either as a flow's
+    /// top-level invocation or in a continuation pipeline).
+    /// This is needed by transform handlers that need access to continuations.
+    pub fn findContainingItem(program: *const Program, target_inv: *const Invocation) ?*const Item {
+        return findInItems(std.heap.page_allocator, program.items, target_inv);
+    }
+
+    fn findInItems(allocator: std.mem.Allocator, items: []const Item, target_inv: *const Invocation) ?*const Item {
+        for (items) |*item| {
+            switch (item.*) {
+                .flow => |*f| {
+                    // The root site is just a continuation — one search path
+                    // covers the flow's own invocation and every nested one.
+                    if (findInContinuation(&f.body, target_inv)) {
+                        return item;
+                    }
+                },
+                .immediate_impl => {},
+                .module_decl => |*m| {
+                    // Recursively search in module items
+                    if (findInItems(allocator, m.items, target_inv)) |found| {
+                        return found;
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn findInContinuation(cont: *const Continuation, target_inv: *const Invocation) bool {
+        if (cont.node) |*node| {
+            if (node.* == .invocation) {
+                if (&node.invocation == target_inv) {
+                    return true;
+                }
+            }
+        }
+        for (cont.continuations) |*child| {
+            if (findInContinuation(child, target_inv)) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+/// One impl-bearing item (a `.flow` or an `.immediate_impl`) paired with the
+/// logical name of the module it was found in. `""` marks the ENTRY file's top
+/// level: not a module, and never home-excluded — the resolver's `~main:event`
+/// self-qualified override spelling lives there. Cross-module override scans
+/// need the home to tell a module's own implementation of an event apart from
+/// another module's override of it: after canonicalization stamps the
+/// enclosing module onto an unqualified impl, BOTH carry the abstract's module
+/// qualifier and only the home distinguishes them.
+pub const ImplSite = struct {
+    item: *const Item,
+    home: []const u8,
+};
+
+/// Collect every `.flow` and `.immediate_impl` reachable from `items`,
+/// descending through `module_decl` boundaries in declaration order. Callers
+/// walking a program's top level pass `home = ""`; walking a module's items,
+/// that module's logical name. A flat top-level scan — what the cross-module
+/// override walks did before — is this walk with the `module_decl` arm removed.
+pub fn collectImplSites(allocator: std.mem.Allocator, items: []const Item, home: []const u8, out: *std.ArrayList(ImplSite)) !void {
+    for (items) |*item| {
+        switch (item.*) {
+            .flow, .immediate_impl => try out.append(allocator, .{ .item = item, .home = home }),
+            .module_decl => |*m| try collectImplSites(allocator, m.items, m.logical_name, out),
+            else => {},
+        }
+    }
+}
+
+/// Strip a trailing phantom annotation from a type string: `*R<active!>` → `*R`.
+///
+/// Single home for what were byte-identical twins in `shape_checker` and
+/// `visitor_emitter`. They had to agree — the refusal below and the emitter's
+/// auto-proc passthrough answer the same question about the same types — and
+/// keeping two copies in step was a promise nobody could check.
+pub fn stripPhantomSuffix(type_str: []const u8) []const u8 {
+    if (type_str.len > 0 and type_str[type_str.len - 1] == '>') {
+        var angle_depth: i32 = 0;
+        var i = type_str.len - 1;
+        while (i > 0) : (i -= 1) {
+            if (type_str[i] == '>') {
+                angle_depth += 1;
+            } else if (type_str[i] == '<') {
+                angle_depth -= 1;
+                if (angle_depth == 0) {
+                    if (i > 0) return type_str[0..i];
+                    break;
+                }
+            }
+        }
+    }
+    return type_str;
+}
+
+/// Would the no-implementation stub for this event FABRICATE an answer it was
+/// never given?
+///
+/// Two readers ask this, and before this function they asked it separately: the
+/// invoked-but-unimplemented refusal (KORU047), deciding whether to reject the
+/// program, and the emitter, deciding what to put in an empty event's body. They
+/// were hand-written to agree — the refusal's own comment says it is "mirroring
+/// the emitter's own synthesis conditions" — which is a duplicate maintained by
+/// care rather than by construction.
+///
+/// True means the stub has to invent something: a value out of nothing for a
+/// `-> T` event, or a choice between outcomes made by taking the first arm.
+/// False means the empty body is honest — an event that produces nothing is a
+/// no-op when empty, a wildcard payload is a shape-validation vehicle, and an
+/// output every field of which is already present in the input gets real
+/// passthrough synthesised rather than a stub.
+///
+/// Only the SHAPE is asked here. Whether an event is marked never-run, is
+/// comptime-only, is declared through a glob, or carries `[abstract]` decides
+/// whether the *refusal* fires; none of it says whether the body would lie.
+/// Those all stay with the refusal, where a reader can check each against the
+/// event in front of them.
+///
+/// `[abstract]` in particular must NOT be answered here. It is a contract about
+/// where the implementation lives, and each caller weighs it differently: the
+/// shape checker refuses an invoked abstract whatever its output shape, while
+/// the emitter's loud-hole guard cares only whether an implementation is present
+/// in the program it is emitting — by then the annotation says nothing the
+/// search has not already answered.
+pub fn stubWouldFabricate(event: *const EventDecl) bool {
+    if (event.return_type != null) return true;
+
+    var terminal_count: usize = 0;
+    var first_terminal: ?*const Branch = null;
+    for (event.branches) |*b| {
+        if (b.kind == .effect) continue;
+        terminal_count += 1;
+        if (first_terminal == null) first_terminal = b;
+    }
+
+    // Void or effect-only: the empty body is a no-op, not a lie.
+    const first = first_terminal orelse return false;
+    // `*` payload: shape-validation-only event (parser/transform vehicle).
+    if (first.payload.is_wildcard) return false;
+    // Two or more outcomes: picking the first one lies about the choice.
+    if (terminal_count >= 2) return true;
+    // A single bare signal arm carries no data to fabricate.
+    if (first.payload.fields.len == 0) return false;
+
+    // Auto-proc passthrough: every output field has a matching input field
+    // (name + base type), so the synthesised identity is real behaviour
+    // (350_AUTO_PROC), not a stub.
+    for (first.payload.fields) |out_field| {
+        var matched = false;
+        for (event.input.fields) |in_field| {
+            if (std.mem.eql(u8, out_field.name, in_field.name) and
+                std.mem.eql(u8, stripPhantomSuffix(out_field.type), stripPhantomSuffix(in_field.type)))
+            {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) return true;
+    }
+    return false;
+}

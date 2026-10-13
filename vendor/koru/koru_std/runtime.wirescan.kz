@@ -1,0 +1,224 @@
+// Koru Standard Library: the `wirescan` part of runtime — the type-directed
+// wire scanner and parse.wire's proc. Joined via `~part wirescan` in
+// runtime.kz; merged into the runtime module at load.
+//
+// wireValidate (wireval part) is the scope-blind shape check. wireScan is the
+// same grammar PLUS the declared field type: a field typed `Expression`
+// admits balanced expression text, a field typed `Source` admits raw text —
+// the colon form `verb: <rest>` fills a verb's lone Source field. Admitted
+// typed text is normalized to canonical quoted wire, so eval, marshal, and
+// the prompt see one representation: the type is the contract, the quoting
+// is an implementation detail of the same bytes.
+
+const WireScan = union(enum) {
+    ok: []const u8, // normalized wire — typed positions re-quoted
+    reject: WireRejection,
+};
+
+// The dispatch-side half of the pair: canonicalize what the gate admitted.
+// A refused line passes through unchanged — the flow parser refuses it
+// downstream with its own diagnostic, so normalization never hides a verdict.
+pub fn wireNormalize(allocator: std.mem.Allocator, s: []const u8, input_fn: ?InputLookupFn, host_input_fn: ?InputLookupFn) []const u8 {
+    return switch (wireScan(allocator, s, input_fn, host_input_fn)) {
+        .ok => |w| w,
+        .reject => s,
+    };
+}
+
+fn wireFieldSpecs(verb: []const u8, input_fn: ?InputLookupFn, host_input_fn: ?InputLookupFn) ?[]const InputFieldSpec {
+    if (input_fn) |f| {
+        if (f(verb)) |specs| return specs;
+    }
+    if (host_input_fn) |f| {
+        if (f(verb)) |specs| return specs;
+    }
+    return null;
+}
+
+fn wireFieldType(specs: ?[]const InputFieldSpec, field: []const u8) ?[]const u8 {
+    if (specs) |ss| {
+        for (ss) |sp| {
+            if (std.mem.eql(u8, sp.name, field)) return sp.type_name;
+        }
+    }
+    return null;
+}
+
+// Captured-text fields name their type `Expression`/`Source` (module-qualified spellings included).
+fn wireIsCapturedType(t: []const u8) bool {
+    const base = if (std.mem.lastIndexOfScalar(u8, t, '.')) |d| t[d + 1 ..] else t;
+    return std.mem.eql(u8, base, "Expression") or std.mem.eql(u8, base, "Source");
+}
+
+fn wireIsSourceType(t: []const u8) bool {
+    const base = if (std.mem.lastIndexOfScalar(u8, t, '.')) |d| t[d + 1 ..] else t;
+    return std.mem.eql(u8, base, "Source");
+}
+
+// The captured-text family — wireEmitQuoted, wireIsBareRef, wireScanCaptured —
+// lives in the `wirecap` part (runtime.wirecap.kz).
+fn wireScan(allocator: std.mem.Allocator, s: []const u8, input_fn: ?InputLookupFn, host_input_fn: ?InputLookupFn) WireScan {
+    if (s.len == 0) return .{ .reject = wireReject("the reply carried no invocation — a reply is one or more invocations, one per line", .{}, 0) };
+
+    // The normalized text must outlive this call — caller arena or the same
+    // never-freed page tolerance the wire layer already carries.
+    var out = std.ArrayList(u8){};
+
+    var i: usize = 0;
+    if (!wireIdentStart(s[0])) return .{ .reject = wireRejectResidue("not an invocation: a wire line is verb(field: \"value\") and starts with a verb name, not '{c}'", .{s[0]}, 0) };
+    while (i < s.len and wireIdentChar(s[i])) i += 1;
+    const verb = s[0..i];
+    const specs = wireFieldSpecs(verb, input_fn, host_input_fn);
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+
+    // Colon form: `verb: <rest>` fills the verb's lone Source field — the
+    // spelling a model reaches for when the argument IS prose.
+    if (i < s.len and s[i] == ':') {
+        if (specs) |ss| {
+            if (ss.len == 1 and wireIsSourceType(ss[0].type_name)) {
+                out.appendSlice(allocator, verb) catch unreachable;
+                out.append(allocator, '(') catch unreachable;
+                out.appendSlice(allocator, ss[0].name) catch unreachable;
+                out.appendSlice(allocator, ": ") catch unreachable;
+                wireEmitQuoted(&out, allocator, std.mem.trim(u8, s[i + 1 ..], " \t\r\n"));
+                out.append(allocator, ')') catch unreachable;
+                return .{ .ok = out.items };
+            }
+        }
+        return .{ .reject = wireRejectResidue("not an invocation: after the verb '{s}' comes '(' — calls are `verb(field: ...)` and `vocabulary()` lists every verb", .{verb}, i) };
+    }
+    if (i >= s.len or s[i] != '(') return .{ .reject = wireRejectResidue("not an invocation: after the verb '{s}' comes '(' — calls are `verb(field: ...)` and `vocabulary()` lists every verb", .{verb}, i) };
+    out.appendSlice(allocator, s[0 .. i + 1]) catch unreachable;
+    i += 1;
+
+    while (true) {
+        while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+        if (i < s.len and s[i] == ')') {
+            out.append(allocator, ')') catch unreachable;
+            i += 1;
+            break;
+        }
+        if (i >= s.len or !wireIdentStart(s[i])) return .{ .reject = wireReject("arguments are name: \"value\" pairs — expected a field name here", .{}, i) };
+        const field_start = i;
+        while (i < s.len and wireIdentChar(s[i])) i += 1;
+        const field = s[field_start..i];
+        while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+        if (i >= s.len or s[i] != ':') return .{ .reject = wireReject("in your '{s}' call: expected ':' after the field '{s}' — '{s}' was inside bare prose that stops at ',' or ')' — wrap punctuation or newlines in \"double quotes\"", .{ verb, field, field }, i) };
+        i += 1;
+        while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+        out.appendSlice(allocator, s[field_start..i]) catch unreachable;
+        const field_type = wireFieldType(specs, field);
+        if (i < s.len and s[i] == '"') {
+            const quote_start = i;
+            i += 1;
+            var closed = false;
+            while (i < s.len) {
+                const c = s[i];
+                if (c == '\\') {
+                    i = if (i + 1 < s.len) i + 2 else s.len;
+                    continue;
+                }
+                if (c == '"') {
+                    closed = true;
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            if (!closed) return .{ .reject = wireReject("unterminated string for the field '{s}' — the reply looks truncated", .{field}, i) };
+            // A quoted value with raw newlines isn't canonical — verbatim copies eval to "" downstream.
+            const quoted = s[quote_start..i];
+            const canon = if (std.mem.indexOfAny(u8, quoted, "\r\n") == null) quoted else
+                std.mem.replaceOwned(u8, allocator, std.mem.replaceOwned(u8, allocator, quoted, "\n", "\\n") catch unreachable, "\r", "\\r") catch unreachable;
+            out.appendSlice(allocator, canon) catch unreachable;
+        } else if (field_type != null and wireIsCapturedType(field_type.?)) {
+            const raw = std.mem.trim(u8, wireScanCaptured(s, &i), " \t");
+            if (raw.len == 0) return .{ .reject = wireReject("the field '{s}' expects captured text — an expression or raw source text", .{field}, i) };
+            // A lone bare token is a bound-name reference — the same
+            // judgment a bare value on any other field gets (`r9.flights`
+            // resolves, an unbound name refuses at validation). Quoting it
+            // here would seal the only spelling a bound name has; prose
+            // and bracketed text still capture, because neither lexes bare.
+            if (wireIsBareRef(raw)) {
+                out.appendSlice(allocator, raw) catch unreachable;
+            } else {
+                wireEmitQuoted(&out, allocator, raw);
+            }
+        } else {
+            // Bare literal — number, true/false, or a bound name: the same token the
+            // interpreter's own parser accepts here, judged by it, not re-parsed.
+            const value_start = i;
+            while (i < s.len and wireBareValueChar(s[i])) i += 1;
+            if (i == value_start) return .{ .reject = wireReject("the value of '{s}' must be a double-quoted string or a bare literal — a number, true/false, or a bound name", .{field}, i) };
+            out.appendSlice(allocator, s[value_start..i]) catch unreachable;
+        }
+        while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+        if (i < s.len and s[i] == ',') {
+            out.append(allocator, ',') catch unreachable;
+            i += 1;
+            continue;
+        }
+        if (i < s.len and s[i] == ')') {
+            out.append(allocator, ')') catch unreachable;
+            i += 1;
+            break;
+        }
+        return .{ .reject = wireReject("after the value of '{s}' comes ',' or ')' — text must be \"double-quoted\"; a bare word reads as a bound name", .{field}, i) };
+    }
+
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+    if (i == s.len) return .{ .ok = out.items };
+    if (s[i] == '|') {
+        out.appendSlice(allocator, s[i..]) catch unreachable;
+        return .{ .ok = out.items };
+    }
+    var j = i;
+    while (j < s.len and (s[j] == ' ' or s[j] == '\t' or s[j] == '\r' or s[j] == '\n')) j += 1;
+    if (j < s.len and s[j] == '|') {
+        out.appendSlice(allocator, s[i..]) catch unreachable;
+        return .{ .ok = out.items };
+    }
+    if (s[i] == '\r' or s[i] == '\n') return .{ .reject = wireReject("one invocation per line: a second invocation goes on its own line", .{}, i) };
+    return .{ .reject = wireReject("one invocation per line: nothing follows the closing ')' except arms", .{}, i) };
+}
+
+// parse.wire's proc — the tor is declared in the `parsewire` part. The scan
+// runs first (typed positions normalize to canonical quoted wire); the arms'
+// grammar is still the interpreter's own parser, so the wire can never accept
+// a chain eval would execute differently.
+~proc parse.wire|zig {
+    const interpreter_mod = @import("root").koru_std.koru_interpreter;
+
+    const s = std.mem.trim(u8, source, " \t\r\n");
+    const wire = switch (wireScan(std.heap.page_allocator, s, input_fn, host_input_fn)) {
+        .reject => |rejection| {
+            const pos = wireLineColumn(s, rejection.byte);
+            return .{ .parse_error = .{
+                .message = rejection.message,
+                .line = pos.line,
+                .column = pos.column,
+                .not_invocation = rejection.not_invocation,
+            } };
+        },
+        .ok => |w| w,
+    };
+
+    // A page-backed arena, intentionally never freed: the returned Flow must
+    // outlive this call, and a few pages per parse are tolerated exactly like
+    // the interpreter's own parse-error messages (and scope-vocabulary's
+    // render above).
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const allocator = arena_state.allocator();
+    return switch (interpreter_mod.parse_event.handler(.{
+        .source = wire,
+        .allocator = allocator,
+    })) {
+        .flow => |f| .{ .parsed = .{ .flow = f, .wire = wire } },
+        .parse_error => |e| .{ .parse_error = .{
+            .message = e.message,
+            .line = e.line,
+            .column = e.column,
+            .not_invocation = false,
+        } },
+    };
+}

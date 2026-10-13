@@ -1,0 +1,63 @@
+// deps.kz - System dependency management for Koru
+//
+// This module provides tors for declaring system-level dependencies
+// (libraries installed via brew, apt, dnf, pacman, etc.) that are required
+// for Koru packages to build.
+//
+// Usage in a library (e.g., curl/index.kz):
+//
+//   import std/deps
+//
+//   std/deps:requires.system {
+//       "name": "curl",
+//       "check": "curl-config --version",
+//       "brew": "curl",
+//       "apt": "libcurl4-openssl-dev"
+//   }
+//
+//   `check` answers presence (installed?). An optional `ready` field answers
+//   liveness — a command whose exit 0 means the dependency is usable NOW:
+//   a daemon accepting connections, a server listening:
+//
+//   std/deps:requires.system {
+//       "name": "docker",
+//       "check": "docker --version",
+//       "ready": "docker info",
+//       "brew": "docker"
+//   }
+//
+//   The third state — installed but not ready — is reported separately;
+//   `deps install` cannot fix a down daemon.
+//
+// Then users can run:
+//   koruc main.kz deps           # Show status of all system dependencies
+//   koruc main.kz deps install   # Install missing deps (auto-detects package manager)
+//   koruc main.kz deps install --pm brew   # Force specific package manager
+
+~import std/compiler
+~import std/build
+
+~[comptime]
+
+~part command
+
+
+// ============================================================
+// REQUIRES.SYSTEM EVENT - Declare a system dependency
+// ============================================================
+
+~[comptime|norun]pub tor requires.system { source: Source }
+
+~proc requires.system|zig {
+    // Void tor - collected during AST walking
+}
+
+// ============================================================
+// REQUIRES.ZIG EVENT - Declare a Zig package dependency
+// ============================================================
+
+~[comptime|norun]pub tor requires.zig { source: Source }
+
+~proc requires.zig|zig {
+    // Void tor - collected during AST walking / build.zig.zon generation
+}

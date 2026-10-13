@@ -1,0 +1,1145 @@
+// vendor.kz - Vendored dependencies as a first-class, compile-time-checked concept.
+//
+// A vendored dependency is source you copied into your own tree. The copy is the
+// easy part; the hard part is that once it's in your repo it LOOKS trustworthy,
+// and nothing notices when it changes. `std/vendor` makes the change loud:
+//
+//   import std/vendor
+//
+//   std/vendor:bindings {
+//       koru/vaxis: ./vendored/vaxis
+//   }
+//
+// Each binding names a module and the local tree that supplies it. `vendor.lock`
+// — one per program, at the compilation root, with every binding path relative to
+// it — records a SHA-256 for every file in that tree plus one tree hash over the
+// sorted manifest. The `bindings` transform
+// recomputes those hashes at COMPILE TIME and refuses the program when they
+// disagree with the lock. A dependency that changed under you does not compile;
+// the diagnostic names the file that drifted.
+//
+// This is the same doctrine the rest of the language runs on — the real surface
+// or a loud failure — applied to the dependency graph. It is deliberately NOT a
+// `vendor audit` you have to remember to run: an audit nobody runs is how 500k
+// compromised packages a year get through.
+//
+// You vendor a library because you had to CHANGE it — a bug upstream will not fix
+// on your schedule, a platform they do not support. So the lock records TWO trees
+// per binding: `as-copied`, what arrived from upstream and is never overwritten,
+// and `as-compiled`, what your program is actually built from. The difference is
+// your patch, computed rather than remembered, and it survives every re-pin.
+//
+// Without that split the one command you must run to accept your own fix is also
+// the command that destroys the evidence of it, and a deliberate patch becomes
+// indistinguishable from a tampered file.
+//
+// Commands:
+//   koruc main.kz vendor add <pkg>  # acquire through npm into your tree, and pin it
+//   koruc main.kz vendor            # status of every binding (default: check)
+//   koruc main.kz vendor check      # same, explicit
+//   koruc main.kz vendor sync       # accept what is on disk as the tree you compile
+//   koruc main.kz vendor diff       # drift against the pin, AND your patch vs upstream
+//
+// `sync` is the one command that makes drift go away, and it is the one command
+// you should read a real diff before running. `diff` is what you read.
+//
+// `add` acquires through npm and does not reimplement it: no registry client, no
+// version-range resolution, no transitive dependency walk. npm fetches; Koru
+// keeps, pins, and diffs — which is the part npm has no answer for.
+
+~import std/compiler
+
+~[comptime]
+
+const std = @import("std");
+
+// The lock's on-disk shape and the hashing that fills it. Plain Zig at the top
+// of a .kz is host-level declaration — the transform and the command procs both
+// reach it, so the pin is computed by ONE piece of code. A second implementation
+// is a second answer, and the whole value here is that there is only one.
+pub const VendorLock = struct {
+    pub const Binding = struct {
+        name: []const u8,
+        path: []const u8,
+    };
+
+    pub const FileHash = struct {
+        path: []const u8,
+        hash: [64]u8,
+    };
+
+    pub const Manifest = struct {
+        files: []const FileHash,
+        tree: [64]u8,
+    };
+
+    pub const Drift = struct {
+        pub const Kind = enum { added, removed, changed };
+        kind: Kind,
+        path: []const u8,
+    };
+
+    pub const ParseError = error{ MissingSeparator, EmptyName, EmptyPath };
+
+    /// Bindings as written in the source block: one `name: path` per line.
+    /// Blank lines and `//` comments are skipped; a trailing comma is tolerated
+    /// so the block reads like every other Koru literal.
+    pub fn parseBindings(alloc: std.mem.Allocator, source: []const u8) !([]Binding) {
+        var out = std.ArrayListUnmanaged(Binding){};
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        while (lines.next()) |raw| {
+            var line = std.mem.trim(u8, raw, " \t\r\n,");
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, "//")) continue;
+
+            const sep = std.mem.indexOfScalar(u8, line, ':') orelse return ParseError.MissingSeparator;
+            const name = std.mem.trim(u8, line[0..sep], " \t");
+            const path = std.mem.trim(u8, line[sep + 1 ..], " \t");
+            if (name.len == 0) return ParseError.EmptyName;
+            if (path.len == 0) return ParseError.EmptyPath;
+
+            try out.append(alloc, .{ .name = name, .path = path });
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    fn hexDigest(digest: [32]u8) [64]u8 {
+        var hex: [64]u8 = undefined;
+        _ = std.fmt.bufPrint(&hex, "{x}", .{digest}) catch unreachable;
+        return hex;
+    }
+
+    fn lessThanPath(_: void, a: FileHash, b: FileHash) bool {
+        return std.mem.order(u8, a.path, b.path) == .lt;
+    }
+
+    /// Hash every regular file under `root`, then hash the sorted manifest to get
+    /// the tree hash. Sorting is what makes the tree hash reproducible: directory
+    /// iteration order is a filesystem detail and must not reach the pin.
+    ///
+    /// `.git` is skipped — a vendored tree's own VCS metadata is not the code you
+    /// are pinning, and it churns on every fetch.
+    pub fn hashTree(alloc: std.mem.Allocator, root: []const u8) !Manifest {
+        var dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
+        defer dir.close();
+
+        var files = std.ArrayListUnmanaged(FileHash){};
+        var walker = try dir.walk(alloc);
+        defer walker.deinit();
+
+        while (try walker.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (std.mem.startsWith(u8, entry.path, ".git/")) continue;
+            if (std.mem.eql(u8, entry.path, ".git")) continue;
+
+            const contents = try entry.dir.readFileAlloc(alloc, entry.basename, 64 * 1024 * 1024);
+            defer alloc.free(contents);
+
+            var h = std.crypto.hash.sha2.Sha256.init(.{});
+            h.update(contents);
+
+            // Normalize the separator so a lock written on Windows and one written
+            // on Unix describe the same tree.
+            const norm = try alloc.dupe(u8, entry.path);
+            std.mem.replaceScalar(u8, norm, '\\', '/');
+
+            try files.append(alloc, .{ .path = norm, .hash = hexDigest(h.finalResult()) });
+        }
+
+        const owned = try files.toOwnedSlice(alloc);
+        std.mem.sort(FileHash, owned, {}, lessThanPath);
+
+        var tree = std.crypto.hash.sha2.Sha256.init(.{});
+        for (owned) |f| {
+            tree.update(f.path);
+            tree.update(&[_]u8{0});
+            tree.update(&f.hash);
+            tree.update("\n");
+        }
+
+        return .{ .files = owned, .tree = hexDigest(tree.finalResult()) };
+    }
+
+    /// Where a vendored tree came from. Present only when `vendor add` placed it,
+    /// because only then does anyone know the answer. Hand-copied trees record
+    /// nothing rather than record a guess.
+    pub const Origin = struct {
+        source: []const u8,
+        package: []const u8,
+        version: []const u8,
+        integrity: []const u8,
+    };
+
+    /// One recorded manifest: a tree hash plus the per-file hashes behind it.
+    pub const Recorded = struct {
+        tree: []const u8,
+        files: std.StringHashMapUnmanaged([]const u8),
+    };
+
+    /// A freshly hashed tree in the shape the lock records, so a live tree and a
+    /// recorded one can be compared by the same code.
+    pub fn recordedFrom(alloc: std.mem.Allocator, m: Manifest) !Recorded {
+        var files = std.StringHashMapUnmanaged([]const u8){};
+        for (m.files) |f| try files.put(alloc, f.path, try alloc.dupe(u8, &f.hash));
+        return .{ .tree = try std.fmt.allocPrint(alloc, "sha256:{s}", .{m.tree}), .files = files };
+    }
+
+    /// The lock as a map from binding name to what was recorded. Absent file is
+    /// `null` — "never pinned" is a different state from "pinned and empty", and
+    /// the caller says different things about each.
+    ///
+    /// TWO manifests, and the pair is the whole point. `as_compiled` is what the
+    /// tree must hash to for the program to build; `as_copied` is what arrived
+    /// from upstream and is never overwritten. The difference between them IS
+    /// your patch — computed, not remembered, and it survives every `sync`.
+    ///
+    /// `as_copied` is null for a tree nobody acquired through `vendor add`, and
+    /// for every lock written before the two-tree format. Unknown provenance is
+    /// reported as unknown; it is not backfilled from `as_compiled`, which would
+    /// assert a zero-line patch that nobody verified.
+    pub const Locked = struct {
+        path: []const u8,
+        as_compiled: Recorded,
+        as_copied: ?Recorded,
+        origin: ?Origin,
+
+        /// The hashes the live tree is checked against. Named rather than
+        /// inlined so no caller can reach for `as_copied` by accident: the build
+        /// gate is always the compiled side.
+        pub fn gate(self: Locked) Recorded {
+            return self.as_compiled;
+        }
+    };
+
+    fn readRecorded(alloc: std.mem.Allocator, obj: std.json.ObjectMap) !Recorded {
+        var files = std.StringHashMapUnmanaged([]const u8){};
+        if (obj.get("files")) |f| {
+            var fit = f.object.iterator();
+            while (fit.next()) |fe| {
+                try files.put(alloc, fe.key_ptr.*, fe.value_ptr.*.string);
+            }
+        }
+        return .{
+            .tree = if (obj.get("tree")) |t| t.string else "",
+            .files = files,
+        };
+    }
+
+    /// Reads both lock versions. Version 1 put one manifest at the top of the
+    /// entry; version 2 splits it into `as-copied` and `as-compiled`. A v1 entry
+    /// loads as the compiled side ONLY — it records what its author last
+    /// accepted, and says nothing about what upstream ever held.
+    pub fn readLock(
+        alloc: std.mem.Allocator,
+        lock_path: []const u8,
+    ) !?std.StringHashMapUnmanaged(Locked) {
+        const text = std.fs.cwd().readFileAlloc(alloc, lock_path, 16 * 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
+        var out = std.StringHashMapUnmanaged(Locked){};
+
+        const bindings = parsed.value.object.get("bindings") orelse return out;
+        var it = bindings.object.iterator();
+        while (it.next()) |entry| {
+            const obj = entry.value_ptr.*.object;
+
+            const compiled = if (obj.get("as-compiled")) |c|
+                try readRecorded(alloc, c.object)
+            else
+                try readRecorded(alloc, obj);
+
+            const copied: ?Recorded = if (obj.get("as-copied")) |c|
+                try readRecorded(alloc, c.object)
+            else
+                null;
+
+            const origin: ?Origin = if (obj.get("origin")) |o| .{
+                .source = if (o.object.get("source")) |v| v.string else "",
+                .package = if (o.object.get("package")) |v| v.string else "",
+                .version = if (o.object.get("version")) |v| v.string else "",
+                .integrity = if (o.object.get("integrity")) |v| v.string else "",
+            } else null;
+
+            try out.put(alloc, entry.key_ptr.*, .{
+                .path = if (obj.get("path")) |p| p.string else "",
+                .as_compiled = compiled,
+                .as_copied = copied,
+                .origin = origin,
+            });
+        }
+        return out;
+    }
+
+    /// Per-file drift, in a stable order: removals and changes follow the lock's
+    /// sorted manifest, additions follow the tree's. A diagnostic that names a
+    /// different file on each run teaches nothing.
+    pub fn drift(
+        alloc: std.mem.Allocator,
+        manifest: Manifest,
+        locked: Locked,
+    ) ![]Drift {
+        return driftAgainst(alloc, manifest, locked.gate());
+    }
+
+    /// Drift of a live tree against one recorded manifest.
+    pub fn driftAgainst(
+        alloc: std.mem.Allocator,
+        manifest: Manifest,
+        recorded: Recorded,
+    ) ![]Drift {
+        var out = std.ArrayListUnmanaged(Drift){};
+
+        var seen = std.StringHashMapUnmanaged(void){};
+        for (manifest.files) |f| try seen.put(alloc, f.path, {});
+
+        var lit = recorded.files.iterator();
+        var missing = std.ArrayListUnmanaged(Drift){};
+        while (lit.next()) |entry| {
+            if (!seen.contains(entry.key_ptr.*)) {
+                try missing.append(alloc, .{ .kind = .removed, .path = entry.key_ptr.* });
+            }
+        }
+        try out.appendSlice(alloc, try sortedByPath(alloc, missing));
+
+        for (manifest.files) |f| {
+            const rec = recorded.files.get(f.path);
+            if (rec == null) {
+                try out.append(alloc, .{ .kind = .added, .path = f.path });
+            } else if (!std.mem.eql(u8, rec.?, &f.hash)) {
+                try out.append(alloc, .{ .kind = .changed, .path = f.path });
+            }
+        }
+
+        return out.toOwnedSlice(alloc);
+    }
+
+    fn sortedByPath(alloc: std.mem.Allocator, list: std.ArrayListUnmanaged(Drift)) ![]Drift {
+        var owned_list = list;
+        const owned = try owned_list.toOwnedSlice(alloc);
+        std.mem.sort(Drift, owned, {}, struct {
+            fn lt(_: void, a: Drift, b: Drift) bool {
+                return std.mem.order(u8, a.path, b.path) == .lt;
+            }
+        }.lt);
+        return owned;
+    }
+
+    /// YOUR PATCH: how the tree you compile differs from the tree you copied.
+    ///
+    /// This is the question `drift` can never answer, because drift compares
+    /// against the last thing you accepted and your patch IS the last thing you
+    /// accepted. Both sides here are recorded manifests, so the answer survives
+    /// every `sync` and is available forever rather than until the next one.
+    ///
+    /// Fully sorted — neither side has a natural order, so the whole result is
+    /// ordered by path and a review reads the same way twice.
+    pub fn patchSet(
+        alloc: std.mem.Allocator,
+        copied: Recorded,
+        compiled: Recorded,
+    ) ![]Drift {
+        var out = std.ArrayListUnmanaged(Drift){};
+
+        var cit = copied.files.iterator();
+        while (cit.next()) |entry| {
+            const now = compiled.files.get(entry.key_ptr.*);
+            if (now == null) {
+                try out.append(alloc, .{ .kind = .removed, .path = entry.key_ptr.* });
+            } else if (!std.mem.eql(u8, now.?, entry.value_ptr.*)) {
+                try out.append(alloc, .{ .kind = .changed, .path = entry.key_ptr.* });
+            }
+        }
+
+        var mit = compiled.files.iterator();
+        while (mit.next()) |entry| {
+            if (!copied.files.contains(entry.key_ptr.*)) {
+                try out.append(alloc, .{ .kind = .added, .path = entry.key_ptr.* });
+            }
+        }
+
+        return sortedByPath(alloc, out);
+    }
+
+    /// Strip the `sha256:` prefix from a recorded tree hash. NOT `trimLeft`,
+    /// which takes a character SET — `trimLeft(tree, "sha256:")` would eat the
+    /// leading digits of a hash that happens to start with `a5…`, and two
+    /// different trees would compare equal.
+    pub fn bareHash(recorded: []const u8) []const u8 {
+        const prefix = "sha256:";
+        if (std.mem.startsWith(u8, recorded, prefix)) return recorded[prefix.len..];
+        return recorded;
+    }
+
+    /// Report the fork: where the tree came from, and how what you compile differs
+    /// from what you copied. This is the half `drift` structurally cannot show,
+    /// because drift compares against the thing your patch already became.
+    ///
+    /// A tree nobody acquired says so only under `diff`. Repeating "provenance
+    /// unknown" on every `check` would train people to skip the line that matters.
+    pub fn reportPatch(alloc: std.mem.Allocator, locked: Locked, verbose: bool) void {
+        if (locked.origin) |o| {
+            std.debug.print("    upstream  {s}@{s} via {s}\n", .{ o.package, o.version, o.source });
+        }
+        const copied = locked.as_copied orelse {
+            if (verbose) std.debug.print("    upstream  not recorded — this tree was not placed by `vendor add`\n", .{});
+            return;
+        };
+        const patch = patchSet(alloc, copied, locked.as_compiled) catch return;
+        if (patch.len == 0) {
+            if (verbose) std.debug.print("    patch     none — byte-identical to what was copied\n", .{});
+            return;
+        }
+        std.debug.print("    patch     {d} file(s) differ from upstream\n", .{patch.len});
+        if (!verbose) return;
+        for (patch) |c| {
+            std.debug.print("      {s:>7}  {s}\n", .{ describeDrift(c.kind), c.path });
+        }
+    }
+
+    pub const AcquireError = error{ NpmMissing, NpmFailed, NoTarball, IntegrityMismatch, ExtractFailed };
+
+    /// Ask npm what it would resolve a spec to, WITHOUT installing anything.
+    /// Returns the resolved version and the registry's published integrity.
+    ///
+    /// npm is the acquirer here on purpose. Koru does not implement a registry
+    /// client, does not resolve version ranges, and does not walk a dependency's
+    /// own dependencies — that is a package manager, and building a worse one is
+    /// not the job. What Koru adds is the part npm has no answer for: keeping the
+    /// source, and remembering what it looked like before you changed it.
+    /// The package name in a spec, with any version or range suffix removed.
+    /// `@scope/pkg` keeps its leading `@` — that one is part of the name.
+    pub fn specName(spec: []const u8) []const u8 {
+        if (spec.len == 0) return spec;
+        const at = std.mem.lastIndexOfScalar(u8, spec[1..], '@') orelse return spec;
+        const cut = at + 1;
+        if (std.mem.indexOfScalar(u8, spec[cut..], '/') != null) return spec;
+        return spec[0..cut];
+    }
+
+    fn npmViewVersion(alloc: std.mem.Allocator, spec: []const u8) ![]const u8 {
+        const res = std.process.Child.run(.{
+            .allocator = alloc,
+            .argv = &[_][]const u8{ "npm", "view", spec, "version", "--json" },
+        }) catch return AcquireError.NpmMissing;
+        if (res.term != .Exited or res.term.Exited != 0) {
+            std.debug.print("{s}", .{res.stderr});
+            return AcquireError.NpmFailed;
+        }
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, res.stdout, .{}) catch return AcquireError.NpmFailed;
+        return switch (parsed.value) {
+            // One matching version comes back as a bare string.
+            .string => |s| s,
+            // A RANGE matching several versions comes back as an array, newest
+            // last. Reading that as an object is what crashed the first version
+            // of this — `^3.0.0` against a package with 3.0.0 and 3.0.1.
+            .array => |a| if (a.items.len == 0)
+                AcquireError.NpmFailed
+            else switch (a.items[a.items.len - 1]) {
+                .string => |s| s,
+                else => AcquireError.NpmFailed,
+            },
+            else => AcquireError.NpmFailed,
+        };
+    }
+
+    pub fn npmResolve(alloc: std.mem.Allocator, spec: []const u8) !struct { version: []const u8, integrity: []const u8, tarball: []const u8 } {
+        // TWO calls, and the first one exists to make the second unambiguous.
+        // Asking for several fields at once while the spec is a RANGE returns an
+        // array of objects rather than one object, so the exact version is pinned
+        // down first and everything else is asked of that.
+        const exact = try npmViewVersion(alloc, spec);
+        const pinned = try std.fmt.allocPrint(alloc, "{s}@{s}", .{ specName(spec), exact });
+
+        const res = std.process.Child.run(.{
+            .allocator = alloc,
+            .argv = &[_][]const u8{ "npm", "view", pinned, "version", "dist.integrity", "dist.tarball", "--json" },
+        }) catch return AcquireError.NpmMissing;
+
+        if (res.term != .Exited or res.term.Exited != 0) {
+            std.debug.print("{s}", .{res.stderr});
+            return AcquireError.NpmFailed;
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, res.stdout, .{}) catch return AcquireError.NpmFailed;
+        if (parsed.value != .object) return AcquireError.NpmFailed;
+        const o = parsed.value.object;
+        return .{
+            .version = if (o.get("version")) |v| v.string else "",
+            .integrity = if (o.get("dist.integrity")) |v| v.string else "",
+            .tarball = if (o.get("dist.tarball")) |v| v.string else "",
+        };
+    }
+
+    /// npm publishes integrity as `sha512-<base64>`. Recomputing it over the
+    /// tarball we actually received is the one moment Koru can verify the
+    /// registry's own claim, so it does — a recorded hash nobody checked is
+    /// decoration.
+    pub fn verifyIntegrity(alloc: std.mem.Allocator, tgz_path: []const u8, integrity: []const u8) !bool {
+        if (!std.mem.startsWith(u8, integrity, "sha512-")) return false;
+        const want_b64 = integrity["sha512-".len..];
+
+        const bytes = try std.fs.cwd().readFileAlloc(alloc, tgz_path, 512 * 1024 * 1024);
+        defer alloc.free(bytes);
+
+        var digest: [64]u8 = undefined;
+        std.crypto.hash.sha2.Sha512.hash(bytes, &digest, .{});
+
+        const enc = std.base64.standard.Encoder;
+        const buf = try alloc.alloc(u8, enc.calcSize(digest.len));
+        defer alloc.free(buf);
+        const got = enc.encode(buf, &digest);
+
+        return std.mem.eql(u8, got, want_b64);
+    }
+
+    pub fn describeDrift(k: Drift.Kind) []const u8 {
+        return switch (k) {
+            .added => "added",
+            .removed => "removed",
+            .changed => "changed",
+        };
+    }
+
+    fn writeRecordedFiles(w: anytype, files: []const FileHash, indent: []const u8) !void {
+        try w.print("{s}\"files\": {{\n", .{indent});
+        for (files, 0..) |f, j| {
+            try w.print("{s}  \"{s}\": \"{s}\"", .{ indent, f.path, f.hash });
+            try w.writeAll(if (j + 1 < files.len) ",\n" else "\n");
+        }
+        try w.print("{s}}}\n", .{indent});
+    }
+
+    /// A recorded manifest read back out of the lock, re-emitted verbatim. The
+    /// copied side is written once and thereafter only ever copied forward, so it
+    /// round-trips through the map it was parsed into rather than being recomputed
+    /// from a tree that no longer exists in that state.
+    fn writeRecordedFromMap(alloc: std.mem.Allocator, w: anytype, rec: Recorded, indent: []const u8) !void {
+        try w.print("{s}\"tree\": \"{s}\",\n", .{ indent, rec.tree });
+
+        var keys = std.ArrayListUnmanaged([]const u8){};
+        defer keys.deinit(alloc);
+        var it = rec.files.iterator();
+        while (it.next()) |e| try keys.append(alloc, e.key_ptr.*);
+        std.mem.sort([]const u8, keys.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lt);
+
+        try w.print("{s}\"files\": {{\n", .{indent});
+        for (keys.items, 0..) |k, j| {
+            try w.print("{s}  \"{s}\": \"{s}\"", .{ indent, k, rec.files.get(k).? });
+            try w.writeAll(if (j + 1 < keys.items.len) ",\n" else "\n");
+        }
+        try w.print("{s}}}\n", .{indent});
+    }
+
+    /// Serialize the lock. Bindings and files are emitted in sorted order so the
+    /// file is byte-stable across machines and reviewable as a diff — a lock that
+    /// reshuffles itself is a lock nobody reads.
+    ///
+    /// `prior` is the lock as it was read, and it is what makes `sync` safe: the
+    /// freshly hashed manifests become `as-compiled`, while `as-copied` and
+    /// `origin` are carried across untouched. Nothing in this function can write
+    /// the copied side — that is the point of the split, and the only writer of
+    /// it is `vendor add`, which is the only caller that knows what upstream sent.
+    pub fn writeLock(
+        alloc: std.mem.Allocator,
+        lock_path: []const u8,
+        names: []const []const u8,
+        paths: []const []const u8,
+        manifests: []const Manifest,
+        prior: ?std.StringHashMapUnmanaged(Locked),
+    ) !void {
+        var buf = std.ArrayListUnmanaged(u8){};
+        defer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+
+        try w.writeAll("{\n  \"version\": 2,\n  \"bindings\": {\n");
+        for (names, paths, manifests, 0..) |name, path, m, i| {
+            const was: ?Locked = if (prior) |p| p.get(name) else null;
+
+            try w.print("    \"{s}\": {{\n", .{name});
+            try w.print("      \"path\": \"{s}\",\n", .{path});
+
+            if (was) |old| {
+                if (old.origin) |o| {
+                    try w.writeAll("      \"origin\": {\n");
+                    try w.print("        \"source\": \"{s}\",\n", .{o.source});
+                    try w.print("        \"package\": \"{s}\",\n", .{o.package});
+                    try w.print("        \"version\": \"{s}\",\n", .{o.version});
+                    try w.print("        \"integrity\": \"{s}\"\n", .{o.integrity});
+                    try w.writeAll("      },\n");
+                }
+                if (old.as_copied) |c| {
+                    try w.writeAll("      \"as-copied\": {\n");
+                    try writeRecordedFromMap(alloc, w, c, "        ");
+                    try w.writeAll("      },\n");
+                }
+            }
+
+            try w.writeAll("      \"as-compiled\": {\n");
+            try w.print("        \"tree\": \"sha256:{s}\",\n", .{m.tree});
+            try writeRecordedFiles(w, m.files, "        ");
+            try w.writeAll("      }\n");
+
+            try w.writeAll(if (i + 1 < names.len) "    },\n" else "    }\n");
+        }
+        try w.writeAll("  }\n}\n");
+
+        const file = try std.fs.cwd().createFile(lock_path, .{});
+        defer file.close();
+        try file.writeAll(buf.items);
+    }
+
+    /// Write a binding that has just been acquired: both sides identical, plus the
+    /// origin. This is the ONLY path that writes `as-copied`, because acquiring is
+    /// the only moment anyone knows what upstream actually sent.
+    pub fn writeAcquired(
+        alloc: std.mem.Allocator,
+        lock_path: []const u8,
+        name: []const u8,
+        path: []const u8,
+        manifest: Manifest,
+        origin: Origin,
+    ) !void {
+        var prior = (try readLock(alloc, lock_path)) orelse std.StringHashMapUnmanaged(Locked){};
+
+        var files = std.StringHashMapUnmanaged([]const u8){};
+        for (manifest.files) |f| {
+            try files.put(alloc, f.path, try alloc.dupe(u8, &f.hash));
+        }
+        const rec: Recorded = .{
+            .tree = try std.fmt.allocPrint(alloc, "sha256:{s}", .{manifest.tree}),
+            .files = files,
+        };
+        try prior.put(alloc, name, .{
+            .path = path,
+            .as_compiled = rec,
+            .as_copied = rec,
+            .origin = origin,
+        });
+
+        var names = std.ArrayListUnmanaged([]const u8){};
+        var it = prior.iterator();
+        while (it.next()) |e| try names.append(alloc, e.key_ptr.*);
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lt);
+
+        var buf = std.ArrayListUnmanaged(u8){};
+        defer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+
+        try w.writeAll("{\n  \"version\": 2,\n  \"bindings\": {\n");
+        for (names.items, 0..) |n, i| {
+            const e = prior.get(n).?;
+            try w.print("    \"{s}\": {{\n", .{n});
+            try w.print("      \"path\": \"{s}\",\n", .{e.path});
+            if (e.origin) |o| {
+                try w.writeAll("      \"origin\": {\n");
+                try w.print("        \"source\": \"{s}\",\n", .{o.source});
+                try w.print("        \"package\": \"{s}\",\n", .{o.package});
+                try w.print("        \"version\": \"{s}\",\n", .{o.version});
+                try w.print("        \"integrity\": \"{s}\"\n", .{o.integrity});
+                try w.writeAll("      },\n");
+            }
+            if (e.as_copied) |c| {
+                try w.writeAll("      \"as-copied\": {\n");
+                try writeRecordedFromMap(alloc, w, c, "        ");
+                try w.writeAll("      },\n");
+            }
+            try w.writeAll("      \"as-compiled\": {\n");
+            try writeRecordedFromMap(alloc, w, e.as_compiled, "        ");
+            try w.writeAll("      }\n");
+            try w.writeAll(if (i + 1 < names.items.len) "    },\n" else "    }\n");
+        }
+        try w.writeAll("  }\n}\n");
+
+        const file = try std.fs.cwd().createFile(lock_path, .{});
+        defer file.close();
+        try file.writeAll(buf.items);
+    }
+
+    /// Everything vendor resolves — `vendor.lock` and every binding path — is
+    /// relative to the COMPILATION ROOT, which is the process CWD here.
+    ///
+    /// Not `dirname(location.file)`: that path is relative to wherever the user
+    /// invoked `koruc` from, while this code runs in the backend, which koruc
+    /// spawns with `cwd = dirname(output)` (src/main.zig:8307). Anchoring on the
+    /// declaring file agrees with CWD only when you happen to compile from the
+    /// directory the file is in — it read as correct in a hand probe and put the
+    /// lock somewhere unreachable under the test harness.
+    ///
+    /// One lock per PROGRAM, next to the entry file, is also the right shape on
+    /// its own terms: a per-file lock would let two files pin the same vendored
+    /// tree to two different hashes, and neither would be wrong.
+    pub const anchor = ".";
+};
+
+// ============================================================
+// BINDINGS - the pinned declaration, checked at compile time
+// ============================================================
+
+// The tor declares the USER surface: a source block of `name: path` lines.
+// The `[transform]` annotation on the PROC is what makes the check happen during
+// compilation rather than in a command the user has to remember to invoke.
+~[comptime|transform]pub tor bindings { source: Source, reporter: *std/compiler:ErrorReporter }
+
+~[transform]proc bindings|zig {
+    const ast = @import("ast");
+
+    // The walker hands transforms the containing item of the matched invocation;
+    // a bindings declaration always lands as a flow. A non-flow item means the
+    // dispatch contract broke upstream — crash loudly.
+    if (item.* != .flow) @panic("vendor bindings transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    var source_text: ?[]const u8 = null;
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "source")) source_text = arg.value;
+    }
+    if (source_text == null) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU171, flow.location, flow.module, "std/vendor:bindings requires a block: bindings {{ module: ./path }}", .{}) } };
+    }
+
+    const bindings = VendorLock.parseBindings(allocator, source_text.?) catch |err| {
+        const what = switch (err) {
+            VendorLock.ParseError.MissingSeparator => "each line is `module: ./path`",
+            VendorLock.ParseError.EmptyName => "a binding line has no module name",
+            VendorLock.ParseError.EmptyPath => "a binding line has no path",
+            else => "unreadable",
+        };
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU171, flow.location, flow.module, "std/vendor:bindings — {s}", .{what}) } };
+    };
+    if (bindings.len == 0) return .{ .transformed = .{} };
+
+    const lock_path = std.fs.path.join(allocator, &[_][]const u8{ VendorLock.anchor, "vendor.lock" }) catch unreachable;
+
+    const lock = VendorLock.readLock(allocator, lock_path) catch |err| {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU171, flow.location, flow.module, "vendor.lock is unreadable ({s}) — delete it and re-pin with `vendor sync`", .{@errorName(err)}) } };
+    };
+    if (lock == null) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU171, flow.location, flow.module, "no vendor.lock — vendored source is unpinned, so nothing can detect a change to it. Pin it with `koruc {s} vendor sync`", .{flow.location.file}) } };
+    }
+
+    for (bindings) |b| {
+        const tree_path = std.fs.path.join(allocator, &[_][]const u8{ VendorLock.anchor, b.path }) catch unreachable;
+
+        const manifest = VendorLock.hashTree(allocator, tree_path) catch |err| {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU171, flow.location, flow.module, "vendored tree for `{s}` cannot be read at `{s}` ({s})", .{ b.name, b.path, @errorName(err) }) } };
+        };
+
+        const locked = lock.?.get(b.name);
+        if (locked == null) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU171, flow.location, flow.module, "`{s}` is bound but not pinned — vendor.lock has no entry for it. Re-pin with `koruc {s} vendor sync`", .{ b.name, flow.location.file }) } };
+        }
+
+        const recorded = VendorLock.bareHash(locked.?.gate().tree);
+        if (std.mem.eql(u8, recorded, &manifest.tree)) continue;
+
+        // The tree moved. Name the FILE, not just the hash — a hash mismatch tells
+        // you something is wrong; a filename tells you what to go read.
+        const changes = VendorLock.drift(allocator, manifest, locked.?) catch unreachable;
+        if (changes.len == 0) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU171, flow.location, flow.module, "vendored `{s}` does not match its pin (tree hash differs but no file did — the lock is corrupt). Re-pin with `koruc {s} vendor sync`", .{ b.name, flow.location.file }) } };
+        }
+
+        const first = changes[0];
+        const rest = changes.len - 1;
+        if (rest == 0) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU171, flow.location, flow.module, "vendored `{s}` drifted from its pin: {s} `{s}`. Review it with `koruc {s} vendor diff`, then re-pin with `vendor sync` once you have read the change", .{ b.name, VendorLock.describeDrift(first.kind), first.path, flow.location.file }) } };
+        }
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU171, flow.location, flow.module, "vendored `{s}` drifted from its pin: {s} `{s}` and {d} more. Review it with `koruc {s} vendor diff`, then re-pin with `vendor sync` once you have read the change", .{ b.name, VendorLock.describeDrift(first.kind), first.path, rest, flow.location.file }) } };
+    }
+
+    // Every binding matches its pin. The declaration has said everything it has
+    // to say at compile time; it emits nothing.
+    return .{ .transformed = .{} };
+}
+
+// ============================================================
+// VENDOR COMMAND - check / sync / diff
+// ============================================================
+
+~std/compiler:command.declare {
+    "name": "vendor",
+    "description": "Manage vendored dependencies",
+    "subcommands": [
+        { "name": "add", "description": "Acquire a package through npm into your source tree and pin what arrived" },
+        { "name": "check", "description": "Report each binding against its pin (default)" },
+        { "name": "sync", "description": "Accept what is on disk as the tree you compile" },
+        { "name": "diff", "description": "Show drift against the pin, and your patch against upstream" }
+    ]
+}
+
+~[comptime|command]pub tor vendor {
+    program: *const std/compiler:Program,
+    allocator: __koru_std.mem.Allocator,
+    argv: []string,
+}
+
+~proc vendor|zig {
+    // The command allocator is leak-checked. Everything here is scratch that
+    // lives exactly as long as the command, so it rides one arena rather than
+    // being freed by hand at each of the dozen early returns.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const Sub = enum { check, sync, diff, add };
+    var sub: Sub = .check;
+    var add_spec: ?[]const u8 = null;
+    var add_as: ?[]const u8 = null;
+    var add_into: ?[]const u8 = null;
+
+    var ai: usize = 0;
+    while (ai < argv.len) : (ai += 1) {
+        const a = argv[ai];
+        if (std.mem.eql(u8, a, "sync")) sub = .sync;
+        if (std.mem.eql(u8, a, "diff")) sub = .diff;
+        if (std.mem.eql(u8, a, "check")) sub = .check;
+        if (std.mem.eql(u8, a, "add")) {
+            sub = .add;
+            if (ai + 1 < argv.len and !std.mem.startsWith(u8, argv[ai + 1], "-")) {
+                add_spec = argv[ai + 1];
+                ai += 1;
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--as") and ai + 1 < argv.len) {
+            add_as = argv[ai + 1];
+            ai += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--into") and ai + 1 < argv.len) {
+            add_into = argv[ai + 1];
+            ai += 1;
+            continue;
+        }
+    }
+
+    // `add` acquires; it does not need the program's existing bindings, and it
+    // runs before the binding it creates could possibly be declared.
+    // `allFlows` reaches through `.module_decl`; `program.items` is the entry file
+    // alone. Both the bindings scan below and the requirement scan in `add` need
+    // that reach, so it is computed once here.
+    const ast_pkg = @import("ast");
+    const all_flows = ast_pkg.allFlows(alloc, program);
+
+    if (sub == .add) {
+        // With no package named, vendor what the program ALREADY declares. This
+        // is the connection that makes vendoring part of package management
+        // rather than a mechanism beside it: `std/package:requires.npm` is where
+        // a Koru program says what it depends on, and until now `vendor add`
+        // made you type those names a second time on the command line.
+        var specs = std.ArrayListUnmanaged([]const u8){};
+        if (add_spec) |s| {
+            specs.append(alloc, s) catch return;
+        } else {
+            for (all_flows) |flow| {
+                const mq = flow.inv().path.module_qualifier orelse continue;
+                if (!std.mem.eql(u8, mq, "std.package")) continue;
+                if (flow.inv().path.segments.len != 2) continue;
+                if (!std.mem.eql(u8, flow.inv().path.segments[0], "requires")) continue;
+                if (!std.mem.eql(u8, flow.inv().path.segments[1], "npm")) continue;
+
+                for (flow.inv().args) |arg| {
+                    if (!std.mem.eql(u8, arg.name, "source")) continue;
+                    // The block body is the INNER text of a JSON object —
+                    // `std/package` splices it straight into a package.json — so
+                    // it parses by putting the braces back.
+                    const wrapped = std.fmt.allocPrint(alloc, "{{{s}}}", .{arg.value}) catch return;
+                    const parsed = std.json.parseFromSlice(std.json.Value, alloc, wrapped, .{}) catch {
+                        std.debug.print("✗ {s}: a requires.npm block is not readable as JSON\n", .{flow.location.file});
+                        std.process.exit(1);
+                    };
+                    var it = parsed.value.object.iterator();
+                    while (it.next()) |e| {
+                        const range = e.value_ptr.*.string;
+                        // npm resolves `name@range` itself; Koru does not read
+                        // version ranges and must not start.
+                        const s = std.fmt.allocPrint(alloc, "{s}@{s}", .{ e.key_ptr.*, range }) catch return;
+                        specs.append(alloc, s) catch return;
+                    }
+                }
+            }
+
+            if (specs.items.len == 0) {
+                std.debug.print("✗ nothing to vendor: no package named, and this program declares no ~std/package:requires.npm\n", .{});
+                std.debug.print("   name one — `koruc <file> vendor add <npm-package> [--as <module>] [--into <dir>]`\n", .{});
+                std.debug.print("   or declare it — ~std/package:requires.npm {{ \"pkg\": \"^1.0.0\" }}\n", .{});
+                std.process.exit(1);
+            }
+            std.debug.print("Vendoring {d} declared npm requirement(s)\n", .{specs.items.len});
+        }
+
+        // `--as` and `--into` name ONE destination, so they apply only when one
+        // package was named. Silently applying them to a whole requirement set
+        // would put every package in the same directory, each overwriting the
+        // last.
+        if (specs.items.len > 1 and (add_as != null or add_into != null)) {
+            std.debug.print("✗ --as/--into name one destination, but {d} packages are being vendored — run them one at a time\n", .{specs.items.len});
+            std.process.exit(1);
+        }
+
+        var binding_lines = std.ArrayListUnmanaged([]const u8){};
+
+        for (specs.items) |spec| {
+        // A scoped name (@scope/pkg) and a versioned one (pkg@1.2.3) both reduce
+        // to a last path segment with any version suffix removed.
+        const slash = std.mem.lastIndexOfScalar(u8, spec, '/');
+        const tail = if (slash) |i| spec[i + 1 ..] else spec;
+        const at = std.mem.lastIndexOfScalar(u8, tail, '@');
+        const bare = if (at) |i| (if (i == 0) tail else tail[0..i]) else tail;
+
+        // An npm name is not an import alias. `is-number` and `@scope/pkg.js` are
+        // ordinary on the registry and illegal as Koru module names, which are
+        // bare identifiers. The DIRECTORY keeps the real package name; only the
+        // module the program imports is normalized, and the mapping between them
+        // is written down in the binding line this command prints.
+        const module = add_as orelse blk: {
+            const m = alloc.dupe(u8, bare) catch return;
+            for (m) |*c| {
+                if (!std.ascii.isAlphanumeric(c.*) and c.* != '_') c.* = '_';
+            }
+            break :blk m;
+        };
+        const into = add_into orelse (std.fmt.allocPrint(alloc, "./vendored/{s}", .{bare}) catch return);
+
+        if (module.len == 0 or (!std.ascii.isAlphabetic(module[0]) and module[0] != '_')) {
+            std.debug.print("✗ `{s}` cannot start a module name — pass one with `--as <module>`\n", .{spec});
+            std.process.exit(1);
+        }
+
+        const resolved = VendorLock.npmResolve(alloc, spec) catch |err| {
+            switch (err) {
+                VendorLock.AcquireError.NpmMissing => std.debug.print("✗ npm is not on PATH — `vendor add` acquires through npm\n", .{}),
+                else => std.debug.print("✗ npm could not resolve `{s}`\n", .{spec}),
+            }
+            std.process.exit(1);
+        };
+        std.debug.print("  resolved  {s}@{s}\n", .{ bare, resolved.version });
+
+        // `npm pack` downloads the published tarball WITHOUT installing it or
+        // touching package.json — acquisition with no side effect on the project.
+        //
+        // Packed at the RESOLVED version, never at the range. Asking npm to
+        // resolve `^3.0.0` twice invites two answers, and then the integrity hash
+        // checked below would belong to a different tarball than the one on disk.
+        const pinned_spec = std.fmt.allocPrint(alloc, "{s}@{s}", .{ VendorLock.specName(spec), resolved.version }) catch return;
+        const pack = std.process.Child.run(.{
+            .allocator = alloc,
+            .argv = &[_][]const u8{ "npm", "pack", pinned_spec, "--silent" },
+        }) catch {
+            std.debug.print("✗ `npm pack {s}` could not run\n", .{pinned_spec});
+            std.process.exit(1);
+        };
+        if (pack.term != .Exited or pack.term.Exited != 0) {
+            std.debug.print("{s}", .{pack.stderr});
+            std.process.exit(1);
+        }
+        const tgz = std.mem.trim(u8, pack.stdout, " \t\r\n");
+        if (tgz.len == 0) {
+            std.debug.print("✗ npm pack produced no tarball for `{s}`\n", .{spec});
+            std.process.exit(1);
+        }
+        // NOT `defer` — every failure below ends in `std.process.exit`, which does
+        // not run deferred code, so a refused download would leave its tarball
+        // sitting in the user's directory looking like something they asked for.
+        const failAdd = struct {
+            fn f(path: []const u8) noreturn {
+                std.fs.cwd().deleteFile(path) catch {};
+                std.process.exit(1);
+            }
+        }.f;
+
+        // Verify the registry's own integrity claim against the bytes that
+        // arrived, before a single one of them lands in the source tree.
+        const ok = VendorLock.verifyIntegrity(alloc, tgz, resolved.integrity) catch false;
+        if (!ok) {
+            std.debug.print("✗ integrity check FAILED for {s}@{s} — the tarball does not match the registry's published {s}\n", .{ bare, resolved.version, resolved.integrity });
+            failAdd(tgz);
+        }
+        std.debug.print("  verified  {s}\n", .{resolved.integrity});
+
+        std.fs.cwd().makePath(into) catch |err| {
+            std.debug.print("✗ cannot create `{s}` ({s})\n", .{ into, @errorName(err) });
+            failAdd(tgz);
+        };
+
+        // npm tarballs wrap everything in a `package/` directory; strip it so the
+        // vendored tree is the library, not a folder containing the library.
+        const untar = std.process.Child.run(.{
+            .allocator = alloc,
+            .argv = &[_][]const u8{ "tar", "-xzf", tgz, "-C", into, "--strip-components", "1" },
+        }) catch {
+            std.debug.print("✗ could not extract {s}\n", .{tgz});
+            failAdd(tgz);
+        };
+        if (untar.term != .Exited or untar.term.Exited != 0) {
+            std.debug.print("{s}", .{untar.stderr});
+            failAdd(tgz);
+        }
+
+        const manifest = VendorLock.hashTree(alloc, into) catch |err| {
+            std.debug.print("✗ cannot hash `{s}` ({s})\n", .{ into, @errorName(err) });
+            failAdd(tgz);
+        };
+
+        const lock_path_add = std.fs.path.join(alloc, &[_][]const u8{ VendorLock.anchor, "vendor.lock" }) catch return;
+        VendorLock.writeAcquired(alloc, lock_path_add, module, into, manifest, .{
+            .source = "npm",
+            .package = bare,
+            .version = resolved.version,
+            .integrity = resolved.integrity,
+        }) catch |err| {
+            std.debug.print("✗ cannot write {s} ({s})\n", .{ lock_path_add, @errorName(err) });
+            failAdd(tgz);
+        };
+
+        std.fs.cwd().deleteFile(tgz) catch {};
+
+        std.debug.print("✓ vendored {s}@{s} → {s}  ({d} files)\n", .{ bare, resolved.version, into, manifest.files.len });
+        binding_lines.append(alloc, std.fmt.allocPrint(alloc, "        {s}: {s}", .{ module, into }) catch return) catch return;
+        }
+
+        // One block, printed once, however many packages were acquired — it is
+        // meant to be pasted whole.
+        std.debug.print("\nDeclare them so the compiler checks them on every build:\n\n", .{});
+        std.debug.print("    std/vendor:bindings {{\n", .{});
+        for (binding_lines.items) |l| std.debug.print("{s}\n", .{l});
+        std.debug.print("    }}\n\n", .{});
+        return;
+    }
+
+    // Collect every `std/vendor:bindings` block in the program, in source order.
+    var names = std.ArrayListUnmanaged([]const u8){};
+    var paths = std.ArrayListUnmanaged([]const u8){};
+    var declaring_file: []const u8 = "";
+
+    // `allFlows` reaches THROUGH `.module_decl`; `program.items` is the entry
+    // file alone. A binding declared inside an imported module was invisible to
+    // this command while the comptime transform — which walks every module —
+    // still found and enforced it, so `check` reported "nothing declared" and
+    // exited 0 for a program that had vendored code under a live pin. That is a
+    // green for an unchecked report, which is the one thing this module exists to
+    // refuse. `std/package` and `std/deps` both had this same defect and both
+    // fixed it the same way.
+    for (all_flows) |flow| {
+        const mq = flow.inv().path.module_qualifier orelse continue;
+        if (!std.mem.eql(u8, mq, "std.vendor")) continue;
+        if (flow.inv().path.segments.len != 1) continue;
+        if (!std.mem.eql(u8, flow.inv().path.segments[0], "bindings")) continue;
+
+        for (flow.inv().args) |arg| {
+            if (!std.mem.eql(u8, arg.name, "source")) continue;
+            const parsed = VendorLock.parseBindings(alloc, arg.value) catch {
+                std.debug.print("✗ {s}: a bindings line is not `module: ./path`\n", .{flow.location.file});
+                return;
+            };
+            for (parsed) |b| {
+                names.append(alloc, b.name) catch return;
+                paths.append(alloc, b.path) catch return;
+            }
+            declaring_file = flow.location.file;
+        }
+    }
+
+    if (names.items.len == 0) {
+        std.debug.print("No vendored bindings declared. Use ~std/vendor:bindings {{ module: ./path }}\n", .{});
+        return;
+    }
+
+    const lock_path = std.fs.path.join(alloc, &[_][]const u8{ VendorLock.anchor, "vendor.lock" }) catch return;
+
+    var manifests = std.ArrayListUnmanaged(VendorLock.Manifest){};
+    for (paths.items, names.items) |p, n| {
+        const tree_path = std.fs.path.join(alloc, &[_][]const u8{ VendorLock.anchor, p }) catch return;
+        const m = VendorLock.hashTree(alloc, tree_path) catch |err| {
+            std.debug.print("✗ {s}: cannot read vendored tree `{s}` ({s})\n", .{ n, p, @errorName(err) });
+            return;
+        };
+        manifests.append(alloc, m) catch return;
+    }
+
+    const lock = VendorLock.readLock(alloc, lock_path) catch |err| {
+        std.debug.print("✗ {s} is unreadable ({s})\n", .{ lock_path, @errorName(err) });
+        return;
+    };
+
+    if (sub == .sync) {
+        // The lock as it stands is handed to the writer so the copied side and the
+        // origin ride across. `sync` accepts what is on disk as the new compiled
+        // side; it has never been told what upstream sent, so it must not be able
+        // to claim it.
+        VendorLock.writeLock(alloc, lock_path, names.items, paths.items, manifests.items, lock) catch |err| {
+            std.debug.print("✗ Failed to write {s}: {s}\n", .{ lock_path, @errorName(err) });
+            return;
+        };
+        std.debug.print("✓ Pinned {d} binding(s) in {s}\n", .{ names.items.len, lock_path });
+        for (names.items, paths.items, manifests.items) |n, p, m| {
+            const kept: []const u8 = blk: {
+                const was = if (lock) |l| l.get(n) else null;
+                if (was == null) break :blk "";
+                if (was.?.as_copied == null) break :blk "";
+                const now = VendorLock.recordedFrom(alloc, m) catch break :blk "";
+                const patch = VendorLock.patchSet(alloc, was.?.as_copied.?, now) catch break :blk "";
+                if (patch.len == 0) break :blk "  (unpatched)";
+                break :blk std.fmt.allocPrint(alloc, "  ({d} file(s) patched vs upstream)", .{patch.len}) catch "";
+            };
+            std.debug.print("  {s} → {s}  sha256:{s}  ({d} files){s}\n", .{ n, p, m.tree[0..12], m.files.len, kept });
+        }
+        return;
+    }
+    if (lock == null) {
+        std.debug.print("✗ No {s} — {d} binding(s) are unpinned. Run `vendor sync` to pin them.\n", .{ lock_path, names.items.len });
+        std.process.exit(1);
+    }
+
+    var drifted: usize = 0;
+    for (names.items, paths.items, manifests.items) |n, p, m| {
+        const locked = lock.?.get(n);
+        if (locked == null) {
+            std.debug.print("✗ {s} → {s}  NOT PINNED\n", .{ n, p });
+            drifted += 1;
+            continue;
+        }
+        const recorded = VendorLock.bareHash(locked.?.gate().tree);
+        if (std.mem.eql(u8, recorded, &m.tree)) {
+            std.debug.print("✓ {s} → {s}  sha256:{s}  ({d} files)\n", .{ n, p, m.tree[0..12], m.files.len });
+            VendorLock.reportPatch(alloc, locked.?, sub == .diff);
+            continue;
+        }
+
+        drifted += 1;
+        const changes = VendorLock.drift(alloc, m, locked.?) catch return;
+        std.debug.print("✗ {s} → {s}  DRIFTED ({d} file(s))\n", .{ n, p, changes.len });
+        if (sub == .diff) {
+            for (changes) |c| {
+                std.debug.print("    {s:>7}  {s}\n", .{ VendorLock.describeDrift(c.kind), c.path });
+            }
+        }
+        VendorLock.reportPatch(alloc, locked.?, sub == .diff);
+    }
+
+    if (drifted == 0) {
+        std.debug.print("✓ All {d} binding(s) match their pin\n", .{names.items.len});
+        return;
+    }
+
+    if (sub == .check) {
+        std.debug.print("\n{d} binding(s) drifted. Read the change with `koruc {s} vendor diff`.\n", .{ drifted, declaring_file });
+    }
+
+    // A read-only report of a broken pin exits NON-ZERO. `check` and `diff` are
+    // what a CI job runs, and a job that prints "DRIFTED" and then exits 0 is a
+    // red reported as green — worse than not checking at all. `sync` is the one
+    // subcommand that legitimately ends clean here: repairing the pin is its job.
+    std.process.exit(1);
+}

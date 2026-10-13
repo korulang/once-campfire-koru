@@ -1,0 +1,127 @@
+// Koru Standard Library: the `define` part of interpreter.kz.
+// Joined via `~part define` in interpreter.kz; merged into the interpreter
+// module at load.
+// The REPL define: install a subflow declaration into the session's
+// defined-flows table, making it a verb callable on subsequent runs.
+// A definition is `tor name { args }` followed by the impl flow
+// `name = <body>`. The body is stored as SOURCE (durable) and re-parsed per
+// dispatch; every call it makes runs through the same possession machinery,
+// so a defined flow can never reach beyond what the session holds.
+//
+// The definition-time analyses (declared obligations must match the body's
+// real behavior; every call must be within the session's scopes) are the
+// richer guarantee and are rungs of the stance, not this slice; call-time
+// possession enforcement is the floor and is already structural.
+~[retain]pub tor define {
+    source: string,
+    defined: *DefinedFlows
+}
+| defined string
+| parse-error { message: string, line: u32, column: u32 }
+
+~proc define|zig {
+    const koru_errors = @import("koru_errors");
+    const allocator = InterpreterThreadState.prepare();
+
+    var reporter = koru_errors.ErrorReporter.init(allocator, "interpreter", source) catch {
+        return .{ .parse_error = .{ .message = "OOM", .line = 0, .column = 0 } };
+    };
+    defer reporter.deinit();
+    // The `.k` suffix is load-bearing: interpreter source is PURE Koru, and
+    // the full parser derives host-embedded mode from the filename — without
+    // the suffix it demands `~` on every declaration (a host rule pure source
+    // must not have).
+    var parser = koru_parser.Parser.init(allocator, source, "runtime_input.k", &[_][]const u8{}, null) catch {
+        return .{ .parse_error = .{ .message = "OOM", .line = 0, .column = 0 }};
+    };
+    defer parser.deinit();
+    parser.fail_fast = true;
+    const parse_result = parser.parse() catch {
+        if (parser.reporter.hasErrors()) {
+            const err = parser.reporter.errors.items[0];
+            return .{ .parse_error = .{
+                .message = std.heap.page_allocator.dupe(u8, err.message) catch "parse error",
+                .line = @intCast(err.location.line),
+                .column = @intCast(err.location.column),
+            }};
+        }
+        return .{ .parse_error = .{ .message = "Parse failed", .line = 0, .column = 0 }};
+    };
+
+    // Find the tor declaration and its impl flow. A definition is exactly two
+    // items: the declaration (event_decl with the input signature) and the
+    // flow whose impl_of names it.
+    var decl: ?*const ast.EventDecl = null;
+    var impl_flow: ?*const ast.Flow = null;
+    for (parse_result.source_file.items) |*item| {
+        switch (item.*) {
+            .event_decl => |*ed| decl = ed,
+            .flow => |*f| {
+                if (f.impl_of != null) impl_flow = f;
+            },
+            else => {},
+        }
+    }
+    if (decl == null or impl_flow == null) {
+        return .{ .parse_error = .{
+            .message = "A definition must be a tor declaration followed by its flow: `tor name { args }` then `name = ...`",
+            .line = 0,
+            .column = 0,
+        }};
+    }
+    const ed = decl.?;
+    if (ed.path.segments.len == 0) {
+        return .{ .parse_error = .{ .message = "Definition has no name", .line = 0, .column = 0 }};
+    }
+    const name = ed.path.segments[ed.path.segments.len - 1];
+
+    // The tor name must lex as one (430_055): never spaces.
+    if (std.mem.indexOfScalar(u8, name, ' ') != null or std.mem.indexOfScalar(u8, name, '\t') != null) {
+        return .{ .parse_error = .{ .message = "Definition name must not contain spaces", .line = 0, .column = 0 }};
+    }
+
+    // Body source: from the impl flow's `=` separator through the end of the
+    // source (the body may span lines). The head is the first line opening
+    // `<name> = ...`, found by name: Flow.location is captured AFTER its
+    // continuations are consumed, so for multi-line bodies it points past
+    // the `=` and the slice comes back empty. The name cannot lie — the
+    // define contract is a declaration plus exactly one `name = ...` flow.
+    var body_source: []const u8 = "";
+    {
+        var line_start: usize = 0;
+        var i: usize = 0;
+        var abs_eq: ?usize = null;
+        while (i <= source.len) : (i += 1) {
+            if (i == source.len or source[i] == '\n') {
+                const line = std.mem.trim(u8, source[line_start..i], " \t\r");
+                if (line.len > name.len and std.mem.startsWith(u8, line, name)) {
+                    const after = line[name.len..];
+                    if (after[0] == ' ' or after[0] == '\t' or after[0] == '=') {
+                        if (std.mem.indexOfScalar(u8, line, '=')) |eq_in_line| {
+                            abs_eq = @intFromPtr(line.ptr) - @intFromPtr(source.ptr) + eq_in_line;
+                        }
+                        break;
+                    }
+                }
+                line_start = i + 1;
+            }
+        }
+        if (abs_eq) |eq| {
+            body_source = std.mem.trim(u8, source[eq + 1 ..], " \t");
+        }
+        if (body_source.len == 0) {
+            return .{ .parse_error = .{ .message = "Definition body is empty", .line = 0, .column = 0 }};
+        }
+        body_source = allocator.dupe(u8, body_source) catch body_source;
+    }
+
+    // Install into the durable table: the argument vocabulary, the declared
+    // outcome contract (` | ok | missing`, the same spelling the compiled
+    // vocabulary renders so an invented verb shows its arm names), and the
+    // body — owned there, a redefine fully replacing.
+    installDefinedFlow(defined, allocator, ed, name, body_source) catch {
+        return .{ .parse_error = .{ .message = "OOM installing definition", .line = 0, .column = 0 }};
+    };
+
+    return .{ .defined = name };
+}

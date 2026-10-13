@@ -1,0 +1,73 @@
+// Koru Standard Library: Supervision
+// ===================================
+//
+// Failure-handling as a compile-time fact, in the `stored`/`captured`
+// family: the arm declares that its producing call is supervised, the
+// transform elaborates the declaration into an ordinary bounded retry
+// loop — the language's own `#`/`@` fold. There is no supervisor object,
+// no registry, no runtime service: the policy is a datablock read at
+// compile time and the mechanism is a generated step tor plus a labeled
+// fold loop.
+//
+//   worker(n)
+//   | ok v |> …
+//   | boom f |> std/supervisor:supervised
+//       | retry t when t < 3
+//
+// or, with an explicit re-entry call and terminal produce:
+//
+//   | boom f |> std/supervisor:supervised
+//       | retry t when t < 3 |> worker(n: f + 4)
+//       | exhausted => boom f
+//
+// The datablock `{ restart: N [, args: { f: expr }] }` is the terse spelling
+// of the same guarantee — `restart: N` is `| retry t when t < N`, and
+// `args:` is the implicit re-entry call's argument map. Under
+// `[with]std/supervisor` the qualifier drops, but the bare name collides
+// with produce-branch spelling — write `supervised()` there.
+//
+// SEMANTICS (pinned by 320_151's hand-written twin):
+//   - `restart: N` means N retries after the initial call — the producing
+//     call runs at most N+1 times.
+//   - Re-entry targets the producing call; unmapped arguments keep the
+//     LAST attempt's values (the step's ambient inputs), not the site's.
+//   - Every non-supervised branch proceeds exactly as written at the site:
+//     the sibling arms dispatch on the generated step's vocabulary, so a
+//     retried `ok` flows through the same arm set as a first-call `ok`.
+//   - Exhaustion forwards the LAST child outcome upward in kind — a
+//     `| err` stays `| err`, a `?!boom` stays a panic. The supervisor
+//     absorbs and defers; it never rewrites an outcome's kind.
+//   - The retry counter rides as a step input named after the retry arm's
+//     own binding (`| retry t` → field `t`) — `when` conditions and
+//     re-entry args resolve verbatim, no shadowing, no `__fail` plumbing.
+//
+// ELABORATION — the language's own `#`/`@` fold, no generated proc:
+//
+//   connect = dial(port)                     tor __sup_step_L<n> { port, t }
+//   | ok => ok                               | ok | refused
+//   | refused |> supervised                  | __more { port, t }
+//       | retry t when t < 5
+//         |> dial(port: port + 1)       ==>  __sup_step_L<n> = dial(port)
+//       | exhausted => refused               | ok => ok
+//                                            | refused when t < 5
+//                                              => __more { port: port+1, t: t+1 }
+//                                            | refused => refused
+//
+//                                            connect = #__sup_L<n> __sup_step_L<n>(port, t: 0)
+//                                            | __more s |> @__sup_L<n>(s.port, s.t)
+//                                            | ok => ok
+//                                            | refused => refused
+//
+// The step's `port` IS the failing attempt's argument — ambient reader
+// semantics, not threading — so `port + 1` reads the failed port. Branch
+// shapes pass through verbatim: a void branch stays void inside the fold,
+// so `| ok p` on a `| ok` declaration refuses at the site exactly as it
+// would without `supervised`.
+
+const std = @import("std");
+~part h
+~part decl
+~part policy
+~part fold
+~part home
+~part explain

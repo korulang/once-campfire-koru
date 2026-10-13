@@ -1,0 +1,46 @@
+// Koru Standard Library: the `refuse` part of interpreter.run — the
+// post-parse gates that reject source which parsed but must never
+// dispatch. Joined via `~part refuse` in interpreter.run.kz; merged into
+// the run part at load.
+//
+// Two refusals share one position — after either parse path, before the
+// scope lookup, before dispatch: prose-shaped invocation names (430_055)
+// and `|*` residual arms (440_020). Both answer `parse-error` from `run`
+// and `validation-error` from `eval`.
+
+/// Event-name prose check: an tor name must lex as identifier segments
+/// with `.`/`-`/`:` between them, never spaces. The fast parser already
+/// rejects prose, but the full-parser fallback re-accepts an English
+/// sentence whose first `(` makes it look like an invocation.
+fn proseInvocationName(flow: *const ast.Flow) bool {
+    for (flow.inv().path.segments) |seg| {
+        if (std.mem.indexOfScalar(u8, seg, ' ') != null or std.mem.indexOfScalar(u8, seg, '\t') != null) return true;
+    }
+    return false;
+}
+
+/// The residual arm `|*` is a compiled-surface construct: its
+/// optional-only routing is a coverage-check promise the interpreter
+/// cannot keep — no coverage check exists here, and on model-emitted
+/// source a wildcard arm would absorb `unhandled-branch` itself. Any
+/// continuation that parsed as a residual refuses the run.
+pub fn containsResidualArm(conts: []const ast.Continuation) bool {
+    for (conts) |*c| {
+        if (c.is_catchall) return true;
+        if (containsResidualArm(c.continuations)) return true;
+    }
+    return false;
+}
+
+/// The parse-error message when a parsed flow trips a wire refusal —
+/// prose invocation name first, then residual arms (the same order the
+/// gates ran inline). Page-backed like the neighboring report payloads.
+fn wireParseRefusal(flow: *const ast.Flow) ?[]const u8 {
+    const msg = if (proseInvocationName(flow))
+        "Event name must not contain spaces: prose is not an invocation"
+    else if (containsResidualArm(flow.body.continuations))
+        "`|*` residual arm is not spellable on the interpreted surface — name each branch explicitly; unhandled optionals surface as `unhandled-branch`"
+    else
+        return null;
+    return std.heap.page_allocator.dupe(u8, msg) catch "wire refusal";
+}

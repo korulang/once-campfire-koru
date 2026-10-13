@@ -1,0 +1,236 @@
+// Koru Standard Library: the `pool` part of interpreter.kz — the handle
+// record. Joined via `~part pool` in interpreter.kz; merged into the
+// interpreter module at load.
+//
+// HandlePool is the custody organ: every `acquire` mints, every discharge
+// releases. When a world-mounted bridge installs `on_custody`, each of
+// those events is witnessed into the world's holds.log — the record a
+// successor session reads before it acts. Pool callbacks are null by
+// default: a bare interpreter run records nothing, and nothing here
+// knows a world exists.
+
+pub const Handle = struct {
+    /// Unique ID within this pool (persistent, incrementing)
+    id: u32,
+    /// Stable handle ID (string) passed through flows - from tor output field
+    handle_id: []const u8,
+    /// Module that defines this obligation (e.g., "sqlite3", "fs", "mem")
+    obligation_module: []const u8,
+    /// Obligation name within that module (e.g., "opened", "allocated")
+    obligation_name: []const u8,
+    /// Tor that discharges this obligation (e.g., "sqlite3:close")
+    discharge_event: []const u8,
+    /// Whether this handle has been discharged
+    discharged: bool,
+    /// Which tor created this resource (e.g., "sqlite3:open")
+    created_by_event: []const u8,
+    /// Resource type name for inspection (e.g., "Connection")
+    resource_type: []const u8,
+    /// Scope that owns this handle (for isolation enforcement)
+    scope_name: []const u8,
+    /// Pool ids this handle depends on (borrowed providers that must outlive
+    /// it). Derived at acquire time from the creating tor's input args that
+    /// name currently-held handles this tor does not itself discharge.
+    /// Guarded withdrawal: a handle is released only after every undischarged
+    /// handle depending on it is gone (Cordis Theorem 63 ordering, mirrored).
+    depends_on: [4]u32,
+    depends_on_len: u8,
+
+    /// Helper to get fully-qualified obligation string (e.g., "sqlite3:opened")
+    pub fn fqObligation(self: *const Handle, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}:{s}", .{ self.obligation_module, self.obligation_name }) catch self.obligation_name;
+    }
+};
+
+/// What the custody record saw happen to a handle.
+pub const CustodyKind = enum { mint, release };
+
+pub const HandlePool = struct {
+    handles: std.ArrayList(Handle),
+    next_id: u32,
+    allocator: std.mem.Allocator,
+    /// The custody witness, when installed: `on_mint` fires from `acquire`
+    /// (subject carries the creating verb's args — the why of the possess),
+    /// `on_release` fires from every discharge path (explicit verb, sweep,
+    /// hang-up) — all of them funnel through dischargeById/discharge.
+    on_custody: ?*const fn (ctx: *anyopaque, kind: CustodyKind, handle: *const Handle, subject: []const u8) void = null,
+    custody_ctx: ?*anyopaque = null,
+
+    pub fn init(allocator: std.mem.Allocator) HandlePool {
+        return .{
+            .handles = std.ArrayList(Handle){ .items = &.{}, .capacity = 0 },
+            .next_id = 1,
+            .allocator = allocator,
+        };
+    }
+
+    /// Free every handle's duped strings, then the list itself.
+    ///
+    /// `acquire` dupes seven strings per handle; this used to drop the list and
+    /// leak all of them. Invisible for as long as it lived, because every caller
+    /// handed the pool a `page_allocator` that nobody was counting. The first
+    /// pool built on the tracked allocator — a `std/bridge` session — failed the
+    /// produced program's leak check immediately.
+    pub fn deinit(self: *HandlePool) void {
+        for (self.handles.items) |h| {
+            self.allocator.free(h.handle_id);
+            self.allocator.free(h.obligation_module);
+            self.allocator.free(h.obligation_name);
+            self.allocator.free(h.discharge_event);
+            self.allocator.free(h.created_by_event);
+            self.allocator.free(h.resource_type);
+            self.allocator.free(h.scope_name);
+        }
+        self.handles.deinit(self.allocator);
+    }
+
+    fn noteCustody(self: *HandlePool, kind: CustodyKind, h: *const Handle, subject: []const u8) void {
+        const cb = self.on_custody orelse return;
+        const ctx = self.custody_ctx orelse return;
+        cb(ctx, kind, h, subject);
+    }
+
+    /// Register a new handle and return its pool ID
+    pub fn acquire(
+        self: *HandlePool,
+        handle_id: []const u8,
+        obligation_module: []const u8,
+        obligation_name: []const u8,
+        discharge_event: []const u8,
+        created_by_event: []const u8,
+        resource_type: []const u8,
+        scope_name: []const u8,
+        depends_on: []const u32,
+        subject: []const u8,
+    ) !u32 {
+        const id = self.next_id;
+        self.next_id += 1;
+
+        var dep_slice: [4]u32 = .{0} ** 4;
+        var dep_len: u8 = 0;
+        for (depends_on) |dep| {
+            if (dep_len >= dep_slice.len) break;
+            dep_slice[dep_len] = dep;
+            dep_len += 1;
+        }
+
+        try self.handles.append(self.allocator, .{
+            .id = id,
+            .handle_id = try self.allocator.dupe(u8, handle_id),
+            .obligation_module = try self.allocator.dupe(u8, obligation_module),
+            .obligation_name = try self.allocator.dupe(u8, obligation_name),
+            .discharge_event = try self.allocator.dupe(u8, discharge_event),
+            .discharged = false,
+            .created_by_event = try self.allocator.dupe(u8, created_by_event),
+            .resource_type = try self.allocator.dupe(u8, resource_type),
+            .scope_name = try self.allocator.dupe(u8, scope_name),
+            .depends_on = dep_slice,
+            .depends_on_len = dep_len,
+        });
+
+        self.noteCustody(.mint, &self.handles.items[self.handles.items.len - 1], subject);
+        return id;
+    }
+
+    /// Whether any undischarged handle depends on `provider_id`. The release
+    /// guard: a provider may not be withdrawn while a dependent holds it.
+    pub fn hasUndischargedDependents(self: *const HandlePool, provider_id: u32) bool {
+        for (self.handles.items) |h| {
+            if (h.discharged) continue;
+            for (h.depends_on[0..h.depends_on_len]) |dep| {
+                if (dep == provider_id) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Mark a handle as discharged by pool ID
+    pub fn dischargeById(self: *HandlePool, id: u32) void {
+        for (self.handles.items) |*h| {
+            if (h.id == id and !h.discharged) {
+                h.discharged = true;
+                self.noteCustody(.release, h, "");
+                return;
+            }
+        }
+    }
+
+    /// Find handle by handle_id string within a specific scope (for explicit discharge)
+    /// Scope isolation prevents cross-scope handle collisions
+    pub fn findByHandleId(self: *HandlePool, handle_id: []const u8, scope_name: []const u8) ?*Handle {
+        for (self.handles.items) |*h| {
+            if (std.mem.eql(u8, h.handle_id, handle_id) and
+                std.mem.eql(u8, h.scope_name, scope_name) and
+                !h.discharged) {
+                return h;
+            }
+        }
+        return null;
+    }
+
+    /// Find handle by handle_id without scope check (for legacy/bridge inspection)
+    pub fn findByHandleIdAnyScope(self: *HandlePool, handle_id: []const u8) ?*Handle {
+        for (self.handles.items) |*h| {
+            if (std.mem.eql(u8, h.handle_id, handle_id) and !h.discharged) {
+                return h;
+            }
+        }
+        return null;
+    }
+
+    /// Mark a handle as discharged by handle_id string (legacy compatibility, no scope check)
+    pub fn discharge(self: *HandlePool, handle_id: []const u8) void {
+        if (self.findByHandleIdAnyScope(handle_id)) |h| {
+            h.discharged = true;
+            self.noteCustody(.release, h, "");
+        }
+    }
+
+    /// Get all undischarged handles
+    pub fn getUndischarged(self: *const HandlePool) []const Handle {
+        // Count undischarged
+        var count: usize = 0;
+        for (self.handles.items) |h| {
+            if (!h.discharged) count += 1;
+        }
+        if (count == 0) return &[_]Handle{};
+
+        // Collect them
+        var result = self.allocator.alloc(Handle, count) catch return &[_]Handle{};
+        var i: usize = 0;
+        for (self.handles.items) |h| {
+            if (!h.discharged) {
+                result[i] = h;
+                i += 1;
+            }
+        }
+        return result;
+    }
+
+    /// Get ALL handles (for bridge inspection - includes discharged)
+    pub fn getAllHandles(self: *const HandlePool) []const Handle {
+        return self.handles.items;
+    }
+
+    pub fn countUndischarged(self: *const HandlePool) usize {
+        var count: usize = 0;
+        for (self.handles.items) |h| {
+            if (!h.discharged) count += 1;
+        }
+        return count;
+    }
+};
+
+/// `name=value, name=value` into `buf` — the custody subject: WHAT the
+/// minting verb took, in the wire's own spellings. Runs at the dispatch
+/// site where the evaluated args still exist; the pool stores no copy —
+/// the witness is synchronous, the slice dies with the call.
+pub fn custodySubject(buf: []u8, args: []const ast.Arg) []const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    for (args, 0..) |a, i| {
+        if (i > 0) w.writeAll(", ") catch break;
+        w.print("{s}={s}", .{ a.name, a.value }) catch break;
+    }
+    return fbs.getWritten();
+}

@@ -1,0 +1,6 @@
+// Compiler flags
+//
+~[comptime]pub tor has-flag { flag: string } -> bool
+~proc has-flag|zig {
+    return CompilerEnv.hasFlag(flag);
+}

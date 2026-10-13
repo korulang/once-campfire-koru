@@ -1,0 +1,175 @@
+// Koru Standard Library: Reactive Stores — the `index` part.
+// Joined via `~part index` in store.kz; merged into the store module at load.
+
+// ============================================================================
+// STORE.INDEX — discovery for `std/indexes:store(<store>, <column>)`
+// ============================================================================
+//
+// The declaration is pure AST-data: std/indexes's `[norun]` `store` tor
+// claims the site, it never executes, and the node stays in program.items
+// for the whole transform pass — the AST is the registry. These helpers are
+// how the verb transforms ask "is my store indexed, and on which column."
+//
+// The map is key→ORDERED HANDLE LIST — every live row carrying the key,
+// in join order. Swap-remove needs no moved-row fixup (a row's handle is
+// unchanged when it moves dense slots — 690_092) and a taken row's entry
+// needs no fixup either: the dead handle resolves to no row through the
+// generational path (690_115/116) and every reader skips it. Maintenance
+// is emitted inside the verbs — an outside watcher could never see the
+// displaced row; no tor fires for it.
+//
+// The one declaration serves both consumers: `! first` answers the
+// LOWEST dense live member (the sweep's first-match parity) and
+// `! query <row> when <row>.<col> == <k>` walks the bucket instead of
+// sweeping — the membership IS the guard. Membership order, not dense
+// order, is the routed query's visit order: identical to the sweep's
+// until a take reshuffles dense slots, and the divergence is pinned.
+
+const StoreIndex = struct {
+    /// Shared KORU161 text — the `! first` refusal and the plan row share it.
+    const MSG_unlowered_key = "std/store:query({s}): the index key names `@{s}`, and that operation has no lowering for this target - a store guard is a Koru expression, and the operations Koru names with `@` are the shared table in codegen_utils.lowerBuiltin";
+    /// The `std/indexes:store(<store>, <col>)` declaration naming
+    /// `store_name`, or null — the first non-`expr`/`source` arg is the
+    /// column. The walk lives in StoreIndexDecls (store.idecls.kz); this
+    /// is its first-match read.
+    fn columnOf(alloc: std.mem.Allocator, program: *const ast_find.Program, store_name: []const u8) ?[]const u8 {
+        const ds = StoreIndexDecls.declsOf(alloc, program, store_name);
+        if (ds.len == 0) return null;
+        return ds[0].column;
+    }
+
+    // --- emit: the buckets' maintenance, spliced inside the verbs' own code ---
+    //
+    // Every live row sits in exactly one bucket — the list at its current
+    // key — appended in join order. `take` emits NOTHING: a taken row's
+    // handle stays in its bucket as a dead member that `__koru_row_of`
+    // resolves to none, and every reader skips dead members. `stored`
+    // writes to the indexed column move the row's membership eagerly — a
+    // stale member under the OLD key would answer for a row that no
+    // longer carries it. `clear` drops every bucket with the map.
+    // (`icol` names the `__index_<col>` field and the `__koru_out_<col>`
+    // capture, both emitted unescaped; `ecol` is the escaped name for a
+    // Zig column read — identical on JS).
+
+    /// Insert: the fresh row joins its key's bucket — appended last, the
+    /// newest member, so the bucket's order is the rows' join order.
+    fn insertPut(alloc: std.mem.Allocator, host_is_js: bool, store_name: []const u8, icol: []const u8, ecol: []const u8) []const u8 {
+        if (storeHostTarget() == .cs)
+            // `__index_<col>` is a `Dictionary<long, List<long>>` (the cell
+            // decl's cs arm) — TryGetValue is getOrPut, `.Add` is append.
+            return std.fmt.allocPrint(alloc,
+                \\long __koru_ik = (long)(__koru_store_{s}.{s}[__koru_new_row]);
+                \\global::System.Collections.Generic.List<long> __koru_ib;
+                \\if (!__koru_store_{s}.__index_{s}.TryGetValue(__koru_ik, out __koru_ib)) {{ __koru_ib = new global::System.Collections.Generic.List<long>(); __koru_store_{s}.__index_{s}[__koru_ik] = __koru_ib; }}
+                \\__koru_ib.Add(__koru_store_{s}.__koru_handle_of(__koru_new_row));
+                \\
+            , .{ store_name, ecol, store_name, icol, store_name, icol, store_name }) catch unreachable;
+        if (host_is_js)
+            return std.fmt.allocPrint(alloc,
+                \\const __koru_ik = __koru_store_{s}.{s}[__koru_new_row];
+                \\let __koru_ib = __koru_store_{s}.__index_{s}.get(__koru_ik);
+                \\if (__koru_ib === undefined) {{ __koru_ib = []; __koru_store_{s}.__index_{s}.set(__koru_ik, __koru_ib); }}
+                \\__koru_ib.push(__koru_store_{s}.__koru_handle_of(__koru_new_row));
+                \\
+            , .{ store_name, ecol, store_name, icol, store_name, icol, store_name }) catch unreachable;
+        return std.fmt.allocPrint(alloc,
+            \\const __koru_ik = __koru_store_{s}.{s}[__koru_new_row];
+            \\const __koru_ig = __koru_store_{s}.__index_{s}.getOrPut(koru_allocator(), __koru_ik) catch @panic("std/indexes: index insert ran out of memory");
+            \\if (!__koru_ig.found_existing) __koru_ig.value_ptr.* = .{{}};
+            \\__koru_ig.value_ptr.append(koru_allocator(), __koru_store_{s}.__koru_handle_of(__koru_new_row)) catch @panic("std/indexes: index insert ran out of memory");
+            \\
+        , .{ store_name, ecol, store_name, icol, store_name }) catch unreachable;
+    }
+
+    /// `clear`: every bucket's backing list goes with the map.
+    fn clearDrop(alloc: std.mem.Allocator, host_is_js: bool, store_name: []const u8, icol: []const u8) []const u8 {
+        if (storeHostTarget() == .cs)
+            // GC reclaims the buckets — `Clear` is the whole job.
+            return std.fmt.allocPrint(alloc, "__koru_store_{s}.__index_{s}.Clear();\n", .{ store_name, icol }) catch unreachable;
+        if (host_is_js)
+            return std.fmt.allocPrint(alloc, "__koru_store_{s}.__index_{s}.clear();\n", .{ store_name, icol }) catch unreachable;
+        return std.fmt.allocPrint(alloc,
+            \\{{
+            \\    var __koru_ci = __koru_store_{s}.__index_{s}.valueIterator();
+            \\    while (__koru_ci.next()) |__koru_cb| __koru_cb.deinit(koru_allocator());
+            \\    __koru_store_{s}.__index_{s}.deinit(koru_allocator());
+            \\}}
+            \\
+        , .{ store_name, icol, store_name, icol }) catch unreachable;
+    }
+
+    /// The index-eligible guard, shared by `! first` and `! query`: the rewritten condition is ONE `==`
+    /// between the row's indexed column (its `<srf>` spelling, `colref`) and
+    /// a row-free key expression. Anything else answers null — the caller
+    /// scans, which computes the same answer the slow way.
+    fn guardKey(cond: []const u8, colref: []const u8) ?[]const u8 {
+        const eq = std.mem.indexOf(u8, cond, "==") orelse return null;
+        // `!=`, `<=`, `>=`, `===` are not the equality the index answers.
+        if (eq > 0 and (cond[eq - 1] == '!' or cond[eq - 1] == '=' or cond[eq - 1] == '<' or cond[eq - 1] == '>')) return null;
+        if (eq + 2 < cond.len and cond[eq + 2] == '=') return null;
+        const lhs = std.mem.trim(u8, cond[0..eq], " ");
+        const rhs = std.mem.trim(u8, cond[eq + 2 ..], " ");
+        const key = if (std.mem.eql(u8, lhs, colref)) rhs else if (std.mem.eql(u8, rhs, colref)) lhs else return null;
+        // One comparison total, a plain key — a compound condition or a
+        // row-reading key is the scan's job.
+        for (key) |c| {
+            switch (c) {
+                '=', '<', '>', '!', '&', '|', '"' => return null,
+                else => {},
+            }
+        }
+        if (std.mem.indexOf(u8, key, " and ") != null or std.mem.indexOf(u8, key, " or ") != null) return null;
+        if (std.mem.indexOf(u8, key, "__koru_srf_") != null) return null;
+        return key;
+    }
+
+    // --- guard routing: the bucket stands in for the sweep ---
+
+    /// `! first <row> when <row>.<icol> == <k>` and `! query <row> when
+    /// <row>.<icol> == <k>` on an indexed store answer the bucket, not a
+    /// sweep — the membership IS the guard. `.route` carries the index
+    /// column and the LOWERED key expression; `.refuse` is the unlowering
+    /// `@@` op name for the caller's diagnostic; `.scan` is every other
+    /// guard shape — the sweep computes the same answer the slow way.
+    const GuardRoute = union(enum) {
+        scan,
+        route: struct { icol: []const u8, key: []const u8 },
+        refuse: []const u8,
+    };
+
+    fn guardRoute(alloc: std.mem.Allocator, program: *const ast_find.Program, store_name: []const u8, guard_z: ?[]const u8, srf_prefix: []const u8) GuardRoute {
+        const icol = columnOf(alloc, program, store_name) orelse return .scan;
+        const gz = guard_z orelse return .scan;
+        const mangled_icol = std.mem.replaceOwned(u8, alloc, icol, ".", "_") catch unreachable;
+        const colref = std.fmt.allocPrint(alloc, "{s}{s}", .{ srf_prefix, mangled_icol }) catch unreachable;
+        const kr = guardKey(gz, colref) orelse return .scan;
+        var unknown_op: []const u8 = "";
+        const key = storeLowerExpr(alloc, kr, &unknown_op) orelse return .{ .refuse = unknown_op };
+        return .{ .route = .{ .icol = icol, .key = key } };
+    }
+
+    /// `! first`'s head — the lowest dense live member of the key's bucket
+    /// is the row the sweep's first match would have found. Dead members
+    /// (taken rows, never ejected) resolve to no row and skip. Opened as
+    /// the block the projections and the body call still sit inside.
+    fn firstHead(alloc: std.mem.Allocator, host_is_js: bool, cellq: []const u8, store_name: []const u8, icol: []const u8, key: []const u8) []const u8 {
+        if (storeHostTarget() == .cs)
+            // `__koru_row_of` answers -1 for a dead member — `-1` is the
+            // "no candidate yet" sentinel, not maxInt.
+            return std.fmt.allocPrint(alloc, "{{\nglobal::System.Collections.Generic.List<long> __koru_ib;\nif ({s}__koru_store_{s}.__index_{s}.TryGetValue((long)({s}), out __koru_ib)) {{\nlong __koru_im = -1;\nforeach (var __koru_bh in __koru_ib) {{\n    var __koru_cand = {s}__koru_store_{s}.__koru_row_of(__koru_bh);\n    if (__koru_cand >= 0 && (__koru_im < 0 || __koru_cand < __koru_im)) __koru_im = __koru_cand;\n}}\nif (__koru_im >= 0) {{\nvar __koru_si = __koru_im;\n", .{ cellq, store_name, icol, key, cellq, store_name }) catch unreachable;
+        if (host_is_js)
+            return std.fmt.allocPrint(alloc, "{{\nconst __koru_ib = {s}__koru_store_{s}.__index_{s}.get({s});\nif (__koru_ib !== undefined) {{\nlet __koru_im = -1;\nfor (const __koru_bh of __koru_ib) {{\n    const __koru_cand = {s}__koru_store_{s}.__koru_row_of(__koru_bh);\n    if (__koru_cand !== null && (__koru_im < 0 || __koru_cand < __koru_im)) __koru_im = __koru_cand;\n}}\nif (__koru_im >= 0) {{\nconst __koru_si = __koru_im;\n", .{ cellq, store_name, icol, key, cellq, store_name }) catch unreachable;
+        return std.fmt.allocPrint(alloc, "if ({s}__koru_store_{s}.__index_{s}.get({s})) |__koru_ib| {{\nvar __koru_im: usize = @import(\"std\").math.maxInt(usize);\nfor (__koru_ib.items) |__koru_bh| {{\n    if ({s}__koru_store_{s}.__koru_row_of(__koru_bh)) |__koru_cand| {{\n        if (__koru_cand < __koru_im) __koru_im = __koru_cand;\n    }}\n}}\nif (__koru_im != @import(\"std\").math.maxInt(usize)) {{\nconst __koru_si = __koru_im;\n", .{ cellq, store_name, icol, key, cellq, store_name }) catch unreachable;
+    }
+
+    /// The lookup's close — seal the handler call and the head's two open
+    /// blocks (the row-test and the bucket's get — the member `for` seals
+    /// itself inside the head; on JS also the scoping block), then
+    /// `| none` and the block the scan path would have closed.
+    fn firstClose(alloc: std.mem.Allocator, host_is_js: bool, none_call: []const u8) []const u8 {
+        // The cs head opens the same three blocks as js (`{`, the bucket
+        // `if`, the `__koru_im >= 0` `if`) — same seal.
+        const seal: []const u8 = if (host_is_js or storeHostTarget() == .cs) ");\n}\n}\n}\n" else ");\n}\n}\n";
+        return std.fmt.allocPrint(alloc, "{s}{s}}}\n", .{ seal, none_call }) catch unreachable;
+    }
+};

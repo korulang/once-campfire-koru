@@ -1,0 +1,59 @@
+// Koru Standard Library: the `items` part of bridge.kz — per-item
+// predicates and the note-tail rescue. Joined via `~part items` in
+// bridge.kz; merged into the bridge module at load.
+
+/// `tor ...` items route to define_event, everything else dispatches.
+fn isDefineItem(item: []const u8) bool {
+    const trimmed = std.mem.trim(u8, item, " \t\r\n");
+    return std.mem.startsWith(u8, trimmed, "tor ");
+}
+
+/// A `note(` item's tail rescue, introspection sessions only. The natural
+/// misspelling is `note(text: <prose>)say(...)` on ONE line — the segmenter
+/// splits at newlines, so the whole line is one item and the malformed note
+/// swallows the wire call after it into the residue string, where it dies
+/// unseen. Find the first `)` whose trimmed suffix passes the wire gate and
+/// return the source index just past it: the prefix still takes the
+/// residue/dispatch path, the suffix becomes its own step.
+fn noteTailSplitAt(br: *Bridge, source: []const u8, it: TurnItem) ?usize {
+    const item = std.mem.trim(u8, source[it.start..it.end], " \t\r\n");
+    if (!std.mem.startsWith(u8, item, "note(")) return null;
+    const base = @intFromPtr(item.ptr) - @intFromPtr(source.ptr);
+    var i: usize = 5;
+    while (i < item.len) : (i += 1) {
+        if (item[i] != ')') continue;
+        const suffix = std.mem.trim(u8, item[i + 1 ..], " \t\r\n");
+        if (suffix.len == 0) continue;
+        if (wireGate(br, suffix) == null) return base + i + 1;
+    }
+    return null;
+}
+
+/// Post-segmentation pass: split every `note(` item carrying a wire tail
+/// into [note prefix, tail]. Returns null when nothing splits, so callers
+/// can keep the original slice.
+fn splitNoteTails(br: *Bridge, source: []const u8, items: []TurnItem) ?[]TurnItem {
+    if (!br.introspection) return null;
+    var out = std.ArrayList(TurnItem){};
+    var split_any = false;
+    for (items) |it| {
+        var start = it.start;
+        while (noteTailSplitAt(br, source, .{ .start = start, .end = it.end })) |at| {
+            out.append(br.allocator, .{ .start = start, .end = at }) catch {
+                out.deinit(br.allocator);
+                return null;
+            };
+            start = at;
+            split_any = true;
+        }
+        out.append(br.allocator, .{ .start = start, .end = it.end }) catch {
+            out.deinit(br.allocator);
+            return null;
+        };
+    }
+    if (!split_any) {
+        out.deinit(br.allocator);
+        return null;
+    }
+    return out.toOwnedSlice(br.allocator) catch null;
+}

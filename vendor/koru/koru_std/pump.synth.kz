@@ -1,0 +1,59 @@
+// Koru Standard Library: the `synth` part of pump — joined via
+// `~part synth` in pump.kz; members land in koru_pump.
+//
+// A join arm's callee isn't always a declared tor: a store's `! step` /
+// `! wait` arms SYNTHESIZE `<s>-step` / `<s>-live` / `<s>-wait` units at
+// transform time, so nothing named `tasks-step` exists in the pre-transform
+// tree the explainer folds. `synthesized` recognizes `<store>-<verb>` against
+// a `std/store:new` site carrying the arm that generates it — reported as
+// generated (with the generator site as `gen` witness), never refused.
+
+const PS = struct {
+    const Synthesized = struct { store: []const u8, gen: *const ast.Invocation };
+
+    fn synthesized(prog: *const ast.Program, li: ?*const ast.Invocation) ?Synthesized {
+        const inv = li orelse return null;
+        const callee = if (inv.path.segments.len == 1) inv.path.segments[0] else return null;
+        const dash = std.mem.lastIndexOfScalar(u8, callee, '-') orelse return null;
+        const store_name = callee[0..dash];
+        const arm = if (std.mem.eql(u8, callee[dash + 1 ..], "step") or std.mem.eql(u8, callee[dash + 1 ..], "live"))
+            "step"
+        else if (std.mem.eql(u8, callee[dash + 1 ..], "wait"))
+            "wait"
+        else
+            return null;
+        const W = struct {
+            fn scan(its: []const ast.Item, want: []const u8, want_arm: []const u8) ?*const ast.Invocation {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .flow => |*fl| {
+                            if (fl.body.node) |*n| {
+                                if (n.* == .invocation) {
+                                    const mq = n.invocation.path.module_qualifier orelse "";
+                                    if ((std.mem.eql(u8, mq, "std.store") or std.mem.eql(u8, mq, "std/store")) and
+                                        n.invocation.path.segments.len == 1 and std.mem.eql(u8, n.invocation.path.segments[0], "new"))
+                                    {
+                                        for (n.invocation.args) |a| {
+                                            if (a.source_value == null and std.mem.eql(u8, a.value, want)) {
+                                                for (fl.body.continuations) |*c| {
+                                                    if (c.kind == .effect and std.mem.eql(u8, std.mem.trim(u8, c.branch, " "), want_arm)) return &n.invocation;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .module_decl => |*md| {
+                            if (scan(md.items, want, want_arm)) |hit| return hit;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            }
+        };
+        if (W.scan(prog.items, store_name, arm)) |gen| return .{ .store = store_name, .gen = gen };
+        return null;
+    }
+};

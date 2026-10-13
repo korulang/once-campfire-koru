@@ -1,0 +1,37 @@
+// std/args — C# implementation facet.
+//
+// Events are declared in the `args.k` companion (merged at import); this
+// file holds the `|cs` proc bodies. `import std/args` merges all same-stem
+// facets into one module, so the contract in `args.k` is in scope here.
+//
+// Alignment with the Zig facet: Environment.GetCommandLineArgs() is
+// [exe-path, ...userargs] — the same [program, ...userargs] shape Zig's
+// std.os.argv carries, so index 0 is the program and index i is
+// GetCommandLineArgs()[i] — matching the Zig facet's indexing exactly
+// (no node's extra leading entry to drop, the way args.kjs does).
+
+~proc all|cs {
+    return global::System.Environment.GetCommandLineArgs();
+}
+
+~proc count|cs {
+    return (long)global::System.Environment.GetCommandLineArgs().Length;
+}
+
+// The branch tag is the Koru branch name VERBATIM, hyphens and all — the
+// emitter compares `result.tag == "out-of-bounds"`.
+~proc get|cs {
+    var __koru_argv = global::System.Environment.GetCommandLineArgs();
+    if (index >= __koru_argv.Length) {
+        return new Output { tag = "out-of-bounds", out_of_bounds = new { } };
+    }
+    return new Output { tag = "arg", arg = __koru_argv[(int)index] };
+}
+
+~proc rest|cs {
+    var __koru_argv = global::System.Environment.GetCommandLineArgs();
+    if (__koru_argv.Length <= 1) {
+        return new string[] { };
+    }
+    return global::System.Linq.Enumerable.ToArray(global::System.Linq.Enumerable.Skip(__koru_argv, 1));
+}

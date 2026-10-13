@@ -1,0 +1,56 @@
+// Koru Standard Library: the `waits` part of time.kz.
+// Joined via `~part waits` in time.kz; merged into the module at load.
+
+// ============================================================================
+// PUMP WAITS
+// ============================================================================
+//
+// What a `std/pump:run` `! idle` arm reaches for. Three shapes because a dead
+// pass is waited three honest ways:
+//
+//   sleep-us   — a fixed wait finer than sleep-ms, for a sub-millisecond spin
+//                budget on a busy machine.
+//   sleep-until — wait to a monotonic deadline (same `now()` epoch). A
+//                deadline, not a duration: composable with anything that knows
+//                when it next wants to run.
+//   pace       — the frame-pacer. `last` is the boundary you last waited to
+//                (start at `std/time:now()`); `pace` sleeps until
+//                `last + period` and returns that boundary, so the next call
+//                paces off the SCHEDULE, not off when the kernel happened to
+//                wake you — a 60 Hz `! tick` that never drifts.
+//
+//   ! idle |> std/time:sleep-ms(ms: 2)
+//   ! idle |> std/time:pace(period: 16_666_667, last: tick_ns): tick_ns
+
+// Sleep for specified microseconds
+~[runtime] pub tor sleep-us { us: u64 }
+
+~[runtime] proc sleep-us|zig {
+    std.Thread.sleep(us * 1_000);
+}
+
+// Sleep until a monotonic deadline (nanoseconds, `std/time:now()` epoch).
+// A deadline already past returns without sleeping — a late caller is not a
+// reason to wait longer.
+~[runtime] pub tor sleep-until { deadline: i128 }
+
+~[runtime] proc sleep-until|zig {
+    const now = __mono_ns();
+    if (deadline > now) std.Thread.sleep(@intCast(deadline - now));
+}
+
+// Sleep until `last + period` and return that boundary — drift-free pacing
+// for a periodic wait. When the schedule already ran late the return is the
+// next boundary still ahead, so a stalled caller resumes on a FUTURE tick
+// rather than paying catch-up sleeps.
+~[runtime] pub tor pace { period: i128, last: i128 } -> i128
+
+~[runtime] proc pace|zig {
+    const now = __mono_ns();
+    var target = last + period;
+    if (target <= now) {
+        target = now + @rem(target - now, period) + period;
+    }
+    std.Thread.sleep(@intCast(target - now));
+    return target;
+}

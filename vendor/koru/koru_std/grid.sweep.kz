@@ -1,0 +1,305 @@
+// Koru Standard Library: the `sweep` part of grid.kz.
+// Joined via `~part sweep` in grid.kz; merged into the grid module at load.
+
+// keeps the body Koru all the way down — a nested `std/store:stored`, a
+// `print.ln`, a guard, all behave exactly as they do anywhere else, because
+// nothing about them has been moved.
+
+~[keyword|comptime|transform|claims_descendants]pub tor sweep {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc sweep|zig {
+    const ast = @import("ast");
+    const ast_functional = @import("ast_functional");
+
+    if (item.* != .flow) @panic("grid:sweep transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    const S = struct {
+        const isIdentCh = @import("emitter_helpers").isKebabIdentChar;
+        // `c.field` -> `<grid>[<cursor>].field`, the SOURCE-LEVEL address.
+        //
+        // The first cut rewrote straight to host text — a direct indexed load
+        // at the loop cursor, no bounds check, which is what the arm wants and
+        // is unarguably the right emitted code. It also made the swept cell
+        // READ-ONLY, and that turned out to be the whole story: a write is
+        // addressed `<grid>[<index>].<field>`, so a body that had already been
+        // lowered to `(&__koru_grid_g.f)[i]` had nothing `stored` could parse,
+        // and there was no way to say "this cell" on the left of a write.
+        // std/store has never had that problem — `! query e |> stored { e.px:
+        // … }` writes through the row binding — so the grid was not missing a
+        // feature, it was ASYMMETRIC with the table it is the sibling of.
+        //
+        // Rewriting to the address instead of the load fixes it by deleting the
+        // special case: the cell binding becomes ordinary addressing, `stored`
+        // parses and threads it exactly as it does any other write, and reads
+        // lower through the one lowering every other read uses. Nothing here
+        // knows whether it produced an lvalue or an rvalue, which is the point.
+        //
+        // The bounds check this reintroduces is the one `__koru_at` performs
+        // against a comptime-known size, on an index the loop constructed from
+        // `0..size`. That is the case the declaration's header calls a floor
+        // rather than a tax — provable in range, and the optimizer deletes it.
+        fn cells(alloc: std.mem.Allocator, text: []const u8, bind: []const u8, ns: []const u8, grid: []const u8, cur: []const u8) []const u8 {
+            _ = ns;
+            const prefix = std.fmt.allocPrint(alloc, "{s}.", .{bind}) catch unreachable;
+            var out = std.ArrayList(u8).initCapacity(alloc, text.len + 64) catch unreachable;
+            var i: usize = 0;
+            while (i < text.len) {
+                const boundary = i == 0 or !isIdentCh(text[i - 1]);
+                if (boundary and std.mem.startsWith(u8, text[i..], prefix)) {
+                    var fe = i + prefix.len;
+                    while (fe < text.len and isIdentCh(text[fe])) fe += 1;
+                    const fname = text[i + prefix.len .. fe];
+                    const piece = std.fmt.allocPrint(alloc, "{s}[{s}].{s}", .{ grid, cur, fname }) catch unreachable;
+                    out.appendSlice(alloc, piece) catch unreachable;
+                    i = fe;
+                } else {
+                    out.append(alloc, text[i]) catch unreachable;
+                    i += 1;
+                }
+            }
+            return out.toOwnedSlice(alloc) catch unreachable;
+        }
+        fn walk(alloc: std.mem.Allocator, cont: *ast.Continuation, bind: []const u8, ns: []const u8, grid: []const u8, cur: []const u8) void {
+            if (cont.condition) |c| {
+                @constCast(cont).condition = cells(alloc, c, bind, ns, grid, cur);
+            }
+            if (cont.node) |*n| {
+                switch (@constCast(n).*) {
+                    .invocation => |*inv| {
+                        for (inv.args) |*a| {
+                            @constCast(a).value = cells(alloc, a.value, bind, ns, grid, cur);
+                            if (a.expression_value) |ev| {
+                                const fresh = alloc.create(ast.CapturedExpression) catch unreachable;
+                                fresh.* = ev.*;
+                                fresh.text = cells(alloc, ev.text, bind, ns, grid, cur);
+                                @constCast(a).expression_value = fresh;
+                            }
+                            if (a.source_value) |sv| {
+                                const fresh = alloc.create(ast.Source) catch unreachable;
+                                fresh.* = sv.*;
+                                fresh.text = cells(alloc, sv.text, bind, ns, grid, cur);
+                                @constCast(a).source_value = fresh;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+            for (cont.continuations) |*k| walk(alloc, @constCast(k), bind, ns, grid, cur);
+        }
+    };
+
+    var grid_name: []const u8 = "";
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "expr")) {
+            var n = arg.value;
+            if (n.len >= 2 and n[0] == '"') n = n[1 .. n.len - 1];
+            grid_name = n;
+        }
+    }
+    if (grid_name.len == 0) {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/grid:sweep requires a grid name: sweep(name)", .{}) };
+    }
+    if (flow.body.continuations.len != 1) {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/grid:sweep({s}): exactly one `! sweep <cell>` branch per site", .{grid_name}) };
+    }
+    const arm = &flow.body.continuations[0];
+    if (!std.mem.eql(u8, std.mem.trim(u8, arm.branch, " "), "sweep")) {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/grid:sweep({s}): the cell branch is spelled `! sweep <cell>`", .{grid_name}) };
+    }
+    // THE CELL BINDING IS AN ADDRESS, so it is a write target as well as a
+    // read. `! sweep c |> std/grid:stored { c.avg: c.sum / c.n }` updates the
+    // cell being visited, which is what `std/store`'s row binding has always
+    // done and what this arm could not do while it rewrote straight to a load.
+    //
+    // A REQUEST BLOCK (`! sweep { [cell]c, [id]i }`) exposing the cell's INDEX
+    // was built here and cut before it shipped. It works and it is three lines
+    // away, but it hands the program a raw position as a VALUE — storable in a
+    // column, passable, comparable against the wrong grid — which is the exact
+    // thing the store's handle discipline exists to forbid, and it would leave
+    // the language with two tables holding two different rules about what an
+    // address is. What it buys is addressing a cell OTHER than the one being
+    // visited: neighbour gathers, `cells[i+1]`. No workload here asks for that
+    // — DOTS' BoidSystem reads only a boid's own hash bucket — so the
+    // vocabulary waits for one that does. (Ruled with Lars 2026-08-03.)
+    const bind = arm.binding orelse {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/grid:sweep({s}): the sweep arm needs a cell binding: `! sweep <cell> |> ...`", .{grid_name}) };
+    };
+
+    // WHERE THE SWEPT GRID'S CELLS LIVE. A sweep site and the declaration it
+    // sweeps need not share a module — the grid is named, not handed over — so
+    // the body's cell reads carry the DECLARING module's namespace, which is a
+    // different question from `home_ns` below (that one is about where this
+    // site's generated units are minted). Conflating the two is how a grid
+    // swept from the entry file over a declaration in `app/lib` emits
+    // `__koru_grid_cells` into a module that has never heard of it.
+    var swept = std.ArrayList(grid_read.GridRef).initCapacity(allocator, 4) catch unreachable;
+    grid_read.collect(allocator, program, &swept);
+    const grid_ns = if (grid_read.find(swept.items, grid_name)) |r| r.ns else {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/grid:sweep({s}): no grid named '{s}' is declared in this program", .{ grid_name, grid_name }) };
+    };
+
+    // The grid's size is comptime-known, and the declaration already emitted it
+    // as `__koru_size` on the cell type — so the loop header names that rather
+    // than re-deriving it, and a grid whose size changes cannot leave a stale
+    // bound behind in a sweep.
+    const cur = std.fmt.allocPrint(allocator, "__koru_gi_L{d}", .{flow.location.line}) catch unreachable;
+    if (ast.refuseUncrossable(allocator, reporter, "grid:sweep", grid_name, "sweep", arm, flow.module)) |r| return .{ .transformed = r };
+    const body = ast_functional.cloneContinuation(allocator, arm) catch unreachable;
+    var mutable_body = body;
+    S.walk(allocator, &mutable_body, std.mem.trim(u8, bind, " "), grid_ns, grid_name, cur);
+
+    // NOW LOWER THE READS, through the same walker the declaration runs over
+    // the whole program. The body did not exist when that pass ran — it is a
+    // clone made here — so it is a subtree the program walk can never have
+    // visited, and without this its cell addresses reach the host verbatim.
+    // std/grid sites inside it are skipped by the walker, which is what leaves
+    // a nested `stored`'s target in source form for `stored` to parse.
+    grid_read.lowerCont(allocator, &mutable_body, swept.items);
+
+    // The body becomes an EVENT with the loop index as its only input, and an
+    // impl flow carrying the (already-rewritten) continuation. The loop is a
+    // `|zig` proc that calls it per cell. This is the store's qbody shape minus
+    // everything a grid does not need: no projection derivation, no handle, no
+    // removal tolerance — a grid cannot take, so the loop is a plain counted
+    // `for` with a known trip count.
+    // SAME IMPORT-DERIVED NAMESPACE RULE as the write unit. The mirror caught
+    // this twice in one session: `flow.module` is the file name, resolution
+    // wants the module's logical name, and the entry file hides the difference.
+    const home_ns = blk_home: {
+        const Find = struct {
+            fn in(its: []const ast.Item, want: []const u8, enclosing: ?[]const u8) ?[]const u8 {
+                for (its) |pi| {
+                    switch (pi) {
+                        .flow => |f| {
+                            if (std.mem.eql(u8, f.module, want)) return enclosing;
+                        },
+                        .module_decl => |m| {
+                            if (in(m.items, want, m.logical_name)) |hit| return hit;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            }
+        };
+        break :blk_home Find.in(program.items, flow.module, null) orelse flow.module;
+    };
+    // And the EMITTED Zig namespace, which is a different spelling again: the
+    // generated loop is raw host code, so it must name the struct its sibling
+    // units emitted into rather than assume the entry module.
+    const emit_ns = if (home_ns.len == 0 or std.mem.eql(u8, home_ns, program.main_module_name))
+        "main_module."
+    else
+        std.fmt.allocPrint(allocator, "{s}.", .{codegen_utils_grid.buildKoruModulePath(allocator, home_ns) catch unreachable}) catch unreachable;
+
+    const body_name = std.fmt.allocPrint(allocator, "__grid_body_L{d}", .{flow.location.line}) catch unreachable;
+    const sweep_name = std.fmt.allocPrint(allocator, "__grid_sweep_L{d}", .{flow.location.line}) catch unreachable;
+
+    const mk = struct {
+        fn path(alloc: std.mem.Allocator, module: []const u8, name: []const u8) ast.DottedPath {
+            const segs = alloc.alloc([]const u8, 1) catch unreachable;
+            segs[0] = alloc.dupe(u8, name) catch unreachable;
+            return ast.DottedPath{ .module_qualifier = alloc.dupe(u8, module) catch unreachable, .segments = segs };
+        }
+    };
+
+    const body_node = mutable_body.node orelse {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/grid:sweep({s}): the sweep arm needs a body (`|> ...`)", .{grid_name}) };
+    };
+    if (body_node != .invocation) {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/grid:sweep({s}): the sweep body must start with an invocation this rung", .{grid_name}) };
+    }
+
+    // The loop proc calls the body tor from RAW ZIG, which dead_strip's
+    // koru-visible reachability model cannot see — so without `retain` the tor
+    // is stripped and the emitted call names a member that does not exist. The
+    // store hit exactly this when its generated |zig procs began calling
+    // generated tors directly; `retain` is the designed answer, not a
+    // workaround.
+    const retain_ann = blk_ret: {
+        const anns = allocator.alloc([]const u8, 1) catch unreachable;
+        anns[0] = allocator.dupe(u8, "retain") catch unreachable;
+        break :blk_ret anns;
+    };
+    var appended = std.ArrayList(ast.Item).initCapacity(allocator, 4) catch unreachable;
+
+    const bin = allocator.alloc(ast.Field, 1) catch unreachable;
+    bin[0] = ast.Field{ .name = allocator.dupe(u8, cur) catch unreachable, .type = allocator.dupe(u8, "i64") catch unreachable };
+    appended.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+        .path = mk.path(allocator, home_ns, body_name),
+        .input = ast.Shape{ .fields = bin },
+        .branches = &[_]ast.Branch{},
+        .is_public = false,
+        .is_implicit_flow = false,
+        .annotations = retain_ann,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } }) catch unreachable;
+
+    appended.append(allocator, ast.Item{ .flow = ast.Flow{
+        .body = ast.rootSite(body_node.invocation, mutable_body.continuations, flow.location),
+        .pre_label = null,
+        .impl_of = mk.path(allocator, home_ns, body_name),
+        .annotations = &[_][]const u8{},
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } }) catch unreachable;
+
+    appended.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+        .path = mk.path(allocator, home_ns, sweep_name),
+        .input = ast.Shape{ .fields = &[_]ast.Field{} },
+        .branches = &[_]ast.Branch{},
+        .is_public = false,
+        .is_implicit_flow = false,
+        .annotations = &[_][]const u8{},
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } }) catch unreachable;
+
+    // A `for (0..N)` with a comptime-known N: the trip count is known before the
+    // loop begins, which is the whole reason a grid sweep vectorises where a
+    // store sweep had to earn it.
+    const guard_line = if (mutable_body.condition) |c|
+        std.fmt.allocPrint(allocator, "    if (!({s})) continue;\n", .{c}) catch unreachable
+    else
+        "";
+    // Same loop, each host's own spelling: Zig's `for (0..N)` hands the
+    // optimizer a known trip count; JS gets the plain counted `for`, its
+    // tors dispatched through the flat `main_module` object (the JS emitter
+    // flattens every module's tors into it — store.kz:100's rule).
+    const sweep_is_js = std.mem.eql(u8, CompilerEnv.lang, "js");
+    const loop = if (sweep_is_js)
+        std.fmt.allocPrint(allocator, "for (let {s} = 0; {s} < {s}__KoruGridT_{s}.__koru_size; {s}++) {{\n{s}    main_module.{s}_event.handler({{ {s}: {s} }});\n}}\nreturn;", .{ cur, cur, grid_ns, grid_name, cur, guard_line, body_name, cur, cur }) catch unreachable
+    else
+        std.fmt.allocPrint(allocator, "for (0..{s}__KoruGridT_{s}.__koru_size) |{s}| {{\n{s}    {s}{s}_event.handler(.{{ .{s} = @as(i64, @intCast({s})) }});\n}}\nreturn;", .{ grid_ns, grid_name, cur, guard_line, emit_ns, body_name, cur, cur }) catch unreachable;
+    appended.append(allocator, ast.Item{ .proc_decl = ast.ProcDecl{
+        .path = mk.path(allocator, home_ns, sweep_name),
+        .body = ast.Source{ .text = loop, .location = flow.location, .scope = .{ .bindings = &[_]ast.ScopeBinding{} }, .phantom_type = null },
+        .annotations = &[_][]const u8{},
+        .target = allocator.dupe(u8, if (sweep_is_js) "js" else "zig") catch unreachable,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } }) catch unreachable;
+
+    const call = ast.Invocation{ .path = mk.path(allocator, home_ns, sweep_name), .args = &[_]ast.Arg{} };
+    return .{ .transformed = .{
+        .replacement = ast.Item{ .flow = ast.Flow{
+            .body = ast.rootSite(call, &[_]ast.Continuation{}, flow.location),
+            .pre_label = null,
+            .impl_of = flow.impl_of,
+            .annotations = &[_][]const u8{},
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } },
+        .appended = appended.toOwnedSlice(allocator) catch unreachable,
+    } };
+}

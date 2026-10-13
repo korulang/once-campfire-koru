@@ -1,0 +1,71 @@
+// Koru Standard Library: the `fieldkit` part of list.kz — the small
+// field/branch constructors the container synthesizers share. Joined via
+// `~part fieldkit` in list.kz; merged into the list module at load.
+
+/// `ref(X)` inner name — the same spelling StoreRefs.inner parses in the
+/// store module; kept local because detection must run even when no
+/// std/store import exists — the no-home refusal is this consumer's job.
+fn refFieldTarget(t0: []const u8) ?[]const u8 {
+    const t = std.mem.trim(u8, t0, " \t");
+    if (t.len > 5 and std.mem.startsWith(u8, t, "ref(") and t[t.len - 1] == ')')
+        return std.mem.trim(u8, t[4 .. t.len - 1], " \t");
+    return null;
+}
+
+/// A one-field Shape field list on the HEAP. `&[_]astz.Field{f}` with a
+/// runtime element materializes the array as a block-scoped const — the slice
+/// dangles when the block ends, and the next splice's whole-program clone
+/// reads freed bytes as Field structs (crash: cloneField → dupe of garbage).
+fn fields1(alloc: std.mem.Allocator, f: astz.Field) []const astz.Field {
+    const out = alloc.alloc(astz.Field, 1) catch unreachable;
+    out[0] = f;
+    return out;
+}
+
+/// A `*List_<Name><phantom>` input field.
+fn field_s(allocator: std.mem.Allocator, name: []const u8, type_base: []const u8, phantom: ?[]const u8) astz.Field {
+    const t = std.fmt.allocPrint(allocator, "*{s}", .{type_base}) catch unreachable;
+    return astz.Field{
+        .name = allocator.dupe(u8, name) catch unreachable,
+        .type = t,
+        .phantom = if (phantom) |p| allocator.dupe(u8, p) catch unreachable else null,
+    };
+}
+
+/// A plain (non-handle) input field — element values and indices. `field_s`
+/// is the container-HANDLE helper and stars every type; a starred element
+/// (`v: *i32`) makes every push call a type error at the emission boundary.
+fn field_plain(allocator: std.mem.Allocator, name: []const u8, t: []const u8) astz.Field {
+    return astz.Field{
+        .name = allocator.dupe(u8, name) catch unreachable,
+        .type = allocator.dupe(u8, t) catch unreachable,
+        .phantom = null,
+    };
+}
+/// `*List_<Name><phantom>` as the branch's IDENTITY payload — the single
+/// `__type_ref` field is what the emitter lowers to a BARE union variant
+/// (`list: *List_<Name>`), matching the hand-written `| list *List_i64<list!>`
+/// shape; a named field would wrap the payload in a struct and break every
+/// `.{ .list = self }` return in the proc body.
+fn listPtrType(allocator: std.mem.Allocator, list_name: []const u8, phantom: []const u8) astz.Field {
+    return astz.Field{
+        .name = allocator.dupe(u8, "__type_ref") catch unreachable,
+        .type = std.fmt.allocPrint(allocator, "*{s}", .{list_name}) catch unreachable,
+        .phantom = allocator.dupe(u8, phantom) catch unreachable,
+    };
+}
+fn field1(allocator: std.mem.Allocator, name: []const u8, t: []const u8) astz.Field {
+    return astz.Field{
+        .name = allocator.dupe(u8, name) catch unreachable,
+        .type = allocator.dupe(u8, t) catch unreachable,
+        .phantom = null,
+    };
+}
+fn emptyBranch(allocator: std.mem.Allocator, name: []const u8) astz.Branch {
+    return astz.Branch{
+        .name = allocator.dupe(u8, name) catch unreachable,
+        .payload = astz.Shape{ .fields = &.{} },
+        .kind = .terminal,
+        .annotations = &.{},
+    };
+}

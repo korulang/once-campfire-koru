@@ -1,0 +1,37 @@
+// Koru Standard Library: the `home` part of supervisor.kz — the home-branch
+// lookup the fold runs when a site sits inside a module_decl. Joined via
+// `~part home` in supervisor.kz; merged into the supervisor module at load.
+// `H`, `std`, and `ast` arrive at module scope from the other parts.
+
+/// The enclosing tor's declared `| <site.branch>` for a site inside a
+/// module_decl — the same lookup the main body runs at program top level.
+const HomeBranch = struct { branch: ?*const ast.Branch, found_decl: bool, name: ?[]const u8 = null };
+fn findHomeDecl(items: []const ast.Item, parent: *const ast.Continuation, branch_name: []const u8) ?HomeBranch {
+    for (items) |*pi| {
+        switch (pi.*) {
+            .flow => |*hf| {
+                if (!H.contContains(&hf.body, parent)) continue;
+                if (hf.impl_of) |io| {
+                    const nm: ?[]const u8 = if (io.segments.len > 0) io.segments[io.segments.len - 1] else null;
+                    for (items) |*di| {
+                        if (di.* != .event_decl) continue;
+                        const ed = &di.event_decl;
+                        if (!H.pathEq(io, ed.path)) continue;
+                        for (ed.branches) |*b| {
+                            if (std.mem.eql(u8, b.name, branch_name)) {
+                                return .{ .branch = b, .found_decl = true, .name = nm };
+                            }
+                        }
+                        return .{ .branch = null, .found_decl = true, .name = nm };
+                    }
+                }
+                return .{ .branch = null, .found_decl = false };
+            },
+            .module_decl => |*m| {
+                if (findHomeDecl(m.items, parent, branch_name)) |hb| return hb;
+            },
+            else => {},
+        }
+    }
+    return null;
+}

@@ -1,0 +1,281 @@
+// Koru Standard Library: the `synth` part of list.kz.
+// Joined via `~part synth` in list.kz; merged into the list module at load.
+//
+// Container synthesis for proto elements: synthesizeContainer mints the
+// element record + List_<Name> handle struct + the six op tors
+// (new/push/len/get/pop/free) into the CALLER's module. For a `ref(T)`
+// field it enforces the home contract at the push boundary through the
+// store module's shared enumeration (RefHomeQuery.homesOf) — the rule
+// lives once, in the library that understands what mints handles.
+
+/// The name a proto door's first argument DECLARES. `<:` extension rides the
+/// labeled-arg split — `std/proto(Dog <: Animal)` arrives as
+/// (name: "Dog <", value: "Animal") — so the entry is the label minus '<',
+/// not the value. A plain value is a plain name.
+/// A synthesized tor decl + its `|zig` proc, appended as two Items.
+fn synthOp(
+    allocator: std.mem.Allocator,
+    flow: *const astz.Flow,
+    name: []const u8,
+    input_fields: []const astz.Field,
+    branches: []const astz.Branch,
+    return_type: ?[]const u8,
+    proc_body: []const u8
+) [2]astz.Item {
+    const path = astz.DottedPath{
+        .module_qualifier = allocator.dupe(u8, flow.module) catch unreachable,
+        .segments = blk: {
+            const segs = allocator.alloc([]const u8, 1) catch unreachable;
+            segs[0] = allocator.dupe(u8, name) catch unreachable;
+            break :blk segs;
+        },
+    };
+    const ed = astz.Item{ .event_decl = astz.EventDecl{
+        .path = path,
+        .input = astz.Shape{ .fields = input_fields },
+        .branches = branches,
+        .return_type = return_type,
+        .is_public = false,
+        .is_implicit_flow = false,
+        .annotations = &.{},
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } };
+    const pd = astz.Item{ .proc_decl = astz.ProcDecl{
+        .path = path,
+        .body = astz.Source{
+            .text = allocator.dupe(u8, proc_body) catch unreachable,
+            .location = flow.location,
+            .scope = .{ .bindings = &.{} },
+            .phantom_type = null,
+        },
+        .annotations = &.{},
+        .target = allocator.dupe(u8, "zig") catch unreachable,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } };
+    return .{ ed, pd };
+}
+
+
+/// Synthesize the container units for a proto element into the caller's module:
+/// element + handle structs (inline_code), then the six op tors and their
+/// `|zig` procs (new/push/len/get/pop/free).
+fn synthesizeContainer(
+    allocator: std.mem.Allocator,
+    program: *const astz.Program,
+    flow: *const astz.Flow,
+    proto_name: []const u8,
+    elem_expr: []const u8,
+    reporter: anytype
+) []const astz.Item {
+
+    const list_name = std.fmt.allocPrint(allocator, "List_{s}", .{proto_name}) catch unreachable;
+    // The proto declaration's fields (see protoFieldsOfProgram).
+    const pf = protoFieldsOfProgram(allocator, program, elem_expr);
+    if (pf.names.len == 0) @panic("proto-fields-empty");
+
+    // ref(T) fields carry the home contract — the proto declares the
+    // kind, the program's pluralities determine the home set, and this
+    // consumer enforces at its push boundary. homesOf is the store's own
+    // enumeration (the rule lives once, in the library that understands
+    // what mints handles); a list asks it who the homes are. No
+    // `koru_store` namespace means no pluralities exist at all — every
+    // home set is empty, and a ref field refuses here as it would there.
+    var refcalls = std.ArrayList(u8).initCapacity(allocator, 0) catch unreachable;
+    var guardtext = std.ArrayList(u8).initCapacity(allocator, 0) catch unreachable;
+    for (pf.names, pf.types) |fname, ftype| {
+        // An owned leaf (`*mod:Type<state!>`) carries a debt per element —
+        // a list moves bytes with no custody edge, so transit lives only on
+        // the channel (`std/channel:new(inbox, capacity: N) { kind: P }`),
+        // which consumes each leaf under `| ok` and mints them per-path.
+        if (std.mem.startsWith(u8, std.mem.trim(u8, ftype, " \t"), "*")) {
+            const r = allocator.alloc(astz.Item, 1) catch unreachable;
+            r[0] = astz.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/list:new({s}): field '{s}' is owned ('{s}') — a list has no custody edge to move an obligation across; std/channel is the consumer that transits owned leaves (`send` settles each path, the arm re-mints them)", .{ proto_name, fname, ftype });
+            return r;
+        }
+        const t = refFieldTarget(ftype) orelse continue;
+        const hs: []const []const u8 = if (comptime @hasDecl(koru_std, "koru_store"))
+            koru_std.koru_store.RefHomeQuery.homesOf(allocator, program, t, flow.module, "", &.{})
+        else
+            &.{};
+        if (hs.len == 0) {
+            const r = allocator.alloc(astz.Item, 1) catch unreachable;
+            r[0] = astz.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/list:new({s}): field '{s}' is ref({s}) but no store holds {s} rows — a ref field needs a home: a plural store whose row carries the target's fields (std/store:new(dogs, capacity: N) {{ Dog }}); without one the field can only ever hold -1", .{ proto_name, fname, t, t });
+            return r;
+        }
+        const flat = facets.flat(allocator, fname);
+        refcalls.appendSlice(allocator, std.fmt.allocPrint(allocator, "__koru_home_{s}_{s}({s}); ", .{ list_name, flat, flat }) catch unreachable) catch unreachable;
+        guardtext.appendSlice(allocator, koru_std.koru_store.StoreRefHome.guard(allocator, .zig, "list", list_name, flat, t, hs)) catch unreachable;
+    }
+
+    // RECORD element: the container stores the whole proto value and push
+    // takes every field by name (the std/store insert convention) — a
+    // boundary that sees the whole record is where a facet gets enforced.
+
+    var units = std.ArrayList(astz.Item).initCapacity(allocator, 13) catch unreachable;
+
+    // 1. Element record + List_<Name> handle struct (inline_code into the
+    //    caller's module). The proto name lowers to a struct with every
+    //    declared field; the name still carries the identity — two protos
+    //    over one shape never interchange (the KORU030 nominal gate).
+    {
+        var sb = std.ArrayList(u8).initCapacity(allocator, 128) catch unreachable;
+        sb.appendSlice(allocator, "pub const ") catch unreachable;
+        sb.appendSlice(allocator, proto_name) catch unreachable;
+        sb.appendSlice(allocator, " = struct {\n") catch unreachable;
+        for (pf.names, pf.types) |fname, ftype| {
+            const s = std.fmt.allocPrint(allocator, "    {s}: {s},\n", .{ facets.flat(allocator, fname), elementZigType(allocator, ftype) }) catch unreachable;
+            sb.appendSlice(allocator, s) catch unreachable;
+        }
+        sb.appendSlice(allocator, "};\n") catch unreachable;
+        sb.appendSlice(allocator, "pub const ") catch unreachable;
+        sb.appendSlice(allocator, list_name) catch unreachable;
+        sb.appendSlice(allocator, " = struct {\n    items: @import(\"std\").ArrayList(") catch unreachable;
+        sb.appendSlice(allocator, proto_name) catch unreachable;
+        sb.appendSlice(allocator, "),\n    allocator: @import(\"std\").mem.Allocator,\n    fn deinit(self: *") catch unreachable;
+        sb.appendSlice(allocator, list_name) catch unreachable;
+        sb.appendSlice(allocator, ") void {\n        self.items.deinit(self.allocator);\n        self.allocator.destroy(self);\n    }\n};\n") catch unreachable;
+        units.append(allocator, astz.Item{ .inline_code = astz.InlineCode{
+            .code = sb.toOwnedSlice(allocator) catch unreachable,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+    }
+
+    // 2. new-<Name> constructor: empty input, `| list` (obligation) + `| err`.
+    {
+        const list_ptr = listPtrType(allocator, list_name, "list!");
+        const err_f = field1(allocator, "__type_ref", "string");
+        const br = allocator.alloc(astz.Branch, 2) catch unreachable;
+        br[0] = astz.Branch{
+            .name = allocator.dupe(u8, "list") catch unreachable,
+            .payload = astz.Shape{ .fields = fields1(allocator, list_ptr) },
+            .kind = .terminal,
+            .annotations = &.{},
+        };
+        br[1] = astz.Branch{
+            .name = allocator.dupe(u8, "err") catch unreachable,
+            .payload = astz.Shape{ .fields = fields1(allocator, err_f) },
+            .kind = .terminal,
+            .annotations = &.{},
+        };
+        const new_name = std.fmt.allocPrint(allocator, "new-{s}", .{proto_name}) catch unreachable;
+        const body = std.fmt.allocPrint(
+            allocator,
+            "const allocator = koru_allocator();\nconst self = allocator.create({s}) catch {{\n    return .{{ .err = \"allocation failed\" }};\n}};\nself.* = .{{\n    .items = @import(\"std\").ArrayList({s}).initCapacity(allocator, 0) catch {{\n        allocator.destroy(self);\n        return .{{ .err = \"allocation failed\" }};\n    }},\n    .allocator = allocator,\n}};\nreturn .{{ .list = self }};",
+            .{ list_name, proto_name },
+        ) catch unreachable;
+        const pair = synthOp(allocator, flow, new_name, &.{}, br, null, body);
+        units.append(allocator, pair[0]) catch unreachable;
+        units.append(allocator, pair[1]) catch unreachable;
+    }
+
+    // 3. push-<Name>: (xs borrow, every proto field by name) -> ?ok | ?!violated | ?!oom.
+    {
+        const op_name = std.fmt.allocPrint(allocator, "push-{s}", .{proto_name}) catch unreachable;
+        const in = allocator.alloc(astz.Field, 1 + pf.names.len) catch unreachable;
+        in[0] = field_s(allocator, "xs", list_name, "list");
+        var init = std.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+        for (pf.names, 0..) |fname, i| {
+            const flat = facets.flat(allocator, fname);
+            in[1 + i] = field_plain(allocator, flat, fieldKoruType(pf.types[i]));
+            init.appendSlice(allocator, std.fmt.allocPrint(allocator, ".{s} = {s}, ", .{ flat, facets.valueExpr(allocator, program, elem_expr, fname) }) catch unreachable) catch unreachable;
+        }
+        const append_body = std.fmt.allocPrint(allocator, "{s}xs.items.append(xs.allocator, .{{ {s} }}) catch {{\n    return .{{ .oom = .{{}} }};\n}};\nreturn .{{ .ok = .{{}} }};", .{ refcalls.items, init.items }) catch unreachable;
+        const body = facets.guardBody(allocator, program, elem_expr, append_body);
+        const pair = synthOp(allocator, flow, op_name, in, facets.enforceBranches(allocator, &.{"oom"}), null, body);
+        units.append(allocator, pair[0]) catch unreachable;
+        units.append(allocator, pair[1]) catch unreachable;
+    }
+
+    // 4. len-<Name>: (xs borrow) -> usize.
+    {
+        const op_name = std.fmt.allocPrint(allocator, "len-{s}", .{proto_name}) catch unreachable;
+        const in = allocator.alloc(astz.Field, 1) catch unreachable;
+        in[0] = field_s(allocator, "xs", list_name, "list");
+        const pair = synthOp(allocator, flow, op_name, in, &.{}, "usize", "return xs.items.items.len;");
+        units.append(allocator, pair[0]) catch unreachable;
+        units.append(allocator, pair[1]) catch unreachable;
+    }
+
+    // 5. get-<Name>: (xs borrow, i) -> | item T | out-of-bounds.
+    {
+        const op_name = std.fmt.allocPrint(allocator, "get-{s}", .{proto_name}) catch unreachable;
+        const in = allocator.alloc(astz.Field, 2) catch unreachable;
+        in[0] = field_s(allocator, "xs", list_name, "list");
+        in[1] = field_plain(allocator, "i", "usize");
+        const br = allocator.alloc(astz.Branch, 2) catch unreachable;
+        br[0] = astz.Branch{
+            .name = allocator.dupe(u8, "item") catch unreachable,
+            .payload = astz.Shape{ .fields = fields1(allocator, field_plain(allocator, "__type_ref", proto_name)) },
+            .kind = .terminal,
+            .annotations = &.{},
+        };
+        br[1] = emptyBranch(allocator, "out-of-bounds");
+        const pair = synthOp(
+            allocator,
+            flow,
+            op_name,
+            in,
+            br,
+            null,
+            "if (i < xs.items.items.len) {\n    return .{ .item = xs.items.items[i] };\n}\nreturn .out_of_bounds;",
+        );
+        units.append(allocator, pair[0]) catch unreachable;
+        units.append(allocator, pair[1]) catch unreachable;
+    }
+
+    // 6. pop-<Name>: (xs borrow) -> | item T | empty.
+    {
+        const op_name = std.fmt.allocPrint(allocator, "pop-{s}", .{proto_name}) catch unreachable;
+        const in = allocator.alloc(astz.Field, 1) catch unreachable;
+        in[0] = field_s(allocator, "xs", list_name, "list");
+        const br = allocator.alloc(astz.Branch, 2) catch unreachable;
+        br[0] = astz.Branch{
+            .name = allocator.dupe(u8, "item") catch unreachable,
+            .payload = astz.Shape{ .fields = fields1(allocator, field_plain(allocator, "__type_ref", proto_name)) },
+            .kind = .terminal,
+            .annotations = &.{},
+        };
+        br[1] = emptyBranch(allocator, "empty");
+        const pair = synthOp(
+            allocator,
+            flow,
+            op_name,
+            in,
+            br,
+            null,
+            "if (xs.items.pop()) |v| {\n    return .{ .item = v };\n}\nreturn .empty;",
+        );
+        units.append(allocator, pair[0]) catch unreachable;
+        units.append(allocator, pair[1]) catch unreachable;
+    }
+
+    // 7. free-<Name>: (xs consume) -> void.
+    {
+        const op_name = std.fmt.allocPrint(allocator, "free-{s}", .{proto_name}) catch unreachable;
+        const in = allocator.alloc(astz.Field, 1) catch unreachable;
+        in[0] = field_s(allocator, "xs", list_name, "!list");
+        const pair = synthOp(allocator, flow, op_name, in, &.{}, null, "xs.deinit();");
+        units.append(allocator, pair[0]) catch unreachable;
+        units.append(allocator, pair[1]) catch unreachable;
+    }
+
+    // The ref-home guard fns the push calls — emitted beside the element
+    // struct, one per ref field, named __koru_home_<List_<Name>>_<field>.
+    if (guardtext.items.len > 0) {
+        units.append(allocator, astz.Item{ .inline_code = astz.InlineCode{
+            .code = guardtext.items,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+    }
+
+    const u = units.toOwnedSlice(allocator) catch unreachable;
+    return u;
+}
+
+// The field/branch constructors (`refFieldTarget`, `fields1`, `field_s`,
+// `field_plain`, `listPtrType`, `field1`, `emptyBranch`) live in
+// list.fieldkit.kz (the `fieldkit` part).

@@ -1,0 +1,570 @@
+// Koru Standard Library: the `command` part of deps.kz — the deps check/
+// install command implementation. Joined via `~part command` in deps.kz;
+// merged into the deps module at load.
+
+// ============================================================
+// DEPS COMMAND - Check and install system dependencies
+// ============================================================
+
+~std/compiler:command.declare {
+    "name": "deps",
+    "description": "Manage system dependencies",
+    "subcommands": [
+        { "name": "check", "description": "Check dependency status (default)" },
+        { "name": "install", "description": "Install missing dependencies" }
+    ]
+}
+
+~[comptime|command]pub tor deps {
+    program: *const std/compiler:Program,
+    allocator: __koru_std.mem.Allocator,
+    argv: []string,
+}
+
+~proc deps|zig {
+    const std = @import("std");
+
+    // Helper types
+    const SystemDep = struct {
+        name: []const u8 = "",
+        check: []const u8 = "",
+        min_version: []const u8 = "",
+        brew: []const u8 = "",
+        apt: []const u8 = "",
+        dnf: []const u8 = "",
+        pacman: []const u8 = "",
+        apk: []const u8 = "",
+        // Liveness probe, separate from `check` (presence): exit 0 means the
+        // dependency is usable now — a daemon accepting connections, a server
+        // listening. `docker --version` answers installed; `docker info`
+        // answers alive. Install commands can fix missing, not not-ready.
+        ready: []const u8 = "",
+    };
+
+    const ZigDep = struct {
+        name: []const u8 = "",
+        url: []const u8 = "",
+        hash: []const u8 = "",
+    };
+
+    const CheckResult = struct {
+        success: bool,
+        output: []const u8,
+        version: ?[3]u32 = null,  // parsed semver: major, minor, patch
+    };
+
+    const Version = struct {
+        major: u32,
+        minor: u32,
+        patch: u32,
+
+        const Self = @This();
+
+        fn parse(s: []const u8) ?Self {
+            // Find version-like pattern: digits.digits.digits
+            var i: usize = 0;
+            // Skip non-digit prefix (e.g., "zig " or "v")
+            while (i < s.len and !std.ascii.isDigit(s[i])) : (i += 1) {}
+            if (i >= s.len) return null;
+
+            const start = i;
+            var dots: [2]usize = .{ 0, 0 };
+            var dot_count: usize = 0;
+
+            while (i < s.len and (std.ascii.isDigit(s[i]) or s[i] == '.')) : (i += 1) {
+                if (s[i] == '.' and dot_count < 2) {
+                    dots[dot_count] = i;
+                    dot_count += 1;
+                }
+            }
+
+            if (dot_count < 1) return null;  // Need at least major.minor
+
+            const major = std.fmt.parseInt(u32, s[start..dots[0]], 10) catch return null;
+            const minor_end = if (dot_count >= 2) dots[1] else i;
+            const minor = std.fmt.parseInt(u32, s[dots[0] + 1 .. minor_end], 10) catch return null;
+            const patch = if (dot_count >= 2)
+                std.fmt.parseInt(u32, s[dots[1] + 1 .. i], 10) catch 0
+            else
+                0;
+
+            return Self{ .major = major, .minor = minor, .patch = patch };
+        }
+
+        fn gte(self: Self, other: Self) bool {
+            if (self.major != other.major) return self.major > other.major;
+            if (self.minor != other.minor) return self.minor > other.minor;
+            return self.patch >= other.patch;
+        }
+
+        fn format(self: Self, buf: []u8) []const u8 {
+            return std.fmt.bufPrint(buf, "{d}.{d}.{d}", .{ self.major, self.minor, self.patch }) catch "?.?.?";
+        }
+    };
+
+    // Helper functions
+    const helpers = struct {
+        fn detectPackageManager(alloc: std.mem.Allocator) ?[]const u8 {
+            const pms = [_]struct { name: []const u8, check_cmd: []const u8 }{
+                .{ .name = "brew", .check_cmd = "brew --version" },
+                .{ .name = "apt", .check_cmd = "apt --version" },
+                .{ .name = "dnf", .check_cmd = "dnf --version" },
+                .{ .name = "pacman", .check_cmd = "pacman --version" },
+                .{ .name = "apk", .check_cmd = "apk --version" },
+            };
+
+            for (pms) |pm| {
+                const result = std.process.Child.run(.{
+                    .allocator = alloc,
+                    .argv = &[_][]const u8{ "sh", "-c", pm.check_cmd },
+                }) catch continue;
+                defer alloc.free(result.stdout);
+                defer alloc.free(result.stderr);
+
+                if (result.term.Exited == 0) {
+                    return pm.name;
+                }
+            }
+            return null;
+        }
+
+        fn runCheck(alloc: std.mem.Allocator, cmd: []const u8) CheckResult {
+            const result = std.process.Child.run(.{
+                .allocator = alloc,
+                .argv = &[_][]const u8{ "sh", "-c", cmd },
+            }) catch return .{ .success = false, .output = "" };
+
+            defer alloc.free(result.stderr);
+
+            if (result.term.Exited == 0) {
+                return .{ .success = true, .output = result.stdout };
+            } else {
+                alloc.free(result.stdout);
+                return .{ .success = false, .output = "" };
+            }
+        }
+
+        fn runInstall(alloc: std.mem.Allocator, pm: []const u8, pkg: []const u8) CheckResult {
+            const cmd = if (std.mem.eql(u8, pm, "brew"))
+                std.fmt.allocPrint(alloc, "brew install {s}", .{pkg}) catch return .{ .success = false, .output = "" }
+            else if (std.mem.eql(u8, pm, "apt"))
+                std.fmt.allocPrint(alloc, "sudo apt install -y {s}", .{pkg}) catch return .{ .success = false, .output = "" }
+            else if (std.mem.eql(u8, pm, "dnf"))
+                std.fmt.allocPrint(alloc, "sudo dnf install -y {s}", .{pkg}) catch return .{ .success = false, .output = "" }
+            else if (std.mem.eql(u8, pm, "pacman"))
+                std.fmt.allocPrint(alloc, "sudo pacman -S --noconfirm {s}", .{pkg}) catch return .{ .success = false, .output = "" }
+            else if (std.mem.eql(u8, pm, "apk"))
+                std.fmt.allocPrint(alloc, "sudo apk add {s}", .{pkg}) catch return .{ .success = false, .output = "" }
+            else
+                return .{ .success = false, .output = "" };
+
+            defer alloc.free(cmd);
+
+            const result = std.process.Child.run(.{
+                .allocator = alloc,
+                .argv = &[_][]const u8{ "sh", "-c", cmd },
+            }) catch return .{ .success = false, .output = "" };
+
+            defer alloc.free(result.stderr);
+
+            if (result.term.Exited == 0) {
+                return .{ .success = true, .output = result.stdout };
+            } else {
+                alloc.free(result.stdout);
+                const err_copy = alloc.dupe(u8, result.stderr) catch "";
+                return .{ .success = false, .output = err_copy };
+            }
+        }
+
+        fn firstLine(s: []const u8) []const u8 {
+            const trimmed = std.mem.trim(u8, s, " \t\n\r");
+            if (std.mem.indexOf(u8, trimmed, "\n")) |idx| {
+                return trimmed[0..idx];
+            }
+            return trimmed;
+        }
+
+        fn parseJsonField(source: []const u8, field: []const u8) []const u8 {
+            // Simple JSON field extraction: find "field": "value"
+            var search_buf: [64]u8 = undefined;
+            const search_pattern = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{field}) catch return "";
+
+            if (std.mem.indexOf(u8, source, search_pattern)) |start| {
+                const after_key = source[start + search_pattern.len ..];
+                // Skip whitespace
+                var i: usize = 0;
+                while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == '\t' or after_key[i] == '\n')) : (i += 1) {}
+                if (i >= after_key.len or after_key[i] != '"') return "";
+                i += 1; // Skip opening quote
+                const value_start = i;
+                while (i < after_key.len and after_key[i] != '"') : (i += 1) {}
+                return after_key[value_start..i];
+            }
+            return "";
+        }
+    };
+
+    // Parse argv
+    var do_install = false;
+    var forced_pm: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "install")) {
+            do_install = true;
+        } else if (std.mem.eql(u8, arg, "--pm") and i + 1 < argv.len) {
+            i += 1;
+            forced_pm = argv[i];
+        }
+    }
+
+    const detected_pm = forced_pm orelse helpers.detectPackageManager(allocator);
+
+    // Collect requires.system declarations
+    var deps_list = std.ArrayListUnmanaged(SystemDep){};
+    defer deps_list.deinit(allocator);
+
+    // Collect requires.zig declarations
+    var zig_deps_list = std.ArrayListUnmanaged(ZigDep){};
+    defer zig_deps_list.deinit(allocator);
+
+    // Always include Zig as a compiler requirement
+    deps_list.append(allocator, SystemDep{
+        .name = "zig",
+        .check = "zig version",
+        .min_version = "0.15.0",
+        .brew = "zig",
+        .apt = "zig",
+        .pacman = "zig",
+        .apk = "zig",
+    }) catch {};
+
+    // Helper to check build flags - inline to avoid cross-module import issues
+    const ann_parser = @import("annotation_parser");
+    const RootEnv = @import("root").CompilerEnv;
+    const matchesBuildFlags = struct {
+        fn check(annotations: []const []const u8) bool {
+            for (annotations) |ann| {
+                const maybe_call = ann_parser.parseCall(std.heap.page_allocator, ann) catch continue;
+                if (maybe_call) |call| {
+                    defer {
+                        var mc = call;
+                        mc.deinit(std.heap.page_allocator);
+                    }
+                    if (std.mem.eql(u8, call.name, "build")) {
+                        for (call.args) |arg| {
+                            var buf: [64]u8 = undefined;
+                            const flag = std.fmt.bufPrint(&buf, "build={s}", .{arg}) catch continue;
+                            if (RootEnv.hasFlagRuntime(flag)) return true;
+                        }
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+    }.check;
+
+    // Scan for project dependencies — including those declared by IMPORTED
+    // LIBRARIES. `program.items` is one level deep, so walking it directly sees
+    // only the entry file: `koru/curl` declaring `requires.system` in its own
+    // index.kz was invisible, and `deps` reported one dependency for a program
+    // that links libcurl. `ast.allFlows` descends through `.module_decl`.
+    const ast_dep = @import("ast");
+    const all_flows = ast_dep.allFlows(allocator, program);
+    defer allocator.free(all_flows);
+    for (all_flows) |flow| {
+        {
+            if (flow.inv().path.module_qualifier) |mq| {
+                if (std.mem.eql(u8, mq, "std.deps") and
+                    flow.inv().path.segments.len == 2 and
+                    std.mem.eql(u8, flow.inv().path.segments[0], "requires") and
+                    std.mem.eql(u8, flow.inv().path.segments[1], "system"))
+                {
+                    // Respect build flags: [build("prod")], [build("dev")], etc.
+                    if (!matchesBuildFlags(flow.inv().annotations)) continue;
+                    // Extract source parameter
+                    for (flow.inv().args) |arg| {
+                        if (std.mem.eql(u8, arg.name, "source")) {
+                            var dep = SystemDep{};
+                            dep.name = helpers.parseJsonField(arg.value, "name");
+                            dep.check = helpers.parseJsonField(arg.value, "check");
+                            dep.min_version = helpers.parseJsonField(arg.value, "min_version");
+                            dep.brew = helpers.parseJsonField(arg.value, "brew");
+                            dep.apt = helpers.parseJsonField(arg.value, "apt");
+                            dep.dnf = helpers.parseJsonField(arg.value, "dnf");
+                            dep.pacman = helpers.parseJsonField(arg.value, "pacman");
+                            dep.apk = helpers.parseJsonField(arg.value, "apk");
+                            dep.ready = helpers.parseJsonField(arg.value, "ready");
+
+                            if (dep.name.len > 0) {
+                                deps_list.append(allocator, dep) catch {
+                                    std.debug.print("Out of memory\n", .{});
+                                    return;
+                                };
+                            }
+                        }
+                    }
+                }
+
+                // Check for requires.zig (Zig package manager dependencies)
+                if (std.mem.eql(u8, mq, "std.deps") and
+                    flow.inv().path.segments.len == 2 and
+                    std.mem.eql(u8, flow.inv().path.segments[0], "requires") and
+                    std.mem.eql(u8, flow.inv().path.segments[1], "zig"))
+                {
+                    if (!matchesBuildFlags(flow.inv().annotations)) continue;
+                    for (flow.inv().args) |arg| {
+                        if (std.mem.eql(u8, arg.name, "source")) {
+                            var zdep = ZigDep{};
+                            zdep.name = helpers.parseJsonField(arg.value, "name");
+                            zdep.url = helpers.parseJsonField(arg.value, "url");
+                            zdep.hash = helpers.parseJsonField(arg.value, "hash");
+
+                            if (zdep.name.len > 0) {
+                                zig_deps_list.append(allocator, zdep) catch {
+                                    std.debug.print("Out of memory\n", .{});
+                                    return;
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Dedupe by name, first occurrence wins. Two libraries may each require
+    // curl, and now that the walk reaches imported modules that is the common
+    // case rather than the exception — a project should be told about curl once.
+    // It also absorbs `koru_std/compiler.kz`'s own `zig` declaration, which the
+    // recursive walk now reaches and which the seeded entry above already states.
+    {
+        var deduped = std.ArrayListUnmanaged(SystemDep){};
+        outer: for (deps_list.items) |d| {
+            for (deduped.items) |seen| {
+                if (std.mem.eql(u8, seen.name, d.name)) continue :outer;
+            }
+            deduped.append(allocator, d) catch break;
+        }
+        deps_list.deinit(allocator);
+        deps_list = deduped;
+    }
+
+    if (deps_list.items.len == 0 and zig_deps_list.items.len == 0) {
+        std.debug.print("No dependencies declared.\n", .{});
+        std.debug.print("Use: ~std.deps:requires.system {{ \"name\": \"...\", \"check\": \"...\", \"brew\": \"...\" }}\n", .{});
+        std.debug.print("     ~std.deps:requires.zig {{ \"name\": \"...\", \"url\": \"...\", \"hash\": \"...\" }}\n", .{});
+        return;
+    }
+
+    // Display zig package dependencies
+    if (zig_deps_list.items.len > 0) {
+        std.debug.print("\nZig package dependencies:\n\n", .{});
+
+        for (zig_deps_list.items) |zdep| {
+            std.debug.print("  {s} \x1b[34m⬡\x1b[0m\n", .{zdep.name});
+            if (zdep.url.len > 0) {
+                std.debug.print("       url: {s}\n", .{zdep.url});
+            }
+            if (zdep.hash.len > 0) {
+                std.debug.print("       hash: {s}\n", .{zdep.hash});
+            }
+        }
+
+        std.debug.print("\n", .{});
+
+        if (do_install) {
+            std.debug.print("Fetching zig dependencies...\n\n", .{});
+            for (zig_deps_list.items) |zdep| {
+                if (zdep.url.len == 0) continue;
+                std.debug.print("  Fetching {s}...\n", .{zdep.name});
+                const fetch_result = std.process.Child.run(.{
+                    .allocator = allocator,
+                    .argv = &[_][]const u8{ "zig", "fetch", zdep.url },
+                }) catch {
+                    std.debug.print("    \x1b[31m✗\x1b[0m failed to run zig fetch\n", .{});
+                    continue;
+                };
+                defer allocator.free(fetch_result.stdout);
+                defer allocator.free(fetch_result.stderr);
+
+                if (fetch_result.term.Exited == 0) {
+                    std.debug.print("    \x1b[32m✓\x1b[0m fetched\n", .{});
+                } else {
+                    std.debug.print("    \x1b[31m✗\x1b[0m fetch failed\n", .{});
+                    if (fetch_result.stderr.len > 0) {
+                        std.debug.print("    {s}\n", .{helpers.firstLine(fetch_result.stderr)});
+                    }
+                }
+            }
+            std.debug.print("\n", .{});
+        }
+    }
+
+    if (deps_list.items.len == 0) return;
+
+    std.debug.print("\nSystem dependencies for this project:\n\n", .{});
+
+    var missing = std.ArrayListUnmanaged(SystemDep){};
+    defer missing.deinit(allocator);
+
+    // Installed but the `ready` probe failed — present, unusable. Kept out of
+    // `missing` on purpose: `deps install` cannot fix a daemon that is down.
+    var not_ready = std.ArrayListUnmanaged(SystemDep){};
+    defer not_ready.deinit(allocator);
+
+    for (deps_list.items) |dep| {
+        if (dep.check.len > 0) {
+            const result = helpers.runCheck(allocator, dep.check);
+            if (result.success) {
+                const first_line = helpers.firstLine(result.output);
+                const installed_version = Version.parse(first_line);
+
+                // Check version constraint if specified
+                var version_ok = true;
+                if (dep.min_version.len > 0) {
+                    if (Version.parse(dep.min_version)) |min_ver| {
+                        if (installed_version) |inst_ver| {
+                            version_ok = inst_ver.gte(min_ver);
+                        } else {
+                            version_ok = false;  // Can't parse installed version
+                        }
+                    }
+                }
+
+                // Liveness is a third state: check passed but `ready` failed.
+                var ready_ok = true;
+                if (version_ok and dep.ready.len > 0) {
+                    const ready_result = helpers.runCheck(allocator, dep.ready);
+                    if (ready_result.output.len > 0) allocator.free(ready_result.output);
+                    ready_ok = ready_result.success;
+                }
+
+                if (version_ok and ready_ok) {
+                    std.debug.print("  {s} \x1b[32m✓\x1b[0m", .{dep.name});
+                } else {
+                    std.debug.print("  {s} \x1b[33m⚠\x1b[0m", .{dep.name});
+                }
+
+                if (result.output.len > 0) {
+                    std.debug.print(" ({s})", .{first_line});
+                    allocator.free(result.output);
+                }
+
+                if (!version_ok) {
+                    std.debug.print(" \x1b[33m- needs >= {s}\x1b[0m", .{dep.min_version});
+                    missing.append(allocator, dep) catch {};
+                } else if (!ready_ok) {
+                    std.debug.print(" \x1b[33m- installed, not ready\x1b[0m", .{});
+                    not_ready.append(allocator, dep) catch {};
+                }
+                std.debug.print("\n", .{});
+            } else {
+                std.debug.print("  {s} \x1b[31m✗\x1b[0m (not found)\n", .{dep.name});
+                missing.append(allocator, dep) catch {};
+            }
+        } else {
+            std.debug.print("  {s} \x1b[33m?\x1b[0m (no check command)\n", .{dep.name});
+        }
+
+        // Show package options
+        std.debug.print("       ", .{});
+        var has_any = false;
+        if (dep.brew.len > 0) {
+            if (detected_pm != null and std.mem.eql(u8, detected_pm.?, "brew")) {
+                std.debug.print("\x1b[1mbrew: {s}\x1b[0m", .{dep.brew});
+            } else {
+                std.debug.print("brew: {s}", .{dep.brew});
+            }
+            has_any = true;
+        }
+        if (dep.apt.len > 0) {
+            if (has_any) std.debug.print(" | ", .{});
+            if (detected_pm != null and std.mem.eql(u8, detected_pm.?, "apt")) {
+                std.debug.print("\x1b[1mapt: {s}\x1b[0m", .{dep.apt});
+            } else {
+                std.debug.print("apt: {s}", .{dep.apt});
+            }
+            has_any = true;
+        }
+        if (dep.dnf.len > 0) {
+            if (has_any) std.debug.print(" | ", .{});
+            std.debug.print("dnf: {s}", .{dep.dnf});
+            has_any = true;
+        }
+        if (dep.pacman.len > 0) {
+            if (has_any) std.debug.print(" | ", .{});
+            std.debug.print("pacman: {s}", .{dep.pacman});
+            has_any = true;
+        }
+        if (!has_any) {
+            std.debug.print("(no packages defined)", .{});
+        }
+        std.debug.print("\n", .{});
+    }
+
+    std.debug.print("\n", .{});
+
+    if (not_ready.items.len > 0) {
+        std.debug.print("\x1b[33mInstalled but not ready — start the service or daemon:\x1b[0m\n", .{});
+        for (not_ready.items) |dep| {
+            std.debug.print("  {s}  (ready-check: {s})\n", .{ dep.name, dep.ready });
+        }
+    }
+
+    if (missing.items.len == 0) {
+        if (not_ready.items.len == 0) {
+            std.debug.print("\x1b[32mAll system dependencies are installed!\x1b[0m\n", .{});
+        }
+        return;
+    }
+
+    if (!do_install) {
+        std.debug.print("To install missing dependencies:\n", .{});
+        std.debug.print("  koruc <file>.kz deps install", .{});
+        if (detected_pm) |pm| {
+            std.debug.print(" (detected: {s})\n", .{pm});
+        } else {
+            std.debug.print(" --pm <brew|apt|dnf|pacman|apk>\n", .{});
+        }
+        return;
+    }
+
+    const pm = detected_pm orelse {
+        std.debug.print("\x1b[31mCould not detect package manager. Use --pm to specify.\x1b[0m\n", .{});
+        return;
+    };
+
+    std.debug.print("Installing {d} missing dependencies with {s}...\n\n", .{ missing.items.len, pm });
+
+    for (missing.items) |dep| {
+        const pkg_name = if (std.mem.eql(u8, pm, "brew") and dep.brew.len > 0) dep.brew
+            else if (std.mem.eql(u8, pm, "apt") and dep.apt.len > 0) dep.apt
+            else if (std.mem.eql(u8, pm, "dnf") and dep.dnf.len > 0) dep.dnf
+            else if (std.mem.eql(u8, pm, "pacman") and dep.pacman.len > 0) dep.pacman
+            else if (std.mem.eql(u8, pm, "apk") and dep.apk.len > 0) dep.apk
+            else "";
+
+        if (pkg_name.len == 0) {
+            std.debug.print("  {s}: \x1b[33mno package defined for {s}\x1b[0m\n", .{ dep.name, pm });
+            continue;
+        }
+
+        std.debug.print("  Installing {s}...\n", .{pkg_name});
+
+        const install_result = helpers.runInstall(allocator, pm, pkg_name);
+        if (install_result.success) {
+            std.debug.print("    \x1b[32m✓\x1b[0m installed\n", .{});
+        } else {
+            std.debug.print("    \x1b[31m✗\x1b[0m failed\n", .{});
+            if (install_result.output.len > 0) {
+                std.debug.print("    {s}\n", .{install_result.output});
+            }
+        }
+        if (install_result.output.len > 0) allocator.free(install_result.output);
+    }
+
+    std.debug.print("\n", .{});
+}

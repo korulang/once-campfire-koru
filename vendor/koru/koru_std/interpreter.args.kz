@@ -1,0 +1,44 @@
+// Koru Standard Library: the `args` part of interpreter.kz — the arg
+// judgment: field membership and bound references, one walk over the
+// flow before it runs. Joined via `~part args` in interpreter.kz;
+// merged into the interpreter module at load.
+
+// ============================================================================
+// ARG JUDGMENT - two refusals, one traversal, judged before the flow runs
+// ============================================================================
+//
+// FIELD MEMBERSHIP — a named field the verb's signature does not declare
+// is refused, never ignored at dispatch. The declared vocabulary comes
+// from the scope's own `get_event_input` table — the check is derived
+// from the same registry data the prompt and dispatcher are emitted
+// from, so it cannot drift from what dispatch enforces. `input_fn`
+// answers null for a name outside the scope: vocabulary membership is a
+// different question (event-denied at dispatch), and an empty list is a
+// real answer — a zero-field verb refuses any named field. A
+// session-defined flow's params are its own surface and are not judged
+// against the scope manifest; calls nested in its arms still are.
+//
+// BOUND REFERENCES — a bare identifier in arg position is a reference,
+// never a literal. Unbound, it must not degrade to its own text
+// (`append(handle: h)` dispatching `handle="h"` fails `HandleNotHeld`,
+// which blames the handle instead of the missing binding). Bindings are
+// per item along an arm path: `| ok h |>` scopes `h` to that arm's
+// subtree — a second item and a sibling arm both see it unbound.
+pub fn checkFlowArgs(
+    flow: *const ast.Flow,
+    input_fn: ?InputLookupFn,
+    defined: ?*DefinedFlows,
+    allocator: std.mem.Allocator,
+    session_env: ?*Environment,
+) ?ValidationError {
+    var bound = std.StringHashMap(void).init(allocator);
+    defer bound.deinit();
+    // Session bindings are bound for this flow's whole text — a name an
+    // earlier turn bound is as real as an arm binding on this one.
+    if (session_env) |se| {
+        var it = se.bindings.iterator();
+        while (it.next()) |e| bound.put(e.key_ptr.*, {}) catch {};
+    }
+    return checkInvocationArgs(&flow.body, input_fn, defined, &bound, allocator);
+}
+

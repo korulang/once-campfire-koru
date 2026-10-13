@@ -1,0 +1,18 @@
+// Koru Standard Library: the `names` part of interpreter.kz — name identity
+// across the authored/mangled boundary. Joined via `~part names`.
+
+/// Koru names compare in normalized space: `-` and `_` are the same
+/// character (ast_mangle folds both to `_` at parse). Interpreter-parsed
+/// source keeps the author's spelling (`| bad-amount`), while a dispatch
+/// outcome or registry spec carries the mangled form (`bad_amount`) — raw
+/// eql can never join them, and every comparison across that boundary owes
+/// this fold.
+fn namesEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const xn = if (x == '-') '_' else x;
+        const yn = if (y == '-') '_' else y;
+        if (xn != yn) return false;
+    }
+    return true;
+}

@@ -1,0 +1,20 @@
+// Koru Standard Library: the `session` part of bridge — the durable-state
+// text helpers a turn's define lines parse through. Joined via
+// `~part session` in bridge.kz; merged into the bridge module at load.
+// The binder itself — `r{N}` minting, deep-copy into session memory,
+// residue — lives in the `bind` part.
+
+/// The declared name of a `tor NAME ...` line (token after `tor`).
+fn defineName(decl_line: []const u8) []const u8 {
+    var toks = std.mem.tokenizeAny(u8, decl_line, " \t");
+    _ = toks.next();
+    return toks.next() orelse "";
+}
+
+/// An impl head opens `<name> = ...` (name then space/tab/`=`).
+fn isImplHead(line: []const u8, name: []const u8) bool {
+    if (name.len == 0 or line.len <= name.len) return false;
+    if (!std.mem.startsWith(u8, line, name)) return false;
+    const after = line[name.len..];
+    return after[0] == ' ' or after[0] == '\t' or after[0] == '=';
+}

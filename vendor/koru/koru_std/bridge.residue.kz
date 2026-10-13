@@ -1,0 +1,22 @@
+// Koru Standard Library: the `residue` part of bridge.kz — residue
+// teaching text and the observer-channel classifier. Joined via
+// `~part residue` in bridge.kz; merged into the bridge module at load.
+
+/// The report a bound residue hands back — and the offense, quoted: the
+/// first bytes of the refused text, so a `tool_call:`/`[Calling` wrapper or
+/// a prose head is named, not just refused.
+fn residueNote(rn: []const u8, item: []const u8) []const u8 {
+    const head = item[0..@min(std.mem.indexOfScalar(u8, item, '\n') orelse item.len, 48)];
+    return std.fmt.allocPrint(std.heap.page_allocator,
+        "residue bound: {s} — '{s}' is not wire; nothing reached the user, but the observer kept it. `say:` reaches the user, `note:` thinks, `verb(field: ...)` calls — `vocabulary()` lists every verb", .{ rn, head })
+        catch @panic("bridge: OOM building residue report");
+}
+
+/// A `note(...)`/`note:`-prefixed item that failed the wire gate is prose
+/// wearing the observer channel's costume — with introspection it binds as
+/// residue, not a wire failure; without the grant it is malformed wire.
+fn isNoteAttempt(br: *Bridge, item: []const u8) bool {
+    if (!br.introspection) return false;
+    const t = std.mem.trim(u8, item, " \t\r\n");
+    return std.mem.startsWith(u8, t, "note(") or std.mem.startsWith(u8, t, "note:");
+}

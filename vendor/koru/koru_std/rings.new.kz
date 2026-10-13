@@ -1,0 +1,466 @@
+// Koru Standard Library: the `new` part of rings.kz — a named ring with a
+// Koru declaration surface. Joined via `~part new` in rings.kz.
+//
+//   std/rings:new(feed, capacity: 256) { value: u64 }
+//   std/rings:new(feed, capacity: 256) { reading: Reading }
+//
+// The `{ }` body is the shared declaration grammar — `name: Type` entries,
+// the same shape `std/proto` writes its fields and `std/channel:new` writes
+// its kinds. A ring declares exactly ONE: the element. The name labels the
+// element for diagnostics and generated units; the type is a proto name or
+// a scalar — protos collapse to structs and scalars ride the same machinery
+// (the degenerate one-word element).
+//
+// What the declaration emits into the ring's home module:
+//   - `pub const <Proto> = struct { ... }` when the element is a proto and
+//     no other consumer derived it yet (the one-name-one-layout ruling).
+//   - `__KoruRingT_<n>` / `__koru_ring_<n>` — the typed MpmcRing cell.
+//   - `__ring_<n>_enqueue` { value: Elem } | ok | full
+//   - `__ring_<n>_dequeue` {} | some Elem | none
+//   - a `__rings_decl_<n>` marker line carrying `elem=<name>` so the chain
+//     steps validate the ring without re-reading this item.
+//
+// The ops are name-addressed (`std/rings:enqueue(feed, v)`) — a ring exists
+// to be shared across flows and threads, so it is a named static, not a
+// flow-bound handle: the std/list handle model refuses a handle that
+// crosses a flow boundary, which is precisely where a ring does its work.
+//
+// No top-level imports — part files share the merged module's consts; a
+// second `const std` per part lands as a duplicate member in the emitted
+// program.
+
+// ---------------------------------------------------------------------------
+// Shared helpers — the channel.kz set, cut to what rings needs.
+// ---------------------------------------------------------------------------
+
+const R = struct {
+
+    fn stripQuotes(n: []const u8) []const u8 {
+        if (n.len >= 2 and n[0] == '"') return n[1 .. n.len - 1];
+        return n;
+    }
+
+    fn identOk(name: []const u8) bool {
+        if (name.len == 0) return false;
+        var first = true;
+        for (name) |c| {
+            const legal = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+                (c == '_') or (c == '-') or (!first and c >= '0' and c <= '9');
+            first = false;
+            if (!legal) return false;
+        }
+        return true;
+    }
+
+    // `had_explicit_label` does not survive the ast_json round-trip into the
+    // backend where transform procs run — see channel.kz for the full note.
+    // The survivors: punned positionals (name == value) and the renamed
+    // `expr`/`expression_value` carry.
+    fn isLabelled(a: ast.Arg) bool {
+        if (a.expression_value != null) return false;
+        return !std.mem.eql(u8, std.mem.trim(u8, a.name, " \t"), std.mem.trim(u8, a.value, " \t"));
+    }
+
+    fn mkPath(alloc: std.mem.Allocator, module: []const u8, name: []const u8) ast.DottedPath {
+        const segs = alloc.alloc([]const u8, 1) catch unreachable;
+        segs[0] = alloc.dupe(u8, name) catch unreachable;
+        return ast.DottedPath{ .module_qualifier = alloc.dupe(u8, module) catch unreachable, .segments = segs };
+    }
+
+    // ---- The decl marker: `// __rings_decl_<name> elem=<type>` ----------
+
+    fn declMarker(alloc: std.mem.Allocator, name: []const u8) []const u8 {
+        return std.fmt.allocPrint(alloc, "__rings_decl_{s}", .{name}) catch unreachable;
+    }
+
+    fn markerExists(prog: *const ast.Program, marker: []const u8) bool {
+        const W = struct {
+            fn scan(its: []const ast.Item, want: []const u8) bool {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .host_line => |*hl| {
+                            if (std.mem.indexOf(u8, hl.content, want) != null) return true;
+                        },
+                        .module_decl => |*md| {
+                            if (scan(md.items, want)) return true;
+                        },
+                        else => {},
+                    }
+                }
+                return false;
+            }
+        };
+        return W.scan(prog.items, marker);
+    }
+
+    // The element type a live marker names (the text after ` elem=`).
+    fn markerElem(alloc: std.mem.Allocator, prog: *const ast.Program, name: []const u8) ?[]const u8 {
+        const marker = declMarker(alloc, name);
+        const W = struct {
+            fn find(al: std.mem.Allocator, its: []const ast.Item, want: []const u8) ?[]const u8 {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .host_line => |*hl| {
+                            if (std.mem.indexOf(u8, hl.content, want)) |at| {
+                                const rest = hl.content[at + want.len ..];
+                                const pfx = " elem=";
+                                if (std.mem.startsWith(u8, rest, pfx)) {
+                                    const tail = rest[pfx.len..];
+                                    const end = std.mem.indexOfAny(u8, tail, " \n") orelse tail.len;
+                                    return al.dupe(u8, tail[0..end]) catch unreachable;
+                                }
+                            }
+                        },
+                        .module_decl => |*md| {
+                            if (find(al, md.items, want)) |hit| return hit;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            }
+        };
+        return W.find(alloc, prog.items, marker);
+    }
+
+    fn markerItem(alloc: std.mem.Allocator, flow: *const ast.Flow, text: []const u8) ast.Item {
+        return ast.Item{ .host_line = ast.HostLine{
+            .content = std.fmt.allocPrint(alloc, "// {s}", .{text}) catch unreachable,
+            .location = flow.location,
+            .module = alloc.dupe(u8, flow.module) catch unreachable,
+        } };
+    }
+
+    // ---- Proto resolution ------------------------------------------------
+    // `isProtoDoor`, `protoSourceText`, `FieldPair`, `protoFields`,
+    // `expandInto`, `zigFieldType`, `structAlreadyEmitted` live in
+    // rings.leafgate.kz (the `leafgate` part, as `RL`).
+
+    // ---- Generated-tor emission -----------------------------------------
+
+    fn emptyBranch(allocator: std.mem.Allocator, name: []const u8) ast.Branch {
+        return ast.Branch{
+            .name = allocator.dupe(u8, name) catch unreachable,
+            .payload = ast.Shape{ .fields = &.{} },
+            .kind = .terminal,
+            .annotations = &.{},
+        };
+    }
+
+    fn identityBranch(allocator: std.mem.Allocator, name: []const u8, t: []const u8) ast.Branch {
+        const f = allocator.alloc(ast.Field, 1) catch unreachable;
+        f[0] = ast.Field{
+            .name = allocator.dupe(u8, "__type_ref") catch unreachable,
+            .type = allocator.dupe(u8, t) catch unreachable,
+            .phantom = null,
+        };
+        return ast.Branch{
+            .name = allocator.dupe(u8, name) catch unreachable,
+            .payload = ast.Shape{ .fields = f },
+            .kind = .terminal,
+            .annotations = &.{},
+        };
+    }
+
+    fn synthOp(
+        allocator: std.mem.Allocator,
+        prog: *const ast.Program,
+        flow: *const ast.Flow,
+        name: []const u8,
+        input_fields: []const ast.Field,
+        branches: []const ast.Branch,
+        return_type: ?[]const u8,
+        proc_body: []const u8,
+        appended: *std.ArrayList(ast.Item),
+    ) void {
+        const retain_ann = blk_ra: {
+            const anns = allocator.alloc([]const u8, 1) catch unreachable;
+            anns[0] = allocator.dupe(u8, "retain") catch unreachable;
+            break :blk_ra anns;
+        };
+        const path = mkPath(allocator, ast_functional.moduleHome(prog, flow) orelse flow.module, name);
+        appended.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+            .path = path,
+            .input = ast.Shape{ .fields = input_fields },
+            .branches = branches,
+            .return_type = if (return_type) |rt| allocator.dupe(u8, rt) catch unreachable else null,
+            .is_public = false,
+            .is_implicit_flow = false,
+            .annotations = retain_ann,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+        appended.append(allocator, ast.Item{ .proc_decl = ast.ProcDecl{
+            .path = path,
+            .body = ast.Source{ .text = allocator.dupe(u8, proc_body) catch unreachable, .location = flow.location, .scope = .{ .bindings = &[_]ast.ScopeBinding{} }, .phantom_type = null },
+            .annotations = &[_][]const u8{},
+            .target = allocator.dupe(u8, "zig") catch unreachable,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+    }
+
+    // ---- The module anchor ----------------------------------------------
+    // A `std/rings:new` site compiles AWAY — dead-strip retires the module's
+    // tors, the emit walk finds `std.rings` empty, and `koru_std.koru_rings`
+    // never lands — while the generated inline_code references `MpmcRing`.
+    // The anchor is a [retain] event spliced into the rings module_decl so
+    // the module always has one live member. (channel.kz, same fix.)
+
+    fn anchorModule(allocator: std.mem.Allocator, prog: *const ast.Program, module_name: []const u8, flow: *const ast.Flow) void {
+        const W = struct {
+            fn find(its: []const ast.Item, want: []const u8) ?*const ast.ModuleDecl {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .module_decl => |*md| {
+                            if (std.mem.eql(u8, md.logical_name, want)) return md;
+                            if (find(md.items, want)) |hit| return hit;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            }
+        };
+        const mod = W.find(prog.items, module_name) orelse return;
+        for (mod.items) |*pi| {
+            if (pi.* == .event_decl) {
+                const ed = &pi.event_decl;
+                if (ed.path.segments.len == 1 and std.mem.eql(u8, ed.path.segments[0], "__rings_anchor")) return;
+            }
+        }
+        const retain_ann = blk: {
+            const anns = allocator.alloc([]const u8, 1) catch unreachable;
+            anns[0] = allocator.dupe(u8, "retain") catch unreachable;
+            break :blk anns;
+        };
+        const item = ast.Item{ .event_decl = ast.EventDecl{
+            .path = mkPath(allocator, module_name, "__rings_anchor"),
+            .input = ast.Shape{ .fields = &.{} },
+            .branches = &.{},
+            .return_type = null,
+            .is_public = false,
+            .is_implicit_flow = false,
+            .annotations = retain_ann,
+            .location = flow.location,
+            .module = allocator.dupe(u8, module_name) catch unreachable,
+        } };
+        const grown = allocator.alloc(ast.Item, mod.items.len + 1) catch unreachable;
+        @memcpy(grown[0..mod.items.len], mod.items);
+        grown[mod.items.len] = item;
+        @constCast(mod).items = grown;
+    }
+};
+
+// ============================================================================
+// RINGS.NEW — `std/rings:new(name, capacity: N) { value: Type }`
+// ============================================================================
+
+~[keyword|comptime|transform]pub tor new {
+    expr: Expression,
+    source: ?Source,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc new|zig {
+    if (item.* != .flow) @panic("rings:new transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+    const struct_literal = @import("struct_literal");
+
+    if (std.mem.eql(u8, CompilerEnv.lang, "js")) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings: rings are a native-runtime construct this rung — the Vyukov ring and its atomics have no JS lowering yet", .{}) } };
+    }
+
+    if (invocation != flow.inv()) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new: a ring declaration is a top-level item", .{}) } };
+    }
+
+    // ---- Args: `expr` carries the name, `capacity:` is named, the `{ }`
+    // body arrives as a source_value. ----
+    var ring_name: []const u8 = "";
+    var cap_text: ?[]const u8 = null;
+    var body_text: ?[]const u8 = null;
+    for (invocation.args) |a| {
+        if (a.source_value) |sv| {
+            body_text = sv.text;
+            continue;
+        }
+        const an = std.mem.trim(u8, a.name, " \t");
+        if (std.mem.eql(u8, an, "expr")) {
+            ring_name = R.stripQuotes(std.mem.trim(u8, a.value, " \t"));
+            continue;
+        }
+        if (std.mem.eql(u8, an, "capacity")) {
+            cap_text = std.mem.trim(u8, a.value, " \t");
+            continue;
+        }
+        if (a.expression_value == null and std.mem.eql(u8, an, std.mem.trim(u8, a.value, " \t"))) {
+            if (ring_name.len == 0) {
+                ring_name = R.stripQuotes(an);
+                continue;
+            }
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): '{s}' is a bare positional — capacity is named: `capacity: N`", .{ ring_name, an }) } };
+        }
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new: unknown argument '{s}' — the head is `std/rings:new(name, capacity: N) {{ value: Type }}`", .{an}) } };
+    }
+    if (ring_name.len == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new needs the ring name — `std/rings:new(feed, capacity: N) {{ value: Type }}`", .{}) } };
+    }
+
+    // ---- The decl carries no arms — a ring has no join surface; consumer
+    // arms are `std/channel`'s job. ----
+    for (flow.body.continuations) |*c| {
+        const cb = std.mem.trim(u8, c.branch, " ");
+        if (cb.len == 0) continue;
+        if (c.kind == .effect) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): a ring has no `!` arms — competing consumers over a named buffer are `std/channel:new({s}, capacity: N) {{ kind: Proto }}`", .{ ring_name, ring_name }) } };
+        }
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): `| {s}` doesn't parse on a declaration — the declaration takes only the element body", .{ ring_name, cb }) } };
+    }
+    if (!R.identOk(ring_name)) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new: the ring name '{s}' is not usable — it must be an identifier (a-z, A-Z, 0-9, '_', '-'; no leading digit)", .{ring_name}) } };
+    }
+    if (R.markerExists(program, R.declMarker(allocator, ring_name))) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): a ring named '{s}' already exists — one declaration per name", .{ ring_name, ring_name }) } };
+    }
+
+    const cap_raw = cap_text orelse {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): a ring is sized at the declaration — `capacity: N`, a power of two above zero", .{ring_name}) } };
+    };
+    const capacity = std.fmt.parseInt(usize, cap_raw, 10) catch {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): capacity '{s}' is not a comptime integer — the ring is sized at the declaration", .{ ring_name, cap_raw }) } };
+    };
+    if (capacity == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): a ring is buffered storage — capacity is a power of two above zero (direct handoff is `std/channel`'s deferred rendezvous)", .{ring_name}) } };
+    }
+    if (capacity & (capacity - 1) != 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): capacity {d} is not a power of two — the Vyukov ring masks by cap-1", .{ ring_name, capacity }) } };
+    }
+
+    // ---- The element body: `{ name: Type }` — exactly one entry. The name
+    // labels the element; the type is a proto name or a scalar. ----
+    const raw_body = body_text orelse {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): a ring declares its element — `std/rings:new({s}, capacity: {d}) {{ value: Type }}`", .{ ring_name, ring_name, capacity }) } };
+    };
+    const body_norm = if (std.mem.indexOfScalar(u8, raw_body, '{') == null)
+        std.fmt.allocPrint(allocator, "{{ {s} }}", .{raw_body}) catch unreachable
+    else
+        raw_body;
+    const table = struct_literal.parseFields(allocator, body_norm) catch |err| {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): {s}", .{ ring_name, struct_literal.describeErrorIn(allocator, err, body_norm) }) } };
+    };
+    if (table.len == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): the element body is empty — a ring declares what it holds (`{{ value: u64 }}`)", .{ring_name}) } };
+    }
+    if (table.len != 1) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): a ring holds ONE element shape — more than one named lane is a channel: `std/channel:new({s}, capacity: {d}) {{ kind: Proto }}`", .{ ring_name, ring_name, capacity }) } };
+    }
+
+    const elem_label = std.mem.trim(u8, table[0].name, " \t");
+    const elem_type = R.stripQuotes(std.mem.trim(u8, table[0].value, " \t"));
+    if (elem_label.len == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): name the element — `{{ value: {s} }}` — the word labels it in diagnostics and generated units", .{ ring_name, elem_type }) } };
+    }
+    if (!R.identOk(elem_label)) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): '{s}' is not usable as the element word — it must be an identifier", .{ ring_name, elem_label }) } };
+    }
+    if (elem_type.len == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): the element needs a type — `{{ {s}: Type }}`", .{ ring_name, elem_label }) } };
+    }
+    if (elem_type[0] == '*' or std.mem.indexOfScalar(u8, elem_type, '[') != null or std.mem.indexOfScalar(u8, elem_type, '<') != null) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): a ring carries plain values — '{s}' is a borrow, array, or phantom-typed element, and none of those have a slot shape this rung", .{ ring_name, elem_type }) } };
+    }
+
+    // The element resolves as a proto (payload = the collapsed struct) or a
+    // scalar/`string`/`ref(X)` (the degenerate word) — nothing else.
+    const is_proto_elem = RL.protoFields(allocator, program, elem_type) != null;
+    const is_scalar_elem = ast_functional.isScalar(std.mem.trim(u8, elem_type, " \t")) or
+        std.mem.eql(u8, elem_type, "string") or
+        (elem_type.len > 5 and std.mem.startsWith(u8, elem_type, "ref("));
+    if (!is_proto_elem and !is_scalar_elem) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): '{s}' names no proto and no scalar — declare it `std/proto({s}) {{ ... }}` or use a scalar", .{ ring_name, elem_type, elem_type }) } };
+    }
+    if (is_proto_elem) {
+        // An owned leaf (`*mod:Type<state!>`) is a debt, not a slot shape —
+        // a bare ring moves bytes with no custody edge (320_171's wall,
+        // generalized to leaves). The channel is the consumer that transits
+        // them: `send` consumes each path under `| ok`, the `!` arm mints.
+        for (RL.protoFields(allocator, program, elem_type).?) |p| {
+            if (std.mem.startsWith(u8, std.mem.trim(u8, p.ftype, " \t"), "*")) {
+                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/rings:new({s}): proto '{s}' leaf '{s}' is owned ('{s}') — a ring slot has no custody edge for an obligation; std/channel is the consumer that transits owned leaves", .{ ring_name, elem_type, p.name, p.ftype }) } };
+            }
+        }
+    }
+
+    var appended = std.ArrayList(ast.Item).initCapacity(allocator, 8) catch unreachable;
+
+    // ---- The decl marker carries the element so chain steps validate the
+    // ring without re-reading this item. ----
+    appended.append(allocator, R.markerItem(allocator, flow, std.fmt.allocPrint(allocator, "__rings_decl_{s} elem={s} as={s} cap={d}", .{ ring_name, elem_label, elem_type, capacity }) catch unreachable)) catch unreachable;
+    R.anchorModule(allocator, program, "std.rings", flow);
+
+    // ---- Element layout (proto only) + the typed ring cell ----
+    {
+        var sb = std.ArrayList(u8).initCapacity(allocator, 256) catch unreachable;
+        if (is_proto_elem and !RL.structAlreadyEmitted(allocator, program, elem_type)) {
+            const fields = RL.protoFields(allocator, program, elem_type).?;
+            sb.appendSlice(allocator, "pub const ") catch unreachable;
+            sb.appendSlice(allocator, elem_type) catch unreachable;
+            sb.appendSlice(allocator, " = struct {\n") catch unreachable;
+            for (fields) |p| {
+                sb.appendSlice(allocator, std.fmt.allocPrint(allocator, "    {s}: {s},\n", .{ p.name, RL.zigFieldType(allocator, p.ftype) }) catch unreachable) catch unreachable;
+            }
+            sb.appendSlice(allocator, "};\n") catch unreachable;
+        }
+        sb.appendSlice(allocator, std.fmt.allocPrint(allocator,
+            "const __KoruRingT_{s} = koru_std.koru_rings.MpmcRing({s}, {d});\nvar __koru_ring_{s}: __KoruRingT_{s} = __KoruRingT_{s}.init();\n",
+            .{ ring_name, RL.zigFieldType(allocator, elem_type), capacity, ring_name, ring_name, ring_name },
+        ) catch unreachable) catch unreachable;
+        appended.append(allocator, ast.Item{ .inline_code = ast.InlineCode{
+            .code = sb.toOwnedSlice(allocator) catch unreachable,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+    }
+
+    // ---- `__ring_<n>_enqueue` { value: Elem } | ok | full ----
+    {
+        const in = allocator.alloc(ast.Field, 1) catch unreachable;
+        in[0] = ast.Field{
+            .name = allocator.dupe(u8, "value") catch unreachable,
+            .type = allocator.dupe(u8, elem_type) catch unreachable,
+            .phantom = null,
+        };
+        const brs = allocator.alloc(ast.Branch, 2) catch unreachable;
+        brs[0] = R.emptyBranch(allocator, "ok");
+        brs[1] = R.emptyBranch(allocator, "full");
+        const body = std.fmt.allocPrint(allocator,
+            "if (__koru_ring_{s}.tryEnqueue(value)) return .ok;\nreturn .full;",
+            .{ring_name},
+        ) catch unreachable;
+        R.synthOp(allocator, program, flow, std.fmt.allocPrint(allocator, "__ring_{s}_enqueue", .{ring_name}) catch unreachable, in, brs, null, body, &appended);
+    }
+
+    // ---- `__ring_<n>_dequeue` {} | some Elem | none ----
+    {
+        const brs = allocator.alloc(ast.Branch, 2) catch unreachable;
+        brs[0] = R.identityBranch(allocator, "some", elem_type);
+        brs[1] = R.emptyBranch(allocator, "none");
+        const body = std.fmt.allocPrint(allocator,
+            "if (__koru_ring_{s}.tryDequeue()) |__v| return .{{ .some = __v }};\nreturn .none;",
+            .{ring_name},
+        ) catch unreachable;
+        R.synthOp(allocator, program, flow, std.fmt.allocPrint(allocator, "__ring_{s}_dequeue", .{ring_name}) catch unreachable, &.{}, brs, null, body, &appended);
+    }
+
+    const marker = std.fmt.allocPrint(allocator, "// std/rings: '{s}' declared ({s}: {s}, cap {d})", .{ ring_name, elem_label, elem_type, capacity }) catch unreachable;
+    return .{ .transformed = .{ .replacement = ast.Item{ .host_line = ast.HostLine{
+        .content = marker,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } }, .appended = appended.toOwnedSlice(allocator) catch unreachable } };
+}

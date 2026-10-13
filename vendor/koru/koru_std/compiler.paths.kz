@@ -1,0 +1,33 @@
+// Koru Standard Library: the `paths` part of compiler.kz.
+// Joined via `~part paths` in compiler.kz; merged into the compiler
+// module at load.
+
+// Helper: Join path segments with dots
+// IMPORTANT: Takes an allocator to return heap-allocated memory (stack memory was causing corruption!)
+const joinPathAlloc = struct {
+    fn call(allocator: std.mem.Allocator, path: []const []const u8) []const u8 {
+        if (path.len == 0) return "";
+        if (path.len == 1) return path[0];
+
+        // Calculate total length needed
+        var total_len: usize = path[0].len;
+        for (1..path.len) |i| {
+            total_len += 1 + path[i].len; // dot + segment
+        }
+
+        // Allocate result buffer
+        const result = allocator.alloc(u8, total_len) catch return path[0]; // Fallback to first segment if alloc fails
+        var pos: usize = 0;
+        @memcpy(result[pos..pos + path[0].len], path[0]);
+        pos += path[0].len;
+
+        for (1..path.len) |i| {
+            result[pos] = '.';
+            pos += 1;
+            @memcpy(result[pos..pos + path[i].len], path[i]);
+            pos += path[i].len;
+        }
+
+        return result[0..pos];
+    }
+}.call;

@@ -1,0 +1,120 @@
+// Koru Standard Library: the `targets` part of control.kz.
+// Joined via `~part targets` in control.kz; merged into the control module at load.
+//
+// The NON-zig template bodies of control.kz's three keywords — the |js and
+// |cs variants of if, cond, for. They share one home because their surfaces
+// converge: if/cond bodies are byte-identical across hosts (the js comment
+// below already argued "shared, not re-derived"), and a fix that lands in
+// one lowering path has to land in all of them — one file is where a sweep
+// actually sees that. The tor decls and the |zig originals stay in
+// control.kz.
+
+// JS variant of if. The per-call render is target-blind to the EMITTER (the
+// body is spliced inline before variant selection), so the RENDERER selects
+// THIS variant when --lang=js. The body is byte-identical to the Zig one — JS
+// `if/else` shares the same surface — but it is now HONESTLY the JS variant,
+// not a Zig-body leak that happened to also be valid JS. The
+// `__koru_continue_N` markers it mints are resolved by js_emitter's
+// emitInlineBodyResolvingContinuations.
+~[template]proc if|js {
+    if ({{ expr }}) {
+        {{ continuations["then"].continue }}
+    } else {
+        {{ continuations["else"].continue }}
+    }
+}
+
+// CS variant of if — the K# vertical. C# `if/else` shares the surface with
+// both other hosts, so the body is again byte-identical; what makes it the cs
+// variant is that selectPerCallTemplateProc picks it under --lang=cs and
+// cs_emitter resolves the `__koru_continue_N` markers.
+~[template]proc if|cs {
+    if ({{ expr }}) {
+        {{ continuations["then"].continue }}
+    } else {
+        {{ continuations["else"].continue }}
+    }
+}
+
+// JS variant of cond. The CASCADE is byte-identical to the Zig one and that is
+// the point: `if (g) { … } else if (g2) { … } else { … }` is one construct in
+// both languages, so every structural decision `cond` makes — first-match
+// exclusivity, the guardless arm as the trailing `else`, `{{ binds }}` hoisted
+// ahead so a guard in condition position sees the name its arm binds — is
+// shared, not re-derived. `arm.continue[unguarded]` mints the same
+// `__koru_continue_bare_N` marker the Zig path uses; js_emitter resolves it via
+// emitInlineBodyResolvingContinuations (mirroring the Zig
+// emitInlineCodeResolvingSplices), exactly as `~[template]proc if|js` does.
+//
+// The ONE divergence is `{{ binds }}`, and it is not in this file: the binder
+// preamble is host DECLARATION syntax (`const v = <scrutinee>;`), so
+// template_processor renders that single context key in the build language
+// (BinderHost). Zig gets `.{ .value = n, }` plus `_ = &v;` unused-suppression
+// and `: T` representation annotations; JS gets `{ value: n, }` and neither —
+// an unused const is legal there and `_ = &v;` does not parse. Keeping it one
+// key means a future improvement to which arms bind lands on both targets at
+// once.
+~[template]proc cond|js {
+    {{ binds }}
+    {% for arm in continuations["c"] %}{% if arm.guard != "" %}if ({{ arm.guard }}) {
+        {{ arm.continue[unguarded] }}
+    } else {% else %}{
+        {{ arm.continue }}
+    }{% endif %}{% endfor %}
+}
+
+// CS variant of cond — the K# vertical. The cascade is byte-identical to the
+// JS one (C# `if / else if / else` is the same construct); the ONE divergence
+// stays in `{{ binds }}`, rendered host-keyed inside template_processor —
+// cs binders lower to `var b = <scrutinee>;` and a `{ k: v }` scrutinee to
+// `new { k = v }`.
+~[template]proc cond|cs {
+    {{ binds }}
+    {% for arm in continuations["c"] %}{% if arm.guard != "" %}if ({{ arm.guard }}) {
+        {{ arm.continue[unguarded] }}
+    } else {% else %}{
+        {{ arm.continue }}
+    }{% endif %}{% endfor %}
+}
+
+// JS variant of for. Same Liquid context surface as the Zig variant —
+// `{{ iterable }}`, `effects["each"]`, `h.inlined_link[scope]`,
+// `continuations["done"].continue` — but a JS-native `for…of` loop header
+// instead of the Zig `for (…) |x| {}` capture form. The per-iteration
+// `{{ h.inlined_link[scope] }}(__koru_item)` mints a `__koru_inline_scoped_N`
+// effect-splice marker, resolved on the JS path by js_emitter's
+// emitInlineBodyResolvingContinuations (mirrors the Zig
+// emitInlineCodeResolvingSplices). The `| done` terminal is continued via the
+// `__koru_continue_N` marker, resolved the same way.
+//
+// CROSS-TARGET (140_014): the iterable expression is classified by the
+// `parse_range` filter (template_processor.zig). A Zig range `0..N` becomes a JS
+// counting loop `for (let i = 0; i < N; i++)` — the performance-correct form
+// (NOT `Array.from`); anything else (e.g. a JS array literal `[1,2,3]`) flows
+// through verbatim as a `for…of`. Only the loop HEADER differs between the two;
+// the body (effect-handler calls) is shared. The richer Zig-subset expression
+// translator (array literals, `@builtins`, …) is the deferred follow-up
+// (docs/PARSER_PALETTE.md §8.4); for now JS `for` supports ranges + JS-shaped
+// iterables.
+~[template]proc for|js {
+    {% const __koru_iter = js_lower(expr) %}{% const __koru_range = parse_range(__koru_iter) %}{% if __koru_range.is_range %}for (let __koru_item{{ __site }} = {{ __koru_range.lo }}; __koru_item{{ __site }} < {{ __koru_range.hi }}; __koru_item{{ __site }}++) {% else %}for (const __koru_item{{ __site }} of {{ __koru_iter }}) {% endif %}{
+        {% if keep != "" %}{% const __koru_keep = js_lower(keep) %}if (!({{ __koru_keep }})) break;
+        {% endif %}{% for h in effects["each"] %}{{ h.inlined_link[scope] }}(__koru_item{{ __site }});
+        {% endfor %}
+    }
+    {{ continuations["done"].continue }}
+}
+
+// CS variant of for — the K# vertical. Same `parse_range` as |js: `0..N` →
+// counting `for` (never `while` — trip count known); else `foreach … in`
+// through `cs_lower`. `__koru_item{{ __site }}`: C# forbids shadowing an
+// enclosing local (CS0136 — unlike JS `let`), so each render spells a fresh
+// induction name shared by the header and the splice arg.
+~[template]proc for|cs {
+    {% const __koru_iter = cs_lower(expr) %}{% const __koru_range = parse_range(__koru_iter) %}{% if __koru_range.is_range %}for (long __koru_item{{ __site }} = {{ __koru_range.lo }}; __koru_item{{ __site }} < {{ __koru_range.hi }}; __koru_item{{ __site }}++) {% else %}foreach (var __koru_item{{ __site }} in {{ __koru_iter }}) {% endif %}{
+        {% if keep != "" %}{% const __koru_keep = cs_lower(keep) %}if (!({{ __koru_keep }})) break;
+        {% endif %}{% for h in effects["each"] %}{{ h.inlined_link[scope] }}(__koru_item{{ __site }});
+        {% endfor %}
+    }
+    {{ continuations["done"].continue }}
+}

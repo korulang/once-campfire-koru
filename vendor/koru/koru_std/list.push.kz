@@ -1,0 +1,30 @@
+// Koru Standard Library: the `push` part of list.kz.
+// Joined via `~part push` in list.kz; merged into the list module at load.
+
+// container's constructor mints alongside it (see the synthesis section).
+// The unified overload-by-container dispatch is the post-milestone gap
+// (660_026 red pin), not this rung's surface.
+~[comptime|transform]pub tor push {
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc push|zig {
+    if (item.* != .flow) @panic("std/list:push transform: containing item is not a flow");
+    return routeOpCall(allocator, program, &item.flow, "push", invocation);
+}
+
+~pub tor push-i64 { xs: *List_i64<list>, v: i64 }
+
+~proc push-i64|zig {
+    xs.items.append(xs.allocator, v) catch {
+        @panic("std/list:push — out of memory");
+    };
+}
+
+// ============================================
+// Read (borrow)
+// ============================================
+

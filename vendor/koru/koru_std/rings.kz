@@ -1,0 +1,161 @@
+// Koru Standard Library: Lock-Free Ring Buffers
+// ==============================================
+//
+// High-performance MPMC (multi-producer, multi-consumer) ring buffers
+// based on Dmitry Vyukov's bounded queue algorithm.
+//
+// DESIGN PHILOSOPHY:
+// - Tors are implicitly tappable - no hooks, no callbacks
+// - Users observe via tap() without modifying this library
+// - Multicast: multiple taps = multiple observers, ALL see every message
+// - `when` clauses fuse predicates into the producer (zero-cost filtering)
+//
+// USAGE — the named surface (the std/store model: a ring is a static, named
+// at the declaration, addressed by name everywhere it is used):
+//
+//   import std/rings
+//
+//   std/rings:new(feed, capacity: 256) { value: u64 }
+//   std/rings:new(feed, capacity: 256) { reading: Reading }   // proto element
+//
+//   std/rings:enqueue(feed, v: 42)
+//   | ok |> ...
+//   | full |> handle_backpressure()
+//
+//   std/rings:dequeue(feed)
+//   | some v |> process(v)    // v IS the element, not v.value
+//   | none |> wait_for_producer()
+//
+// OBSERVABILITY (implicit - no library changes needed):
+//   tap(std/rings:enqueue -> *) | ok e |> telemetry:record_enqueue()
+//   tap(std/rings:enqueue -> *) | full |> metrics:backpressure()
+//   tap(std/rings:dequeue -> *) | some v when v.ring == my_ring |> log(v)
+//
+// MULTICAST:
+//   Unlike traditional MPMC where one consumer wins, taps enable TRUE multicast:
+//   - Multiple taps on same tor = ALL observers see EVERY message
+//   - Perfect for telemetry, logging, PGO, debugging
+//   - Zero cost when no taps attached
+
+const std = @import("std");
+const ast = @import("ast");
+// ============================================================================
+// RING BUFFER IMPLEMENTATION (Vyukov's bounded MPMC queue)
+// ============================================================================
+//
+// Zig generic - instantiate with your type:
+//   const MyRing = MpmcRing(u64, 1024);
+
+const CacheLine = 64;
+
+pub fn MpmcRing(comptime T: type, comptime capacity: usize) type {
+    if (capacity & (capacity - 1) != 0) {
+        @compileError("Ring capacity must be power of 2");
+    }
+
+    const Slot = struct {
+        seq: std.atomic.Value(usize),
+        value: T,
+    };
+
+    return struct {
+        const Self = @This();
+
+        head: std.atomic.Value(usize) align(CacheLine),
+        _pad1: [CacheLine - @sizeOf(std.atomic.Value(usize))]u8 = undefined,
+
+        tail: std.atomic.Value(usize) align(CacheLine),
+        _pad2: [CacheLine - @sizeOf(std.atomic.Value(usize))]u8 = undefined,
+
+        slots: [capacity]Slot align(CacheLine),
+
+        pub fn init() Self {
+            @setEvalBranchQuota(capacity * 8);
+            var self = Self{
+                .head = std.atomic.Value(usize).init(0),
+                .tail = std.atomic.Value(usize).init(0),
+                .slots = undefined,
+            };
+
+            for (&self.slots, 0..) |*slot, i| {
+                slot.seq = std.atomic.Value(usize).init(i);
+                slot.value = undefined;
+            }
+
+            return self;
+        }
+
+        pub fn tryEnqueue(self: *Self, value: T) bool {
+            var pos = self.head.load(.monotonic);
+
+            while (true) {
+                const slot = &self.slots[pos & (capacity - 1)];
+                const seq = slot.seq.load(.acquire);
+                const dif = @as(isize, @intCast(seq)) -% @as(isize, @intCast(pos));
+
+                if (dif == 0) {
+                    if (self.head.cmpxchgWeak(
+                        pos,
+                        pos + 1,
+                        .monotonic,
+                        .monotonic,
+                    ) == null) {
+                        slot.value = value;
+                        slot.seq.store(pos + 1, .release);
+                        return true;
+                    }
+                    pos = self.head.load(.monotonic);
+                } else if (dif < 0) {
+                    return false;
+                } else {
+                    pos = self.head.load(.monotonic);
+                    std.Thread.yield() catch {};
+                }
+            }
+        }
+
+        pub fn tryDequeue(self: *Self) ?T {
+            var pos = self.tail.load(.monotonic);
+
+            while (true) {
+                const slot = &self.slots[pos & (capacity - 1)];
+                const seq = slot.seq.load(.acquire);
+                const dif = @as(isize, @intCast(seq)) -% @as(isize, @intCast(pos + 1));
+
+                if (dif == 0) {
+                    if (self.tail.cmpxchgWeak(
+                        pos,
+                        pos + 1,
+                        .monotonic,
+                        .monotonic,
+                    ) == null) {
+                        const value = slot.value;
+                        slot.seq.store(pos + capacity, .release);
+                        return value;
+                    }
+                    pos = self.tail.load(.monotonic);
+                } else if (dif < 0) {
+                    return null;
+                } else {
+                    pos = self.tail.load(.monotonic);
+                    std.Thread.yield() catch {};
+                }
+            }
+        }
+    };
+}
+
+// ============================================================================
+// PARTS — the named surface
+// ============================================================================
+//
+// `std/rings:new(name, capacity: N) { value: Type }` declares a named ring
+// (rings.new.kz); `std/rings:enqueue(name, v)` / `std/rings:dequeue(name)`
+// address it (rings.ops.kz). The raw MpmcRing generic above stays the
+// substrate — generated code and host code both may instantiate it
+// directly, but the Koru surface is the named one.
+
+~part new
+~part leafgate
+~part ops
+~part home

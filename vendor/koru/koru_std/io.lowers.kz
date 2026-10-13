@@ -1,0 +1,36 @@
+// Koru Standard Library: the `lowers` part of io.kz.
+// Joined via `~part lowers` in io.kz; merged into the io module at load.
+//
+// The `{{ … }}` interpolation doors — one per host vocabulary arm. Both
+// engines splice a Koru expression into host text through these twins;
+// they live together because a fix to the lowering contract lands in
+// both places or in neither.
+
+/// A `{{ … }}` INTERPOLATION IS A KORU EXPRESSION, and this builder splices it
+/// into JavaScript. It is the third door onto the same pass — after `std/store`'s
+/// guards and `std/kernel`'s op bodies — and it was the last one still writing
+/// the text through raw.
+///
+/// What that cost: `print.ln("… {{ new:s }}")` over `! updated { old, new }`
+/// emitted a bare `new` into the concatenation, and node refused the file. It
+/// also meant an interpolation naming `a and b` or `@as(i64, x)` reached node
+/// unlowered, which nothing had noticed because no test interpolates one.
+///
+/// Refusal is swallowed rather than reported: an unmodelled `@`-operation here
+/// falls back to the raw text, which is what this site did for every expression
+/// until now, so the failure mode is unchanged rather than newly silent. The
+/// diagnostic belongs with the print transform's own error surface and that is a
+/// separate job.
+fn ioLowerJsExpr(alloc: std.mem.Allocator, text: []const u8) []const u8 {
+    var d = codegen_utils_io.LowerDiag{};
+    return codegen_utils_io.lowerKoruExpr(alloc, text, .js, .koru_expr, &d) catch text;
+}
+
+/// The third door's cs twin: a `{{ … }}` interpolation is a Koru expression,
+/// lowered through the `.cs` vocabulary arm. Same swallowed-refusal contract
+/// as ioLowerJsExpr — an unmodelled operation falls back to raw text (the
+/// pre-lowering behavior), the diagnostic surface being a separate job.
+fn ioLowerCsExpr(alloc: std.mem.Allocator, text: []const u8) []const u8 {
+    var d = codegen_utils_io.LowerDiag{};
+    return codegen_utils_io.lowerKoruExpr(alloc, text, .cs, .koru_expr, &d) catch text;
+}

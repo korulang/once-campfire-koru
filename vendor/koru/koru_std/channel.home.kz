@@ -1,0 +1,54 @@
+// Channel home resolution — where a channel declaration or a chain-step
+// flow lives, spelled for synthesized path qualifiers. Joined via
+// `~part home` in channel.kz; merged into the channel module.
+//
+// The generic tree walks (moduleHome, containingFlow, findEventDecl) live
+// in ast_functional — every comptime module needs them and .kz parts cannot
+// share private fns. This file also declares the module's ast_functional
+// import for that reason; channel.kz's `std`/`ast` are already module-wide.
+const ast_functional = @import("ast_functional");
+
+const CHM = struct {
+    // Where `chan_name` was declared, spelled for path qualifiers — the
+    // generated units live in the DECLARING module, which is not
+    // necessarily the chain step's. Both decl spellings count: a live
+    // `std/channel:new` flow (the declaration may not have lowered yet) and
+    // the `__channel_decl_<name>` host_line marker its lowering leaves. For
+    // top-level hits the containing item's own `.module` is already the
+    // entry file's qualifier spelling.
+    fn chanHome(alloc: std.mem.Allocator, prog: *const ast.Program, chan_name: []const u8) ?[]const u8 {
+        const W = struct {
+            fn scan(its: []const ast.Item, want: []const u8, marker: []const u8, enclosing: ?[]const u8) ?[]const u8 {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .flow => |*f| {
+                            if (f.body.node) |*n| {
+                                if (n.* == .invocation and isChannelInv(&n.invocation, "new") and CH.declSubject(&n.invocation, want)) return enclosing orelse f.module;
+                            }
+                        },
+                        .host_line => |*hl| {
+                            if (std.mem.indexOf(u8, hl.content, marker) != null) return enclosing orelse hl.module;
+                        },
+                        .module_decl => |*md| {
+                            if (scan(md.items, want, marker, md.logical_name)) |hit| return hit;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            }
+        };
+        return W.scan(prog.items, chan_name, CH.declMarker(alloc, chan_name), null);
+    }
+
+    fn isChannelModule(mq: []const u8) bool {
+        return std.mem.eql(u8, mq, "std.channel") or std.mem.eql(u8, mq, "std/channel");
+    }
+
+    fn isChannelInv(inv: *const ast.Invocation, verb: []const u8) bool {
+        if (inv.path.segments.len != 1) return false;
+        if (!std.mem.eql(u8, inv.path.segments[0], verb)) return false;
+        const mq = inv.path.module_qualifier orelse return false;
+        return isChannelModule(mq);
+    }
+};

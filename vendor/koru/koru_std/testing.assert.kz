@@ -1,0 +1,91 @@
+// Koru Standard Library: the `assert` part of testing.kz.
+// Joined via `~part assert` in testing.kz; merged into the testing module at load.
+
+// =============================================================================
+// Assertions
+// =============================================================================
+
+// Pass-through assertion checkpoint
+// Usage: assert(u.name == "Alice") |> next_step()
+// Panics with message if expression is false, otherwise continues
+~[keyword|comptime|transform|pure] pub tor assert {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc assert|zig {
+    const std_import = @import("std");
+    const ast = @import("ast");
+
+    // Get the flow from the item
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Position-agnostic: the runner lifts nested sites into a synthetic
+    // top-level flow, so `invocation` IS the flow's own invocation at every depth.
+    // One write-back path: a statement-shaped inline_body (the old fork used
+    // preamble_code at top level and a raw inline_code node in pipelines —
+    // same emitted statement, two encodings). Continuations are KEPT so a
+    // chained `assert(x) |> next()` keeps running its chain at any depth.
+    _ = invocation;
+
+    // Build assertion code - use idiomatic Zig testing assertions.
+    // //@koru:inline_stmt marks it statement-shaped for the inline emitter.
+    const assert_code = std_import.fmt.allocPrint(
+        allocator,
+        "//@koru:inline_stmt\ntry @import(\"std\").testing.expect({s});",
+        .{ expr }
+    ) catch unreachable;
+
+    const new_marks = allocator.alloc([]const u8, flow.inv().marks.len + 1) catch unreachable;
+    for (flow.inv().marks, 0..) |m, idx| new_marks[idx] = m;
+    new_marks[flow.inv().marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_invocation = ast.Invocation{
+        .path = flow.inv().path,
+        .args = &[_]ast.Arg{},
+        .annotations = flow.inv().annotations,
+        .marks = new_marks,
+        .inserted_by_tap = flow.inv().inserted_by_tap,
+        .from_opaque_tap = flow.inv().from_opaque_tap,
+        .inline_body = assert_code,
+    };
+
+    const transformed_flow = ast.Flow{
+        .body = ast.rootSite(new_invocation, flow.body.continuations, flow.location),
+        .annotations = flow.annotations,
+        .pre_label = flow.pre_label,
+        .super_shape = flow.super_shape,
+        .inline_body = assert_code,
+        .is_pure = true,
+        .is_transitively_pure = true,
+        .impl_of = flow.impl_of,
+        .location = flow.location,
+        .module = flow.module,
+    };
+
+    const new_item = ast.Item{ .flow = transformed_flow };
+
+    return .{ .replacement = new_item };
+}
+
+// Simple pass - marks a test branch as passing (noop)
+~[keyword|comptime|transform|pure] pub tor assert.ok {}
+
+~proc assert.ok|zig {
+    // assert.ok is a pass-through checkpoint - do nothing
+    // The test passed this branch by reaching this point
+}
+
+// Simple fail - fails the test with optional message
+~[keyword] pub tor assert.fail { message: ?string }
+
+~[pure] proc assert.fail|zig {
+    const msg = message orelse "Assertion failed";
+    @panic(msg);
+}

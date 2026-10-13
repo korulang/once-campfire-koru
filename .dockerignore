@@ -1,0 +1,16 @@
+.git
+.docker-context
+.zig-cache
+zig-out
+/a.out
+/*_emitted.zig
+/backend*.zig
+/build*.zig
+/program.ast.json
+/compiler_env.json
+/generated/*.zig
+/seed/
+/storage/
+/tmp/
+/bench/droplet-run-*/
+node_modules

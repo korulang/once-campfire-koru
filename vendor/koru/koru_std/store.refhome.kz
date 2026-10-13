@@ -1,0 +1,312 @@
+// Koru Standard Library: Reactive Stores — the `refhome` part.
+// Joined via `~part refhome` in store.kz; merged into the store module at load.
+//
+// The HOME check for `ref(T)` columns: a handle written into `col: ref(T)`
+// must carry the brand of a store that HOLDS T — a plural store whose
+// expanded leaf set carries T's flat fields. The test is field-set
+// subsumption, not name-matching, so a `<:`-extended proto's store is a
+// home of its parents (698_014) and erased protos need no parent record —
+// their markers already arrive merged.
+//
+// Homes enumerate from the whole program: live `std/store:new` decls expand
+// their seeds; consumed ones carry `; fields` on the create marker. The
+// guard fn each store emits (`__koru_home_<store>_<col>`) compares the
+// handle's brand byte against every home's `__koru_brand`, skipping lean
+// stores via @hasDecl — a store that never mints handles is no home.
+// Pinned: 698_012/013 (foreign handle traps at insert/stored), 698_015
+// (-1 is the unset sentinel), 698_016 (no home refuses at create).
+
+pub const StoreRefHome = struct {
+    const ast = @import("ast");
+    const struct_literal = @import("struct_literal");
+    const codegen_utils = @import("codegen_utils");
+
+    /// A leaf column in seed spelling — post-expansion for a store.
+    const LeafSpec = struct { name: []const u8, type: []const u8 };
+
+    /// The seed leaf-type gate: every non-scalar leaf must be a declared
+    /// terminal or a `ref()` — the refusal `new` used to run inline.
+    fn leafGate(alloc: std.mem.Allocator, prog: *const ast.Program, reporter: anytype, flow: *const ast.Flow, store_name: []const u8, cell_fields: []const struct_literal.StructField, scope_home: []const u8) ?ast.Item {
+        for (cell_fields) |cf| {
+            const peeled = struct_literal.peelBaseType(cf.value);
+            const ltype = if (peeled.type.len != 0) peeled.type else std.mem.trim(u8, cf.value, " ");
+            const known_scalar_leaf = std.mem.eql(u8, ltype, "i64") or std.mem.eql(u8, ltype, "i32") or
+                std.mem.eql(u8, ltype, "f64") or std.mem.eql(u8, ltype, "f32") or
+                std.mem.eql(u8, ltype, "bool") or std.mem.eql(u8, ltype, "string");
+            const char_shaped = std.mem.startsWith(u8, ltype, "char[");
+            const owned_shaped = std.mem.startsWith(u8, ltype, "*") or std.mem.indexOfScalar(u8, ltype, '<') != null;
+            if (!known_scalar_leaf and !char_shaped and !owned_shaped and StoreRefs.inner(ltype) == null and !SL.TermRef.isDeclared(prog, ltype, scope_home)) {
+                return ast.refusal(alloc, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): leaf '{s}' names unknown '{s}' — a leaf must be a scalar material or a terminal of its home", .{ store_name, cf.name, ltype });
+            }
+        }
+        return null;
+    }
+
+    /// The consumed-marker tail: `; ref …` edges then `; fields …` (fields
+    /// last — markerLeaves reads to end of line).
+    fn marker(alloc: std.mem.Allocator, cell_fields: []const struct_literal.StructField) []const u8 {
+        return std.fmt.allocPrint(alloc, "{s}{s}", .{ StoreRefs.suffix(alloc, cell_fields), fieldsSuffix(alloc, cell_fields) }) catch unreachable;
+    }
+
+    /// A seed block's leaf set: proto members flatten exactly as the `new`
+    /// gate's own expansion; plain leaves keep their declared spelling.
+    fn seedLeaves(alloc: std.mem.Allocator, prog: *const ast.Program, seed_text: []const u8, home: []const u8) []LeafSpec {
+        const braced = std.fmt.allocPrint(alloc, "{{{s}}}", .{seed_text}) catch unreachable;
+        var one: [1]struct_literal.StructField = undefined;
+        const raws: []const struct_literal.StructField = if (struct_literal.isIdentityBlock(braced)) blk: {
+            one[0] = .{ .name = ast.STORE_IDENTITY_COLUMN, .value = std.mem.trim(u8, seed_text, " \t\n\r") };
+            break :blk &one;
+        } else struct_literal.parseFields(alloc, braced) catch return &.{};
+        var out = std.ArrayList(LeafSpec){};
+        var flat = std.ArrayList(struct_literal.StructField){};
+        var provs = std.ArrayList(SL.ColProv){};
+        var stack = std.ArrayList([]const u8){};
+        for (raws) |cf| {
+            const peeled = struct_literal.peelBaseType(cf.value);
+            const ftype = if (peeled.type.len != 0) peeled.type else std.mem.trim(u8, cf.value, " ");
+            if (SL.MemberRef.fieldsOf(prog, ftype, home) == null) {
+                out.append(alloc, .{ .name = cf.name, .type = ftype }) catch unreachable;
+                continue;
+            }
+            const fname = if (cf.name.len == 0 or std.mem.eql(u8, cf.name, ast.STORE_IDENTITY_COLUMN)) "" else cf.name;
+            flat.clearRetainingCapacity();
+            SL.ProtoExpander.expand(alloc, prog, home, "", fname, ftype, &stack, null, &flat, &provs);
+            for (flat.items) |lf| out.append(alloc, .{ .name = lf.name, .type = lf.value }) catch unreachable;
+        }
+        return out.items;
+    }
+
+    /// `; fields a: i64, b: ref(X)` off a consumed create-marker line — the
+    /// leaf set the seed's self-erase would otherwise take with it.
+    fn markerLeaves(alloc: std.mem.Allocator, line: []const u8) []LeafSpec {
+        const idx = std.mem.indexOf(u8, line, "; fields ") orelse return &.{};
+        var out = std.ArrayList(LeafSpec){};
+        var toks = std.mem.splitScalar(u8, line[idx + "; fields ".len ..], ',');
+        while (toks.next()) |tok| {
+            const t = std.mem.trim(u8, tok, " \t");
+            const colon = std.mem.indexOfScalar(u8, t, ':') orelse continue;
+            out.append(alloc, .{ .name = std.mem.trim(u8, t[0..colon], " \t"), .type = std.mem.trim(u8, t[colon + 1 ..], " \t") }) catch unreachable;
+        }
+        return out.items;
+    }
+
+    const Home = struct { name: []const u8, leaves: []LeafSpec };
+
+    /// Every plural store in the program with its leaf set — live
+    /// `std/store:new` decls expand their seed, consumed markers carry
+    /// `; fields`. Capacity-1 values mint no handles; never homes.
+    fn stores(alloc: std.mem.Allocator, prog: *const ast.Program) []Home {
+        var out = std.ArrayList(Home){};
+        collect(alloc, prog, prog.items, null, &out);
+        return out.items;
+    }
+
+    /// `enclosing` mirrors storeNewHomeIn: module_decl items use the
+    /// module's logical name, top-level flows their own `f.module`.
+    fn collect(alloc: std.mem.Allocator, prog: *const ast.Program, items: []const ast.Item, enclosing: ?[]const u8, out: *std.ArrayList(Home)) void {
+        for (items) |*pi| {
+            switch (pi.*) {
+                .flow => |*f| {
+                    const node = f.body.node orelse continue;
+                    if (node != .invocation) continue;
+                    const inv = &node.invocation;
+                    if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "new")) continue;
+                    const mq = inv.path.module_qualifier orelse continue;
+                    if (!std.mem.eql(u8, mq, "std.store") and !std.mem.eql(u8, mq, "std/store")) continue;
+                    var name: []const u8 = "";
+                    var seed: []const u8 = "";
+                    var cap: usize = 1;
+                    for (inv.args) |a| {
+                        if (std.mem.eql(u8, a.name, "expr")) {
+                            name = std.mem.trim(u8, a.value, " \t\"");
+                        } else if (std.mem.eql(u8, a.name, "source")) {
+                            seed = a.value;
+                        } else if (std.mem.eql(u8, a.name, "capacity")) {
+                            cap = std.fmt.parseInt(usize, std.mem.trim(u8, a.value, " \t"), 10) catch 1;
+                        }
+                    }
+                    if (name.len == 0 or cap <= 1) continue;
+                    const lv = seedLeaves(alloc, prog, seed, enclosing orelse f.module);
+                    out.append(alloc, .{ .name = name, .leaves = lv }) catch unreachable;
+                },
+                .inline_code => |ic| {
+                    var lines = std.mem.splitScalar(u8, ic.code, '\n');
+                    while (lines.next()) |raw| {
+                        const line = std.mem.trimLeft(u8, raw, " \t");
+                        const prefix = "// std/store: plural store '";
+                        if (!std.mem.startsWith(u8, line, prefix)) continue;
+                        const rest = line[prefix.len..];
+                        const q = std.mem.indexOfScalar(u8, rest, '\'') orelse continue;
+                        out.append(alloc, .{ .name = rest[0..q], .leaves = markerLeaves(alloc, line) }) catch unreachable;
+                    }
+                },
+                .module_decl => |md| collect(alloc, prog, md.items, md.logical_name, out),
+                else => {},
+            }
+        }
+    }
+
+    /// flat ⊆ leaves — every (name, type) of the target's flat field set is
+    /// a leaf of the store. Seed spelling on both sides; terminal aliases
+    /// stay named (a store that spells the material where the proto spells
+    /// the alias is a different contract, not a home).
+    fn holds(leaves: []const LeafSpec, fnames: []const []const u8, ftypes: []const []const u8) bool {
+        for (fnames, ftypes) |n, t| {
+            var found = false;
+            for (leaves) |l| {
+                if (std.mem.eql(u8, l.name, n) and std.mem.eql(u8, l.type, t)) found = true;
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    /// The names of plural stores holding `target` — the emitting store
+    /// counts via `self_leaves` (its own marker is not written yet).
+    pub fn homes(alloc: std.mem.Allocator, prog: *const ast.Program, target: []const u8, scope_home: []const u8, self_name: []const u8, self_leaves: []const LeafSpec) [][]const u8 {
+        const flat = SL.ProtoExpander.getFlat(alloc, prog, target, scope_home) orelse return &.{};
+        var out = std.ArrayList([]const u8){};
+        if (holds(self_leaves, flat.names, flat.types)) out.append(alloc, self_name) catch unreachable;
+        for (stores(alloc, prog)) |h| {
+            if (std.mem.eql(u8, h.name, self_name)) continue;
+            if (holds(h.leaves, flat.names, flat.types)) out.append(alloc, h.name) catch unreachable;
+        }
+        return out.items;
+    }
+
+    /// A column's ref target in seed spelling — the leaf value peeled of
+    /// any `default[type]` wrap. `cell_fields[i]` pairs with
+    /// `field_names[i]` for user columns.
+    fn colTarget(cell_fields: []const struct_literal.StructField, i: usize) ?[]const u8 {
+        if (i >= cell_fields.len) return null;
+        const peeled = struct_literal.peelBaseType(cell_fields[i].value);
+        const ftype = if (peeled.type.len != 0) peeled.type else std.mem.trim(u8, cell_fields[i].value, " ");
+        return StoreRefs.inner(ftype);
+    }
+
+    /// `"__koru_home_<store>_<col>(<v>); "` for a ref column, "" else —
+    /// the generated write sites prepend it inline.
+    fn call(alloc: std.mem.Allocator, cell_fields: []const struct_literal.StructField, i: usize, store: []const u8, v: []const u8) []const u8 {
+        if (colTarget(cell_fields, i) == null) return "";
+        return std.fmt.allocPrint(alloc, "__koru_home_{s}_{s}({s}); ", .{ store, cell_fields[i].name, v }) catch unreachable;
+    }
+
+    /// `; fields a: i64, b: ref(X)` — the consumed marker's leaf record.
+    fn fieldsSuffix(alloc: std.mem.Allocator, cell_fields: []const struct_literal.StructField) []const u8 {
+        var sb = std.ArrayList(u8){};
+        for (cell_fields) |cf| {
+            const peeled = struct_literal.peelBaseType(cf.value);
+            const ftype = if (peeled.type.len != 0) peeled.type else std.mem.trim(u8, cf.value, " ");
+            sb.appendSlice(alloc, if (sb.items.len == 0) "; fields " else ", ") catch unreachable;
+            sb.appendSlice(alloc, std.fmt.allocPrint(alloc, "{s}: {s}", .{ cf.name, ftype }) catch unreachable) catch unreachable;
+        }
+        return sb.items;
+    }
+
+    /// The ref target a consumed `; ref col->T` marker names for a column —
+    /// bulkemit's write path reads this to place the guard call. Falls back
+    /// to the live decl's seed when the site has not transformed yet.
+    fn refTargetOf(alloc: std.mem.Allocator, prog: *const ast.Program, store: []const u8, col: []const u8) ?[]const u8 {
+        if (refTargetInItems(prog.items, store, col)) |t| return t;
+        return refTargetInDecls(alloc, prog, prog.items, null, store, col);
+    }
+    fn refTargetInItems(items: []const ast.Item, store: []const u8, col: []const u8) ?[]const u8 {
+        for (items) |*pi| {
+            switch (pi.*) {
+                .inline_code => |ic| {
+                    var lines = std.mem.splitScalar(u8, ic.code, '\n');
+                    while (lines.next()) |raw| {
+                        const line = std.mem.trimLeft(u8, raw, " \t");
+                        if (!std.mem.startsWith(u8, line, "// std/store:")) continue;
+                        const want = std.mem.indexOf(u8, line, "'") orelse continue;
+                        const rest = line[want + 1 ..];
+                        const q = std.mem.indexOfScalar(u8, rest, '\'') orelse continue;
+                        if (!std.mem.eql(u8, rest[0..q], store)) continue;
+                        const ridx = std.mem.indexOf(u8, line, "; ref ") orelse return null;
+                        const rseg = line[ridx + "; ref ".len ..];
+                        const rend = std.mem.indexOfScalar(u8, rseg, ';') orelse rseg.len;
+                        var toks = std.mem.splitScalar(u8, rseg[0..rend], ',');
+                        while (toks.next()) |tok| {
+                            const t = std.mem.trim(u8, tok, " \t");
+                            const arrow = std.mem.indexOf(u8, t, "->") orelse continue;
+                            if (std.mem.eql(u8, std.mem.trim(u8, t[0..arrow], " \t"), col))
+                                return std.mem.trim(u8, t[arrow + 2 ..], " \t");
+                        }
+                        return null;
+                    }
+                },
+                .module_decl => |md| {
+                    if (refTargetInItems(md.items, store, col)) |t| return t;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+    fn refTargetInDecls(alloc: std.mem.Allocator, prog: *const ast.Program, items: []const ast.Item, enclosing: ?[]const u8, store: []const u8, col: []const u8) ?[]const u8 {
+        for (items) |*pi| {
+            switch (pi.*) {
+                .flow => |*f| {
+                    const node = f.body.node orelse continue;
+                    if (node != .invocation) continue;
+                    const inv = &node.invocation;
+                    if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "new")) continue;
+                    const mq = inv.path.module_qualifier orelse continue;
+                    if (!std.mem.eql(u8, mq, "std.store") and !std.mem.eql(u8, mq, "std/store")) continue;
+                    var name: []const u8 = "";
+                    var seed: []const u8 = "";
+                    for (inv.args) |a| {
+                        if (std.mem.eql(u8, a.name, "expr")) {
+                            name = std.mem.trim(u8, a.value, " \t\"");
+                        } else if (std.mem.eql(u8, a.name, "source")) {
+                            seed = a.value;
+                        }
+                    }
+                    if (!std.mem.eql(u8, name, store)) continue;
+                    for (seedLeaves(alloc, prog, seed, enclosing orelse f.module)) |l| {
+                        if (std.mem.eql(u8, l.name, col)) return StoreRefs.inner(l.type);
+                    }
+                    return null;
+                },
+                .module_decl => |md| {
+                    if (refTargetInDecls(alloc, prog, md.items, md.logical_name, store, col)) |t| return t;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    /// The whole home-check computation for one store's ref columns:
+    /// refuses when a target has no home, else carries both targets' guard
+    /// fn texts for the cell emission to append.
+    const Checks = struct { refusal: ?ast.Item, zig: []const u8, js: []const u8, cs: []const u8 };
+    fn build(alloc: std.mem.Allocator, prog: *const ast.Program, reporter: anytype, flow: *const ast.Flow, store_name: []const u8, cell_fields: []const struct_literal.StructField, scope_home: []const u8) Checks {
+        var zig = std.ArrayList(u8){};
+        var js = std.ArrayList(u8){};
+        var cs = std.ArrayList(u8){};
+        const self_leaves = alloc.alloc(LeafSpec, cell_fields.len) catch unreachable;
+        for (cell_fields, 0..) |cf, i| {
+            const peeled = struct_literal.peelBaseType(cf.value);
+            self_leaves[i] = .{ .name = cf.name, .type = if (peeled.type.len != 0) peeled.type else std.mem.trim(u8, cf.value, " ") };
+        }
+        for (cell_fields, 0..) |cf, i| {
+            const fname = cf.name;
+            const t = colTarget(cell_fields, i) orelse continue;
+            const hs = RefHomeQuery.homesOf(alloc, prog, t, scope_home, store_name, self_leaves);
+            if (hs.len == 0) {
+                return .{ .refusal = ast.refusal(alloc, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): field '{s}' is ref({s}) but no store holds {s} rows — a ref column needs a home: a container store whose row carries the target's fields (std/store:new(dogs, capacity: N) {{ Dog }}); without one the column can only ever hold -1", .{ store_name, fname, t, t }), .zig = "", .js = "", .cs = "" };
+            }
+            zig.appendSlice(alloc, guard(alloc, .zig, "store", store_name, fname, t, hs)) catch unreachable;
+            js.appendSlice(alloc, guard(alloc, .js, "store", store_name, fname, t, hs)) catch unreachable;
+            cs.appendSlice(alloc, guard(alloc, .cs, "store", store_name, fname, t, hs)) catch unreachable;
+        }
+        return .{ .refusal = null, .zig = zig.items, .js = js.items, .cs = cs.items };
+    }
+
+    // The guard body lives in the `hostemit` part (line wall); the pub
+    // member stays — `std/list` calls `StoreRefHome.guard` cross-module.
+    pub fn guard(alloc: std.mem.Allocator, host: codegen_utils.HostTarget, label: []const u8, owner: []const u8, col: []const u8, target: []const u8, home_list: []const []const u8) []const u8 {
+        return storeRefHomeGuard(alloc, host, label, owner, col, target, home_list);
+    }
+};

@@ -1,0 +1,67 @@
+// Koru Standard Library: the `defined` part of interpreter.kz.
+// Joined via `~part defined` in interpreter.kz; merged into the interpreter
+// module at load.
+// Runtime-defined-flow DISPATCH — the call half of the REPL define
+// (interpreter.define.kz is the install half). A defined flow's body is
+// stored source, re-parsed and executed inline per dispatch, and the
+// defined-flows table is a live namespace: a body that calls a defined
+// name — its own included — resolves to the CURRENT body.
+//
+// That makes a self-referencing redefine recursion, and `run` forwards no
+// budget (metering parked in bridge.run.kz), so depth is the only bound:
+// MAX_DEFINED_DEPTH answers before nested frames kill the host stack
+// mid-turn, as an ordinary refusal the session survives. Bounded
+// recursion — a drain re-calling itself only while a verb answers `more`
+// — stays legal under the cap. Pin: 440_042.
+pub const MAX_DEFINED_DEPTH: u32 = 64;
+
+pub fn findDefinedFlow(defined: *const DefinedFlows, name: []const u8) ?DefinedFlow {
+    return defined.get(name);
+}
+
+/// Dispatch one defined flow: depth-guard, bind params, re-parse the stored
+/// body, execute, unbind. The depth counter lives on ctx so nested defined
+/// dispatches — self-reference and mutual recursion alike — all count
+/// against the same cap.
+pub fn dispatchDefinedFlow(ctx: *InterpreterContext, df: DefinedFlow, evaluated_inv: *const ast.Invocation) anyerror!DispatchResult {
+    // Runaway recursion is a refusal, not a stack overflow: the cap
+    // answers before the frame nesting kills the host process.
+    if (ctx.defined_depth >= MAX_DEFINED_DEPTH) {
+        ctx.failing_event_name = persistentEventName(evaluated_inv);
+        ctx.error_detail = std.fmt.allocPrint(std.heap.page_allocator, "defined flow '{s}' exceeded the dispatch depth cap ({d}) — its body calls itself with no outcome that stops it", .{ df.name, MAX_DEFINED_DEPTH }) catch "defined flow exceeded the dispatch depth cap";
+        return error.DefinedDepthExceeded;
+    }
+    ctx.defined_depth += 1;
+    defer ctx.defined_depth -= 1;
+    for (df.params) |pname| {
+        var pval: []const u8 = "";
+        for (evaluated_inv.args) |arg| {
+            if (std.mem.eql(u8, arg.name, pname)) {
+                pval = arg.value;
+                break;
+            }
+        }
+        try ctx.env.bind(pname, .{
+            .branch = try ctx.allocator.dupe(u8, pval),
+            .fields = &[_]NamedField{},
+        });
+    }
+    switch (flow_parser.parseFlow(ctx.allocator, df.body_source)) {
+        .flow => |*body_flow| {
+            const body_value = try executeFlow(body_flow, ctx);
+            for (df.params) |pname| ctx.env.remove(pname);
+            return .{
+                .branch = body_value.branch,
+                .fields = body_value.fields,
+            };
+        },
+        .err => |e| {
+            // The body was validated at define time; a parse failure here
+            // is an internal inconsistency, not the model's. Name the flow,
+            // the rejection, and the stored body so the shape stays
+            // debuggable.
+            std.debug.print("[REDEFINE-DISPATCH] re-parse of '{s}' failed: {s}; body was: '{s}'\n", .{ df.name, e.message, df.body_source });
+            return error.ValidationFailed;
+        },
+    }
+}

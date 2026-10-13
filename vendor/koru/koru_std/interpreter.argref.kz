@@ -1,0 +1,31 @@
+// Koru Standard Library: the `argref` part of interpreter.kz — the
+// bare-reference judgment used by the arg check: which raw arg values are
+// references to bound names. Joined via `~part argref` in interpreter.kz;
+// merged into the interpreter module at load. `std` arrives at module
+// scope from the other parts — a local import here would shadow it.
+
+/// The name a bare arg value references, or null when the value is a
+/// literal or an expression. A quoted value is a string literal; a
+/// `base.field` shape references `base`; bare `true`/`false`/`null` are
+/// literals, not references. Anything that does not lex as an identifier
+/// (numbers, operators, prose) is outside this question.
+fn unboundRefName(raw: []const u8, bound: *const std.StringHashMap(void)) ?[]const u8 {
+    const t = std.mem.trim(u8, raw, " \t");
+    if (t.len == 0 or t[0] == '"') return null;
+    const base = if (std.mem.indexOfScalar(u8, t, '.')) |dot| t[0..dot] else t;
+    if (!isWireIdent(base)) return null;
+    if (std.mem.eql(u8, base, "true") or std.mem.eql(u8, base, "false") or std.mem.eql(u8, base, "null")) return null;
+    if (bound.contains(base)) return null;
+    return base;
+}
+
+fn isWireIdent(t: []const u8) bool {
+    if (t.len == 0) return false;
+    // First char is a letter or `_` only — a leading `-` or digit is a
+    // number literal (`-1`, `42`), not a reference.
+    if (!std.ascii.isAlphabetic(t[0]) and t[0] != '_') return false;
+    for (t[1..]) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;
+    }
+    return true;
+}

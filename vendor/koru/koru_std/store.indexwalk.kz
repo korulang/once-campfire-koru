@@ -1,0 +1,222 @@
+// Koru Standard Library: Reactive Stores — the `indexwalk` part.
+// Joined via `~part indexwalk` in store.kz; merged into the store module at load.
+
+// ============================================================================
+// STORE.INDEXWALK — the `! query` bucket walk for an indexed guard
+// ============================================================================
+//
+// `! query <row> when <row>.<col> == <k>` on an `std/indexes`-declared
+// store walks the key's bucket instead of sweeping — the membership IS
+// the guard. Two walk shapes, picked by what the body can reach: a body
+// that cannot disturb the bucket gets a `for` over the captured slice
+// (one map probe for the whole query); a body that can gets a `while`
+// whose post-body survival check re-reads the bucket and re-examines the
+// slot a moved member vacated — 690_031's re-check contract at bucket
+// granularity. Visit order under the route is bucket (join) order.
+//
+// The shared row-fire emit (`fireRow`) lives in `store.cols.kz` — it serves
+// the sweep and both walks, and the wall keeps the emit helpers together.
+
+const StoreIndexWalk = struct {
+    const ast = @import("ast");
+    const ast_functional = @import("ast_functional");
+    const struct_literal = @import("struct_literal");
+
+    /// `! query`'s head — two walks, picked by what the body can reach.
+    /// A body that cannot disturb the bucket (`stable` — no insert or
+    /// clear on this store, no write to the indexed column; a take only
+    /// leaves a dead member the row-resolve skips) walks the captured
+    /// slice with a `for`: one map probe total, membership fixed for the
+    /// duration. A body that CAN takes a `while` walk whose end is a live
+    /// question — see memberClose. The key binds ONCE either way.
+    fn memberHead(alloc: std.mem.Allocator, host_is_js: bool, cellq: []const u8, store_name: []const u8, icol: []const u8, key: []const u8, stable: bool) []const u8 {
+        if (storeHostTarget() == .cs) {
+            if (stable)
+                return std.fmt.allocPrint(alloc, "long __koru_ik = (long)({s});\nglobal::System.Collections.Generic.List<long> __koru_ib;\nif ({s}__koru_store_{s}.__index_{s}.TryGetValue(__koru_ik, out __koru_ib)) {{\nforeach (var __koru_bh in __koru_ib) {{\n    var __koru_si = {s}__koru_store_{s}.__koru_row_of(__koru_bh);\n    if (__koru_si < 0) continue;\n", .{ key, cellq, store_name, icol, cellq, store_name }) catch unreachable;
+            return std.fmt.allocPrint(alloc, "long __koru_ik = (long)({s});\nvar __koru_bi = 0;\nwhile (true) {{\n    global::System.Collections.Generic.List<long> __koru_ib;\n    if (!{s}__koru_store_{s}.__index_{s}.TryGetValue(__koru_ik, out __koru_ib) || __koru_bi >= __koru_ib.Count) break;\n    var __koru_bh = __koru_ib[__koru_bi];\n    var __koru_si = {s}__koru_store_{s}.__koru_row_of(__koru_bh);\n    if (__koru_si < 0) {{ __koru_bi += 1; continue; }}\n", .{ key, cellq, store_name, icol, cellq, store_name }) catch unreachable;
+        }
+        if (host_is_js) {
+            if (stable)
+                return std.fmt.allocPrint(alloc, "const __koru_ik = {s};\nconst __koru_ib = {s}__koru_store_{s}.__index_{s}.get(__koru_ik);\nif (__koru_ib !== undefined) {{\nfor (const __koru_bh of __koru_ib) {{\n    const __koru_si = {s}__koru_store_{s}.__koru_row_of(__koru_bh);\n    if (__koru_si === null) continue;\n", .{ key, cellq, store_name, icol, cellq, store_name }) catch unreachable;
+            return std.fmt.allocPrint(alloc, "const __koru_ik = {s};\nlet __koru_bi = 0;\nwhile (true) {{\n    const __koru_ib = {s}__koru_store_{s}.__index_{s}.get(__koru_ik);\n    if (__koru_ib === undefined || __koru_bi >= __koru_ib.length) break;\n    const __koru_bh = __koru_ib[__koru_bi];\n    const __koru_si = {s}__koru_store_{s}.__koru_row_of(__koru_bh);\n    if (__koru_si === null) {{ __koru_bi += 1; continue; }}\n", .{ key, cellq, store_name, icol, cellq, store_name }) catch unreachable;
+        }
+        if (stable)
+            return std.fmt.allocPrint(alloc, "const __koru_ik = {s};\nif ({s}__koru_store_{s}.__index_{s}.getPtr(__koru_ik)) |__koru_ib| {{\nfor (__koru_ib.items) |__koru_bh| {{\n    const __koru_si = {s}__koru_store_{s}.__koru_row_of(__koru_bh) orelse continue;\n", .{ key, cellq, store_name, icol, cellq, store_name }) catch unreachable;
+        return std.fmt.allocPrint(alloc, "const __koru_ik = {s};\nvar __koru_bi: usize = 0;\nwhile (true) {{\n    const __koru_ib = {s}__koru_store_{s}.__index_{s}.getPtr(__koru_ik) orelse break;\n    if (__koru_bi >= __koru_ib.items.len) break;\n    const __koru_bh = __koru_ib.items[__koru_bi];\n    const __koru_si = {s}__koru_store_{s}.__koru_row_of(__koru_bh) orelse {{ __koru_bi += 1; continue; }};\n", .{ key, cellq, store_name, icol, cellq, store_name }) catch unreachable;
+    }
+
+    // --- the stable-walk gate: can the body disturb this bucket? ---
+    //
+    // The bucket array is touched by exactly three verbs on this store:
+    // `insert`/`new` (append — and a getOrPut that can rehash the map,
+    // invalidating a captured bucket pointer), `clear` (drops every
+    // bucket outright), and a `stored` write to the INDEXED column
+    // (orderedRemove shifts the very members the walk is mid-way
+    // through). `take` is deliberately absent — it leaves a dead handle
+    // the row-resolve skips, and writes to every other column don't
+    // move membership. Both spellings are matched because the scan runs
+    // on a body mid-transplant: `insert`/`stored` doors before their
+    // transforms, `__store_insert_`/`__store_envwrite_`/`__store_clear_`
+    // units after. Anything the predicate cannot read answers YES —
+    // the survival walk is never wrong, only slower.
+    const DisturbCtx = struct {
+        alloc: std.mem.Allocator,
+        store: []const u8,
+        icol: []const u8,
+        icol_index: ?usize,
+        bind: []const u8,
+    };
+
+    fn isBucketDisturbing(ctx: DisturbCtx, inv: *const ast.Invocation) bool {
+        if (inv.path.segments.len != 1) return false;
+        const seg = inv.path.segments[0];
+        const mq = inv.path.module_qualifier;
+        const std_store = mq == null or std.mem.eql(u8, mq.?, "std.store");
+
+        // Post-transform verb units — the store name is baked into the
+        // tor name.
+        for ([_][]const u8{ "__store_insert_", "__store_inserth_", "__store_insertf_" }) |p| {
+            if (std.mem.startsWith(u8, seg, p)) return std.mem.eql(u8, seg[p.len..], ctx.store);
+        }
+        if (std.mem.startsWith(u8, seg, "__store_clear_"))
+            return std.mem.eql(u8, seg["__store_clear_".len..], ctx.store);
+        if (std.mem.startsWith(u8, seg, "__store_envwrite_")) {
+            const rest = seg["__store_envwrite_".len..];
+            if (!std.mem.startsWith(u8, rest, ctx.store)) return false;
+            // Multi-field envelope: `__store_envwrite_<s>_c<i>_c<i>…` —
+            // the column indices ride in the name. Bare `envwrite_<s>`
+            // is the single-field unit; its column is the `field` bit.
+            var q = ctx.store.len;
+            if (q == rest.len) {
+                const bi = ctx.icol_index orelse return true;
+                for (inv.args) |a| {
+                    if (!std.mem.eql(u8, a.name, "field")) continue;
+                    const shl = std.mem.indexOf(u8, a.value, "<<") orelse return true;
+                    var e = shl + 2;
+                    while (e < a.value.len and a.value[e] == ' ') e += 1;
+                    var d = e;
+                    while (d < a.value.len and std.ascii.isDigit(a.value[d])) d += 1;
+                    if (d == e) return true;
+                    const fi = std.fmt.parseInt(usize, a.value[e..d], 10) catch return true;
+                    return fi == bi;
+                }
+                return true;
+            }
+            while (q < rest.len) {
+                if (rest[q] != '_' or q + 2 >= rest.len or rest[q + 1] != 'c' or !std.ascii.isDigit(rest[q + 2])) return true;
+                var e = q + 2;
+                while (e < rest.len and std.ascii.isDigit(rest[e])) e += 1;
+                const fi = std.fmt.parseInt(usize, rest[q + 2 .. e], 10) catch return true;
+                if (ctx.icol_index) |bi| {
+                    if (fi == bi) return true;
+                } else return true;
+                q = e;
+            }
+            return false;
+        }
+
+        if (!std_store) return false;
+
+        // Raw doors. `insert`/`new`/`clear` name their store in the
+        // `expr` arg — same shape `TakeScan.isTakeOn` reads.
+        if (std.mem.eql(u8, seg, "insert") or std.mem.eql(u8, seg, "new") or std.mem.eql(u8, seg, "clear")) {
+            for (inv.args) |a| {
+                if (!std.mem.eql(u8, a.name, "expr")) continue;
+                const v = if (a.value.len >= 2 and a.value[0] == '"') a.value[1 .. a.value.len - 1] else a.value;
+                const lb = std.mem.indexOfScalar(u8, v, '[') orelse return true;
+                return std.mem.eql(u8, std.mem.trim(u8, v[0..lb], " "), ctx.store);
+            }
+            return true;
+        }
+        // `stored { <head>.<field>: v, … }` — disturb iff a write lands
+        // on this store's indexed column. The target's head is the
+        // store (dotted or `[row]`-addressed) or a row binding; the
+        // query's own `bind` is this store's row, and a foreign head
+        // could still be this store under a nested binding — anything
+        // but a plain miss on the FIELD is a yes.
+        if (std.mem.eql(u8, seg, "stored")) {
+            var block_text: ?[]const u8 = null;
+            for (inv.args) |a| {
+                if (std.mem.eql(u8, a.name, "source")) block_text = a.value;
+            }
+            const src = block_text orelse return true;
+            const braced = std.fmt.allocPrint(ctx.alloc, "{{{s}}}", .{src}) catch return true;
+            const writes = struct_literal.parseFields(ctx.alloc, braced) catch return true;
+            for (writes) |w| {
+                const nm = w.name;
+                var head: []const u8 = undefined;
+                var fld: []const u8 = undefined;
+                if (std.mem.indexOfScalar(u8, nm, '[')) |lb| {
+                    const rb = std.mem.lastIndexOfScalar(u8, nm, ']') orelse return true;
+                    if (rb + 1 >= nm.len or nm[rb + 1] != '.') return true;
+                    head = std.mem.trim(u8, nm[0..lb], " ");
+                    fld = nm[rb + 2 ..];
+                    // Row-addressed: the head IS the store name.
+                    if (!std.mem.eql(u8, head, ctx.store)) continue;
+                    if (std.mem.eql(u8, fld, ctx.icol)) return true;
+                } else {
+                    const dot = std.mem.indexOfScalar(u8, nm, '.') orelse continue;
+                    head = nm[0..dot];
+                    fld = nm[dot + 1 ..];
+                    // A write to another field moves nothing. A write to
+                    // THIS field through a head that names neither this
+                    // store nor the row bind could still be this store's
+                    // row under a nested binding — call it a yes.
+                    if (!std.mem.eql(u8, fld, ctx.icol)) continue;
+                    return true;
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /// Does the query body reach a verb that can disturb this store's
+    /// buckets? `bind` is the arm's row variable (`e` in
+    /// `! query e when …`) — the head a `stored` block writes through.
+    /// `icol_index` is the column's position in the field order, which
+    /// the post-transform `envwrite_<s>_c<i>` names carry.
+    fn bodyDisturbsBucket(alloc: std.mem.Allocator, program: *const ast_find.Program, program_items: []const *const ast.Item, body: *const ast.Continuation, store_name: []const u8, icol: []const u8, bind: []const u8) bool {
+        var icol_index: ?usize = null;
+        if (storeFieldOrder(alloc, program, store_name)) |order| {
+            for (order, 0..) |c, i| {
+                if (std.mem.eql(u8, c, icol)) {
+                    icol_index = i;
+                    break;
+                }
+            }
+        }
+        return ast_functional.armReachesInvocation(alloc, program_items, body, DisturbCtx{
+            .alloc = alloc,
+            .store = store_name,
+            .icol = icol,
+            .icol_index = icol_index,
+            .bind = bind,
+        }, isBucketDisturbing) catch true;
+    }
+
+    /// One route decision for both arms: `! first` answers the bucket's
+    /// lowest dense live member, `! query` walks the bucket — and the
+    /// walk's shape is decided here too (`stable`), because the disturb
+    /// scan runs once per site on the same body clone.
+    const QueryRoute = union(enum) {
+        scan,
+        first: struct { icol: []const u8, key: []const u8 },
+        query: struct { icol: []const u8, key: []const u8, stable: bool },
+        refuse: []const u8,
+    };
+
+    fn planQueryRoute(alloc: std.mem.Allocator, program: *const ast_find.Program, is_first: bool, is_view: bool, store_name: []const u8, guard_z: ?[]const u8, srf_prefix: []const u8, body: *const ast.Continuation, row_bind: []const u8) QueryRoute {
+        if (is_view) return .scan;
+        switch (StoreIndex.guardRoute(alloc, program, store_name, guard_z, srf_prefix)) {
+            .scan => return .scan,
+            .refuse => |op| return .{ .refuse = op },
+            .route => |r| {
+                if (is_first) return .{ .first = .{ .icol = r.icol, .key = r.key } };
+                const stable = !bodyDisturbsBucket(alloc, program, flatItems(alloc, program.items), body, store_name, r.icol, row_bind);
+                return .{ .query = .{ .icol = r.icol, .key = r.key, .stable = stable } };
+            },
+        }
+    }
+
+};

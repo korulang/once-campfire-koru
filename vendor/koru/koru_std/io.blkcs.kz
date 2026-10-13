@@ -1,0 +1,249 @@
+// Koru Standard Library: the `blkcs` part of io.kz.
+// Joined via `~part blkcs` in io.kz; merged into the io module at load.
+//
+// print.blk|cs — the C#-target variant of the block-print transform, ported
+// from print.blk|js in io.blk.kz. Same scan: `{% if v %}…{% endif %}` →
+// `(v ? "escaped" : "")` (C#'s ternary is the same shape), `{{ var:fmt }}` →
+// the ioCsPlaceholderOperand door (parens + .cs lowering + the :.N honoring),
+// literal runs escaped into `"…"` segments, all joined by ` + ` — C# string
+// concat promotes the operand exactly like JS.
+//
+// Newline: JS's console.log appends one, so |js strips a trailing `\n` from
+// the template content. __koru_stdout_write is a bare Write — the same strip
+// applies, then the newline is re-added inside the concat, so the emitted
+// program writes exactly what |zig's raw_posix writes.
+~proc print.blk|cs {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Position-agnostic: the runner lifts nested sites into a synthetic
+    // top-level flow, so `invocation` IS the flow's own invocation at every depth.
+    _ = invocation;
+
+    const raw_content = source.text;
+    const content = if (raw_content.len > 0 and raw_content[raw_content.len - 1] == '\n')
+        raw_content[0 .. raw_content.len - 1]
+    else
+        raw_content;
+
+    var buf = std.ArrayList(u8).initCapacity(allocator, 256) catch unreachable;
+    var first = true;
+    var in_literal = false;
+
+    const openLit = struct {
+        fn call(b: *std.ArrayList(u8), a: std.mem.Allocator, f: *bool, il: *bool) void {
+            if (!il.*) {
+                if (!f.*) b.appendSlice(a, " + ") catch unreachable;
+                b.append(a, '"') catch unreachable;
+                il.* = true;
+                f.* = false;
+            }
+        }
+    }.call;
+
+    const closeLit = struct {
+        fn call(b: *std.ArrayList(u8), a: std.mem.Allocator, il: *bool) void {
+            if (il.*) {
+                b.append(a, '"') catch unreachable;
+                il.* = false;
+            }
+        }
+    }.call;
+
+    const escapeAndAppend = struct {
+        fn call(b: *std.ArrayList(u8), a: std.mem.Allocator, c: u8) void {
+            switch (c) {
+                '"' => b.appendSlice(a, "\\\"") catch unreachable,
+                '\\' => b.appendSlice(a, "\\\\") catch unreachable,
+                '\n' => b.appendSlice(a, "\\n") catch unreachable,
+                '\r' => b.appendSlice(a, "\\r") catch unreachable,
+                '\t' => b.appendSlice(a, "\\t") catch unreachable,
+                else => b.append(a, c) catch unreachable,
+            }
+        }
+    }.call;
+
+    var i: usize = 0;
+    while (i < content.len) {
+        // {% if var %}...{% endif %} → + (var ? "body_escaped" : "") +
+        if (i + 1 < content.len and content[i] == '{' and content[i + 1] == '%') {
+            const tag_start = i + 2;
+            var ws_start = tag_start;
+            while (ws_start < content.len and (content[ws_start] == ' ' or content[ws_start] == '\t')) : (ws_start += 1) {}
+
+            if (ws_start + 3 <= content.len and std.mem.eql(u8, content[ws_start..ws_start + 3], "if ")) {
+                const var_start = ws_start + 3;
+                var var_pos = var_start;
+                while (var_pos < content.len and (content[var_pos] == ' ' or content[var_pos] == '\t')) : (var_pos += 1) {}
+                var var_end = var_pos;
+                while (var_end < content.len and content[var_end] != ' ' and content[var_end] != '\t' and content[var_end] != '%') : (var_end += 1) {}
+                const cond_var = content[var_pos..var_end];
+
+                var tag_end = var_end;
+                while (tag_end + 1 < content.len and !(content[tag_end] == '%' and content[tag_end + 1] == '}')) : (tag_end += 1) {}
+
+                if (tag_end + 1 < content.len) {
+                    const body_start = tag_end + 2;
+                    const endif_marker = "{% endif %}";
+                    if (std.mem.indexOf(u8, content[body_start..], endif_marker)) |endif_offset| {
+                        const body_end = body_start + endif_offset;
+                        const body_content = content[body_start..body_end];
+
+                        closeLit(&buf, allocator, &in_literal);
+                        if (!first) buf.appendSlice(allocator, " + ") catch unreachable;
+                        first = false;
+
+                        buf.append(allocator, '(') catch unreachable;
+                        buf.appendSlice(allocator, cond_var) catch unreachable;
+                        buf.appendSlice(allocator, " ? \"") catch unreachable;
+                        for (body_content) |c| escapeAndAppend(&buf, allocator, c);
+                        buf.appendSlice(allocator, "\" : \"\")") catch unreachable;
+
+                        i = body_end + endif_marker.len;
+                        continue;
+                    }
+                }
+            }
+            // Unrecognized {% — treat as literal.
+            openLit(&buf, allocator, &first, &in_literal);
+            escapeAndAppend(&buf, allocator, content[i]);
+            i += 1;
+        }
+        // {{ var:fmt }} → the operand door (lowering + parens + :.N honoring)
+        else if (i + 1 < content.len and content[i] == '{' and content[i + 1] == '{') {
+            const placeholder_start = i + 2;
+            var ws_start = placeholder_start;
+            while (ws_start < content.len and (content[ws_start] == ' ' or content[ws_start] == '\t')) : (ws_start += 1) {}
+
+            var j = ws_start;
+            while (j + 1 < content.len and !(content[j] == '}' and content[j + 1] == '}')) : (j += 1) {}
+
+            if (j + 1 < content.len) {
+                var ws_end = j;
+                while (ws_end > ws_start and (content[ws_end - 1] == ' ' or content[ws_end - 1] == '\t')) : (ws_end -= 1) {}
+
+                const placeholder = content[ws_start..ws_end];
+                // Keyed `store[k: v]` is a pinned hole (690_018) — refuse
+                // before the `:` spec split inside the operand helper would
+                // take the bracket colon.
+                if (codegen_utils_io.colonInsideBrackets(placeholder)) {
+                    return .{ .replacement = ast.refusal(allocator, reporter, .KORU168, flow.location, flow.module, "std/io:print.blk: '{{{{ {s} }}}}' uses keyed addressing 'store[key: value]' - a pinned hole (690_018); bind the row's handle and interpolate store[handle].field instead", .{placeholder}) };
+                }
+
+                closeLit(&buf, allocator, &in_literal);
+                if (!first) buf.appendSlice(allocator, " + ") catch unreachable;
+                first = false;
+                ioCsPlaceholderOperand(&buf, allocator, placeholder);
+
+                i = j + 2;
+            } else {
+                openLit(&buf, allocator, &first, &in_literal);
+                escapeAndAppend(&buf, allocator, content[i]);
+                i += 1;
+            }
+        } else {
+            openLit(&buf, allocator, &first, &in_literal);
+            escapeAndAppend(&buf, allocator, content[i]);
+            i += 1;
+        }
+    }
+
+    closeLit(&buf, allocator, &in_literal);
+
+    // Empty template → emit `""` so the write gets a valid arg.
+    if (first) buf.appendSlice(allocator, "\"\"") catch unreachable;
+
+    const inline_code = std.fmt.allocPrint(
+        allocator,
+        "__koru_stdout_write({s} + \"\\n\");",
+        .{buf.items}
+    ) catch unreachable;
+
+    // Position-agnostic: one write-back path at every depth (the runner lifts
+    // nested sites and grafts the result back) — mirror |zig's AST surgery.
+    const impl_segments = allocator.alloc([]const u8, 2) catch unreachable;
+    impl_segments[0] = allocator.dupe(u8, "print") catch unreachable;
+    impl_segments[1] = allocator.dupe(u8, "blk.impl") catch unreachable;
+    const impl_path = ast.DottedPath{
+        .module_qualifier = flow.inv().path.module_qualifier,
+        .segments = impl_segments,
+    };
+
+    const new_inv_marks = allocator.alloc([]const u8, flow.inv().marks.len + 1) catch unreachable;
+    for (flow.inv().marks, 0..) |m, idx| {
+        new_inv_marks[idx] = m;
+    }
+    new_inv_marks[flow.inv().marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_invocation = ast.Invocation{
+        .path = impl_path,
+        .args = flow.inv().args,
+        .annotations = flow.inv().annotations, .marks = new_inv_marks,
+        .inserted_by_tap = flow.inv().inserted_by_tap,
+        .from_opaque_tap = flow.inv().from_opaque_tap,
+    };
+
+    // Whole-struct copy, NOT a field-list literal: a hand-rolled literal
+    // silently drops any field it doesn't name (this exact rebuild used to
+    // lose impl_variant, breaking variant subflows whose body is a print).
+    var transformed_flow = flow.*;
+    transformed_flow.body = ast.rootSite(new_invocation, flow.body.continuations, flow.location);
+    transformed_flow.inline_body = inline_code;
+
+    const new_item = ast.Item{ .flow = transformed_flow };
+    return .{ .replacement = new_item };
+}
+
+/// Emit one `{{ … }}` placeholder's VALUE operand for the C# concat
+/// `__printInterpolateCs` is building — the ioJsPlaceholderOperand twin.
+/// The spec after the first `:` is dropped (C# string concat ToString()s the
+/// operand, same promotion rule as JS) — EXCEPT a `:.N` precision tail, which
+/// emits `(x).ToString("F"+N, InvariantCulture)`: culture-invariant so a
+/// French locale doesn't answer "3,14".
+fn ioCsPlaceholderOperand(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, raw: []const u8) void {
+    var ws_start: usize = 0;
+    while (ws_start < raw.len and (raw[ws_start] == ' ' or raw[ws_start] == '\t')) : (ws_start += 1) {}
+    var ws_end = raw.len;
+    while (ws_end > ws_start and (raw[ws_end - 1] == ' ' or raw[ws_end - 1] == '\t')) : (ws_end -= 1) {}
+
+    var var_name = raw[ws_start..ws_end];
+    var precision: ?[]const u8 = null;
+    var handle_deref = false;
+    if (std.mem.indexOf(u8, var_name, ":")) |colon_pos| {
+        const spec = var_name[colon_pos + 1 ..];
+        var_name = var_name[0..colon_pos];
+        // `:S` is the owned-handle form (610_007): print the payload, not the
+        // handle — the zig arm's `args[i].data` spelled `(i).data` here.
+        if (std.mem.eql(u8, spec, "S")) handle_deref = true;
+        if (std.mem.indexOf(u8, spec, ":")) |p2| {
+            // `:.N` — the dot is the precision marker, digits after it are N.
+            const rest = spec[p2 + 1 ..];
+            if (rest.len > 1 and rest[0] == '.') {
+                const d = rest[1..];
+                var digits = true;
+                for (d) |c| digits = digits and c >= '0' and c <= '9';
+                if (digits) precision = d;
+            }
+        }
+    }
+
+    if (precision) |d| {
+        buf.append(allocator, '(') catch unreachable;
+        buf.appendSlice(allocator, ioLowerCsExpr(allocator, var_name)) catch unreachable;
+        buf.appendSlice(allocator, ").ToString(\"F") catch unreachable;
+        buf.appendSlice(allocator, d) catch unreachable;
+        buf.appendSlice(allocator, "\", global::System.Globalization.CultureInfo.InvariantCulture)") catch unreachable;
+    } else {
+        // `__koru_str` unwraps a bool operand to `true`/`false` — C#
+        // ToString would answer `True`, and the `is bool` test has to live
+        // behind `dynamic` (a statically-typed operand can't spell it).
+        buf.appendSlice(allocator, "__koru_str(") catch unreachable;
+        buf.appendSlice(allocator, ioLowerCsExpr(allocator, var_name)) catch unreachable;
+        if (handle_deref) buf.appendSlice(allocator, ".data") catch unreachable;
+        buf.append(allocator, ')') catch unreachable;
+    }
+}

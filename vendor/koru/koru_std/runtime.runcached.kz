@@ -1,0 +1,69 @@
+// Koru Standard Library: the `runcached` part of runtime — the cached
+// run variant's Zig impl. Joined via `~part runcached` in runtime.kz;
+// merged into the runtime module at load. The tor decl rides in the
+// `run` part, which owns both scoped-run signatures.
+
+~proc run-cached|zig {
+    const interpreter_mod = @import("root").koru_std.koru_interpreter;
+
+    const scope_result = get_scope_event.handler(.{ .name = scope });
+    switch (scope_result) {
+        .scope => |s| {
+            const result = interpreter_mod.run_cached_event.handler(.{
+                .source = source,
+                .dispatcher = s.dispatcher,
+                .cost_fn = s.cost_fn,
+                .creates_obligations_fn = s.creates_obligations_fn,
+                .discharges_obligations_fn = s.discharges_obligations_fn,
+                .discharge_event_fn = s.discharge_event_fn,
+                .creates_spec_fn = s.creates_spec_fn,
+                .discharges_spec_fn = s.discharges_spec_fn,
+                .budget = budget,
+                .handle_pool = handle_pool,
+                .fail_fast = fail_fast,
+                .scope_name = scope,
+                .auto_discharge = auto_discharge,
+                .lenient = lenient, .input_fn = s.input_fn,
+                .host_dispatch = host_dispatch,
+                .session_env = session_env,
+                .session_bind_fn = session_bind_fn,
+                .session_bind_env = session_bind_env,
+                .session_bind_counter = session_bind_counter,
+            });
+            switch (result) {
+                .unhandled_branch => |u| return .{ .unhandled_branch = .{ .branch = u.branch, .payload = u.payload, .handles = u.handles } },
+                .result => |r| return .{ .result = .{
+                    .value = r.value,
+                    .used = r.used,
+                    .handles = r.handles,
+                    .bound = r.bound,
+                    .trace = r.trace,
+                } },
+                .exhausted => |e| return .{ .exhausted = .{
+                    .used = e.used,
+                    .last_event = e.last_event,
+                    .handles = e.handles,
+                } },
+                .parse_error => |e| return .{ .parse_error = .{
+                    .message = e.message,
+                    .line = e.line,
+                    .column = e.column,
+                } },
+                .validation_error => |e| return .{ .validation_error = e },
+                .dispatch_error => |e| {
+                    if (std.mem.eql(u8, e.message, "EventDenied")) {
+                        return .{ .event_denied = e.event_name };
+                    }
+                    return .{ .dispatch_error = .{
+                        .event_name = e.event_name,
+                        .message = e.message,
+                        .trace = e.trace,
+                    } };
+                },
+            }
+        },
+        .not_found => return .{ .scope_not_found = scope },
+    }
+}
+
+// ============================================================================

@@ -1,0 +1,30 @@
+// Koru Standard Library: the `select` part of interpreter.kz — picking the
+// arm a dispatched outcome runs. Joined via `~part select` in interpreter.kz.
+//
+// There is no catch-all: an arm names a declared branch or the outcome goes
+// unhandled. A same-branch `when` guard gates the arm and is judged in
+// source order — the machinery lives in the `guards` part. (kopium
+// bridge-mirror 2026-09-12-branch-arms, 2026-09-13-arm-when-guards)
+
+const ArmChoice = struct {
+    // The continuation to run, or null when nothing applies.
+    idx: ?usize,
+};
+
+fn selectArm(
+    continuations: []const ast.Continuation,
+    branch: []const u8,
+    fields: []const NamedField,
+    bindings: *const ExprBindings,
+    allocator: std.mem.Allocator,
+) !ArmChoice {
+    var matched_idx: ?usize = null;
+    for (continuations, 0..) |*c, ci| {
+        const plain_ok = branch.len == 0 and namesEql(c.branch, "ok");
+        if (!plain_ok and !namesEql(c.branch, branch)) continue;
+        if (!try armGuardPasses(c, branch, fields, bindings, allocator)) continue;
+        matched_idx = ci;
+        break;
+    }
+    return .{ .idx = matched_idx };
+}

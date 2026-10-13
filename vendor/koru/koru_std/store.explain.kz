@@ -1,0 +1,104 @@
+// Koru Standard Library: the `explain` part of store — joined via
+// `~part explain` in store.kz; members land in koru_store.
+//
+// A store's truth is scattered: `std/store:new` declares columns and
+// interceptor arms, `std/store:insert`/`query`/`take`/`clear`/`stripe`
+// sites reference it by name, standing watches ride the bare
+// `std/store(name)` form, and `! step`/`! wait` turn the store into a
+// pump participant exposing `<s>-step`/`<s>-live`/`<s>-wait`. The
+// explainer folds the sites — the member block through the same
+// `struct_literal.parseFields` the transform calls — and reports the
+// composition: capacity, columns, interceptors, site counts, pump verbs,
+// member-proto facets (refine's own `metFields` fold), and each query
+// site's plan — index routing decided by the transform's own fold (SPlan).
+
+// The site fold lives in `sites` (SX), the plan fold in `plan` (SPlan).
+
+// @retain: explain_store_event is referenced from generated code
+// (koruc's koru_explain_gather invokes every discovered [explainer]).
+~[comptime|explainer]pub tor explain-store {
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> ExplainReport
+
+~proc explain-store|zig {
+    const Entry = ast_find.ExplainReport.Entry;
+    const Section = ast_find.ExplainReport.Section;
+    const SH = @import("site_hash");
+    const has_refine = @hasDecl(koru_std, "koru_refine");
+
+    var stores = std.ArrayList(SX.Store).initCapacity(allocator, 4) catch unreachable;
+    SX.foldSites(allocator, program.items, &stores);
+    const sites = SH.collectSites(allocator, program) catch &.{};
+
+    if (stores.items.len == 0) {
+        return .{ .title = "std/store", .sections = &.{ .{ .heading = "stores", .entries = &.{
+            .{ .note = "no std/store sites — nothing is stored" },
+        } } } };
+    }
+
+    var sections = std.ArrayList(Section).initCapacity(allocator, stores.items.len) catch unreachable;
+    for (stores.items) |*s| {
+        var entries = std.ArrayList(Entry).initCapacity(allocator, 12 + s.members.items.len * 2) catch unreachable;
+        if (!s.declared) {
+            entries.append(allocator, .{ .property = .{ .key = "status", .value = .{ .string = "refused: referenced by sites but never created — `std/store:new` declares a store" } } }) catch unreachable;
+        }
+        const new_at: []const []const u8 = if (s.new_inv) |ni|
+            SH.hashesFor(allocator, sites, &.{@intFromPtr(ni)}) catch &.{}
+        else
+            &.{};
+        if (s.capacity) |cap| {
+            entries.append(allocator, .{ .property = .{ .key = "capacity", .value = .{ .integer = cap }, .at = new_at } }) catch unreachable;
+        }
+        entries.append(allocator, .{ .property = .{ .key = "columns", .value = .{ .integer = @intCast(s.members.items.len) }, .at = new_at } }) catch unreachable;
+        for (s.members.items) |m| {
+            entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "{s}{s}", .{ m.spelled, if (m.owned) " — owned" else "" }) catch unreachable }) catch unreachable;
+        }
+        SPlan.indexRows(allocator, program, s.name, sites, &entries);
+        if (s.arms.items.len > 0) {
+            var names = std.ArrayList(u8).initCapacity(allocator, 48) catch unreachable;
+            for (s.arms.items, 0..) |a, i| {
+                if (i > 0) names.appendSlice(allocator, ", ") catch unreachable;
+                names.appendSlice(allocator, a.name) catch unreachable;
+            }
+            entries.append(allocator, .{ .property = .{ .key = "interceptors", .value = .{ .string = names.items } } }) catch unreachable;
+        }
+        if (s.has_step) {
+            // The participant row carries the `new` site's hash — the door a
+            // pump row's `← synthesized` witness resolves back through.
+            entries.append(allocator, .{ .property = .{ .key = "participant", .value = .{ .string = std.fmt.allocPrint(allocator, "pump participant — exposes {s}-step / {s}-live{s}", .{ s.name, s.name, if (s.has_wait) std.fmt.allocPrint(allocator, " / {s}-wait", .{s.name}) catch unreachable else "" }) catch unreachable }, .at = new_at } }) catch unreachable;
+        }
+        entries.append(allocator, .{ .property = .{ .key = "inserts", .value = .{ .integer = @intCast(s.inserts.items.len) }, .at = SH.hashesFor(allocator, sites, s.inserts.items) catch &.{} } }) catch unreachable;
+        entries.append(allocator, .{ .property = .{ .key = "queries", .value = .{ .integer = @intCast(s.queries.items.len) }, .at = SH.hashesFor(allocator, sites, SPlan.qptrs(allocator, s.queries.items)) catch &.{} } }) catch unreachable;
+        SPlan.queryRows(allocator, program, s, sites, &entries);
+        entries.append(allocator, .{ .property = .{ .key = "watches", .value = .{ .integer = @intCast(s.watches.items.len) }, .at = SH.hashesFor(allocator, sites, s.watches.items) catch &.{} } }) catch unreachable;
+        if (s.takes.items.len + s.clears.items.len > 0) {
+            entries.append(allocator, .{ .property = .{ .key = "takes", .value = .{ .integer = @intCast(s.takes.items.len) }, .at = SH.hashesFor(allocator, sites, s.takes.items) catch &.{} } }) catch unreachable;
+            entries.append(allocator, .{ .property = .{ .key = "clears", .value = .{ .integer = @intCast(s.clears.items.len) }, .at = SH.hashesFor(allocator, sites, s.clears.items) catch &.{} } }) catch unreachable;
+        }
+
+        // Facet enforcement: a member type's met fields become `?!violated`
+        // guards on the generated insert tors — the same fold, so what is
+        // reported is what is enforced.
+        if (has_refine) {
+            var met_total: usize = 0;
+            for (s.members.items) |m| {
+                const tn = SX.memberTypeName(allocator, m.spelled) orelse continue;
+                const fields = koru_std.koru_refine.metFields(allocator, program, s.home, tn, null);
+                for (fields) |*f| {
+                    if (koru_std.koru_refine.carriesTerms(f)) met_total += 1;
+                }
+            }
+            if (met_total > 0) {
+                entries.append(allocator, .{ .property = .{ .key = "facets_declared", .value = .{ .integer = @intCast(met_total) } } }) catch unreachable;
+                entries.append(allocator, .{ .note = "insert enforces them — every generated insert event declares `?!violated <column>`; unhandled it panics, `| violated f |>` supervises" }) catch unreachable;
+            }
+        }
+        sections.append(allocator, .{ .heading = std.fmt.allocPrint(allocator, "{s}:{s}", .{ s.home, s.name }) catch unreachable, .entries = entries.toOwnedSlice(allocator) catch &.{} }) catch unreachable;
+    }
+
+    return .{
+        .title = "std/store",
+        .sections = sections.toOwnedSlice(allocator) catch &.{},
+    };
+}

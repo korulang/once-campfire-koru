@@ -1,0 +1,28 @@
+// Koru Standard Library: the `diffstate` part of gate.kz.
+// Joined via `~part diffstate` in gate.kz; merged into the module at load.
+// The judged state's shaping — today exactly one narrowing: a row tagged
+// `judge-additions` asks "does the diff add", so its state is the diff's
+// added lines plus file/hunk orientation headers, nothing else.
+
+const gate_diffstate = struct {
+    // `judge-additions` narrows the judged state to added lines — a
+    // "does the diff add" rule cannot tell addition from adjacency when
+    // unchanged context carries the very text it hunts: measured on
+    // the-construct-is-a-tor (2026-10-08), an identical clean state
+    // judged VIOLATION/CLEAN/VIOLATION purely from context noise.
+    fn judgedState(a: std.mem.Allocator, tags: []const u8, diff: []const u8) []const u8 {
+        if (!gate_helpers.tagged(tags, "judge-additions")) return diff;
+        var out = std.ArrayList(u8){};
+        var it = std.mem.splitScalar(u8, diff, '\n');
+        while (it.next()) |line| {
+            if ((line.len > 0 and line[0] == '+') or
+                std.mem.startsWith(u8, line, "diff --git") or
+                std.mem.startsWith(u8, line, "@@"))
+            {
+                out.appendSlice(a, line) catch return out.items;
+                out.append(a, '\n') catch return out.items;
+            }
+        }
+        return out.items;
+    }
+};

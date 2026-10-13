@@ -1,0 +1,69 @@
+// Koru Standard Library: the `contract` part of runtime — the signature
+// line's full render for the wire prompt. Joined via `~part contract` in
+// runtime.kz; merged into the runtime module at load.
+//
+// Three helpers compose one vocabulary line: the call surface
+// (`name(arg: type<phantom>)`), what the verb mints (`-> <obligation!>`),
+// and the outcome contract (`| branch payload` — the arm vocabulary the
+// wire grammar tells the model to name). Every piece renders from the
+// same spec tables dispatch enforces, so the prompt cannot describe a
+// call the law would refuse — or hide an outcome the law would fire.
+
+/// The call surface: `name(field: type, field: type<phantom>)`.
+fn wireSignatureLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, event_name: []const u8, input: []const InputFieldSpec) void {
+    out.appendSlice(allocator, event_name) catch unreachable;
+    out.append(allocator, '(') catch unreachable;
+    for (input, 0..) |field, i| {
+        if (i > 0) out.appendSlice(allocator, ", ") catch unreachable;
+        out.appendSlice(allocator, field.name) catch unreachable;
+        out.appendSlice(allocator, ": ") catch unreachable;
+        out.appendSlice(allocator, field.type_name) catch unreachable;
+        if (field.phantom) |p| {
+            out.append(allocator, '<') catch unreachable;
+            out.appendSlice(allocator, p) catch unreachable;
+            out.append(allocator, '>') catch unreachable;
+        }
+    }
+    out.append(allocator, ')') catch unreachable;
+}
+
+/// What the verb mints — ` -> <obligation!>` per create edge, the produce
+/// side a `<state>` arg elsewhere consumes.
+fn wireMintSuffix(out: *std.ArrayList(u8), allocator: std.mem.Allocator, creates: []const CreateSpec) void {
+    for (creates) |spec| {
+        out.appendSlice(allocator, " -> ") catch unreachable;
+        if (spec.branch) |b| {
+            out.appendSlice(allocator, b) catch unreachable;
+            out.append(allocator, ' ') catch unreachable;
+        }
+        out.append(allocator, '<') catch unreachable;
+        out.appendSlice(allocator, spec.obligation_name) catch unreachable;
+        out.appendSlice(allocator, "!>") catch unreachable;
+    }
+}
+
+/// The outcome contract — ` | ok string | missing string | ?hint string` —
+/// the branch names an arm must spell. A `__type_ref` field is a
+/// positional payload (render the type alone); named fields render as the
+/// record the arm binds. `?` marks an optional outcome: the only branch
+/// a turn may omit.
+fn wireBranchSuffix(out: *std.ArrayList(u8), allocator: std.mem.Allocator, branches: []const BranchSpec) void {
+    for (branches) |branch| {
+        out.appendSlice(allocator, " | ") catch unreachable;
+        if (branch.is_optional) out.append(allocator, '?') catch unreachable;
+        out.appendSlice(allocator, branch.name) catch unreachable;
+        if (branch.fields.len == 1 and std.mem.eql(u8, branch.fields[0].name, "__type_ref")) {
+            out.append(allocator, ' ') catch unreachable;
+            out.appendSlice(allocator, branch.fields[0].type_name) catch unreachable;
+        } else if (branch.fields.len > 0) {
+            out.appendSlice(allocator, " { ") catch unreachable;
+            for (branch.fields, 0..) |f, i| {
+                if (i > 0) out.appendSlice(allocator, ", ") catch unreachable;
+                out.appendSlice(allocator, f.name) catch unreachable;
+                out.appendSlice(allocator, ": ") catch unreachable;
+                out.appendSlice(allocator, f.type_name) catch unreachable;
+            }
+            out.appendSlice(allocator, " }") catch unreachable;
+        }
+    }
+}

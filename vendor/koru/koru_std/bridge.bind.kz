@@ -1,0 +1,183 @@
+// Koru Standard Library: the `bind` part of bridge — the session binder:
+// how a value gets its durable `rN` name, and the dispatch that carries the
+// binder into every run. Joined via `~part bind` in bridge.kz; merged into
+// the bridge module at load.
+//
+// The session env outlives the per-run arena: every dispatched result
+// auto-binds `r{N}`, and the `bind` host verb writes here for values that
+// arrive out-of-band (a harness handing back what the real tool returned).
+// Names and field bytes are copied into the session allocator — arena
+// slices die at the next prepare(), so anything bound here must own its
+// bytes.
+
+const Runtime = @import("root").koru_std.koru_runtime;
+
+fn skipWs(src: []const u8, start: usize) usize {
+    var i = start;
+    while (i < src.len and (src[i] == ' ' or src[i] == '\t' or src[i] == '\r' or src[i] == '\n')) i += 1;
+    return i;
+}
+
+/// Flat JSON object → NamedFields on `alloc`. Nested objects/arrays carry
+/// their raw bytes as string_val — FieldValue has no composite variant, so
+/// a nested field is honest data but not field-indexable one level down.
+/// Returns null when `src` is not a well-formed object.
+fn jsonObjectFields(alloc: std.mem.Allocator, src: []const u8) ?[]Interp.NamedField {
+    var i = skipWs(src, 0);
+    if (i >= src.len or src[i] != '{') return null;
+    i += 1;
+    var fields = std.ArrayList(Interp.NamedField){};
+    while (true) {
+        i = skipWs(src, i);
+        if (i >= src.len) return null;
+        if (src[i] == '}') return fields.toOwnedSlice(alloc) catch null;
+        if (src[i] != '"') return null;
+        const kstart = i + 1;
+        i = kstart;
+        while (i < src.len and src[i] != '"') : (i += 1) {
+            if (src[i] == '\\') i += 1;
+        }
+        if (i >= src.len) return null;
+        const key = src[kstart..i];
+        i += 1;
+        i = skipWs(src, i);
+        if (i >= src.len or src[i] != ':') return null;
+        i += 1;
+        i = skipWs(src, i);
+        if (i >= src.len) return null;
+        var fv: Interp.FieldValue = undefined;
+        if (src[i] == '"') {
+            const vstart = i + 1;
+            i = vstart;
+            while (i < src.len and src[i] != '"') : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            if (i >= src.len) return null;
+            fv = .{ .string_val = alloc.dupe(u8, src[vstart..i]) catch return null };
+            i += 1;
+        } else if (src[i] == '{' or src[i] == '[') {
+            const vstart = i;
+            var depth: i32 = 0;
+            var instr = false;
+            while (i < src.len) : (i += 1) {
+                const c = src[i];
+                if (instr) {
+                    if (c == '\\') {
+                        i += 1;
+                    } else if (c == '"') {
+                        instr = false;
+                    }
+                    continue;
+                }
+                if (c == '"') {
+                    instr = true;
+                } else if (c == '{' or c == '[') {
+                    depth += 1;
+                } else if (c == '}' or c == ']') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0) return null;
+            fv = .{ .string_val = alloc.dupe(u8, src[vstart..i]) catch return null };
+        } else {
+            const vstart = i;
+            while (i < src.len and src[i] != ',' and src[i] != '}') i += 1;
+            const tok = std.mem.trim(u8, src[vstart..i], " \t\r\n");
+            if (std.mem.eql(u8, tok, "true")) {
+                fv = .{ .bool_val = true };
+            } else if (std.mem.eql(u8, tok, "false")) {
+                fv = .{ .bool_val = false };
+            } else if (std.fmt.parseInt(i64, tok, 10)) |n| {
+                fv = .{ .int_val = n };
+            } else |_| {
+                if (std.fmt.parseFloat(f64, tok)) |f| {
+                    fv = .{ .float_val = f };
+                } else |_| {
+                    fv = .{ .string_val = alloc.dupe(u8, tok) catch return null };
+                }
+            }
+        }
+        fields.append(alloc, .{
+            .name = alloc.dupe(u8, key) catch return null,
+            .value = fv,
+        }) catch return null;
+        i = skipWs(src, i);
+        if (i < src.len and src[i] == ',') {
+            i += 1;
+            continue;
+        }
+        if (i < src.len and src[i] == '}') return fields.toOwnedSlice(alloc) catch null;
+        return null;
+    }
+}
+
+/// Deep-copy a run-arena Value into session memory and bind it under
+/// `name`. A scalar payload that holds a JSON object also gains the
+/// object's members as named fields — `__type_ref` stays first so a bare
+/// `r3` still renders the whole datum, and `r3.user_id` resolves by name.
+fn bindSessionValue(se: *Environment, name: []const u8, v: Interp.Value) void {
+    const alloc = se.allocator;
+    var fields = std.ArrayList(Interp.NamedField){};
+    for (v.fields) |f| {
+        const fv: Interp.FieldValue = switch (f.value) {
+            .string_val => |s| .{ .string_val = alloc.dupe(u8, s) catch return },
+            else => f.value,
+        };
+        fields.append(alloc, .{
+            .name = alloc.dupe(u8, f.name) catch return,
+            .value = fv,
+        }) catch return;
+    }
+    if (v.fields.len == 1 and std.mem.eql(u8, v.fields[0].name, "__type_ref")) {
+        switch (v.fields[0].value) {
+            .string_val => |s| {
+                if (jsonObjectFields(alloc, s)) |extra| {
+                    fields.appendSlice(alloc, extra) catch {};
+                }
+            },
+            else => {},
+        }
+    }
+    se.bind(alloc.dupe(u8, name) catch return, .{
+        .branch = alloc.dupe(u8, v.branch) catch return,
+        .fields = fields.toOwnedSlice(alloc) catch return,
+    }) catch {};
+}
+
+/// Auto-bind a dispatched result under the session's next `r{N}` name.
+/// Returns the name for the wire — the model that sees `bound: r3` can
+/// write `r3.field` on any later turn.
+fn bindResult(br: *Bridge, v: Interp.Value) []const u8 {
+    return sessionBindAdapter(br.session_env, &br.bound_count, v);
+}
+
+/// The interpreter's per-dispatch binder — same mint as bindResult, so
+/// mid-chain calls and terminal results share one `r{N}` sequence with
+/// residue and `bind`. Wired into run as `session_bind_*`: every link of a
+/// chain gets a durable name, not only the value the flow happened to end on.
+fn sessionBindAdapter(se: *Environment, counter: *u64, v: Interp.Value) []const u8 {
+    counter.* += 1;
+    const name = std.fmt.allocPrint(se.allocator, "r{d}", .{counter.*}) catch return "";
+    if (name.len == 0) return "";
+    bindSessionValue(se, name, v);
+    return name;
+}
+
+/// Residue: text that never lexed as an invocation, bound into the session
+/// as a scalar value instead of destroyed. The model's own words become a
+/// value it can re-emit through a real verb (`say(text: r7)`) — correction
+/// exercises the wire rather than bypassing it. Returns the bound name.
+fn bindResidue(br: *Bridge, text: []const u8) []const u8 {
+    const fields = [_]Interp.NamedField{
+        .{ .name = "__type_ref", .value = .{ .string_val = text } },
+    };
+    return bindResult(br, .{ .branch = "residue", .fields = &fields });
+}
+
+/// dispatchThroughScope lives in the `wiregate` part, with the gate whose
+/// admitted spellings it normalizes.
+

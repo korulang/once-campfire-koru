@@ -1,0 +1,224 @@
+// Koru Standard Library: the `qrewrite` part of store.kz.
+// Joined via `~part qrewrite` in store.kz; merged into the module at load.
+
+// The query arm's row-binding rewriter — lifted out of the transform fn to
+// file scope so store.query.kz stays under its line baseline. Self-contained:
+// every dependency arrives as a parameter.
+const SRewrite = struct {
+    const ast = @import("ast");
+    const Form = enum { target, live, input };
+    const isIdentCh = @import("emitter_helpers").isKebabIdentChar;
+    fn refs(alloc: std.mem.Allocator, text: []const u8, bind: []const u8, store: []const u8, fields: []const []const u8, srf: []const u8, cursor: []const u8, form: Form, used: []bool, unknown: *?[]const u8, view_mode: bool) []const u8 {
+        const prefix = std.fmt.allocPrint(alloc, "{s}.", .{bind}) catch unreachable;
+        const expr_ctx = ast.expressionMask(alloc, text);
+        var out = std.ArrayList(u8).initCapacity(alloc, text.len + 32) catch unreachable;
+        var i: usize = 0;
+        while (i < text.len) {
+            const at_boundary = ast.identBoundaryBefore(text, i);
+            if (at_boundary and (i == 0 or text[i - 1] != '.') and std.mem.startsWith(u8, text[i..], prefix)) {
+                const fstart = i + prefix.len;
+                const rest = text[fstart..];
+                var best_fi: ?usize = null;
+                var best_len: usize = 0;
+                for (fields, 0..) |f, fi| {
+                    if (std.mem.startsWith(u8, rest, f)) {
+                        const after_char_idx = fstart + f.len;
+                        const boundary_ok = after_char_idx >= text.len or !isIdentCh(text[after_char_idx]);
+                        if (boundary_ok and f.len > best_len) {
+                            best_fi = fi;
+                            best_len = f.len;
+                        }
+                    }
+                }
+                if (best_fi) |ci| {
+                    const fname = fields[ci];
+                    const fend = fstart + best_len;
+                    const esc_fname = codegen_utils_store.escapeZigIdentifier(alloc, fname) catch fname;
+                    const t = switch (form) {
+                        .target => std.fmt.allocPrint(alloc, "{s}[{s}].{s}", .{ store, cursor, esc_fname }) catch unreachable,
+                        // Dense cursor — a direct column read (O10.iv).
+                        // EXCEPT through a view: one body shared by member
+                        // loops, no `__koru_store_<view>` to address, so
+                        // thread the value like `.input` (690_297).
+                        .live => if (view_mode) blk3: {
+                            used[ci] = true;
+                            const mangled = std.mem.replaceOwned(u8, alloc, fname, ".", "_") catch unreachable;
+                            break :blk3 std.fmt.allocPrint(alloc, "{s}{s}", .{ srf, mangled }) catch unreachable;
+                        } else std.fmt.allocPrint(alloc, "__koru_store_{s}.{s}[{s}]", .{ store, esc_fname, SCursor.liveIndex(alloc, cursor) }) catch unreachable,
+                        .input => blk4: {
+                            used[ci] = true;
+                            const mangled = std.mem.replaceOwned(u8, alloc, fname, ".", "_") catch unreachable;
+                            break :blk4 std.fmt.allocPrint(alloc, "{s}{s}", .{ srf, mangled }) catch unreachable;
+                        },
+                    };
+                    out.appendSlice(alloc, t) catch unreachable;
+                    i = fend;
+                    continue;
+                }
+                var fend = fstart;
+                while (fend < text.len and (isIdentCh(text[fend]) or text[fend] == '.')) fend += 1;
+                // `<row>.<not-a-column>`: the binding is unambiguous, so this
+                // is a typo the store can name, not a free name to pass on to
+                // the host as `undeclared identifier`.
+                if (fend > fstart and unknown.* == null) unknown.* = alloc.dupe(u8, text[fstart..fend]) catch unreachable;
+            }
+            // A ONE-column store's row names no field, so the BARE binding is
+            // the value: `! query n |> use(v: n)`. Derived from `fields`
+            // rather than threaded — the column list already says it.
+            const row_is_identity = fields.len == 1 and std.mem.eql(u8, fields[0], ast.STORE_IDENTITY_COLUMN);
+            // On a multi-column store the bare binding is the ROW CURSOR —
+            // `take(store[r])` addresses the swept row. The body's cursor
+            // input is a DENSE index but `store[...]` resolves handles, so
+            // the rewrite mints the handle at use (`__koru_handle_of`), matching
+            // 690_031. `bareBindEnd` (store.cols.kz) owns the adjacency rule —
+            // the binding counts only in VALUE position, never as a `.bind`
+            // field, a `bind:` name, or a `#`/`@`/`?` marker (690_361/362/363).
+            const bare_end = if (expr_ctx[i] and at_boundary) bareBindEnd(text, i, bind, expr_ctx) else null;
+            if (!row_is_identity and bare_end != null and (form == .input or form == .live)) {
+                const t = std.fmt.allocPrint(alloc, "__koru_store_{s}.__koru_handle_of({s})", .{ store, SCursor.liveIndex(alloc, cursor) }) catch unreachable;
+                out.appendSlice(alloc, t) catch unreachable;
+                i = bare_end.?;
+                continue;
+            }
+            if (row_is_identity and bare_end != null) {
+                const fname = fields[0];
+                const t = switch (form) {
+                    .target => std.fmt.allocPrint(alloc, "{s}[{s}].{s}", .{ store, cursor, fname }) catch unreachable,
+                    .live => if (view_mode) blk4: {
+                        used[0] = true;
+                        break :blk4 std.fmt.allocPrint(alloc, "{s}{s}", .{ srf, fname }) catch unreachable;
+                    } else std.fmt.allocPrint(alloc, "__koru_store_{s}.{s}[{s}]", .{ store, fname, SCursor.liveIndex(alloc, cursor) }) catch unreachable,
+                    .input => blk5: {
+                        used[0] = true;
+                        break :blk5 std.fmt.allocPrint(alloc, "{s}{s}", .{ srf, fname }) catch unreachable;
+                    },
+                };
+                out.appendSlice(alloc, t) catch unreachable;
+                i = bare_end.?;
+                continue;
+            }
+            out.append(alloc, text[i]) catch unreachable;
+            i += 1;
+        }
+        return out.toOwnedSlice(alloc) catch unreachable;
+    }
+    // A row-addressed lvalue is TWO different things spelled as one string.
+    // The head and the field are a write TARGET — Koru spelling, which the
+    // `stored` transform re-parses below by splitting on the brackets. But
+    // whatever sits BETWEEN the brackets is a READ, and it was getting the
+    // target form too: `stored { other[r.h].v: … }` inside a sweep lowered
+    // the index to `other[refs[cursor].h].v`, where the inner store name
+    // never received its `__koru_store_` prefix because nothing downstream
+    // re-lowers a target-form read. It failed as an undeclared identifier in
+    // the emitted Zig.
+    //
+    // Reads already compose to any depth; this is the write side catching up
+    // to one hop. The splitter below uses the FIRST `[` and the LAST `]`, so
+    // a lowered read nested inside the brackets survives the re-parse.
+    fn storedTarget(alloc: std.mem.Allocator, text: []const u8, bind: []const u8, store: []const u8, fields: []const []const u8, srf: []const u8, cursor: []const u8, used: []bool, unknown: *?[]const u8, view_mode: bool) []const u8 {
+        const lb = std.mem.indexOfScalar(u8, text, '[') orelse
+            return refs(alloc, text, bind, store, fields, srf, cursor, .target, used, unknown, view_mode);
+        const rb = std.mem.lastIndexOfScalar(u8, text, ']') orelse
+            return refs(alloc, text, bind, store, fields, srf, cursor, .target, used, unknown, view_mode);
+        if (rb <= lb + 1) return refs(alloc, text, bind, store, fields, srf, cursor, .target, used, unknown, view_mode);
+        var out = std.ArrayList(u8).initCapacity(alloc, text.len + 64) catch unreachable;
+        out.appendSlice(alloc, refs(alloc, text[0 .. lb + 1], bind, store, fields, srf, cursor, .target, used, unknown, view_mode)) catch unreachable;
+        out.appendSlice(alloc, refs(alloc, text[lb + 1 .. rb], bind, store, fields, srf, cursor, .live, used, unknown, view_mode)) catch unreachable;
+        out.appendSlice(alloc, refs(alloc, text[rb..], bind, store, fields, srf, cursor, .target, used, unknown, view_mode)) catch unreachable;
+        return out.toOwnedSlice(alloc) catch unreachable;
+    }
+    // A stored block is `target: value` pairs — targets take the indexed
+    // lvalue, values read the live column.
+    fn storedBlock(alloc: std.mem.Allocator, text: []const u8, bind: []const u8, store: []const u8, fields: []const []const u8, srf: []const u8, cursor: []const u8, used: []bool, unknown: *?[]const u8, view_mode: bool) []const u8 {
+        const braced = std.fmt.allocPrint(alloc, "{{{s}}}", .{text}) catch unreachable;
+        const struct_literal_s = @import("struct_literal");
+        const pairs = struct_literal_s.parseFields(alloc, braced) catch return text;
+        var out = std.ArrayList(u8).initCapacity(alloc, text.len + 64) catch unreachable;
+        for (pairs, 0..) |pr, i| {
+            if (i > 0) out.appendSlice(alloc, ", ") catch unreachable;
+            out.appendSlice(alloc, storedTarget(alloc, pr.name, bind, store, fields, srf, cursor, used, unknown, view_mode)) catch unreachable;
+            out.appendSlice(alloc, ": ") catch unreachable;
+            out.appendSlice(alloc, refs(alloc, pr.value, bind, store, fields, srf, cursor, .live, used, unknown, view_mode)) catch unreachable;
+        }
+        return out.toOwnedSlice(alloc) catch unreachable;
+    }
+    fn walkCont(alloc: std.mem.Allocator, cont: *ast.Continuation, bind: []const u8, store: []const u8, fields: []const []const u8, srf: []const u8, cursor: []const u8, used: []bool, unknown: *?[]const u8, view_mode: bool) void {
+        // A nested arm's `when` guard runs inside the body tor, so it reads
+        // the threaded inputs like any other body expression.
+        if (cont.condition) |c| {
+            @constCast(cont).condition = refs(alloc, c, bind, store, fields, srf, cursor, .input, used, unknown, view_mode);
+        }
+        if (cont.node) |*n| {
+            switch (@constCast(n).*) {
+                .invocation => |*inv| {
+                    const is_stored = blk2: {
+                        if (inv.path.module_qualifier) |mq| {
+                            if (std.mem.eql(u8, mq, "std.store") and inv.path.segments.len == 1 and std.mem.eql(u8, inv.path.segments[0], "stored")) break :blk2 true;
+                        }
+                        break :blk2 false;
+                    };
+                    // An Arg carries its text up to three ways — `value`, the
+                    // captured `expression_value` (what a `{{ hole }}` in a
+                    // string literal resolves against), and `source_value`.
+                    // All three must move together or the emitted code
+                    // disagrees with itself; query rewrites the same trio
+                    // (store.kz:1565).
+                    for (inv.args) |*a| {
+                        const is_source_block = is_stored and std.mem.eql(u8, a.name, "source");
+                        @constCast(a).value = if (is_source_block)
+                            storedBlock(alloc, a.value, bind, store, fields, srf, cursor, used, unknown, view_mode)
+                        else
+                            refs(alloc, a.value, bind, store, fields, srf, cursor, .input, used, unknown, view_mode);
+                        if (a.expression_value) |ev| {
+                            const fresh = alloc.create(ast.CapturedExpression) catch unreachable;
+                            fresh.* = ev.*;
+                            fresh.text = if (is_source_block)
+                                storedBlock(alloc, ev.text, bind, store, fields, srf, cursor, used, unknown, view_mode)
+                            else
+                                refs(alloc, ev.text, bind, store, fields, srf, cursor, .input, used, unknown, view_mode);
+                            @constCast(a).expression_value = fresh;
+                        }
+                        if (a.source_value) |sv| {
+                            const fresh = alloc.create(ast.Source) catch unreachable;
+                            fresh.* = sv.*;
+                            fresh.text = if (is_source_block)
+                                storedBlock(alloc, sv.text, bind, store, fields, srf, cursor, used, unknown, view_mode)
+                            else
+                                refs(alloc, sv.text, bind, store, fields, srf, cursor, .input, used, unknown, view_mode);
+                            @constCast(a).source_value = fresh;
+                        }
+                    }
+                    // Frozen template text (690_074 freeze; rule-arm twin in
+                    // store.new.kz) — same `.input` rewrite, else `e.` ships
+                    // raw to a scope holding only `__koru_srf_` (690_312).
+                    if (inv.inline_body) |*ib| ib.* = refs(alloc, ib.*, bind, store, fields, srf, cursor, .input, used, unknown, view_mode);
+                },
+                else => {},
+            }
+        }
+        // Rule 4 of 690_086 — bindings resolve innermost first. A nested
+        // sweep arm that REBINDS this name shadows it (rule 5): everything
+        // under that arm reads the INNER row, and the inner site's own
+        // transform claims those references. Descending past the rebind
+        // would hand them to the outer row — a resolution decided by pass
+        // order instead of by the rule.
+        const node_is_sweep = blk5: {
+            if (cont.node) |*n| {
+                if (n.* == .invocation) {
+                    if (n.invocation.path.module_qualifier) |mq| {
+                        if (std.mem.eql(u8, mq, "std.store") and n.invocation.path.segments.len == 1 and std.mem.eql(u8, n.invocation.path.segments[0], "query")) break :blk5 true;
+                    }
+                }
+            }
+            break :blk5 false;
+        };
+        for (cont.continuations) |*c| {
+            if (node_is_sweep and std.mem.eql(u8, std.mem.trim(u8, c.branch, " "), "query")) {
+                if (c.binding) |cb| {
+                    if (std.mem.eql(u8, cb, bind)) continue;
+                }
+            }
+            walkCont(alloc, @constCast(c), bind, store, fields, srf, cursor, used, unknown, view_mode);
+        }
+    }
+};

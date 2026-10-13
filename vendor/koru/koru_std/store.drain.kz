@@ -1,0 +1,69 @@
+// Koru Standard Library: the `drain` part of store.kz.
+// Joined via `~part drain` in store.kz; merged into the module at load.
+
+// ------------------------------------------------------------------
+// Drain — a rule whose row body is exactly `take(s[e])` with a discard
+// `| item` removes every row the invoked sweep visits. Per-row take
+// reads every column into the payload and swap-writes the last row's
+// columns into the freed slot — work for the payload's sake and for
+// survivor liveness. A drain has neither.
+//
+// The teardown is the clear unit's canonical reset, not a walk of
+// take's freelist pushes: every issued slot's generation bumps once
+// (`0..hslot_next` covers live rows AND slots freed by earlier takes),
+// then `hslot_next`, `free_len` and `len` drop to zero and `ident`
+// re-arms. Materializing the freelist paid three costs for one
+// observable difference — refilled rows take slots in fresh order
+// rather than take's LIFO pop order: the fill loop itself, a cold
+// page-fault pass over `hslot_free`, and `ident` flipping false
+// FOREVER, which degraded every later drain/refill to the scalar
+// slot-mapping path. `clear` already blesses reset order, and the slot
+// SET reissued is identical either way. Dead slot bytes (`row_hslot`,
+// `hslot_row`, stale freelist entries) stay unreachable post-reset:
+// resolve's `slot < hslot_next` rejects them, and the next
+// materialize() rebuilds the mapping for live rows only.
+// Every doubt declines the site: `when` makes the walk selective, a
+// `| item` read makes materialisation load-bearing, an owned column
+// discharges one obligation at a time, a `! removed` arm fires per row.
+// An index column is NO doubt — take reseats nothing and dead handles
+// idle in buckets — so a teardown leaves the index exactly as
+// sequential take would. A declined site stays per-row take.
+// ------------------------------------------------------------------
+
+const DrainScan = struct {
+    const ast = @import("ast");
+    const codegen_utils = @import("codegen_utils");
+
+    // The pre-rewrite body is one `take(s[row_bind])` site whose
+    // continuations are all empty `item`/`empty` arms — the payload
+    // may be bound but nothing else runs per row.
+    fn isBody(store: []const u8, body: *const ast.Continuation, row_bind: []const u8) bool {
+        const node = body.node orelse return false;
+        const inv = switch (node) {
+            .invocation => |iv| iv,
+            else => return false,
+        };
+        if (!TakeScan.isTakeOn(store, &inv)) return false;
+        var addressed = false;
+        for (inv.args) |a| {
+            if (!std.mem.eql(u8, a.name, "expr")) continue;
+            const v = if (a.value.len >= 2 and a.value[0] == '"') a.value[1 .. a.value.len - 1] else a.value;
+            const lb = std.mem.indexOfScalar(u8, v, '[') orelse return false;
+            if (!std.mem.endsWith(u8, v, "]")) return false;
+            if (!std.mem.eql(u8, std.mem.trim(u8, v[0..lb], " "), store)) return false;
+            if (!std.mem.eql(u8, std.mem.trim(u8, v[lb + 1 .. v.len - 1], " "), row_bind)) return false;
+            addressed = true;
+        }
+        if (!addressed) return false;
+        for (body.continuations) |c| {
+            if (!std.mem.eql(u8, c.branch, "item") and !std.mem.eql(u8, c.branch, "empty")) return false;
+            if (c.node) |cn| {
+                if (cn != .terminal) return false;
+            }
+            if (c.kind != .terminal) return false;
+            if (c.continuations.len > 0 or c.condition != null or c.destructure.len > 0) return false;
+        }
+        return true;
+    }
+
+};

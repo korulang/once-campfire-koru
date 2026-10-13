@@ -1,0 +1,131 @@
+// Koru Standard Library: the `srefscan` part of store.kz.
+// Joined via `~part srefscan` in store.kz; merged into the module at load.
+
+const StoredScan = struct {
+    const stripQuotes = @import("emitter_helpers").stripQuotes;
+    const mkPathH2 = @import("emitter_helpers").mkPathH;
+    const isIdent = @import("emitter_helpers").isKebabIdentChar;
+    // Boundary-aware store-name rewrite: `game.entities` → the cell path,
+    // only where `game` is a whole identifier followed by a dot.
+    fn storeRefs(alloc: std.mem.Allocator, text: []const u8, name: []const u8, is_identity: bool) []const u8 {
+        const expr_ctx = ast_find.expressionMask(alloc, text);
+        var out = std.ArrayList(u8).initCapacity(alloc, text.len + 32) catch unreachable;
+        var i: usize = 0;
+        while (i < text.len) {
+            const at_boundary = ast_find.identBoundaryBefore(text, i);
+            const starts = at_boundary and (i == 0 or text[i - 1] != '.') and std.mem.startsWith(u8, text[i..], name);
+            const after = i + name.len;
+            if (starts and after < text.len and text[after] == '.') {
+                out.appendSlice(alloc, "__koru_store_") catch unreachable;
+                out.appendSlice(alloc, name) catch unreachable;
+                i += name.len;
+            } else if (is_identity and expr_ctx[i] and starts and
+                (after >= text.len or (!isIdent(text[after]) and text[after] != '[')))
+            {
+                // A ONE-column store read on the RHS of its own write:
+                // `stored { counter: counter + 2 }`. `[` is excluded so a row
+                // index (`todos[…]`) still takes the indexed path below.
+                out.appendSlice(alloc, "__koru_store_") catch unreachable;
+                out.appendSlice(alloc, name) catch unreachable;
+                out.append(alloc, '.') catch unreachable;
+                out.appendSlice(alloc, ast_find.STORE_IDENTITY_COLUMN) catch unreachable;
+                i += name.len;
+            } else {
+                out.append(alloc, text[i]) catch unreachable;
+                i += 1;
+            }
+        }
+        return out.toOwnedSlice(alloc) catch unreachable;
+    }
+    // Every store name visible in the program — untransformed creates plus
+    // generated apply events — so a row index / RHS can rewrite a FOREIGN
+    // singleton cell (`todos[ui.sel]` → `__koru_store_ui.sel`, 690_075).
+    fn allStoreNames(alloc: std.mem.Allocator, prog: *const ast_find.Program) []const []const u8 {
+        return storeAllNames(alloc, prog);
+    }
+    fn storeRefsAll(alloc: std.mem.Allocator, prog: *const ast_find.Program, text: []const u8) []const u8 {
+        var t = text;
+        for (allStoreNames(alloc, prog)) |nm| t = storeRefs(alloc, t, nm, isIdentityStore(alloc, prog, nm));
+        return t;
+    }
+    // `store[index].field` → SoA column read (690_076). Runs AFTER
+    // storeRefsAll so a cross-store index is already `__koru_store_ui.sel`.
+    //
+    // The rewriter itself is file scope (`storeIndexedRefs`), because a
+    // private helper struct inside a transform is a lowering boundary and
+    // `new`'s whole-program walk needs the same lowering (690_250/690_254).
+    // A `stored` site is emitted into the declaring module's own namespace,
+    // so every store reaches it unprefixed.
+    fn indexedFieldRefsAll(alloc: std.mem.Allocator, prog: *const ast_find.Program, text: []const u8) []const u8 {
+        return storeIndexedRefsIn(alloc, prog, text, storeScopeBare(alloc, prog));
+    }
+    fn lowerStoreExprs(alloc: std.mem.Allocator, prog: *const ast_find.Program, text: []const u8) []const u8 {
+        return indexedFieldRefsAll(alloc, prog, storeRefsAll(alloc, prog, text));
+    }
+    // The module a store was DECLARED in — where its generated accessors
+    // live. A write site in another module must call them there, not in
+    // its own namespace: store names are program-global but the accessors
+    // are emitted into the declaring module only (110_022). Same two-source
+    // shape as `fieldOrder`, so it answers under any transform order.
+    fn storeHomeModule(alloc: std.mem.Allocator, prog: *const ast_find.Program, store: []const u8) ?[]const u8 {
+        const apply_name = std.fmt.allocPrint(alloc, "__store_apply_{s}", .{store}) catch unreachable;
+        // Descends into `module_decl` for the same reason as `new`'s twin at
+        // the top of this file: a library declaring its own store writes the
+        // `new` inside the module, and a top-level-only search reports no
+        // home for precisely that case.
+        const Find = struct {
+            fn applyIn(its: []const ast_find.Item, want: []const u8) ??[]const u8 {
+                for (its) |*pi| {
+                    if (pi.* == .event_decl) {
+                        const ed = &pi.event_decl;
+                        if (ed.path.segments.len == 1 and std.mem.eql(u8, ed.path.segments[0], want)) {
+                            return ed.path.module_qualifier;
+                        }
+                    } else if (pi.* == .module_decl) {
+                        if (applyIn(pi.module_decl.items, want)) |hit| return hit;
+                    }
+                }
+                return null;
+            }
+            // `enclosing` is the containing module's LOGICAL name — see the
+            // twin of this helper at the top of the file.
+            fn newIn(its: []const ast_find.Item, want: []const u8, enclosing: ?[]const u8) ?[]const u8 {
+                for (its) |*pi| {
+                    if (pi.* == .flow) {
+                        const f = &pi.flow;
+                        const inv = f.inv();
+                        if (inv.path.segments.len == 1 and std.mem.eql(u8, inv.path.segments[0], "new")) {
+                            const mq = inv.path.module_qualifier orelse continue;
+                            if (std.mem.eql(u8, mq, "std.store")) {
+                                for (inv.args) |a| {
+                                    if (std.mem.eql(u8, a.name, "expr") and std.mem.eql(u8, stripQuotes(a.value), want)) {
+                                        return enclosing orelse f.module;
+                                    }
+                                }
+                            }
+                        }
+                    } else if (pi.* == .module_decl) {
+                        if (newIn(pi.module_decl.items, want, pi.module_decl.logical_name)) |m| return m;
+                    }
+                }
+                return null;
+            }
+        };
+        if (Find.applyIn(prog.items, apply_name)) |hit| return hit;
+        if (Find.newIn(prog.items, store, null)) |m| return m;
+        return null;
+    }
+    // Field order for a store, deterministic under any transform order.
+    // File-scope `storeFieldOrder` is THE answer; this copy had only two of
+    // its three sources and so declined to lower for a plural store whose
+    // `new` had run but whose apply event it could not see.
+    fn fieldOrder(alloc: std.mem.Allocator, prog: *const ast_find.Program, store: []const u8) ?[]const []const u8 {
+        return storeFieldOrder(alloc, prog, store);
+    }
+    /// Does this store name ONE column and no field? Then the store itself
+    /// is the lvalue and the synthesized column takes the value.
+    fn isIdentityStore(alloc: std.mem.Allocator, prog: *const ast_find.Program, store: []const u8) bool {
+        const order = fieldOrder(alloc, prog, store) orelse return false;
+        return order.len == 1 and std.mem.eql(u8, order[0], ast_find.STORE_IDENTITY_COLUMN);
+    }
+};

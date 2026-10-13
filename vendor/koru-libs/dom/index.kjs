@@ -1,0 +1,90 @@
+// koru/dom |js facet — the host bodies for the events declared in index.k.
+// Same facet layout the suite pins in 140_009/140_010: one stem, per-target
+// implementation files, merged at import.
+
+~proc run|js {
+    document.title = title;
+    document.addEventListener("click", (ev) => {
+        const el = ev.target.closest("[data-action]");
+        if (el === null) return;
+        const action = parseInt(el.getAttribute("data-action"), 10);
+        const idAttr = el.getAttribute("data-id");
+        const id = idAttr === null ? 0 : parseInt(idAttr, 10);
+        // WHERE the click landed, carried as a value rather than read back out
+        // of the page. The paint stashed the key on the element it created, so
+        // walking up to the nearest one that has it answers "which row" in a
+        // few parent steps — no attribute to parse, no document to search, and
+        // nothing the consumer had to write into its markup to make it work.
+        let owner = ev.target;
+        while (owner !== null && owner.__koru_key === undefined) owner = owner.parentNode;
+        click({ action: action, id: id, key: owner === null ? 0 : owner.__koru_key });
+    });
+}
+
+// The keyed element registry. A component declaring `key` records what it
+// painted; `drop` detaches it. This is the library's own book, never the
+// consumer's — an app using the markup surface writes no lookup code at all,
+// which is the difference between a DOM library and a DOM convention.
+//
+// Keyed by whatever the caller supplies. From a store that is a row HANDLE,
+// which survives compaction: `take` swap-removes the last row into the freed
+// slot, so a row's position changes under it while its handle does not.
+const __koru_dom_reg = new Map();
+
+// Both directions, because the paint is the one moment both are in hand.
+//
+// The map answers "which element does this key own" — that is what a repaint
+// and a drop need. The property on the element answers the inverse, "which key
+// painted this", which is what a CLICK needs, and recording it here is the
+// whole reason a consumer no longer has to write its rows' identity into the
+// page as text for the delegation to parse back out.
+//
+// The reference does exactly this and nothing more (`tr.data_id = data.id`,
+// vanillajs Main.js:352). An expando on a node the library created is not
+// state anyone else can collide with.
+function __koru_dom_track(key, node) {
+    __koru_dom_reg.set(key, node);
+    node.__koru_key = key;
+}
+
+// The library's HOST surface: host code in the same module addresses the
+// element a key owns, instead of searching the page for it.
+//
+// This exists because mutating text in place is still host work. A row's text
+// column can be READ from Koru but not EXTENDED — building "old + suffix"
+// needs an allocating string instance, since the cheap page-allocated form is
+// a read-only view, and on a hot path that is one allocation per row per
+// update. Until a text column can grow in place, the read-modify-write lives
+// here, and the only thing it needs from the library is WHICH element.
+//
+// Returns undefined for a key nothing was painted under; a caller that has a
+// live handle from the store cannot be in that position.
+function koruDomNode(key) {
+    return __koru_dom_reg.get(key);
+}
+
+~proc drop|js {
+    const node = __koru_dom_reg.get(key);
+    if (node === undefined) return;
+    __koru_dom_reg.delete(key);
+    if (node.parentNode !== null) node.parentNode.removeChild(node);
+}
+
+~proc drop-all|js {
+    // Per-node detach, deliberately. A "clear the whole container in one call"
+    // path was built and MEASURED AT ZERO: 17.1ms against 16.6ms without it.
+    // Reading why is the useful part — the container carries a whitespace text
+    // node from the page's own HTML, so the "do we own every child?" test never
+    // matched and the fast branch never ran once. It was dead code that
+    // benchmarked as noise.
+    //
+    // Making it fire would mean either taking nodes the library did not create
+    // (wrong: a container we do not wholly own is not ours to empty) or walking
+    // the children to partition them, which is the scan this whole design
+    // exists to delete. What remains is ~3.6ms of a thousand-row clear, and it
+    // is honest work: N nodes leave the page, so N detaches happen.
+    for (const node of __koru_dom_reg.values()) {
+        if (node.parentNode !== null) node.parentNode.removeChild(node);
+    }
+    __koru_dom_reg.clear();
+}

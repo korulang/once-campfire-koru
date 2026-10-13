@@ -1,0 +1,32 @@
+// Koru Standard Library: Reactive Stores — the `refhomeapi` part.
+// Joined via `~part refhomeapi` in store.kz; merged into the store
+// module at load.
+//
+// The cross-consumer entry point for ref(T) home enumeration: the
+// `qualifier:name` split lives here exactly once, then defers to
+// StoreRefHome.homes. Every consumer that materializes a `ref(T)` field
+// — a store's columns, a list's push — asks this one authority who the
+// homes are; the answer is a fact about the program, not the consumer.
+
+pub const RefHomeQuery = struct {
+    const ast = @import("ast");
+
+    /// The home set for a ref target spelled `ref(T)` or `ref(home:T)`.
+    /// `self_*` let the emitting store count itself (its own marker is
+    /// not written yet); a consumer that mints nothing passes "" and an
+    /// empty leaf set.
+    pub fn homesOf(alloc: std.mem.Allocator, prog: *const ast.Program, t: []const u8, scope_home: []const u8, self_name: []const u8, self_leaves: []const StoreRefHome.LeafSpec) [][]const u8 {
+        var home = scope_home;
+        var name = t;
+        if (std.mem.lastIndexOfScalar(u8, t, ':')) |ci| {
+            const qual = std.mem.trim(u8, t[0..ci], " \t");
+            name = std.mem.trim(u8, t[ci + 1 ..], " \t");
+            const dotted = alloc.dupe(u8, qual) catch unreachable;
+            for (dotted) |*c| {
+                if (c.* == '/') c.* = '.';
+            }
+            home = dotted;
+        }
+        return StoreRefHome.homes(alloc, prog, name, home, self_name, self_leaves);
+    }
+};

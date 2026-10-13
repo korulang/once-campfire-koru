@@ -1,0 +1,407 @@
+~[comptime]
+
+const std = @import("std");
+
+// ============================================================================
+// std/panic — program-wide answers to panic branches
+// ============================================================================
+// `?!` is the optional-to-handle branch kind: a caller that writes `| bad v |>`
+// answers it; a caller that doesn't gets a synthesized @panic at the site, and
+// --panic-branches=strict can enumerate every such site at compile time. Lazy
+// programs leave those holes; careful programs write forty identical arms.
+// std/panic is the third option: a spelled, pattern-scoped graft that supplies
+// the arm nobody wrote — the hole answered once instead of forty times, and
+// what it does not cover still crashes.
+//
+//     std/panic:catch(net:* -> oom)
+//     ! oom f when f.retryable |> backoff(f)
+//     ! oom f |> std/panic:die("unrecoverable")
+//
+// The parens expression is tap's selector grammar verbatim: `source` is a
+// tor-path glob (`risky`, `net:*`, `std.io:print.*`) selecting call sites;
+// `-> dest` is an optional panic-branch-name glob selecting which `?!`
+// outcomes. The `!` arms are effect branches — deliberately non-exhaustive:
+// each names a panic branch it answers, with `when` filters allowed. At every
+// matched site where that `?!` is unhandled, the arm body is grafted in as the
+// missing `|` arm (is_transformed_subtree — proven by std/control:capture).
+// If every grafted arm for a branch is guarded, a synthesized unguarded tail
+// arm re-panics at runtime: silence still means crash.
+//
+// Verdict discipline: a `?!` is the callee's terminal product — nothing
+// resumes it. The grafted arm IS the tail of the abandoned path, and its end
+// is the answer to "was the panic resolved": `=> name payload` forwards the
+// same outcome upward (not resolved — the frame above decides), `=> other`
+// resolves as a different declared outcome, `die` kills here, and a bare end
+// abandons the path. Abandonment is legal only where the path is allowed to
+// end: inside a producing flow (an impl that owes its caller an outcome), an
+// arm with a bare end would trade a loud crash for a dead path — so catch
+// refuses to graft it there unless every leaf ends in a verdict.
+//
+// What a catch can never do is quiet a crash it did not name.
+
+// ============================================================================
+// DIE - owned panic, one verb per target
+// ============================================================================
+// The synthesized hole's bodies are already per-target panic emission; die
+// makes that verb user-callable from inside a grafted arm (or anywhere).
+
+~[runtime] pub tor die { msg: string } -> noreturn
+
+~[runtime] proc die|zig {
+    std.debug.panic("{s}", .{msg});
+}
+
+// ============================================================================
+// CATCH - the site-pattern graft
+// ============================================================================
+
+~[comptime|transform]pub tor catch { expr: Expression, reporter: *std/compiler:ErrorReporter }
+
+~[transform]proc catch|zig {
+    const ast = @import("ast");
+    const ast_functional = @import("ast_functional");
+    const emitter_helpers = @import("emitter_helpers");
+    const errors = @import("errors");
+
+    if (item.* != .flow) @panic("panic catch: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    // ---- selector: "<src-glob>" or "<src-glob> -> <branch-glob>" ----
+    // Expression params ride invocation.args (never the Input struct) when a
+    // transform declares walker machinery — trellis reads args[0] the same way.
+    if (invocation.args.len == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU179, flow.location, flow.module, "std/panic:catch requires a site pattern: catch(<tor-or-glob> [-> <panic-branch-glob>])", .{}) } };
+    }
+    var raw = std.mem.trim(u8, invocation.args[0].value, " \t");
+    if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') raw = raw[1 .. raw.len - 1];
+    var source_pat: []const u8 = "*";
+    var dest_pat: []const u8 = "*";
+    const trimmed = raw;
+    if (std.mem.indexOf(u8, trimmed, "->")) |arrow| {
+        source_pat = std.mem.trim(u8, trimmed[0..arrow], " \t");
+        dest_pat = std.mem.trim(u8, trimmed[arrow + 2 ..], " \t");
+    } else {
+        source_pat = trimmed;
+    }
+    if (source_pat.len == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU179, flow.location, flow.module, "std/panic:catch requires a site pattern: catch(<tor-or-glob> [-> <panic-branch-glob>])", .{}) } };
+    }
+
+    // ---- collect `!` arms: each is one (branch-name, handler-body) offer ----
+    var arms = std.ArrayList(*const ast.Continuation){};
+    for (flow.body.continuations) |*c| {
+        if (c.kind != .effect) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU179, c.location, flow.module, "std/panic:catch takes `!` arms only - `! <panic-branch> [bind] [when <cond>] |> <body>`; `|` arms would claim exhaustiveness a pillow does not have", .{}) } };
+        }
+        arms.append(allocator, c) catch @panic("oom");
+    }
+    if (arms.items.len == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU179, flow.location, flow.module, "std/panic:catch({s}) declares no `!` arms - nothing to graft; a catch that answers nothing must not compile silently", .{raw}) } };
+    }
+
+    // ---- glob matcher (verbatim shape from std/taps) ----
+    const matchSegment = struct {
+        fn m(pattern: []const u8, value: []const u8) bool {
+            if (std.mem.eql(u8, pattern, "*")) return true;
+            if (std.mem.eql(u8, pattern, value)) return true;
+            if (pattern.len > 2 and pattern[0] == '*' and pattern[1] == '.') {
+                return std.mem.endsWith(u8, value, pattern[1..]);
+            }
+            if (pattern.len > 2 and pattern[pattern.len - 2] == '.' and pattern[pattern.len - 1] == '*') {
+                const prefix = pattern[0 .. pattern.len - 2];
+                return std.mem.startsWith(u8, value, prefix) and
+                    value.len > prefix.len and value[prefix.len] == '.';
+            }
+            if (pattern.len > 1 and pattern[pattern.len - 1] == '*') {
+                return std.mem.startsWith(u8, value, pattern[0 .. pattern.len - 1]);
+            }
+            return false;
+        }
+    }.m;
+
+    const pathMatches = struct {
+        fn m(pattern: []const u8, path: *const ast.DottedPath, fallback_module: ?[]const u8, alloc: std.mem.Allocator) bool {
+            if (std.mem.eql(u8, pattern, "*") or std.mem.eql(u8, pattern, "*:*")) return true;
+            const colon = std.mem.indexOfScalar(u8, pattern, ':');
+            const pat_mod = if (colon) |idx| pattern[0..idx] else null;
+            const pat_path = if (colon) |idx| pattern[idx + 1 ..] else pattern;
+            if (pat_mod) |pm| {
+                const pm_path = path.module_qualifier orelse fallback_module;
+                if (pm_path) |mq| {
+                    if (!matchSegment(pm, mq)) return false;
+                } else return false;
+            }
+            var len: usize = 0;
+            for (path.segments) |seg| len += seg.len + 1;
+            if (len > 0) len -= 1;
+            const path_str = alloc.alloc(u8, len) catch return false;
+            defer alloc.free(path_str);
+            var pos: usize = 0;
+            for (path.segments, 0..) |seg, i| {
+                if (i > 0) {
+                    path_str[pos] = '.';
+                    pos += 1;
+                }
+                @memcpy(path_str[pos .. pos + seg.len], seg);
+                pos += seg.len;
+            }
+            return matchSegment(pat_path, path_str);
+        }
+    }.m;
+
+    // ---- is this invocation path std/panic:die — the owned-death verdict? ----
+    const isDie = struct {
+        fn m(path: *const ast.DottedPath) bool {
+            const last = path.segments[path.segments.len - 1];
+            if (!std.mem.eql(u8, last, "die")) return false;
+            const q = path.module_qualifier orelse return true; // bare `die(...)` counts
+            return std.mem.eql(u8, q, "std.panic");
+        }
+    }.m;
+
+    // ---- leaf-verdict scan ----
+    // A leaf is a continuation with no children — the point where a path ends.
+    // Verdict leaves: `=>`/`->` produces (branch_constructor / expression at
+    // leaf), `@label` jumps (the fold's own exit analysis owns them), and
+    // die() (noreturn). Everything else — bare arm ends, `_`, void calls —
+    // abandons the path.
+    const Verdict = struct {
+        fn leaf(n: ?ast.Node) bool {
+            const node = n orelse return false;
+            return switch (node) {
+                .branch_constructor => true,
+                .label_jump => true,
+                .expression => true,
+                .invocation => |iv| isDie(&iv.path),
+                .label_with_invocation => |lwi| isDie(&lwi.invocation.path),
+                .conditional => |cd| branches: {
+                    for (cd.branches) |b| {
+                        if (!seq(b.body)) break :branches false;
+                    }
+                    break :branches true;
+                },
+                .foreach => |fe| branches: {
+                    for (fe.branches) |b| {
+                        if (!seq(b.body)) break :branches false;
+                    }
+                    break :branches true;
+                },
+                .switch_result => |sr| branches: {
+                    for (sr.branches) |b| {
+                        if (!seq(b.body)) break :branches false;
+                    }
+                    break :branches true;
+                },
+                .conditional_block => |cb| blk: {
+                    if (cb.nodes.len == 0) break :blk false;
+                    break :blk leaf(cb.nodes[cb.nodes.len - 1]);
+                },
+                else => false,
+            };
+        }
+
+        fn cont(c: *const ast.Continuation) bool {
+            if (c.continuations.len == 0) return leaf(c.node);
+            for (c.continuations) |*ch| {
+                if (!cont(ch)) return false;
+            }
+            return true;
+        }
+
+        // A sibling list is sequential steps on one path: leafless entries
+        // before the last are pass-through steps; only the last (and every
+        // nested dispatch's leaves) must carry a verdict.
+        fn seq(cs: []const ast.Continuation) bool {
+            if (cs.len == 0) return false;
+            for (cs, 0..) |*c, i| {
+                for (c.continuations) |*ch| {
+                    if (!cont(ch)) return false;
+                }
+                if (i == cs.len - 1 and c.continuations.len == 0 and !leaf(c.node)) return false;
+            }
+            return true;
+        }
+
+        // Does this flow owe its caller an outcome on every path?
+        fn producing(f: *const ast.Flow, prog: *const ast.Program) bool {
+            const impl_path = f.impl_of orelse return false;
+            const decl = emitter_helpers.findEventDeclByPath(prog.items, &impl_path) orelse return false;
+            return decl.branches.len > 0 or decl.return_type != null;
+        }
+    };
+
+    const Walker = struct {
+        alloc: std.mem.Allocator,
+        prog: *const ast.Program,
+        arm_list: []const *const ast.Continuation,
+        src: []const u8,
+        dst: []const u8,
+        grafts: usize = 0,
+        conflict: ?struct { site_file: []const u8, site_line: usize, branch: []const u8 } = null,
+        dead_end: ?struct { site_file: []const u8, site_line: usize, branch: []const u8 } = null,
+
+        fn walkItems(self: *@This(), items: []const ast.Item) void {
+            for (items) |*it| {
+                switch (it.*) {
+                    .flow => |*f| {
+                        // the flow head IS a call site — `risky(-1) | ok |>`
+                        // is a top-level statement flow, not a continuation
+                        const head = f.inv();
+                        self.trySite(f, &head.path, f.location, &f.body.continuations);
+                        self.walkConts(f, f.body.continuations);
+                    },
+                    .module_decl => |*mod| self.walkItems(mod.items),
+                    else => {},
+                }
+            }
+        }
+
+        fn walkConts(self: *@This(), f: *const ast.Flow, conts: []const ast.Continuation) void {
+            for (conts) |*cont| {
+                if (cont.node) |*nd| {
+                    switch (nd.*) {
+                        .invocation => |*iv| self.trySite(f, &iv.path, cont.location, &cont.continuations),
+                        .label_with_invocation => |*lwi| self.trySite(f, &lwi.invocation.path, cont.location, &cont.continuations),
+                        else => {},
+                    }
+                }
+                self.walkConts(f, cont.continuations);
+            }
+        }
+
+        // One dispatch position — flow head or nested call — owning a mutable
+        // continuation list (`slot` = f.body.continuations or cont.continuations).
+        fn trySite(self: *@This(), f: *const ast.Flow, path: *const ast.DottedPath, loc: errors.SourceLocation, slot: *const []const ast.Continuation) void {
+            const qual: ?[]const u8 = path.module_qualifier orelse if (f.module.len > 0) f.module else null;
+            if (qual) |q| {
+                if (std.mem.eql(u8, q, "std.panic")) return; // never pillow panic's own verbs
+            }
+            if (!pathMatches(self.src, path, qual, self.alloc)) return;
+            const decl = emitter_helpers.findEventDeclByPath(self.prog.items, path) orelse return;
+
+            // per-branch graft: every `!` arm whose name passes `dst` and names a
+            // declared `?!` on this tor offers itself when the site left it open
+            var handled_branches = std.StringHashMap(void).init(self.alloc);
+            var bi: usize = 0;
+            while (bi < self.arm_list.len) : (bi += 1) {
+                const arm = self.arm_list[bi];
+                if (!matchSegment(self.dst, arm.branch)) continue;
+                if (handled_branches.contains(arm.branch)) continue;
+                var declared = false;
+                for (decl.branches) |b| {
+                    if (b.is_panic and std.mem.eql(u8, b.name, arm.branch)) declared = true;
+                }
+                if (!declared) continue;
+
+                // coverage: a user arm for the same branch wins outright; a prior
+                // graft for it is a conflict — two pillows, one hole, refuse
+                var covered = false;
+                var covered_by_graft = false;
+                for (slot.*) |c| {
+                    if (c.kind == .terminal and !c.is_catchall and std.mem.eql(u8, c.branch, arm.branch)) {
+                        covered = true;
+                        covered_by_graft = c.is_transformed_subtree;
+                    }
+                    if (c.is_catchall) covered = true;
+                }
+                if (covered_by_graft) {
+                    if (self.conflict == null) {
+                        self.conflict = .{ .site_file = loc.file, .site_line = loc.line, .branch = arm.branch };
+                    }
+                    handled_branches.put(arm.branch, {}) catch @panic("oom");
+                    continue;
+                }
+                if (covered) {
+                    handled_branches.put(arm.branch, {}) catch @panic("oom");
+                    continue;
+                }
+
+                // verdict discipline: inside a producing flow every leaf of the
+                // grafted run must close the path — else crash trades for dead
+                // path and the fault only surfaces as a backend "implicit
+                // return" error about a function the author never wrote
+                if (Verdict.producing(f, self.prog)) {
+                    var arm_needs_verdict = false;
+                    for (self.arm_list) |sib| {
+                        if (!std.mem.eql(u8, sib.branch, arm.branch)) continue;
+                        if (!Verdict.cont(sib)) arm_needs_verdict = true;
+                    }
+                    if (arm_needs_verdict) {
+                        if (self.dead_end == null) {
+                            self.dead_end = .{ .site_file = loc.file, .site_line = loc.line, .branch = arm.branch };
+                        }
+                        handled_branches.put(arm.branch, {}) catch @panic("oom");
+                        continue;
+                    }
+                }
+
+                // graft this branch's full arm run in decl order (guards filter;
+                // contiguous arms on the same branch are one dispatch family)
+                var any_guarded = false;
+                var any_unguarded = false;
+                for (self.arm_list) |sib| {
+                    if (!std.mem.eql(u8, sib.branch, arm.branch)) continue;
+                    var grafted = ast_functional.cloneContinuation(self.alloc, sib) catch @panic("oom");
+                    grafted.kind = .terminal;
+                    grafted.is_transformed_subtree = true;
+                    grafted.location = loc;
+                    self.appendArm(slot, grafted) catch @panic("oom");
+                    if (grafted.condition == null) {
+                        any_unguarded = true;
+                    } else {
+                        any_guarded = true;
+                    }
+                    self.grafts += 1;
+                }
+
+                // all-guarded cover needs an honest else: guards failing at
+                // runtime must crash, not fall through an open switch
+                if (any_guarded and !any_unguarded) {
+                    const panic_text = std.fmt.allocPrint(
+                        self.alloc,
+                        "@panic(\\\"{s}: panic branch '{s}' - every std/panic arm's guard failed at runtime\\\");",
+                        .{ path.segments[path.segments.len - 1], arm.branch },
+                    ) catch @panic("oom");
+                    var fallback = ast_functional.cloneContinuation(self.alloc, self.arm_list[bi]) catch @panic("oom");
+                    fallback.kind = .terminal;
+                    fallback.binding = null;
+                    fallback.condition = null;
+                    fallback.condition_expr = null;
+                    fallback.destructure = &.{};
+                    fallback.is_transformed_subtree = true;
+                    fallback.location = loc;
+                    fallback.node = .{ .inline_code = panic_text };
+                    fallback.continuations = &.{};
+                    self.appendArm(slot, fallback) catch @panic("oom");
+                    self.grafts += 1;
+                }
+                handled_branches.put(arm.branch, {}) catch @panic("oom");
+            }
+        }
+
+        fn appendArm(self: *@This(), slot: *const []const ast.Continuation, grafted: ast.Continuation) !void {
+            const s = @constCast(slot);
+            const n = s.len;
+            const next = try self.alloc.alloc(ast.Continuation, n + 1);
+            @memcpy(next[0..n], s.*);
+            next[n] = grafted;
+            s.* = next;
+        }
+    };
+
+    var walker = Walker{ .alloc = allocator, .prog = program, .arm_list = arms.items, .src = source_pat, .dst = dest_pat };
+    walker.walkItems(program.items);
+
+    if (walker.conflict) |c| {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU179, flow.location, flow.module, "std/panic:catch({s}): panic branch '{s}' at {s}:{d} is already answered by another catch - two pillows, one hole; narrow a pattern or merge the arms", .{ raw, c.branch, c.site_file, c.site_line }) } };
+    }
+    if (walker.dead_end) |d| {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU179, flow.location, flow.module, "std/panic:catch({s}): the `! {s}` arm grafted at {s}:{d} would end a path that owes its caller an outcome - an absorb inside a producing flow must close with a verdict: `=> <branch>`, `-> <value>`, or std/panic:die", .{ raw, d.branch, d.site_file, d.site_line }) } };
+    }
+    if (walker.grafts == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU179, flow.location, flow.module, "std/panic:catch({s}) answered nothing - no unhandled ?! site matched; the pattern is stale or the problem is already solved", .{raw}) } };
+    }
+
+    // answered: the decl dissolves
+    return .{ .transformed = .{ .replacement = ast.Item{ .inline_code = ast.InlineCode{ .code = "", .location = flow.location, .module = flow.module } } } };
+}

@@ -1,0 +1,1442 @@
+// Koru Standard Library: Tor Taps
+// ==================================
+//
+// Observe event transitions without touching the flow being observed.
+//
+// A tap inserts a void call at the front of a matching continuation chain: the
+// bound value stays in scope, and the optimizer sees an ordinary step — so
+// observation lowers to a free, inline call rather than a runtime hook.
+//
+// USAGE (in `.kz`):
+//   import std/taps
+//
+//   // Observe a concrete source, bind its produced value, react:
+//   tap(compute -> *): v |> observed(value: v)
+//
+//   // Metatype branch (required for wildcard sources):
+//   tap(* -> *)
+//   | Profile p |> profiler(p)
+
+~[comptime]
+
+const std = @import("std");
+
+// Global counter to ensure metatype bindings remain unique across transform passes.
+var metatype_global_counter: usize = 0;
+
+// ============================================================================
+// TAP TRANSFORM
+// ============================================================================
+// When the compiler encounters tap(...), this transform:
+// 1. Parses the source/destination patterns
+// 2. Walks the program AST finding matching transitions
+// 3. Wraps matching continuations with the tap's void call
+// 4. Removes the tap declaration (it compiled away)
+
+~[keyword|comptime|transform]pub tor tap {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc tap|zig {
+    const ast = @import("ast");
+    const ast_functional = @import("ast_functional");
+    const errors = @import("errors");
+
+    // ========================================================================
+    // STEP 1: Extract tap configuration from the declaration
+    // ========================================================================
+
+    // Parse expr to extract source and destination
+    // Format: "source -> destination" (e.g., "hello -> *", "* -> *")
+    var source: []const u8 = "*";
+    var destination: []const u8 = "*";
+
+    if (std.mem.indexOf(u8, expr, "->")) |arrow_pos| {
+        source = std.mem.trim(u8, expr[0..arrow_pos], " \t");
+        destination = std.mem.trim(u8, expr[arrow_pos + 2..], " \t");
+    } else {
+        // No arrow, treat entire expr as source, destination = *
+        source = std.mem.trim(u8, expr, " \t");
+    }
+
+    // KEBAB-CANONICAL: names are bytes everywhere in the pipeline, so the tap
+    // pattern compares verbatim against tor names — `add-five -> *` matches
+    // the tor registered as `add-five`. No normalization on either side.
+
+    const tap_flow = if (item.* == .flow) &item.flow
+        else return .{};
+
+    if (tap_flow.body.continuations.len == 0) {
+        return .{};
+    }
+
+    // All tap branches - we support multiple handlers for same branch (fan-out)
+    var all_tap_branches = tap_flow.body.continuations;
+
+    // Bare-return tap surface: `tap(e -> *): v |> obs(v)` carries the value bind
+    // `v` on the tap flow HEAD (return_binding), while the observer sits on a
+    // void-branch (`branch == ""`) continuation with no binding. Lift `v` onto
+    // that continuation so the wrap path rewrites it like a branch tap's payload
+    // bind (to the source tor's produced value at the match site).
+    if (tap_flow.inv().return_binding) |head_bind| {
+        if (allocator.alloc(ast.Continuation, all_tap_branches.len) catch null) |patched| {
+            for (all_tap_branches, 0..) |tc, i| {
+                patched[i] = tc;
+                if (tc.branch.len == 0 and tc.binding == null) patched[i].binding = head_bind;
+            }
+            all_tap_branches = patched;
+        }
+    }
+
+    // Pattern matching config
+    // Any pattern with a glob wildcard (*) should be treated as wildcard
+    // (affects inserted invocation marking to prevent infinite recursion)
+    const source_is_wildcard = std.mem.eql(u8, source, "*") or std.mem.eql(u8, source, "*:*");
+    const dest_is_wildcard = std.mem.eql(u8, destination, "*") or std.mem.eql(u8, destination, "*:*");
+
+    // Check if any tap branch is a metatype (matches all source branches)
+    var is_metatype = false;
+    for (all_tap_branches) |*tc| {
+        if (std.mem.eql(u8, tc.branch, "Transition") or
+            std.mem.eql(u8, tc.branch, "Profile") or
+            std.mem.eql(u8, tc.branch, "Audit")) {
+            is_metatype = true;
+            break;
+        }
+    }
+
+    // Capture destination in a const for use inside Helper struct
+    // (Zig doesn't allow mutable vars to cross struct boundaries)
+    const dest_final = destination;
+
+    // ========================================================================
+    // STEP 2: Walk program, transform matching flows
+    // ========================================================================
+
+    const Helper = struct {
+        fn hasAnnotation(annotations: []const []const u8, name: []const u8) bool {
+            for (annotations) |ann| {
+                if (std.mem.eql(u8, ann, name)) return true;
+            }
+            return false;
+        }
+
+        fn hashBytes(base: usize, bytes: []const u8) usize {
+            var h = base;
+            for (bytes) |c| {
+                h = h *% 131 +% c;
+            }
+            return h;
+        }
+
+        fn hashLocation(loc: errors.SourceLocation) usize {
+            var h: usize = 0;
+            h = hashBytes(h, loc.file);
+            h = h *% 131 +% loc.line;
+            h = h *% 131 +% loc.column;
+            return h;
+        }
+
+        fn uniquifyMetatypeBindings(
+            alloc: std.mem.Allocator,
+            continuations: []const ast.Continuation,
+            metatype_counter: *usize,
+            tap_salt: usize,
+        ) ![]ast.Continuation {
+            var rewritten = try alloc.alloc(ast.Continuation, continuations.len);
+            for (continuations, 0..) |cont, i| {
+                var new_cont = cont;
+
+                if (cont.node) |step| {
+                    if (step == .metatype_binding) {
+                        const old_binding = step.metatype_binding.binding;
+                        const local_id = metatype_counter.*;
+                        metatype_counter.* += 1;
+                        var buf: [64]u8 = undefined;
+                        const new_binding = std.fmt.bufPrint(
+                            &buf,
+                            "_profile_{x}_{d}",
+                            .{ tap_salt, local_id },
+                        ) catch "_profile_0";
+                        var new_step = step;
+                        new_step.metatype_binding.binding = alloc.dupe(u8, new_binding) catch old_binding;
+                        new_cont.node = new_step;
+
+                        if (cont.condition) |cond| {
+                            new_cont.condition = try rewriteBindingInValue(alloc, cond, old_binding, new_binding);
+                        }
+                        if (cont.continuations.len > 0) {
+                            new_cont.continuations = try rewriteBindingInContinuations(
+                                alloc,
+                                cont.continuations,
+                                old_binding,
+                                new_binding,
+                            );
+                        }
+                    }
+                }
+
+                if (new_cont.continuations.len > 0) {
+                    new_cont.continuations = try uniquifyMetatypeBindings(
+                        alloc,
+                        new_cont.continuations,
+                        metatype_counter,
+                        tap_salt,
+                    );
+                }
+
+                rewritten[i] = new_cont;
+            }
+            return rewritten;
+        }
+
+        fn flowIsOpaque(flow: *const ast.Flow) bool {
+            return hasAnnotation(flow.annotations, "opaque");
+        }
+
+        fn continuationFromOpaqueTap(cont: *const ast.Continuation) bool {
+            if (cont.node) |step| {
+                return switch (step) {
+                    .invocation => |inv| inv.from_opaque_tap,
+                    .label_with_invocation => |lwi| lwi.invocation.from_opaque_tap,
+                    .metatype_binding => |mb| mb.from_opaque_tap,
+                    .conditional_block => |cb| cb.from_opaque_tap,
+                    else => false,
+                };
+            }
+            return false;
+        }
+
+        fn collectOpaqueEvents(
+            items: []const ast.Item,
+            alloc: std.mem.Allocator,
+            opaque_events: *std.StringHashMap(void),
+        ) !void {
+            for (items) |ast_item| {
+                switch (ast_item) {
+                    .event_decl => |event| {
+                        if (hasAnnotation(event.annotations, "opaque")) {
+                            const canonical = buildCanonicalName(alloc, &event.path, event.module) catch continue;
+                            if (opaque_events.contains(canonical)) {
+                                alloc.free(canonical);
+                            } else {
+                                try opaque_events.put(canonical, {});
+                            }
+                        }
+                    },
+                    .module_decl => |module| {
+                        try collectOpaqueEvents(module.items, alloc, opaque_events);
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        fn isEventOpaque(
+            opaque_events: *const std.StringHashMap(void),
+            path: *const ast.DottedPath,
+            containing_module: ?[]const u8,
+            alloc: std.mem.Allocator,
+        ) bool {
+            const canonical = buildCanonicalName(alloc, path, containing_module) catch return false;
+            defer alloc.free(canonical);
+            return opaque_events.contains(canonical);
+        }
+
+        // Match a segment with glob wildcard support
+        // Supports: exact match, full wildcard (*), prefix wildcard (*.foo), suffix wildcard (foo.*, foo*)
+        fn matchSegment(pattern: []const u8, value: []const u8) bool {
+            // Full wildcard matches anything
+            if (std.mem.eql(u8, pattern, "*")) return true;
+
+            // Exact match
+            if (std.mem.eql(u8, pattern, value)) return true;
+
+            // Prefix wildcard: *.io matches std.io, test.io
+            if (pattern.len > 2 and pattern[0] == '*' and pattern[1] == '.') {
+                const suffix = pattern[1..]; // includes the dot
+                return std.mem.endsWith(u8, value, suffix);
+            }
+
+            // Suffix wildcard with dot: file.* matches file.read, file.write
+            if (pattern.len > 2 and pattern[pattern.len - 2] == '.' and pattern[pattern.len - 1] == '*') {
+                const prefix = pattern[0 .. pattern.len - 2]; // excludes the .*
+                return std.mem.startsWith(u8, value, prefix) and
+                       value.len > prefix.len and value[prefix.len] == '.';
+            }
+
+            // Bare suffix wildcard: print* matches println, print, printf
+            if (pattern.len > 1 and pattern[pattern.len - 1] == '*') {
+                const prefix = pattern[0 .. pattern.len - 1]; // everything before *
+                return std.mem.startsWith(u8, value, prefix);
+            }
+
+            return false;
+        }
+
+        // Check if an tor path matches a pattern
+        // Pattern can be: "tor", "module:tor", or "module:path.to.tor"
+        // fallback_module: Used when path.module_qualifier is null (e.g., for flows declared in a module)
+        fn pathMatches(pattern: []const u8, is_wildcard: bool, path: *const ast.DottedPath, fallback_module: ?[]const u8, alloc: std.mem.Allocator) bool {
+            if (is_wildcard and (std.mem.eql(u8, pattern, "*") or std.mem.eql(u8, pattern, "*:*"))) return true;
+
+            // Check if pattern has module qualifier (contains :)
+            const pattern_colon = std.mem.indexOfScalar(u8, pattern, ':');
+            const pattern_module = if (pattern_colon) |idx| pattern[0..idx] else null;
+            const pattern_path = if (pattern_colon) |idx| pattern[idx + 1..] else pattern;
+
+            // Check module qualifier match (with glob support)
+            if (pattern_module) |pm| {
+                // Use explicit module_qualifier if present, otherwise fall back to containing module
+                const path_module = path.module_qualifier orelse fallback_module;
+                if (path_module) |mq| {
+                    if (!matchSegment(pm, mq)) return false;
+                } else {
+                    return false; // Pattern has module but path doesn't (and no fallback)
+                }
+            }
+
+            // Build path string for comparison (segments joined by .)
+            var len: usize = 0;
+            for (path.segments) |seg| len += seg.len + 1;
+            if (len > 0) len -= 1;
+
+            const path_str = alloc.alloc(u8, len) catch return false;
+            defer alloc.free(path_str);
+
+            var pos: usize = 0;
+            for (path.segments, 0..) |seg, i| {
+                if (i > 0) { path_str[pos] = '.'; pos += 1; }
+                @memcpy(path_str[pos..pos+seg.len], seg);
+                pos += seg.len;
+            }
+
+            // Use glob matching for path pattern (handles *, prefix.*, *.suffix, etc.)
+            return matchSegment(pattern_path, path_str);
+        }
+
+        // Rewrite binding references in a string value
+        // Handles both field access ("d.field" → "_tap_123.field")
+        // and bare identifiers ("d" → "_tap_123") for identity branches
+        fn rewriteBindingInValue(
+            alloc: std.mem.Allocator,
+            value: []const u8,
+            old_binding: []const u8,
+            new_binding: []const u8,
+        ) ![]const u8 {
+            var result = std.ArrayList(u8).initCapacity(alloc, value.len + new_binding.len * 2) catch unreachable;
+            errdefer result.deinit(alloc);
+
+            var i: usize = 0;
+            while (i < value.len) {
+                // Check if we're at the start of the old_binding
+                if (i + old_binding.len <= value.len and
+                    std.mem.eql(u8, value[i .. i + old_binding.len], old_binding))
+                {
+                    // Check that it's a word boundary (not part of a larger identifier)
+                    const at_start = (i == 0) or !isIdentChar(value[i - 1]);
+                    const at_end = (i + old_binding.len >= value.len) or !isIdentChar(value[i + old_binding.len]);
+
+                    if (at_start and at_end) {
+                        // Replace with new_binding
+                        result.appendSlice(alloc, new_binding) catch unreachable;
+                        i += old_binding.len;
+                        continue;
+                    }
+                }
+                // Copy character as-is
+                result.append(alloc, value[i]) catch unreachable;
+                i += 1;
+            }
+
+            return result.toOwnedSlice(alloc) catch unreachable;
+        }
+
+        // Check if character is a valid identifier character
+        fn isIdentChar(c: u8) bool {
+            return (c >= 'a' and c <= 'z') or
+                (c >= 'A' and c <= 'Z') or
+                (c >= '0' and c <= '9') or
+                c == '_';
+        }
+
+        // Rewrite binding references in a Step's invocation args
+        fn rewriteStepBinding(
+            alloc: std.mem.Allocator,
+            step: ast.Step,
+            old_binding: []const u8,
+            new_binding: []const u8,
+        ) !ast.Step {
+            if (step != .invocation) return step;
+
+            const inv = step.invocation;
+            const rewritten_args = alloc.alloc(ast.Arg, inv.args.len) catch unreachable;
+
+            for (inv.args, 0..) |arg, i| {
+                var new_arg = arg;
+                new_arg.value = try rewriteBindingInValue(alloc, arg.value, old_binding, new_binding);
+                rewritten_args[i] = new_arg;
+            }
+
+            var new_inv = inv;
+            new_inv.args = rewritten_args;
+            return ast.Step{ .invocation = new_inv };
+        }
+
+        // Rewrite binding references in invocation args (shared helper)
+        fn rewriteInvocationBinding(
+            alloc: std.mem.Allocator,
+            inv: ast.Invocation,
+            old_binding: []const u8,
+            new_binding: []const u8,
+        ) !ast.Invocation {
+            const rewritten_args = alloc.alloc(ast.Arg, inv.args.len) catch unreachable;
+
+            for (inv.args, 0..) |arg, i| {
+                var new_arg = arg;
+                new_arg.value = try rewriteBindingInValue(alloc, arg.value, old_binding, new_binding);
+                rewritten_args[i] = new_arg;
+            }
+
+            var new_inv = inv;
+            new_inv.args = rewritten_args;
+            // Transform-grafted generated code lives on the invocation
+            // (Invocation.inline_body — same encoding as a raw .inline_code
+            // node). Rewrite binding references in it too.
+            if (inv.inline_body) |ib| {
+                new_inv.inline_body = try rewriteBindingInValue(alloc, ib, old_binding, new_binding);
+            }
+            return new_inv;
+        }
+
+        // Rewrite binding references in a Step (invocations + label invocations)
+        fn rewriteStepBindingDeep(
+            alloc: std.mem.Allocator,
+            step: ast.Step,
+            old_binding: []const u8,
+            new_binding: []const u8,
+        ) !ast.Step {
+            switch (step) {
+                .invocation => {
+                    const new_inv = try rewriteInvocationBinding(alloc, step.invocation, old_binding, new_binding);
+                    return ast.Step{ .invocation = new_inv };
+                },
+                .label_with_invocation => {
+                    var lwi = step.label_with_invocation;
+                    lwi.invocation = try rewriteInvocationBinding(alloc, lwi.invocation, old_binding, new_binding);
+                    return ast.Step{ .label_with_invocation = lwi };
+                },
+                .label_jump => {
+                    var lj = step.label_jump;
+                    const rewritten_args = alloc.alloc(ast.Arg, lj.args.len) catch unreachable;
+                    for (lj.args, 0..) |arg, i| {
+                        var new_arg = arg;
+                        new_arg.value = try rewriteBindingInValue(alloc, arg.value, old_binding, new_binding);
+                        rewritten_args[i] = new_arg;
+                    }
+                    lj.args = rewritten_args;
+                    return ast.Step{ .label_jump = lj };
+                },
+                .inline_code => {
+                    const rewritten = try rewriteBindingInValue(alloc, step.inline_code, old_binding, new_binding);
+                    return ast.Step{ .inline_code = rewritten };
+                },
+                else => return step,
+            }
+        }
+
+        // Rewrite binding references in continuation tree (tap handler only)
+        fn rewriteBindingInContinuations(
+            alloc: std.mem.Allocator,
+            continuations: []const ast.Continuation,
+            old_binding: []const u8,
+            new_binding: []const u8,
+        ) ![]ast.Continuation {
+            var rewritten = try alloc.alloc(ast.Continuation, continuations.len);
+            for (continuations, 0..) |cont, i| {
+                var new_cont = cont;
+                if (cont.node) |step| {
+                    new_cont.node = try rewriteStepBindingDeep(alloc, step, old_binding, new_binding);
+                }
+                if (cont.condition) |cond| {
+                    new_cont.condition = try rewriteBindingInValue(alloc, cond, old_binding, new_binding);
+                }
+                if (cont.continuations.len > 0) {
+                    new_cont.continuations = try rewriteBindingInContinuations(
+                        alloc,
+                        cont.continuations,
+                        old_binding,
+                        new_binding,
+                    );
+                }
+                rewritten[i] = new_cont;
+            }
+            return rewritten;
+        }
+
+        fn cloneContinuationsDeep(
+            alloc: std.mem.Allocator,
+            continuations: []const ast.Continuation,
+        ) ![]ast.Continuation {
+            var cloned = try alloc.alloc(ast.Continuation, continuations.len);
+            for (continuations, 0..) |*cont, i| {
+                cloned[i] = try ast_functional.cloneContinuation(alloc, cont);
+            }
+            return cloned;
+        }
+
+        // Splice original flow into tap terminal points
+        fn spliceContinuations(
+            alloc: std.mem.Allocator,
+            tap_conts: []const ast.Continuation,
+            original_step: ?ast.Step,
+            original_conts: []const ast.Continuation,
+        ) ![]ast.Continuation {
+            var result = try alloc.alloc(ast.Continuation, tap_conts.len);
+            for (tap_conts, 0..) |*tc, i| {
+                var new_tc = tc.*;
+                // Terminal point if node is terminal (|> _) or null.
+                // A tap branch with no nested continuations implicitly passes through.
+                var is_pass_through = if (tc.node) |s| s == .terminal else true;
+                if (!is_pass_through and tc.continuations.len == 0) {
+                    is_pass_through = true;
+                }
+
+                if (is_pass_through) {
+                    new_tc.node = original_step;
+                    new_tc.continuations = try cloneContinuationsDeep(alloc, original_conts);
+                } else if (tc.continuations.len > 0) {
+                    new_tc.continuations = try spliceContinuations(alloc, tc.continuations, original_step, original_conts);
+                }
+                result[i] = new_tc;
+            }
+            return result;
+        }
+
+        // Wrap a continuation with a tap call
+        // Original: { branch, binding, step: X, continuations: [...] }
+        // Case A (Void Tap): | branch b |> TAP | "" |> X | [...]
+        // Case B (Spliced):  | branch b |> TAP | tap_br |> X | [...]
+        fn wrapContinuation(
+            alloc: std.mem.Allocator,
+            original: *const ast.Continuation,
+            original_id: usize,
+            tap_salt: usize,
+            metatype_counter: *usize,
+            tap_stp: ast.Step,
+            tap_conts: []const ast.Continuation,
+            tap_binding: ?[]const u8,  // The tap's binding (e.g., "f")
+            tap_condition: ?[]const u8,  // The tap's when clause condition (string)
+            tap_condition_expr: ?*ast.Expression,  // The tap's when clause parsed expression
+            mark_inserted: bool,  // Kept for API compatibility but no longer used - all invocations are marked
+            tap_is_opaque: bool,  // True if this tap has [opaque]
+            tap_branch: []const u8,  // The tap's branch (e.g., "Profile", "Transition", or regular branch)
+            source_event: ?[]const u8,  // Canonical source event for metatypes
+            source_produced: ?[]const u8,  // Bare-return source head's `: r` bind (the produced value in scope)
+        ) !ast.Continuation {
+            _ = mark_inserted;  // All invocations are now marked, so this parameter is unused
+            // Check if this is a metatype tap (Profile, Transition, Audit)
+            const is_metatype_tap = std.mem.eql(u8, tap_branch, "Profile") or
+                               std.mem.eql(u8, tap_branch, "Transition") or
+                               std.mem.eql(u8, tap_branch, "Audit");
+            var final_conts: []ast.Continuation = undefined;
+
+            // Rewrite tap step's binding references if needed
+            // e.g., "f.file.handle" → "_tap_0.file.handle" (using synthesized or original binding)
+            var rewritten_step = tap_stp;
+            var effective_binding = original.binding;
+            var rewritten_condition = tap_condition;
+            var metatype_unique_binding: ?[]const u8 = null;
+            var tap_conts_to_use = tap_conts;
+
+            // For metatype taps, always synthesize a unique binding name for the metatype struct.
+            // If the tap provides an explicit binding, rewrite references to use the unique binding.
+            if (is_metatype_tap) {
+                const local_id = metatype_counter.*;
+                metatype_counter.* += 1;
+                var buf: [80]u8 = undefined;
+                const synth_binding = std.fmt.bufPrint(
+                    &buf,
+                    "_profile_{x}_{x}_{d}",
+                    .{ tap_salt, original_id, local_id },
+                ) catch "_profile_0";
+                metatype_unique_binding = alloc.dupe(u8, synth_binding) catch null;
+                if (tap_binding != null and metatype_unique_binding != null) {
+                    const tb = tap_binding.?;
+                    const ub = metatype_unique_binding.?;
+                    rewritten_step = try rewriteStepBindingDeep(alloc, tap_stp, tb, ub);
+                    tap_conts_to_use = try rewriteBindingInContinuations(alloc, tap_conts, tb, ub);
+                    if (tap_condition) |cond| {
+                        rewritten_condition = try rewriteBindingInValue(alloc, cond, tb, ub);
+                    }
+                }
+            } else if (tap_binding != null and tap_branch.len == 0 and source_produced != null) {
+                // Bare-return tap (`tap(e -> *): v |> obs(v)`): the source `-> T`
+                // tor has no branch payload binding; its produced value is the
+                // source head's `: r` bind, already declared in scope. Rewrite the
+                // tap's `v` straight to that (`obs(value: v)` → `obs(value: r)`).
+                // No effective_binding synthesized — `r` already exists.
+                const tb = tap_binding.?;
+                const sp = source_produced.?;
+                rewritten_step = try rewriteStepBindingDeep(alloc, tap_stp, tb, sp);
+                tap_conts_to_use = try rewriteBindingInContinuations(alloc, tap_conts, tb, sp);
+                if (tap_condition) |cond| {
+                    rewritten_condition = try rewriteBindingInValue(alloc, cond, tb, sp);
+                }
+            } else if (tap_binding != null) {
+                const tb = tap_binding.?;
+                if (original.binding) |ob| {
+                    // If original binding is "_", synthesize a unique binding for the tap
+                    // This matches what auto-discharge does, allowing references to work
+                    if (std.mem.eql(u8, ob, "_")) {
+                        // Synthesize unique binding using hash of branch + indent + tap step path
+                        var hash: u32 = 0;
+                        for (original.branch) |c| hash = hash *% 31 +% c;
+                        hash = hash *% 31 +% @as(u32, @intCast(original.indent));
+                        if (tap_stp == .invocation) {
+                            for (tap_stp.invocation.path.segments) |seg| {
+                                for (seg) |c| hash = hash *% 31 +% c;
+                            }
+                        }
+                        var buf: [32]u8 = undefined;
+                        const synth_binding = std.fmt.bufPrint(&buf, "_tap_{d}", .{hash % 100000}) catch "_tap_0";
+                        effective_binding = alloc.dupe(u8, synth_binding) catch ob;
+                        rewritten_step = try rewriteStepBindingDeep(alloc, tap_stp, tb, effective_binding.?);
+                        tap_conts_to_use = try rewriteBindingInContinuations(alloc, tap_conts, tb, effective_binding.?);
+                        // Also rewrite the condition string
+                        if (tap_condition) |cond| {
+                            rewritten_condition = try rewriteBindingInValue(alloc, cond, tb, effective_binding.?);
+                        }
+                    } else {
+                        rewritten_step = try rewriteStepBindingDeep(alloc, tap_stp, tb, ob);
+                        tap_conts_to_use = try rewriteBindingInContinuations(alloc, tap_conts, tb, ob);
+                        // Also rewrite the condition string
+                        if (tap_condition) |cond| {
+                            rewritten_condition = try rewriteBindingInValue(alloc, cond, tb, ob);
+                        }
+                    }
+                } else {
+                    // Original has no binding (null), but tap uses one - synthesize a binding
+                    // This happens when original is `| done |> _` (no capture) but tap has `| done d when ... |>`
+                    // Use a hash that includes branch name, indent level, and location for uniqueness
+                    var hash: u32 = 0;
+                    for (original.branch) |c| hash = hash *% 31 +% c;
+                    hash = hash *% 31 +% @as(u32, @intCast(original.indent));
+                    // Also include tap step info for uniqueness (different invocations get different names)
+                    if (tap_stp == .invocation) {
+                        for (tap_stp.invocation.path.segments) |seg| {
+                            for (seg) |c| hash = hash *% 31 +% c;
+                        }
+                    }
+                    var buf: [32]u8 = undefined;
+                    const synth_binding = std.fmt.bufPrint(&buf, "_tap_{d}", .{hash % 100000}) catch "_tap_0";
+                    effective_binding = alloc.dupe(u8, synth_binding) catch null;
+                    if (effective_binding) |eb| {
+                        rewritten_step = try rewriteStepBindingDeep(alloc, tap_stp, tb, eb);
+                        tap_conts_to_use = try rewriteBindingInContinuations(alloc, tap_conts, tb, eb);
+                        // Also rewrite the condition string
+                        if (tap_condition) |cond| {
+                            rewritten_condition = try rewriteBindingInValue(alloc, cond, tb, eb);
+                        }
+                    }
+                }
+            }
+
+            if (tap_conts_to_use.len > 0) {
+                tap_conts_to_use = try uniquifyMetatypeBindings(
+                    alloc,
+                    tap_conts_to_use,
+                    metatype_counter,
+                    tap_salt,
+                );
+                // Case B: Splice original flow into tap's terminal points
+                // SPECIAL CASE: If original.node is metatype_binding (from a previous metatype tap)
+                // and this is NOT a metatype tap, skip wrapping entirely to preserve the profiler.
+                // Specific taps (like koru:end -> write_footer) won't fire when profiling is active,
+                // but the profiler will correctly capture all transitions.
+                if (original.node) |orig_step| {
+                    const orig_is_metatype = orig_step == .metatype_binding;
+                    if (orig_is_metatype and !is_metatype_tap) {
+                        // Already wrapped by metatype tap and we're not a metatype tap - skip wrapping
+                        // Return original unchanged to preserve the profiler's wrapping
+                        return original.*;
+                    } else {
+                        final_conts = try spliceContinuations(alloc, tap_conts_to_use, original.node, original.continuations);
+                    }
+                } else {
+                    final_conts = try spliceContinuations(alloc, tap_conts_to_use, original.node, original.continuations);
+                }
+            } else {
+                // Case A: Simple void tap, resume original flow on void branch ""
+                const inner_cont = try alloc.create(ast.Continuation);
+                inner_cont.* = ast.Continuation{
+                    .branch = "",           // Resume on void branch for void taps
+                    .binding = null,
+                    .binding_type = .branch_payload,
+                    .node = original.node,
+                    .continuations = original.continuations,
+                    .indent = original.indent,
+                    .condition = null,
+                    .condition_expr = null,
+                };
+                final_conts = try alloc.alloc(ast.Continuation, 1);
+                final_conts[0] = inner_cont.*;
+            }
+
+            // CRITICAL: Mark ALL tap-inserted invocations to prevent double-wrapping
+            // by transformNestedInvocations. Without this, non-wildcard taps like
+            // "koru:end -> * | done |> write_footer()" would have write_footer() wrapped
+            // AGAIN by the universal tap, causing duplicate profile/write_event calls.
+            if (rewritten_step == .invocation) {
+                var marked_inv = rewritten_step.invocation;
+                marked_inv.inserted_by_tap = true;
+                marked_inv.from_opaque_tap = tap_is_opaque;
+                rewritten_step = ast.Step{ .invocation = marked_inv };
+            } else if (rewritten_step == .label_with_invocation) {
+                var marked_lwi = rewritten_step.label_with_invocation;
+                marked_lwi.invocation.inserted_by_tap = true;
+                marked_lwi.invocation.from_opaque_tap = tap_is_opaque;
+                rewritten_step = ast.Step{ .label_with_invocation = marked_lwi };
+            }
+
+            // Add @scope annotation to mark this as a scope boundary for obligation tracking.
+            // Tap code runs in its own scope - it can observe but cannot satisfy outer obligations.
+            const scope_marks = alloc.alloc([]const u8, 1) catch unreachable;
+            scope_marks[0] = alloc.dupe(u8, "@scope") catch unreachable;
+
+            // For metatype taps, insert a metatype_binding step before the tap step
+            var actual_step = rewritten_step;
+            var actual_conts = final_conts;
+
+            if (is_metatype_tap) {
+                if (source_event) |src_event| {
+                    // Extract destination tor from ORIGINAL flow (not the tap handler!)
+                    // For profiling, we want to know where the flow goes next, not what the tap does
+                    var dest_event: ?[]const u8 = null;
+                    if (original.node) |step| {
+                        if (step == .invocation) {
+                            // The original flow's step IS the destination
+                            dest_event = buildCanonicalName(alloc, &step.invocation.path, null) catch null;
+                        }
+                    }
+
+                    // Create metatype_binding step (use unique binding name)
+                    // A bare return that produced a value (`source_produced`, the
+                    // head's `: r` bind) carried a payload across this transition —
+                    // naming it "__void" (the void-completion sentinel) lies in the
+                    // Profile record. The bare branch's name is "result", the same
+                    // vocabulary the tap registry tests and the 009/010 pins use.
+                    // Only a truly empty completion keeps "".
+                    const observed_branch = if (original.branch.len == 0 and source_produced != null)
+                        alloc.dupe(u8, "result") catch "result"
+                    else
+                        original.branch;
+                    const metatype_step = ast.Step{ .metatype_binding = .{
+                        .metatype = alloc.dupe(u8, tap_branch) catch tap_branch,
+                        .binding = metatype_unique_binding orelse tap_binding orelse "_metatype",
+                        .source_event = alloc.dupe(u8, src_event) catch src_event,
+                        .dest_event = dest_event,
+                        .branch = observed_branch,
+                        .inserted_by_tap = true,
+                        .from_opaque_tap = tap_is_opaque,
+                    } };
+
+                    // Create inner continuation that runs the tap step
+                    const inner_cont = try alloc.create(ast.Continuation);
+                    inner_cont.* = ast.Continuation{
+                        .branch = "",  // Void continuation (metatype_binding doesn't branch)
+                        .binding = null,
+                        .binding_type = .branch_payload,
+                        .node = rewritten_step,
+                        .continuations = final_conts,
+                        .indent = original.indent + 1,
+                        .condition = null,
+                        .condition_expr = null,
+                    };
+                    const inner_conts = try alloc.alloc(ast.Continuation, 1);
+                    inner_conts[0] = inner_cont.*;
+
+                    actual_step = metatype_step;
+                    actual_conts = inner_conts;
+                }
+            }
+
+            // Return wrapped continuation
+            // Use the TAP's when clause condition (rewritten to use effective binding)
+            return ast.Continuation{
+                .branch = original.branch,
+                .binding = effective_binding,
+                .binding_type = original.binding_type,
+                .binding_marks = scope_marks,
+                .node = actual_step,
+                .continuations = actual_conts,
+                .indent = original.indent,
+                .condition = rewritten_condition,
+                .condition_expr = tap_condition_expr,  // TODO: Rewrite expression tree too
+            };
+        }
+
+        /// Build canonical tor name from DottedPath (e.g., "input:hello" or "module:path.to.tor")
+        fn buildCanonicalName(alloc: std.mem.Allocator, path: *const ast.DottedPath, containing_module: ?[]const u8) ![]const u8 {
+            // Calculate length
+            var len: usize = 0;
+            const module = path.module_qualifier orelse containing_module orelse "input";
+            len += module.len + 1; // module:
+            for (path.segments, 0..) |seg, i| {
+                if (i > 0) len += 1; // .
+                len += seg.len;
+            }
+
+            // Build string
+            const result = try alloc.alloc(u8, len);
+            var pos: usize = 0;
+            @memcpy(result[pos..pos + module.len], module);
+            pos += module.len;
+            result[pos] = ':';
+            pos += 1;
+            for (path.segments, 0..) |seg, i| {
+                if (i > 0) { result[pos] = '.'; pos += 1; }
+                @memcpy(result[pos..pos + seg.len], seg);
+                pos += seg.len;
+            }
+            return result;
+        }
+
+        /// Transform continuations by wrapping with matching tap handlers
+        /// Supports multi-branch fan-out: multiple tap handlers for same branch all fire
+        fn transformContinuations(
+            alloc: std.mem.Allocator,
+            continuations: []const ast.Continuation,
+            tap_branches: []const ast.Continuation,  // ALL tap continuations
+            is_meta: bool,
+            source_pattern: []const u8,
+            source_wildcard: bool,
+            dest_pattern: []const u8,
+            dest_wildcard: bool,
+            force_dest_match: bool,
+            tap_salt: usize,
+            metatype_counter: *usize,
+            tap_is_opaque: bool,
+            current_source_path: *const ast.DottedPath,
+            containing_module: ?[]const u8,
+            current_source_is_opaque: bool,
+            opaque_events: *const std.StringHashMap(void),
+            source_produced: ?[]const u8,  // Bare-return source head's `: r` bind (produced value in scope at this level)
+        ) !struct { conts: []ast.Continuation, modified: bool, head_bind: ?[]const u8 = null } {
+            const source_event = buildCanonicalName(alloc, current_source_path, containing_module) catch null;
+            const source_matches = source_wildcard or pathMatches(
+                source_pattern, source_wildcard, current_source_path, containing_module, alloc
+            );
+            const allow_wrap_for_source = source_matches and !current_source_is_opaque;
+
+            // Coyote time: no continuations means terminal position (void destination).
+            // Treat this as a wildcard destination match and insert the tap.
+            if (continuations.len == 0) {
+                if ((!dest_wildcard and !force_dest_match) or !allow_wrap_for_source) {
+                    return .{ .conts = @constCast(continuations), .modified = false };
+                }
+
+                var terminal_cont = ast.Continuation{
+                    .branch = "",
+                    .binding = null,
+                    .binding_type = .branch_payload,
+                    .node = null,
+                    .continuations = &[_]ast.Continuation{},
+                    .indent = 0,
+                    .condition = null,
+                    .condition_expr = null,
+                };
+
+                var tap_inserted = false;
+                var synthesized_head_bind: ?[]const u8 = null;
+                const terminal_id = hashLocation(terminal_cont.location) ^
+                    @intFromPtr(continuations.ptr) ^
+                    @as(usize, continuations.len);
+                for (tap_branches) |*tap_cont| {
+                    const tap_step = tap_cont.node orelse continue;
+                    const tap_nested = tap_cont.continuations;
+                    const tap_binding = tap_cont.binding;
+                    const tap_condition = tap_cont.condition;
+                    const tap_condition_expr = tap_cont.condition_expr;
+
+                    // At terminal position (void tor at end of flow), only these taps should fire:
+                    // 1. Metatype taps (Profile/Transition/Audit) - observe any transition
+                    // 2. Void-branch taps (| |> with empty branch) - match void tor completion
+                    // Branch-specific taps (like | next v |>) should NOT fire because
+                    // "next" doesn't match a void tor's empty branch.
+                    const is_metatype_tap = std.mem.eql(u8, tap_cont.branch, "Profile") or
+                                           std.mem.eql(u8, tap_cont.branch, "Transition") or
+                                           std.mem.eql(u8, tap_cont.branch, "Audit");
+                    const is_void_branch_tap = tap_cont.branch.len == 0;
+                    if (!is_metatype_tap and !is_void_branch_tap) {
+                        // Skip non-matching taps at terminal position
+                        continue;
+                    }
+
+                    // A bare-return tap binding (`tap(e -> *): f |> obs(f.x)`)
+                    // needs the observed value IN SCOPE. When the source head
+                    // has no `: r` bind, a binding stamped on the void wrapper
+                    // continuation names nothing the emitter ever declares —
+                    // the tap step then references an undeclared identifier
+                    // (330_031). Mint the head's bind HERE and hand it to the
+                    // caller, which stamps it as the head invocation's
+                    // return_binding; the wrap rewrites the tap's references
+                    // to it via the source_produced path.
+                    var effective_source_produced = source_produced;
+                    if (!is_metatype_tap and tap_binding != null and source_produced == null) {
+                        var head_buf: [32]u8 = undefined;
+                        const head_name = std.fmt.bufPrint(&head_buf, "_tap_{d}", .{(tap_salt ^ terminal_id) % 100000}) catch "_tap_head";
+                        synthesized_head_bind = alloc.dupe(u8, head_name) catch null;
+                        effective_source_produced = synthesized_head_bind;
+                    }
+
+                    terminal_cont = try wrapContinuation(
+                        alloc,
+                        &terminal_cont,
+                        terminal_id,
+                        tap_salt,
+                        metatype_counter,
+                        tap_step,
+                        tap_nested,
+                        tap_binding,
+                        tap_condition,
+                        tap_condition_expr,
+                        source_wildcard,
+                        tap_is_opaque,
+                        tap_cont.branch,
+                        source_event,
+                        effective_source_produced,
+                    );
+                    tap_inserted = true;
+                    break;
+                }
+
+                if (!tap_inserted) {
+                    return .{ .conts = @constCast(continuations), .modified = false };
+                }
+
+                var result = try alloc.alloc(ast.Continuation, 1);
+                result[0] = terminal_cont;
+                return .{ .conts = result, .modified = true, .head_bind = synthesized_head_bind };
+            }
+
+            var new_conts = try alloc.alloc(ast.Continuation, continuations.len);
+            var any_modified = false;
+
+            for (continuations, 0..) |*cont, i| {
+                // Opaque instrumentation (profiler) is invisible to other opaque
+                // taps — but user-authored taps must still observe the transition
+                // (514 / 310_006 + --profile).
+                if (continuationFromOpaqueTap(cont) and tap_is_opaque) {
+                    new_conts[i] = cont.*;
+                    continue;
+                }
+
+                var this_cont = cont.*;
+                const is_explicit_terminal = if (cont.node) |step| step == .terminal else false;
+                if (is_explicit_terminal) {
+                    this_cont.node = null;
+                }
+
+                if (this_cont.node == null) {
+                    if ((!dest_wildcard and !force_dest_match) or !allow_wrap_for_source) {
+                        new_conts[i] = this_cont;
+                        continue;
+                    }
+
+                    // Check if any tap branch matches this terminal
+                    var tap_inserted = false;
+                    const cont_id = hashLocation(cont.location) ^ @intFromPtr(cont) ^ i;
+                    for (tap_branches) |*tap_cont| {
+                        const branch_matches = is_meta or std.mem.eql(u8, cont.branch, tap_cont.branch);
+                        if (!branch_matches) continue;
+
+                        const tap_step = tap_cont.node orelse continue;
+                        const tap_nested = tap_cont.continuations;
+                        const tap_binding = tap_cont.binding;
+                        const tap_condition = tap_cont.condition;
+                        const tap_condition_expr = tap_cont.condition_expr;
+
+                        // Use the same wrapper path as non-terminal continuations so
+                        // metatype bindings are rewritten consistently.
+                        new_conts[i] = try wrapContinuation(
+                            alloc,
+                            &this_cont,
+                            cont_id,
+                            tap_salt,
+                            metatype_counter,
+                            tap_step,
+                            tap_nested,
+                            tap_binding,
+                            tap_condition,
+                            tap_condition_expr,
+                            source_wildcard,
+                            tap_is_opaque,
+                            tap_cont.branch,
+                            source_event,
+                            source_produced,
+                        );
+                        any_modified = true;
+                        tap_inserted = true;
+                        break;  // Only insert first matching tap for terminals
+                    }
+
+                    if (!tap_inserted) {
+                        new_conts[i] = this_cont;
+                    }
+                    continue;
+                }
+
+                var dest_matches = dest_wildcard;
+                var dest_is_opaque = false;
+                var skip_wrap_for_tap = false;
+                var next_source_path = current_source_path;
+                var next_source_is_opaque = current_source_is_opaque;
+
+                if (cont.node) |step| {
+                    const maybe_inv: ?*const ast.Invocation = if (step == .invocation)
+                        &step.invocation
+                    else if (step == .label_with_invocation)
+                        &step.label_with_invocation.invocation
+                    else
+                        null;
+
+                    if (maybe_inv) |inv| {
+                        dest_matches = dest_wildcard or pathMatches(
+                            dest_pattern, dest_wildcard, &inv.path, containing_module, alloc
+                        );
+                        dest_is_opaque = isEventOpaque(opaque_events, &inv.path, containing_module, alloc);
+
+                        if (inv.inserted_by_tap and source_wildcard) {
+                            skip_wrap_for_tap = true;
+                        } else {
+                            next_source_path = &inv.path;
+                            next_source_is_opaque = dest_is_opaque;
+                        }
+                    } else if (source_wildcard) {
+                        switch (step) {
+                            .metatype_binding => |mb| {
+                                if (mb.inserted_by_tap) {
+                                    skip_wrap_for_tap = true;
+                                }
+                            },
+                            .conditional_block => |cb| {
+                                if (cb.inserted_by_tap) {
+                                    skip_wrap_for_tap = true;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                }
+
+                // Recurse before wrapping so nested transitions are transformed in-place.
+                // The produced value for the nested level is this step's bare-return
+                // bind (`step(): r |> ...`), so a deeper bare-return tap can reach it.
+                const next_source_produced: ?[]const u8 = if (this_cont.node) |s|
+                    (if (s == .invocation) s.invocation.return_binding
+                     else if (s == .label_with_invocation) s.label_with_invocation.invocation.return_binding
+                     else null)
+                else null;
+                // A bare-return (`-> r`) is a TERMINUS: no downstream. The wrap below
+                // observes it correctly — the tap fires on the continuation LEADING to
+                // the return. But recursing into its (always empty) tail trips the
+                // "no continuations => terminal position" void-completion wrap at the
+                // top of this fn, synthesizing a SECOND observer AFTER the return —
+                // unreachable code. Don't recurse past a terminus.
+                // Belief: concepts/frag-tap-observes-a-transition.md
+                const node_is_bare_return = if (this_cont.node) |s|
+                    (s == .branch_constructor and s.branch_constructor.is_bare_return)
+                else false;
+                // A terminus has no tail to transform, so skip the recursion for it
+                // entirely (recursing would trip the void-completion wrap — see above).
+                if (!node_is_bare_return) {
+                    const nested = try transformContinuations(
+                        alloc,
+                        this_cont.continuations,
+                        tap_branches,
+                        is_meta,
+                        source_pattern,
+                        source_wildcard,
+                        dest_pattern,
+                        dest_wildcard,
+                        false,
+                        tap_salt,
+                        metatype_counter,
+                        tap_is_opaque,
+                        next_source_path,
+                        containing_module,
+                        next_source_is_opaque,
+                        opaque_events,
+                        next_source_produced,
+                    );
+                    this_cont.continuations = nested.conts;
+                    if (nested.modified) any_modified = true;
+                    // The nested terminal path minted a head bind for a
+                    // bare-return tap on THIS step's result — stamp it as the
+                    // step invocation's return_binding so the emitter declares
+                    // the value the tap references (330_031).
+                    if (nested.head_bind) |hb| {
+                        if (this_cont.node) |s| {
+                            if (s == .invocation) {
+                                var new_inv = s.invocation;
+                                new_inv.return_binding = hb;
+                                this_cont.node = ast.Step{ .invocation = new_inv };
+                            } else if (s == .label_with_invocation) {
+                                var new_lwi = s.label_with_invocation;
+                                new_lwi.invocation.return_binding = hb;
+                                this_cont.node = ast.Step{ .label_with_invocation = new_lwi };
+                            }
+                        }
+                    }
+                }
+
+                const should_wrap = allow_wrap_for_source and (force_dest_match or dest_matches) and !dest_is_opaque and !skip_wrap_for_tap;
+                if (!should_wrap) {
+                    new_conts[i] = this_cont;
+                    continue;
+                }
+
+                // Find ALL matching tap branches for this continuation
+                // This enables fan-out: multiple handlers for same branch
+                var wrapped_cont = this_cont;
+                var wrap_count: usize = 0;
+
+                const cont_id = hashLocation(cont.location) ^ @intFromPtr(cont) ^ i;
+                for (tap_branches) |*tap_cont| {
+                    const branch_matches = is_meta or std.mem.eql(u8, cont.branch, tap_cont.branch);
+                    if (!branch_matches) continue;
+
+                    const tap_step = tap_cont.node orelse continue;
+                    const tap_nested = tap_cont.continuations;
+                    const tap_binding = tap_cont.binding;
+                    const tap_condition = tap_cont.condition;
+                    const tap_condition_expr = tap_cont.condition_expr;
+
+                    // Wrap with this tap handler (chain multiple wraps)
+                    wrapped_cont = try wrapContinuation(
+                        alloc,
+                        &wrapped_cont,
+                        cont_id,
+                        tap_salt,
+                        metatype_counter,
+                        tap_step,
+                        tap_nested,
+                        tap_binding,
+                        tap_condition,
+                        tap_condition_expr,
+                        source_wildcard,
+                        tap_is_opaque,
+                        tap_cont.branch,
+                        source_event,
+                        source_produced,
+                    );
+                    wrap_count += 1;
+                }
+
+                if (wrap_count > 0) {
+                    new_conts[i] = wrapped_cont;
+                    any_modified = true;
+                } else {
+                    new_conts[i] = this_cont;
+                }
+            }
+
+            return .{ .conts = new_conts, .modified = any_modified };
+        }
+
+        fn transformNestedInvocations(
+            alloc: std.mem.Allocator,
+            continuations: []const ast.Continuation,
+            source_pattern: []const u8,
+            source_wildcard: bool,
+            dest_pattern: []const u8,
+            dest_wildcard: bool,
+            tap_salt: usize,
+            metatype_counter: *usize,
+            tap_is_opaque: bool,
+            current_source_path: *const ast.DottedPath,
+            containing_module: ?[]const u8,
+            current_source_is_opaque: bool,
+            opaque_events: *const std.StringHashMap(void),
+            tap_branches: []const ast.Continuation,  // ALL tap continuations
+            is_meta: bool,
+        ) !struct { conts: []ast.Continuation, modified: bool, head_bind: ?[]const u8 = null } {
+            const inner = try transformContinuations(
+                alloc,
+                continuations,
+                tap_branches,
+                is_meta,
+                source_pattern,
+                source_wildcard,
+                dest_pattern,
+                dest_wildcard,
+                false,
+                tap_salt,
+                metatype_counter,
+                tap_is_opaque,
+                current_source_path,
+                containing_module,
+                current_source_is_opaque,
+                opaque_events,
+                null,
+            );
+            return .{ .conts = inner.conts, .modified = inner.modified, .head_bind = inner.head_bind };
+        }
+    };
+
+    const tap_is_opaque = Helper.hasAnnotation(tap_flow.annotations, "opaque");
+
+    var opaque_events = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = opaque_events.keyIterator();
+        while (it.next()) |key| {
+            allocator.free(key.*);
+        }
+        opaque_events.deinit();
+    }
+    Helper.collectOpaqueEvents(program.items, allocator, &opaque_events) catch unreachable;
+    const tap_salt = Helper.hashLocation(tap_flow.location);
+    const metatype_counter = &metatype_global_counter;
+
+    // Build new program with transformed flows
+    var new_items = std.ArrayList(ast.Item).initCapacity(allocator, program.items.len) catch unreachable;
+    var any_tap_inserted = false;
+
+    for (program.items) |*prog_item| {
+        // Skip the tap declaration itself (it compiles away)
+        if (prog_item == item) continue;
+
+        if (prog_item.* == .flow) {
+            const flow = &prog_item.flow;
+            var flow_modified = false;
+            var new_continuations = flow.body.continuations;
+
+            if (Helper.flowIsOpaque(flow)) {
+                new_items.append(allocator, ast_functional.cloneItem(allocator, prog_item) catch unreachable) catch unreachable;
+                continue;
+            }
+
+            const invoked_is_opaque = Helper.isEventOpaque(&opaque_events, &flow.inv().path, flow.module, allocator);
+            const force_dest_match = source_is_wildcard and Helper.pathMatches(
+                dest_final,
+                dest_is_wildcard,
+                &flow.inv().path,
+                flow.module,
+                allocator,
+            );
+            const result = Helper.transformContinuations(
+                allocator,
+                flow.body.continuations,
+                all_tap_branches,
+                is_metatype,
+                source,
+                source_is_wildcard,
+                dest_final,
+                dest_is_wildcard,
+                force_dest_match,
+                tap_salt,
+                metatype_counter,
+                tap_is_opaque,
+                &flow.inv().path,
+                flow.module,
+                invoked_is_opaque,
+                &opaque_events,
+                flow.inv().return_binding,
+            ) catch unreachable;
+
+            if (result.modified) {
+                new_continuations = Helper.uniquifyMetatypeBindings(
+                    allocator,
+                    result.conts,
+                    metatype_counter,
+                    tap_salt,
+                ) catch unreachable;
+                flow_modified = true;
+            }
+
+            if (flow_modified) {
+                // A bare-return tap on an unbound head minted the head's bind
+                // (330_031) — stamp it so the emitter declares the observed
+                // value the tap step references.
+                var head_inv = flow.inv().*;
+                if (result.head_bind) |hb| head_inv.return_binding = hb;
+                // Create modified flow
+                const new_flow = ast.Flow{
+                    .body = ast.rootSite(head_inv, new_continuations, flow.location),
+                    .annotations = flow.annotations,
+                    .pre_label = flow.pre_label,
+                    .super_shape = flow.super_shape,
+                    .inline_body = flow.inline_body,
+                    .is_pure = flow.is_pure,
+                    .is_transitively_pure = flow.is_transitively_pure,
+                    .location = flow.location,
+                    .module = flow.module,
+                    .impl_of = flow.impl_of,
+                };
+                new_items.append(allocator, ast.Item{ .flow = new_flow }) catch unreachable;
+                any_tap_inserted = true;
+            } else {
+                new_items.append(allocator, ast_functional.cloneItem(allocator, prog_item) catch unreachable) catch unreachable;
+            }
+        } else if (prog_item.* == .module_decl) {
+            // Handle imported modules - must descend to remove tap and transform flows
+            const module = &prog_item.module_decl;
+
+            // System modules: don't transform their flows, but DO remove the tap declaration
+            // The tap itself must be removed to prevent infinite loops, even in system modules
+            const is_std_module = std.mem.startsWith(u8, module.logical_name, "std.") or
+                                  std.mem.eql(u8, module.logical_name, "koru");
+            if (module.is_system or is_std_module) {
+                // Check if this module contains the tap we're processing
+                var contains_tap = false;
+                for (module.items) |*mod_item| {
+                    if (mod_item == item) {
+                        contains_tap = true;
+                        break;
+                    }
+                }
+
+                if (contains_tap) {
+                    // Clone module BUT remove the tap
+                    var new_mod_items = std.ArrayList(ast.Item).initCapacity(allocator, module.items.len) catch unreachable;
+                    for (module.items) |*mod_item| {
+                        if (mod_item == item) continue; // Remove the tap
+                        new_mod_items.append(allocator, ast_functional.cloneItem(allocator, mod_item) catch unreachable) catch unreachable;
+                    }
+                    const new_module = ast.ModuleDecl{
+                        .logical_name = allocator.dupe(u8, module.logical_name) catch unreachable,
+                        .canonical_path = allocator.dupe(u8, module.canonical_path) catch unreachable,
+                        .items = new_mod_items.toOwnedSlice(allocator) catch unreachable,
+                        .is_system = module.is_system,
+                        .location = module.location,
+                    };
+                    new_items.append(allocator, ast.Item{ .module_decl = new_module }) catch unreachable;
+                } else {
+                    // No tap in this module, just clone it
+                    new_items.append(allocator, ast_functional.cloneItem(allocator, prog_item) catch unreachable) catch unreachable;
+                }
+                continue;
+            }
+
+            var new_mod_items = std.ArrayList(ast.Item).initCapacity(allocator, module.items.len) catch unreachable;
+
+            for (module.items) |*mod_item| {
+                // Skip the tap if it's in this module
+                if (mod_item == item) {
+                    continue;
+                }
+
+                if (mod_item.* == .flow) {
+                    const flow = &mod_item.flow;
+                    var flow_modified = false;
+                    var new_continuations = flow.body.continuations;
+
+                    if (Helper.flowIsOpaque(flow)) {
+                        new_mod_items.append(allocator, ast_functional.cloneItem(allocator, mod_item) catch unreachable) catch unreachable;
+                        continue;
+                    }
+
+                    const invoked_is_opaque = Helper.isEventOpaque(&opaque_events, &flow.inv().path, flow.module, allocator);
+                    const force_dest_match = source_is_wildcard and Helper.pathMatches(
+                        dest_final,
+                        dest_is_wildcard,
+                        &flow.inv().path,
+                        flow.module,
+                        allocator,
+                    );
+                    const result = Helper.transformContinuations(
+                        allocator,
+                        flow.body.continuations,
+                        all_tap_branches,
+                        is_metatype,
+                        source,
+                        source_is_wildcard,
+                        dest_final,
+                        dest_is_wildcard,
+                        force_dest_match,
+                        tap_salt,
+                        metatype_counter,
+                        tap_is_opaque,
+                        &flow.inv().path,
+                        flow.module,
+                        invoked_is_opaque,
+                        &opaque_events,
+                        flow.inv().return_binding,
+                    ) catch unreachable;
+
+                    if (result.modified) {
+                        new_continuations = Helper.uniquifyMetatypeBindings(
+                            allocator,
+                            result.conts,
+                            metatype_counter,
+                            tap_salt,
+                        ) catch unreachable;
+                        flow_modified = true;
+                    }
+
+                    if (flow_modified) {
+                        // Same head-bind stamp as the top-level flow site
+                        // (330_031): a bare-return tap on an unbound head.
+                        var head_inv = flow.inv().*;
+                        if (result.head_bind) |hb| head_inv.return_binding = hb;
+                        const new_flow = ast.Flow{
+                            .body = ast.rootSite(head_inv, new_continuations, flow.location),
+                            .annotations = flow.annotations,
+                            .pre_label = flow.pre_label,
+                            .super_shape = flow.super_shape,
+                            .inline_body = flow.inline_body,
+                            .is_pure = flow.is_pure,
+                            .is_transitively_pure = flow.is_transitively_pure,
+                            .location = flow.location,
+                            .module = flow.module,
+                            .impl_of = flow.impl_of,
+                        };
+                        new_mod_items.append(allocator, ast.Item{ .flow = new_flow }) catch unreachable;
+                        any_tap_inserted = true;
+                    } else {
+                        new_mod_items.append(allocator, ast_functional.cloneItem(allocator, mod_item) catch unreachable) catch unreachable;
+                    }
+                } else {
+                    new_mod_items.append(allocator, ast_functional.cloneItem(allocator, mod_item) catch unreachable) catch unreachable;
+                }
+            }
+
+            // Create new module_decl with updated items
+            const new_module = ast.ModuleDecl{
+                .logical_name = allocator.dupe(u8, module.logical_name) catch unreachable,
+                .canonical_path = allocator.dupe(u8, module.canonical_path) catch unreachable,
+                .items = new_mod_items.toOwnedSlice(allocator) catch unreachable,
+                .is_system = module.is_system,
+                .annotations = module.annotations,
+                .location = module.location,
+            };
+            new_items.append(allocator, ast.Item{ .module_decl = new_module }) catch unreachable;
+        } else {
+            new_items.append(allocator, ast_functional.cloneItem(allocator, prog_item) catch unreachable) catch unreachable;
+        }
+    }
+
+    // ========================================================================
+    // STEP 3: Return transformed program (tap declaration removed)
+    // ========================================================================
+
+    var new_annotations = allocator.alloc([]const u8, program.module_annotations.len) catch unreachable;
+    for (program.module_annotations, 0..) |ann, i| {
+        new_annotations[i] = allocator.dupe(u8, ann) catch unreachable;
+    }
+
+    const new_program = allocator.create(ast.Program) catch unreachable;
+    new_program.* = ast.Program{
+        .items = new_items.toOwnedSlice(allocator) catch unreachable,
+        .module_annotations = new_annotations,
+        .main_module_name = allocator.dupe(u8, program.main_module_name) catch unreachable,
+        .allocator = allocator,
+    };
+
+    return .{ .whole_program = new_program };
+}

@@ -1,0 +1,175 @@
+// Koru Standard Library: the `hostverbs` part of bridge — the session-
+// level verbs the interpreter dispatches when the scope's own dispatcher
+// denies: `vocabulary`, `grammar`, and `bind`, plus the tor surfaces
+// that render the same text to host callers. Joined via `~part hostverbs`
+// in bridge.kz; merged into the bridge module at load.
+
+// ============================================================================
+// VOCABULARY - the derived prompt, session-shaped
+// ============================================================================
+//
+// `std/runtime:scope-vocabulary` renders a scope's COMPILED tors — the
+// base vocabulary the program was built with. This tor grows that with the
+// session's DEFINED flows, so the prompt walks the whole environment a REPL
+// accumulates: compiled scopes plus the verbs the agent invented on earlier
+// turns. That visibility is the second half of the R1 claim — an invention
+// the agent never sees in its own prompt is an invention it will not use.
+//
+// The same arena discipline as scope-vocabulary: the returned string is
+// page-backed and intentionally never freed, because it must outlive this
+// call and land in the caller's prompt buffer.
+
+~pub tor vocabulary { br: *Bridge<session> }
+| ok string
+| not-found string
+
+~proc vocabulary|zig {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const allocator = arena_state.allocator();
+    const text = renderVocabulary(allocator, br.scope, br.defined, br.introspection, br.session_env)
+        orelse return .{ .not_found = br.scope };
+    return .{ .ok = text };
+}
+
+// The render both surfaces share — the `vocabulary` tor for host callers and
+// the `vocabulary()` wire verb agree byte-for-byte: compiled scope, the
+// granted host verbs (so the session's answer is self-describing), then the
+// session's own inventions, one line each: `name(param: type<!phantom>, ...)`.
+fn renderVocabulary(allocator: std.mem.Allocator, scope: []const u8, defined: ?*DefinedFlows, introspection: bool, session_env: ?*Environment) ?[]const u8 {
+    const rt = @import("root").koru_std.koru_runtime;
+    var out = std.ArrayList(u8).initCapacity(allocator, 256) catch unreachable;
+
+    switch (rt.scope_vocabulary_event.handler(.{ .name = scope })) {
+        .ok => |v| out.appendSlice(allocator, v) catch unreachable,
+        .not_found => return null,
+    }
+
+    if (introspection) {
+        if (out.items.len > 0) out.append(allocator, '\n') catch unreachable;
+        out.appendSlice(allocator, introspection_verbs) catch unreachable;
+    }
+    appendDefinedLines(&out, allocator, defined);
+    appendBoundLines(&out, allocator, session_env);
+
+    return out.toOwnedSlice(allocator) catch unreachable;
+}
+
+// Bound session values — the names a turn may reference. One line each:
+// `r3 {user_id, name}` — the binding and the fields it carries, so the
+// agent sees both that `r3` exists and what `r3.<field>` may name.
+fn appendBoundLines(out: *std.ArrayList(u8), allocator: std.mem.Allocator, session_env: ?*Environment) void {
+    const se = session_env orelse return;
+    var it = se.bindings.iterator();
+    while (it.next()) |entry| {
+        if (out.items.len > 0) out.append(allocator, '\n') catch unreachable;
+        out.appendSlice(allocator, entry.key_ptr.*) catch unreachable;
+        const fields = entry.value_ptr.fields;
+        if (fields.len == 0) continue;
+        // `__type_ref` is the datum itself — list only the addressable fields.
+        var listed = false;
+        for (fields) |f| {
+            if (std.mem.eql(u8, f.name, "__type_ref")) continue;
+            if (!listed) {
+                out.appendSlice(allocator, " {") catch unreachable;
+                listed = true;
+            } else out.appendSlice(allocator, ", ") catch unreachable;
+            out.appendSlice(allocator, f.name) catch unreachable;
+        }
+        if (listed) out.append(allocator, '}') catch unreachable;
+    }
+}
+
+// `appendDefinedLines` — the invented-verbs render, with each flow's
+// declared outcome contract — lives in bridge.deflines.kz (the `deflines`
+// part), shared with the affordances render.
+
+// ============================================================================
+// GRAMMAR - the derived prompt, complete: the wire's rules + the session's
+// whole vocabulary
+// ============================================================================
+//
+// `std/runtime:scope-grammar` renders the wire's shape rules above the
+// scope's COMPILED verbs. The prompt an agent actually lives under needs one
+// more thing: the session's DEFINED flows, the verbs it invented on earlier
+// turns. This render is that whole surface — rules, compiled base, and
+// inventions, one string — so the agent's prompt is the register block plus
+// its own growth, and nothing hand-typed. A turn judged by the wire gate
+// (parse.wire, in `run` above) and a prompt built from this render are the
+// same declaration read twice.
+
+~pub tor grammar { br: *Bridge<session> }
+| ok string
+| not-found string
+
+~proc grammar|zig {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const allocator = arena_state.allocator();
+    const text = renderGrammar(allocator, br.scope, br.defined, br.introspection, br.session_env)
+        orelse return .{ .not_found = br.scope };
+    return .{ .ok = text };
+}
+
+fn renderGrammar(allocator: std.mem.Allocator, scope: []const u8, defined: ?*DefinedFlows, introspection: bool, session_env: ?*Environment) ?[]const u8 {
+    const rt = @import("root").koru_std.koru_runtime;
+    var out = std.ArrayList(u8).initCapacity(allocator, 512) catch unreachable;
+
+    switch (rt.scope_grammar_event.handler(.{ .name = scope })) {
+        .ok => |g| out.appendSlice(allocator, g) catch unreachable,
+        .not_found => return null,
+    }
+
+    if (introspection) {
+        out.append(allocator, '\n') catch unreachable;
+        out.appendSlice(allocator, introspection_verbs) catch unreachable;
+    }
+    // The session's inventions, same as `vocabulary` renders them.
+    appendDefinedLines(&out, allocator, defined);
+    appendBoundLines(&out, allocator, session_env);
+
+    return out.toOwnedSlice(allocator) catch unreachable;
+}
+
+// ============================================================================
+// HOST VERBS - introspection as ordinary wire calls
+// ============================================================================
+//
+// `vocabulary()` and `grammar()` on the wire are not register-block verbs and
+// not a protocol side channel: they are host-provided verbs, granted per
+// session by `create(introspection: true)` and consulted by the interpreter
+// only when the scope's dispatcher denies — so a scope verb or a `define`d
+// verb of the same name always outranks them, and an ungranted session hears
+// event-denied exactly as for a forged word. Their answer is the live
+// session: the compiled scope, the granted host verbs themselves, and every
+// verb the session has invented.
+
+const Interp = @import("root").koru_std.koru_interpreter;
+
+pub fn hostDispatch(
+    name: []const u8,
+    inv: *const Interp.Invocation,
+    view: *const Interp.HostView,
+    out: *Interp.DispatchResult,
+) anyerror!void {
+    if (hostInputLookup(name) == null) return error.EventDenied;
+    const is_vocab = std.mem.eql(u8, name, "vocabulary");
+    const is_bind = std.mem.eql(u8, name, "bind");
+    const is_note = std.mem.eql(u8, name, "note");
+    if (is_bind) return hostBind(view, inv, out);
+    if (is_note) return hostNote(view, inv, out);
+    if (inv.args.len != 0) {
+        view.error_detail.* = std.fmt.allocPrint(view.allocator,
+            "'{s}' takes no fields — call it bare: {s}()", .{ name, name })
+            catch "'vocabulary'/'grammar' take no fields";
+        return error.DispatchFailed;
+    }
+    const text = (if (is_vocab)
+        renderVocabulary(view.allocator, view.scope_name, view.defined, true, view.session_env)
+    else
+        renderGrammar(view.allocator, view.scope_name, view.defined, true, view.session_env)) orelse {
+            view.error_detail.* = "host verb on a scope the registry does not know";
+            return error.DispatchFailed;
+        };
+    const S = struct { threadlocal var field_buf: [1]Interp.NamedField = undefined; };
+    S.field_buf[0] = .{ .name = "__type_ref", .value = .{ .string_val = text } };
+    out.* = .{ .branch = "", .fields = S.field_buf[0..1] };
+}

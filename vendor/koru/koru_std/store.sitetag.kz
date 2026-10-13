@@ -1,0 +1,27 @@
+// Koru Standard Library: Reactive Stores — synthesized-name site tags.
+// Joined via `~part sitetag` in store.kz; merged into the store module at load.
+
+/// The file tag a synthesized store unit carries in its minted name.
+///
+/// Query/sweep declarations emit into the STORE's home scope no matter which
+/// file armed them, so a name keyed on store+line alone collides the moment
+/// two files arm the same store on the same source line (690_306: `sim/` and
+/// `ext/` each `! query` `items` at line 14 → one `__store_sweepbody_items_L14`
+/// for two bodies). `flow.module` cannot discriminate — it is the file
+/// BASENAME, identical for `sim/index.k` and `ext/index.k` — so the tag comes
+/// from the site's full path: parent-dir + stem keeps it readable; a short
+/// path hash keeps it unique when two roots carry the same tail (vendored
+/// copies of one file inside a program).
+fn storeSiteTag(alloc: std.mem.Allocator, file: []const u8) []const u8 {
+    const stem = std.fs.path.stem(file);
+    const parent = if (std.fs.path.dirname(file)) |d| std.fs.path.basename(d) else "";
+    const has_parent = parent.len > 0 and !std.mem.eql(u8, parent, ".");
+    var b = std.ArrayList(u8).initCapacity(alloc, stem.len + parent.len + 9) catch unreachable;
+    if (has_parent) {
+        for (parent) |c| b.append(alloc, if (std.ascii.isAlphanumeric(c)) c else '_') catch unreachable;
+        b.append(alloc, '_') catch unreachable;
+    }
+    for (stem) |c| b.append(alloc, if (std.ascii.isAlphanumeric(c)) c else '_') catch unreachable;
+    b.appendSlice(alloc, std.fmt.allocPrint(alloc, "_{x}", .{std.hash.Wyhash.hash(0, file) & 0xffffff}) catch unreachable) catch unreachable;
+    return b.toOwnedSlice(alloc) catch unreachable;
+}

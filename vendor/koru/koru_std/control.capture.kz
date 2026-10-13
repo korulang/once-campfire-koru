@@ -1,0 +1,353 @@
+// Koru Standard Library: the `capture` part of control.kz.
+// Joined via `~part capture` in control.kz; merged into the control module at load.
+
+// ============================================================================
+// CAPTURE - Accumulation with pure semantics (ZERO OVERHEAD)
+// ============================================================================
+//
+// Syntax: capture { total: 0 }
+//         ! as acc |> for(items)
+//             ! each i |> captured { total: acc.total + i }
+//         | captured final |> result(sum: final.total)
+//
+// Both `capture` and `captured` take a SOURCE BLOCK — bare braces, no parens.
+// Bare `name { ... }` is unambiguously an invocation since the `=>` construct
+// glyph took over branch construction (210_047). The parens forms
+// `capture({...})` / `captured({...})` are retired (ratified 2026-06-11).
+// A block holding a single bare expression (`capture { entity }`) seeds from
+// an existing value instead of building a new struct cell.
+//
+// ARCHITECTURE:
+// - capture is a comptime transform: `! as` binds the cell (live/during),
+//   `captured { ... }` invocations are rewritten into general `.assignment`
+//   nodes, `| captured` is the one-shot after-read.
+//
+// SEMANTICS:
+// - Pure from Koru's perspective (captured computes the NEXT value)
+// - Efficient mutation in generated Zig (var cell + field writes)
+// - Decomposes fold while preserving purity guarantees
+// The tor declares the USER surface (second [transform]proc migrant after
+// std/regex:match): a source block, the `! as` cell effect, the optional
+// `| captured` after-read. The shape checker enforces this contract with zero
+// capture-specific code. The machine interface (invocation/item/program/
+// allocator → transformed SiteResult) is the proc-return convention.
+~[keyword|comptime|transform]pub tor capture { source: Source, reporter: *std/compiler:ErrorReporter }
+! as *
+| ?captured *
+
+~[transform]proc capture|zig {
+    const ast = @import("ast");
+    const struct_literal = @import("struct_literal");
+
+    // The walker hands transforms the containing item of the matched
+    // invocation; a capture invocation always lives in a flow. A non-flow
+    // item means the dispatch contract broke upstream — crash loudly.
+    if (item.* != .flow) @panic("capture transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    // Idempotency: a prior run already set preamble_code.
+    if (flow.preamble_code != null) return .{ .transformed = .{} };
+
+    // The cell seed is the invocation's source block (parser attaches the
+    // block interior as the `source` arg). A capture without a block is
+    // meaningless — fail loudly at the user.
+    var source_text: ?[]const u8 = null;
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "source")) source_text = arg.value;
+    }
+    if (source_text == null) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU164, flow.location, flow.module, "~capture requires a seed block: capture {{ field: value }}", .{}) } };
+    }
+
+    // --- Find `! as <cell>` (the mutable cell) and `| captured <result>` (the
+    //     after-read). Mirrors const's `| as` lookup. ---
+    var as_cont: ?*const ast.Continuation = null;
+    var captured_cont: ?*const ast.Continuation = null;
+    var cell_name: []const u8 = "acc";
+    var result_name: []const u8 = "result";
+    for (flow.body.continuations) |*cont| {
+        if (std.mem.eql(u8, cont.branch, "as")) {
+            as_cont = cont;
+            if (cont.binding) |b| cell_name = b;
+        } else if (std.mem.eql(u8, cont.branch, "captured")) {
+            captured_cont = cont;
+            if (cont.binding) |b| result_name = b;
+        }
+    }
+    if (as_cont == null) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU164, flow.location, flow.module, "~capture requires a `! as <cell>` effect branch", .{}) } };
+    }
+
+    // `! as _` discards the cell NAME, but the cell IS the accumulator the
+    // capture machinery declares, writes (via `captured {...}`), and reads (the
+    // `| captured` after-read) — it needs a real, referenceable Zig identifier.
+    // A bare `_` cannot be declared (`var _: T` is a Zig error) nor read. So a
+    // `_` cell is never a genuine discard: synthesize a real name, keyed on
+    // source line for uniqueness across sibling captures. cell_name is the
+    // single source for every downstream reference (preamble var/type, rewrite
+    // target, done read), so renaming here covers them all. Mirrors the
+    // auto-discharge `_`→synthetic rename for obligation-carrying binds.
+    if (std.mem.eql(u8, cell_name, "_")) {
+        cell_name = std.fmt.allocPrint(allocator, "__koru_cap_{d}", .{flow.location.line}) catch unreachable;
+    }
+
+    // The cell's fields, in declaration order, parsed ONCE via the struct-literal
+    // projector (the walker foundation). Used for the `var` seed below. Bare
+    // entries pun by name/path; bare expressions and redundant labels are
+    // rejected (nothing is positional). The Source text is the block INTERIOR;
+    // the projector wants braces back. Singleton non-punnable (`capture { entity }`)
+    // is the existing-expression seed carve-out.
+    const expr = std.fmt.allocPrint(allocator, "{{{s}}}", .{source_text.?}) catch unreachable;
+    const cell_fields = struct_literal.parseFieldsWithOptions(allocator, expr, .{ .allow_singleton_expression = true }) catch |err| {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU164, flow.location, flow.module, "~capture seed: {s}", .{struct_literal.describeErrorIn(allocator, err, expr)}) } };
+    };
+
+    // --- Rewrite `captured(...)` invocations into general `.assignment` nodes
+    //     that write field-wise into the cell. The opaque `{...}` payload is
+    //     interpreted by the projector under the pun law — bare paths pun by
+    //     last segment; bare expressions / redundant labels fail loudly.
+    //     No `.capture` node, no emitter concession. ---
+    const Rewriter = struct {
+        err: ?struct { msg: []const u8, loc: @TypeOf(flow.location) } = null,
+
+        fn rewrite(
+            self: *@This(),
+            alloc: std.mem.Allocator,
+            cont: *const ast.Continuation,
+            target: []const u8,
+        ) *const ast.Continuation {
+            var new_node: ?ast.Node = cont.node;
+            if (cont.node) |step| {
+                if (step == .invocation) {
+                    const segs = step.invocation.path.segments;
+                    if (segs.len > 0 and std.mem.eql(u8, segs[segs.len - 1], "captured")) {
+                        // Block form: the parser stored the block INTERIOR as the
+                        // source arg's value; the projector wants braces back.
+                        const raw = if (step.invocation.args.len > 0) step.invocation.args[0].value else "";
+                        const payload = std.fmt.allocPrint(alloc, "{{{s}}}", .{raw}) catch unreachable;
+                        const parsed = struct_literal.parseFields(alloc, payload) catch |err| {
+                            self.err = .{ .msg = std.fmt.allocPrint(alloc, "captured: {s}", .{struct_literal.describeErrorIn(alloc, err, payload)}) catch "captured: struct literal error", .loc = cont.location };
+                            const out_err = alloc.create(ast.Continuation) catch unreachable;
+                            out_err.* = cont.*;
+                            return out_err;
+                        };
+                        const asgn_fields = alloc.alloc(ast.Field, parsed.len) catch unreachable;
+                        for (parsed, 0..) |pf, i| {
+                            asgn_fields[i] = .{
+                                .name = alloc.dupe(u8, pf.name) catch unreachable,
+                                .type = "",
+                                .expression_str = alloc.dupe(u8, pf.value) catch unreachable,
+                            };
+                        }
+                        new_node = .{ .assignment = .{
+                            .target = target,
+                            .fields = asgn_fields,
+                        } };
+                    }
+                }
+            }
+            const new_conts = alloc.alloc(ast.Continuation, cont.continuations.len) catch unreachable;
+            for (cont.continuations, 0..) |*nc, i| {
+                new_conts[i] = self.rewrite(alloc, nc, target).*;
+            }
+            const out = alloc.create(ast.Continuation) catch unreachable;
+            out.* = cont.*;
+            out.node = new_node;
+            out.continuations = new_conts;
+            return out;
+        }
+    };
+
+    var rewriter = Rewriter{};
+    const rewritten_as = rewriter.rewrite(allocator, as_cont.?, cell_name);
+    if (rewriter.err) |e| {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU164, e.loc, flow.module, "{s}", .{e.msg}) } };
+    }
+
+    // --- Assemble the new flow continuations: void chains so the REAL for / if
+    //     templates run over the cell (no degradation). ---
+    var new_conts = std.ArrayList(ast.Continuation).initCapacity(allocator, 2) catch unreachable;
+
+    // (1) The `! as` body, flattened to a void chain. The cell is in scope from
+    //     the preamble, so its binding is already satisfied.
+    new_conts.append(allocator, .{
+        .branch = "",
+        .binding = null,
+        .condition = null,
+        .node = rewritten_as.node,
+        .indent = 0,
+        .continuations = rewritten_as.continuations,
+    }) catch unreachable;
+
+    // (2) `| captured result` → `const result = cell;` (the after-read) then the
+    //     captured body. A plain inline_code binding + the body as its child.
+    if (captured_cont) |cc| {
+        // A `_` (or `_`-prefixed) read binding is a DISCARD: the user runs the
+        // after-body without reading the cell — emit no binding at all
+        // (`const _ = cell;` is not legal Zig).
+        const bind_code = if (std.mem.startsWith(u8, result_name, "_"))
+            allocator.dupe(u8, "") catch unreachable
+        else
+            std.fmt.allocPrint(allocator, "const {s} = {s};", .{ result_name, cell_name }) catch unreachable;
+        const body_inner = allocator.alloc(ast.Continuation, 1) catch unreachable;
+        body_inner[0] = .{
+            .branch = "",
+            .binding = null,
+            .condition = null,
+            .node = cc.node,
+            .indent = 0,
+            .continuations = cc.continuations,
+        };
+        new_conts.append(allocator, .{
+            .branch = "",
+            .binding = null,
+            .condition = null,
+            .node = .{ .inline_code = bind_code },
+            .indent = 0,
+            .continuations = body_inner,
+        }) catch unreachable;
+    }
+
+    // --- The cell seed: `var <cell> = .{ .name = value, ... };`, built from the
+    //     projector's fields (no koruStructToZig text surgery). For existing-var
+    //     captures (`capture(myVar)`) the expr is not a struct literal, so emit
+    //     it verbatim. `_ = &cell;` keeps it live even if the loop never writes. ---
+    //
+    // HOST LANGUAGE. Everything below is host DECLARATION syntax, which makes it
+    // the one part of this transform that cannot be target-neutral — the same
+    // split `cond`'s `{{ binds }}` makes at template_processor.zig:594
+    // (`lowerScrutinee`), for the same reason and with the same two answers. A
+    // capture cell is a struct literal plus a mutable binding; Zig needs a
+    // synthesized non-comptime struct type to get a runtime cell out of an
+    // anonymous literal, JS needs `let` and an object literal and nothing else.
+    // Read the build language ONCE, here, and let both spellings fall out of it:
+    // a second `preamble_js` field would be two lowerings of one construct, the
+    // shape `for`/`scan` was converged to avoid (see `for`, above).
+    //
+    // Before this, the Zig text was unconditional, so `--lang=js` got a
+    // `comptime blk:` type synthesis and `_ = &cell;` spliced into JavaScript.
+    // Every capture on the JS target refused at emission (20 of the 29
+    // UnsupportedConstruct failures, measured 2026-08-06) — correctly, since the
+    // alternative was emitting Zig and calling it JS.
+    const host_is_js = std.mem.eql(u8, CompilerEnv.lang, "js");
+
+    // A block holding exactly one bare expression seeds from an existing
+    // value: `capture { entity }`. After the pun law, a bare punnable name
+    // resolves to name==value (e.g. entity/entity); a singleton non-punnable
+    // keeps name=="". Anything with distinct named fields builds a fresh
+    // struct cell.
+    const is_existing_var = cell_fields.len == 1 and (cell_fields[0].name.len == 0 or
+        std.mem.eql(u8, cell_fields[0].name, cell_fields[0].value));
+    const is_struct_init = !is_existing_var;
+    const init_host = if (is_struct_init) blk: {
+        var seed = std.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+        seed.appendSlice(allocator, if (host_is_js) "{ " else ".{ ") catch unreachable;
+        for (cell_fields, 0..) |cf, i| {
+            if (i > 0) seed.appendSlice(allocator, ", ") catch unreachable;
+            if (cf.name.len > 0) {
+                if (!host_is_js) seed.append(allocator, '.') catch unreachable;
+                seed.appendSlice(allocator, cf.name) catch unreachable;
+                seed.appendSlice(allocator, if (host_is_js) ": " else " = ") catch unreachable;
+            }
+            // Koru-native typed seed: `floor: 0[i32]` pins the cell field's
+            // type — the SAME annotation (and the same parser) as `const`'s
+            // `count: 42[i32]`. Zig pins with @as; untyped values paste
+            // verbatim (and a bare 0 stays comptime_int, which the runtime
+            // cell rejects — the annotation is how you say "this is data").
+            //
+            // JS has ONE number type and no comptime, so there is nothing to pin
+            // and nothing to rescue: the annotation is PEELED and the value pasted
+            // bare. Dropping it is not a loss of information on that target — it is
+            // the absence of the problem the annotation solves.
+            const peeled = struct_literal.peelBaseType(cf.value);
+            if (peeled.type.len > 0 and !host_is_js) {
+                seed.appendSlice(allocator, "@as(") catch unreachable;
+                seed.appendSlice(allocator, peeled.type) catch unreachable;
+                seed.appendSlice(allocator, ", ") catch unreachable;
+                seed.appendSlice(allocator, peeled.value) catch unreachable;
+                seed.appendSlice(allocator, ")") catch unreachable;
+            } else if (peeled.type.len > 0) {
+                seed.appendSlice(allocator, peeled.value) catch unreachable;
+            } else {
+                seed.appendSlice(allocator, cf.value) catch unreachable;
+            }
+        }
+        seed.appendSlice(allocator, " }") catch unreachable;
+        break :blk seed.toOwnedSlice(allocator) catch unreachable;
+    } else cell_fields[0].value;
+    // JS: `let <cell> = <init>;` and that is the whole declaration. An object
+    // literal is already mutable and structurally typed, so the Zig type
+    // synthesis below has no twin to write; an unused binding is legal there, so
+    // `_ = &cell;` has none either (and does not parse).
+    //
+    // An anonymous ZIG struct literal is comptime, so a bare `var cell = .{...}`
+    // is a comptime var and runtime field writes fail. Give the cell an explicit
+    // struct type built from the seed's fields (made non-comptime) so it is a
+    // runtime value. Existing-var captures already have a concrete type — seed
+    // verbatim.
+    const preamble = if (host_is_js)
+        std.fmt.allocPrint(allocator, "let {s} = {s};", .{ cell_name, init_host }) catch unreachable
+    else if (is_struct_init) blk2: {
+        const type_name = std.fmt.allocPrint(allocator, "__KoruCaptureT_{s}", .{cell_name}) catch unreachable;
+        var p = std.ArrayList(u8).initCapacity(allocator, 512) catch unreachable;
+        p.appendSlice(allocator, "const ") catch unreachable;
+        p.appendSlice(allocator, type_name) catch unreachable;
+        p.appendSlice(allocator, " = comptime blk: {\n") catch unreachable;
+        p.appendSlice(allocator, "    const __info = @typeInfo(@TypeOf(") catch unreachable;
+        p.appendSlice(allocator, init_host) catch unreachable;
+        p.appendSlice(allocator, "));\n") catch unreachable;
+        p.appendSlice(allocator, "    var __fields: [__info.@\"struct\".fields.len]@import(\"std\").builtin.Type.StructField = undefined;\n") catch unreachable;
+        p.appendSlice(allocator, "    for (__info.@\"struct\".fields, 0..) |__f, __i| {\n") catch unreachable;
+        p.appendSlice(allocator, "        __fields[__i] = .{ .name = __f.name, .type = __f.type, .default_value_ptr = null, .is_comptime = false, .alignment = __f.alignment };\n") catch unreachable;
+        p.appendSlice(allocator, "    }\n") catch unreachable;
+        p.appendSlice(allocator, "    break :blk @Type(.{ .@\"struct\" = .{ .layout = .auto, .fields = &__fields, .decls = &.{}, .is_tuple = false } });\n") catch unreachable;
+        p.appendSlice(allocator, "};\n") catch unreachable;
+        p.appendSlice(allocator, "var ") catch unreachable;
+        p.appendSlice(allocator, cell_name) catch unreachable;
+        p.appendSlice(allocator, ": ") catch unreachable;
+        p.appendSlice(allocator, type_name) catch unreachable;
+        p.appendSlice(allocator, " = ") catch unreachable;
+        p.appendSlice(allocator, init_host) catch unreachable;
+        p.appendSlice(allocator, ";\n_ = &") catch unreachable;
+        p.appendSlice(allocator, cell_name) catch unreachable;
+        p.appendSlice(allocator, ";") catch unreachable;
+        break :blk2 p.toOwnedSlice(allocator) catch unreachable;
+    } else std.fmt.allocPrint(allocator, "var {s} = {s};\n_ = &{s};", .{ cell_name, init_host, cell_name }) catch unreachable;
+
+    // --- @pass_ran (circuit breaker) + @shape_valid (conscious checker
+    //     exemption, WITH reason). The dissolution CONSUMES the user's
+    //     `! as`/`| captured` branches — they become the cell preamble and
+    //     field assignments — so the replacement flow no longer matches the
+    //     tor's user contract. That is by design, and this is the rare,
+    //     explicit @shape_valid case. NOTE: checkers run AFTER transforms, so
+    //     the user surface is validated HERE in the transform (loud
+    //     @compileError on missing block / missing `! as`), not by the shape
+    //     checker. The decl's branch contract still serves parse + docs. ---
+    const new_marks = allocator.alloc([]const u8, flow.inv().marks.len + 2) catch unreachable;
+    for (flow.inv().marks, 0..) |m, i| new_marks[i] = m;
+    new_marks[flow.inv().marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+    new_marks[flow.inv().marks.len + 1] = allocator.dupe(u8, "@shape_valid(\"capture dissolves ! as / | captured into cell preamble + assignments\")") catch unreachable;
+
+    const new_invocation = ast.Invocation{
+        .path = flow.inv().path,
+        .args = flow.inv().args,
+        .annotations = flow.inv().annotations,
+        .marks = new_marks,
+        .inserted_by_tap = flow.inv().inserted_by_tap,
+        .from_opaque_tap = flow.inv().from_opaque_tap,
+    };
+
+    // WHOLE-STRUCT COPY, never a field-list literal. A literal silently drops
+    // every field it does not name, and this one named eleven of them — losing
+    // `is_impl` and `impl_variant`, which decide how a subflow implementation
+    // (`run = capture { … }`) is validated. io.kz carries the same warning at
+    // its own rebuild, written after that exact drop broke variant subflows
+    // whose body is a print. Copy first, then set only what changes.
+    var transformed_flow = flow.*;
+    transformed_flow.body = ast.rootSite(new_invocation, new_conts.toOwnedSlice(allocator) catch unreachable, flow.location);
+    transformed_flow.inline_body = null;
+    transformed_flow.preamble_code = preamble;
+
+    const new_item = ast.Item{ .flow = transformed_flow };
+    return .{ .transformed = .{ .replacement = new_item } };
+}

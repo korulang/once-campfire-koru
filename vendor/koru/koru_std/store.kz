@@ -1,0 +1,817 @@
+// Koru Standard Library: Reactive Stores
+// Application state as a compiled-reactivity substrate. The FULL design —
+// 9 rulings, adversary-stamped theses, the open queue — lives in
+// tests/regression/600_STDLIB/690_STORE/DESIGN.md (delete-when-pinned).
+// The pins (690_001..008) are the acceptance tests; this file grows until
+// they green, rung by rung.
+//
+// THE SPINE (ruled 2026-07-04):
+//   - A store is COMPTIME-NAMED and second-class (ruling 9): never a value,
+//     never passed, never nested. `create(game) { ... }` declares name +
+//     shape + seed; anyone anywhere links by name.
+//   - `stored { game.field: expr }` is the SOLE write path.
+//   - Subscriptions (`watch`) compile INTO the write path — tap-style,
+//     producer owns the guard, NO runtime registry (ruling 7).
+//   - Ruling (f): all writes route through ONE centralizing write-subflow
+//     per store; watches/interceptors/guards splice there ONCE.
+//   - Writes interleave, never overlap: write + full cascade is the
+//     atomicity unit ((h) lean); birth is not a write (O9 lean — the seed
+//     is stored in memory, never dispatched as an tor).
+// RUNG ONE — COMPLETE (690_001-004 green runners, 690_006 green designed
+// rejection; SHOWN 2026-07-05). The (f) architecture:
+//   `create` is the coordinator. Per store it appends FIVE units:
+//     1. The module-scope typed cell (capture's @Type builder, host_line).
+//     2. An APPLY tor — one terminal branch per field, announcing what
+//        was written (`| entities i64`; with an `updated` interceptor the
+//        payload is `{ old, new }` — the (c) usage-synthesis lean).
+//     3. The apply |zig proc — switch on the comptime-constant field index,
+//        write the cell, return the field's branch with the new value.
+//        (kernel's raw-Zig generated-proc precedent.)
+//     4. The WRITE tor — the store's sole write surface, void.
+//     5. The write tor's implementing FLOW — head invokes apply; its
+//        continuation arms ARE the transplanted interceptor+watch branches,
+//        interceptors sequenced first ((h): watches observe settled state),
+//        guards riding as arm conditions (producer owns the if). THIS is
+//        the ruling-(f) centralizing write-subflow: bodies splice here
+//        ONCE; the atomicity lock and T8 backend cells will live in this
+//        body. A nested `stored` inside an interceptor body compiles into
+//        a call into the OTHER store's write-subflow — the cascade is
+//        ordinary calls through generated subflows, no runtime registry.
+//   `stored` rewrites each write site into a plain invocation of the write
+//   tor — an ordinary flow, emitted inside a function like any call.
+//   `watch` sites run the transplant-purity check (ruling (a): free names
+//   ⊆ own bindings ∪ comptime-known — koru-level diagnostic, 690_006) and
+//   self-erase once the coordinator has spliced their bodies.
+//
+// STILL WALLED (loud, never silent — KORU047 doctrine):
+//   - Multiple watches on one field — needs taps' sequencing splice.
+//   - Multi-field `stored` blocks — the (i) chain-envelope, rung two.
+//   - Mixing `updated {old,new}` with field-level consumers on one store.
+//   - Guarded watch on a field that also has interceptors.
+//   - Nested (mid-flow) watch splicing; watch-before-create source order.
+//   - Non-i64 fields; guarded interceptors; `inserted`/`removed` (rung 2).
+//
+// ARCHITECTURE NOTES:
+//   - Generated decls follow kernel's precedent exactly (event_decl +
+//     proc_decl with raw-Zig body, appended as top-level items; the
+//     emitter finds impl_of flows by scanning items at emission time).
+//   - Watch collection is kernel's findShapeSource pattern: the transform
+//     receives *const Program and walks items for `std/store:watch(name)`
+//     flows. Source order: create must precede its watches (loud wall
+//     otherwise — the walker transforms in program order, and the
+//     coordinator must still be able to see untransformed watch bodies).
+//   - Validation happens IN the transforms (loud refusal), not the
+//     shape checker — checkers run after transforms (capture precedent).
+
+const std = @import("std");
+const ast_find = @import("ast");
+const codegen_utils_store = @import("codegen_utils");
+// Module-scope spellings the moved `~part` helpers use — named unlike the
+// member/local aliases (`ast`, `codegen_utils`, …) those structs and procs
+// carry, so no reference turns ambiguous or shadowed.
+const struct_literal_store = @import("struct_literal");
+const ast_functional_store = @import("ast_functional");
+
+/// The emitted-Zig namespace a store's units live in, dot-terminated.
+/// The entry module emits as `main_module.`; every other module emits under the
+/// `koru_`-prefixed mangling of its LOGICAL name (`app.lib` → `koru_app.koru_lib.`),
+/// which is the same rule `emitter_helpers.writeModulePath` applies. Hardcoding
+/// `main_module.` — as this file did in fifteen places — addresses a
+/// module-declared store's units into the entry file's namespace, where they do
+/// not exist.
+/// `home` is the LOGICAL name (`storeHomeModule`), and it is compared against
+/// `main_module_name`: for an entry-file store the two coincide, which is why
+/// the hardcoded form worked for every store that lived in the entry file.
+fn storeEmitQualifier(alloc: std.mem.Allocator, home: []const u8, main_module_name: []const u8) []const u8 {
+    if (home.len == 0 or std.mem.eql(u8, home, main_module_name)) return "main_module.";
+    const path = codegen_utils_store.buildKoruModulePath(alloc, home) catch unreachable;
+    return std.fmt.allocPrint(alloc, "{s}.", .{path}) catch unreachable;
+}
+/// JavaScript has ONE namespace for tors and ANOTHER for the cell, and
+/// neither is the Zig one — which is why this cannot be a single answer.
+/// `js_emitter` flattens every tor in the program, imported modules included,
+/// into the one `main_module` object (its own comment at :155 says so: "JS
+/// object keys are a FLAT namespace while Koru tor paths are not"). So an
+/// event dispatch is `main_module.<name>_event` no matter which module declared
+/// the store, and the `koru_app.koru_lib.` mangling names nothing.
+fn storeEventQualifier(alloc: std.mem.Allocator, home: []const u8, main_module_name: []const u8) []const u8 {
+    // cs joins the JS answer — both flatten every module's event decls into
+    // `main_module` — with one difference: the cs emitter folds the declaring
+    // module's qualifier INTO the class name (`sim`'s `__store_sweepbody_*`
+    // emits as `sim___store_sweepbody_*_event`), because C# nested classes
+    // are one flat namespace and `io:free`/`string:free` collided otherwise
+    // (690_046). So the cs prefix is `main_module.` for entry-module events
+    // and `main_module.<folded-home>_` for the rest — the qualifier lives
+    // inside the basename, between the namespace and the name.
+    if (std.mem.eql(u8, CompilerEnv.lang, "js")) return "main_module.";
+    if (std.mem.eql(u8, CompilerEnv.lang, "cs")) {
+        if (home.len == 0 or std.mem.eql(u8, home, main_module_name)) return "main_module.";
+        const folded = alloc.dupe(u8, home) catch unreachable;
+        for (folded) |*c| {
+            if (c.* == '/' or c.* == '.' or c.* == '-') c.* = '_';
+        }
+        return std.fmt.allocPrint(alloc, "main_module.{s}_", .{folded}) catch unreachable;
+    }
+    return storeEmitQualifier(alloc, home, main_module_name);
+}
+/// The CELL, on the other hand, is a module-scope `let` written above
+/// `main_module` (the `.inline_code` path), so it is reachable BARE from every
+/// handler and any qualifier at all is wrong. On Zig the cell lives inside the
+/// declaring module's emitted struct and needs the full namespace.
+fn storeCellQualifier(alloc: std.mem.Allocator, home: []const u8, main_module_name: []const u8) []const u8 {
+    // The cs cell is a `static class` nested inside `main_module` via
+    // `.inline_code` — reachable bare from every handler, same as the JS
+    // module-scope `let`.
+    if (std.mem.eql(u8, CompilerEnv.lang, "js") or std.mem.eql(u8, CompilerEnv.lang, "cs")) return "";
+    return storeEmitQualifier(alloc, home, main_module_name);
+}
+/// THE BUILD'S TARGET, readable from anywhere in this module. A transform's
+/// nested helper structs cannot capture a local, and `SRewrite.refs` recurses
+/// through thirteen call sites — threading a parameter down that chain to reach
+/// two index casts is more surface than reading the one global the answer comes
+/// from anyway.
+fn storeHostTarget() codegen_utils_store.HostTarget {
+    return if (std.mem.eql(u8, CompilerEnv.lang, "js")) .js else if (std.mem.eql(u8, CompilerEnv.lang, "cs")) .cs else .zig;
+}
+/// A `stored` WRITE TARGET, parsed. Two spellings reach here — the dotted
+/// singleton head `store.field` and the bracket row head `store[handle].field`,
+/// which is also what a sweep arm's row binding lowers to (690_118).
+///
+/// Module scope because it now has TWO readers: the `stored` transform, which
+/// turns a target into a write, and `storeWriteColumnSets` below, which reads
+/// the same targets from `new` to decide what to specialise. One grammar with
+/// two parsers is how the two would come to disagree about what a write site
+/// says, and a scan that mis-reads a head silently declines to optimise it.
+const StoreWriteHead = struct { store: []const u8, row: ?[]const u8, field: []const u8 };
+const StoreHeadError = error{ malformed_bracket, bracket_needs_field, not_dotted };
+
+fn storeParseWriteHead(name: []const u8) StoreHeadError!StoreWriteHead {
+    if (std.mem.indexOfScalar(u8, name, '[')) |lb| {
+        const rb = std.mem.lastIndexOfScalar(u8, name, ']') orelse return StoreHeadError.malformed_bracket;
+        if (rb + 1 >= name.len or name[rb + 1] != '.') return StoreHeadError.bracket_needs_field;
+        return .{
+            .store = std.mem.trim(u8, name[0..lb], " "),
+            .row = std.mem.trim(u8, name[lb + 1 .. rb], " "),
+            .field = name[rb + 2 ..],
+        };
+    }
+    const dotm = std.mem.indexOfScalar(u8, name, '.') orelse return StoreHeadError.not_dotted;
+    return .{ .store = name[0..dotm], .row = null, .field = name[dotm + 1 ..] };
+}
+
+/// The name of the write unit specialised to one COLUMN SET.
+///
+/// `__store_envwrite_<store>` takes a bitmask naming the columns a call writes
+/// and tests every bit at runtime. The mask is a COMPILE-TIME CONSTANT at every
+/// call site — the emitted call reads `field: (((5)))` — so those tests exist
+/// only because one unit serves every column set.
+///
+/// Measured (4096 rows x 50000 frames, two columns written per row): with the
+/// writes made unconditional the benchmark runs at the hand-written-JavaScript
+/// control, and with them conditional it runs 2.1x slower. It is the
+/// CONDITIONALITY, not the mask arithmetic and not the body size: swapping
+/// `Math.floor(m / 2**i) % 2` for a bitwise test measured nothing, and padding
+/// an unconditional body back to full length also measured nothing.
+///
+/// Producer and consumer derive this name from the same sorted index list, so
+/// they agree by construction; if they ever did not, the consumer would name an
+/// tor nobody declared and the emitter would say so.
+fn storeEnvwriteSpecName(alloc: std.mem.Allocator, store: []const u8, cols: []const usize) []const u8 {
+    var b = std.ArrayList(u8).initCapacity(alloc, 32) catch unreachable;
+    b.appendSlice(alloc, "__store_envwrite_") catch unreachable;
+    b.appendSlice(alloc, store) catch unreachable;
+    for (cols) |c| {
+        b.appendSlice(alloc, std.fmt.allocPrint(alloc, "_c{d}", .{c}) catch unreachable) catch unreachable;
+    }
+    return b.toOwnedSlice(alloc) catch unreachable;
+}
+
+/// EVERY DISTINCT COLUMN SET WRITTEN TO `store` ANYWHERE IN THE PROGRAM.
+///
+/// Shaped like `TakeScan` (:2020): a `stored` site is very often NOT a
+/// top-level flow. Measured on an ECS benchmark whose only write lives in a
+/// `! query` arm, a scan of `flatItems` alone found ZERO sites — the write is a
+/// node inside the arm's continuation tree. So this walks flows AND their
+/// continuations, exactly as the take scan does.
+///
+/// Transform ORDER is deliberately not reasoned about, for `TakeScan`'s reason:
+/// it matches the pre-transform spelling and lets a site that has already been
+/// rewritten fall through. A missed site is not specialised and runs the
+/// general masked unit — slower, never wrong.
+fn storeCollectWriteSet(alloc: std.mem.Allocator,
+    inv: ast_find.Invocation,
+    aliases: []const []const u8,
+    order: []const []const u8,
+    out: *std.ArrayList([]const usize),
+) void {
+
+    if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "stored")) return;
+    if (inv.path.module_qualifier) |mq| {
+        if (!std.mem.eql(u8, mq, "std.store")) return;
+    }
+    var block: ?[]const u8 = null;
+    for (inv.args) |a| {
+        if (std.mem.eql(u8, a.name, "source")) block = a.value;
+    }
+    const bt = block orelse return;
+    const struct_literal = @import("struct_literal");
+    const braced = std.fmt.allocPrint(alloc, "{{{s}}}", .{bt}) catch unreachable;
+    const writes = struct_literal.parseFields(alloc, braced) catch return;
+    if (writes.len < 2) return; // a one-column write has no mask to resolve
+    var cols = std.ArrayList(usize).initCapacity(alloc, writes.len) catch unreachable;
+    for (writes) |wm| {
+        const head = storeParseWriteHead(wm.name) catch return;
+        if (!storeNameIn(aliases, head.store)) return;
+        var found = false;
+        for (order, 0..) |fname, i| {
+            if (std.mem.eql(u8, fname, head.field)) {
+                cols.append(alloc, i) catch unreachable;
+                found = true;
+            }
+        }
+        if (!found) return;
+    }
+    // Ascending, so the key is a property of the SET and two blocks writing the
+    // same columns in different orders share one specialisation.
+    std.mem.sort(usize, cols.items, {}, comptime std.sort.asc(usize));
+    for (out.items) |seen| {
+        if (seen.len != cols.items.len) continue;
+        var same = true;
+        for (seen, cols.items) |a, b| {
+            if (a != b) same = false;
+        }
+        if (same) return;
+    }
+    out.append(alloc, cols.toOwnedSlice(alloc) catch unreachable) catch unreachable;
+}
+
+/// A write inside a sweep or rule arm names its target through the ARM'S ROW
+/// BINDING — `! query e |> std/store:stored { e.px: … }` — and the store's own
+/// name appears there only after the query transform rewrites it, which happens
+/// after this scan runs. So the walk carries the set of names that mean "this
+/// store" in the current subtree: the store itself, plus every binding
+/// introduced by an arm of a flow whose head is a store verb on it.
+fn storeCollectAliases(alloc: std.mem.Allocator,
+    c: *const ast_find.Continuation,
+    out: *std.ArrayList([]const u8),
+) void {
+    if (c.binding) |b| {
+        const t = std.mem.trim(u8, b, " ");
+        if (t.len > 0 and !std.mem.eql(u8, t, "_") and !storeNameIn(out.items, t)) {
+            out.append(alloc, t) catch unreachable;
+        }
+    }
+    for (c.continuations) |*k| storeCollectAliases(alloc, k, out);
+}
+
+/// A store verb can sit at ANY depth, not only at a flow's head: in
+/// `for(0..N) ! each f |> std/store:query(ents) ! query e |> stored { e.px: … }`
+/// the flow's head is `std/control:for` and the query is a continuation node.
+/// So the alias set is extended on the way DOWN — at every site that targets
+/// this store, the arms below it bind its rows.
+fn storeScanCont(alloc: std.mem.Allocator,
+    c: *const ast_find.Continuation,
+    aliases: []const []const u8,
+    store: []const u8,
+    order: []const []const u8,
+    out: *std.ArrayList([]const usize),
+) void {
+    var sub = aliases;
+    if (c.node) |n| {
+        if (n == .invocation) {
+            storeCollectWriteSet(alloc, n.invocation, aliases, order, out);
+            if (storeFlowTargets(n.invocation, store)) {
+                var ext = std.ArrayList([]const u8).initCapacity(alloc, aliases.len + 2) catch unreachable;
+                ext.appendSlice(alloc, aliases) catch unreachable;
+                for (c.continuations) |*k| storeCollectAliases(alloc, k, &ext);
+                sub = ext.items;
+            }
+        }
+    }
+    for (c.continuations) |*k| storeScanCont(alloc, k, sub, store, order, out);
+}
+
+/// Is this flow's head a `std/store:<verb>(store)` on the store we are scanning
+/// for? Only then do its arm bindings alias it.
+fn storeFlowTargets(inv: ast_find.Invocation, store: []const u8) bool {
+    if (inv.path.segments.len != 1) return false;
+    const mq = inv.path.module_qualifier orelse return false;
+    if (!std.mem.eql(u8, mq, "std.store")) return false;
+    for (inv.args) |a| {
+        if (!std.mem.eql(u8, a.name, "expr")) continue;
+        const v = if (a.value.len >= 2 and a.value[0] == '"') a.value[1 .. a.value.len - 1] else a.value;
+        const lb = std.mem.indexOfScalar(u8, v, '[') orelse return std.mem.eql(u8, std.mem.trim(u8, v, " "), store);
+        return std.mem.eql(u8, std.mem.trim(u8, v[0..lb], " "), store);
+    }
+    return false;
+}
+
+fn storeWriteColumnSets(alloc: std.mem.Allocator,
+    prog: *const ast_find.Program,
+    store: []const u8,
+    order: []const []const u8,
+) []const []const usize {
+    var out = std.ArrayList([]const usize).initCapacity(alloc, 4) catch unreachable;
+    for (flatItems(alloc, prog.items)) |pi| {
+        if (pi.* != .flow) continue;
+        var aliases = std.ArrayList([]const u8).initCapacity(alloc, 4) catch unreachable;
+        aliases.append(alloc, store) catch unreachable;
+        if (storeFlowTargets(pi.flow.inv().*, store)) {
+            storeCollectAliases(alloc, &pi.flow.body, &aliases);
+        }
+        storeCollectWriteSet(alloc, pi.flow.inv().*, aliases.items, order, &out);
+        storeScanCont(alloc, &pi.flow.body, aliases.items, store, order, &out);
+    }
+    return out.toOwnedSlice(alloc) catch unreachable;
+}
+
+/// A KORU EXPRESSION on its way into a generated host body, rendered for the
+/// build's target.
+///
+/// A `std/store` guard is text the user wrote in Koru — `hp > 40 and kind == 1`
+/// — and this transform splices it into a proc body it assembles itself. That
+/// route never passed through the emitter's lowering, so the guard reached
+/// `node` with `and` still in it while `js_emitter` had known how to lower it
+/// for months. The pass now lives in `codegen_utils.lowerKoruExpr` precisely so
+/// a transform can reach it; this is that call.
+///
+/// On Zig it is the identity, so the emitted text is unchanged to the byte —
+/// Koru's operator set is a Zig subset and that is the current ruling.
+///
+/// Returns null when the expression names an `@`-operation the vocabulary does
+/// not model, filling `unknown` with the name so the caller can refuse by name.
+/// Refusing is the point: passing an unmodelled operation through is how one
+/// target silently accepts what the other cannot run.
+fn storeLowerExpr(alloc: std.mem.Allocator, text: []const u8, unknown: *[]const u8) ?[]const u8 {
+    const target = storeHostTarget();
+    var d = codegen_utils_store.LowerDiag{};
+    const lowered = codegen_utils_store.lowerKoruExpr(alloc, text, target, .koru_expr, &d) catch |err| switch (err) {
+        error.OutOfMemory => unreachable,
+        error.UnsupportedBuiltin => {
+            unknown.* = d.unknown_builtin;
+            return null;
+        },
+    };
+    return lowered;
+}
+
+/// Find a SYNTHESIZED store declaration by its exact generated name, at any
+/// module depth.
+///
+/// A store declared inside an imported module has its units synthesized INTO
+/// that module — that is where they must live for their own paths to resolve —
+/// so a top-level-only lookup reports the store as undeclared while looking
+/// straight at it.
+///
+/// Descending through every module is safe HERE and only here: the name is a
+/// generated `__store_*` symbol that exists nowhere else in the program. A
+/// general scan flattened the same way starts matching ordinary flows inside
+/// `std.compiler` and friends, which is a different and much worse bug.
+fn findSynthDecl(its: []const ast_find.Item, want: []const u8) ?*const ast_find.EventDecl {
+    for (its) |*pi| {
+        if (pi.* == .event_decl) {
+            const ed = &pi.event_decl;
+            if (ed.path.segments.len == 1 and std.mem.eql(u8, ed.path.segments[0], want)) return ed;
+        } else if (pi.* == .module_decl) {
+            if (findSynthDecl(pi.module_decl.items, want)) |d| return d;
+        }
+    }
+    return null;
+}
+
+fn pathsMatchStore(a: *const ast_find.DottedPath, b: *const ast_find.DottedPath) bool {
+    if (a.segments.len != b.segments.len) return false;
+    for (a.segments, b.segments) |sa, sb| {
+        if (!std.mem.eql(u8, sa, sb)) return false;
+    }
+    if (a.module_qualifier) |qa| {
+        if (b.module_qualifier) |qb| return std.mem.eql(u8, qa, qb);
+    }
+    // A missing qualifier on either side matches on segments alone.
+    return true;
+}
+
+fn findEventByPathStore(its: []const ast_find.Item, path: *const ast_find.DottedPath) ?*const ast_find.EventDecl {
+    for (its) |*pipe| {
+        switch (pipe.*) {
+            .event_decl => |*decl| {
+                if (pathsMatchStore(&decl.path, path)) return decl;
+            },
+            .module_decl => |*mod| {
+                if (findEventByPathStore(mod.items, path)) |d| return d;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// A flow's OWN parameters shadow store names inside its body, exactly the way
+/// 690_090 extends the rule to continuation bindings (`! query items`). Without
+/// this, `~transit = reframe(goal, history)` with a store also named `history`
+/// rewrites the punned argument to the store cell (`__koru_store_history`)
+/// instead of leaving the parameter name for Zig to resolve. Resolve the flow's
+/// implementing tor and return its input-field names so a walk can seed its
+/// bound-set; returns empty for a flow with no `impl_of`.
+fn flowParamNamesStore(alloc: std.mem.Allocator, prog: *const ast_find.Program, f: *const ast_find.Flow) []const []const u8 {
+    const path_val = f.impl_of orelse return &.{};
+    const path: *const ast_find.DottedPath = &path_val;
+    const decl = findEventByPathStore(prog.items, path) orelse return &.{};
+    if (decl.input.fields.len == 0) return &.{};
+    const names = alloc.alloc([]const u8, decl.input.fields.len) catch unreachable;
+    for (decl.input.fields, 0..) |field, i| names[i] = field.name;
+    return names;
+}
+
+/// Every item in the program, flattened through `.module_decl`, in tree order,
+/// as POINTERS into the program's own arrays.
+///
+/// `program.items` is one level deep: an imported module arrives as a single
+/// `.module_decl` carrying its own items. Every scan in this file that reads
+/// `program.items` directly is therefore blind to a store declared, watched,
+/// queried or written inside a library — and the failure is not a miss, it is a
+/// diagnostic pointing at the author: "unknown store — no std/store:new(c)
+/// found", with the `new` sitting four lines above the `watch`.
+///
+/// The caveat `findSynthDecl` carries still applies and is the reason this
+/// returns items rather than flows: flattening is safe for a predicate that
+/// names something only the store machinery mints (a `__store_*` symbol, a
+/// `std/store:<verb>` invocation) and UNSAFE for a general `.flow` scan, which
+/// would start matching ordinary flows inside `std.compiler` and friends. Every
+/// caller here is predicate-guarded; a new one must be too.
+///
+/// Pointers, not copies, so a site may take `&pi.flow` and keep it, and so the
+/// two mutating walks can `@constCast` a real program node rather than a
+/// temporary.
+///
+/// The result is MEMOIZED per items-epoch. Flattening is O(program); the store
+/// machinery calls it per field, per leaf, per interceptor arm — thousands of
+/// times per compile — and every result lands on the compile arena, which frees
+/// nothing until exit. That product is what SIGKILLed monolithic programs
+/// (≈9.7 GB live for the 003_ecs benchmark). The memo keeps ONE flatten per
+/// items-epoch. The key is the items SLICE HEADER (buffer pointer + length):
+/// every structural write-back — appendItems, boxed replacements, site splices —
+/// allocates a fresh top-level array, so minted declarations are never hidden
+/// behind a stale list, and a write path that mutated the header in place would
+/// serve stale structure (none exists; this is the memo's contract). Content
+/// mutations (rewrites that @constCast nodes in place) are visible through the
+/// cached pointers and need no invalidation. Returned slices are never freed or
+/// mutated, only abandoned, so a nested call that evicts the cache cannot
+/// invalidate an outer caller's iteration.
+var flat_memo_buf_ptr: usize = 0;
+var flat_memo_buf_len: usize = std.math.maxInt(usize);
+var flat_memo_out: []const *const ast_find.Item = &.{};
+var flat_memo_lock: std.Thread.Mutex = .{};
+
+fn flatItems(alloc: std.mem.Allocator, items: []const ast_find.Item) []const *const ast_find.Item {
+    flat_memo_lock.lock();
+    defer flat_memo_lock.unlock();
+    if (flat_memo_buf_ptr == @intFromPtr(items.ptr) and flat_memo_buf_len == items.len) return flat_memo_out;
+    var out = std.ArrayList(*const ast_find.Item){};
+    collectFlat(alloc, items, &out);
+    flat_memo_buf_ptr = @intFromPtr(items.ptr);
+    flat_memo_buf_len = items.len;
+    flat_memo_out = out.items;
+    return out.items;
+}
+
+fn collectFlat(alloc: std.mem.Allocator, items: []const ast_find.Item, out: *std.ArrayList(*const ast_find.Item)) void {
+    for (items) |*it| {
+        out.append(alloc, it) catch return;
+        if (it.* == .module_decl) collectFlat(alloc, it.module_decl.items, out);
+    }
+}
+
+/// The module a store was DECLARED in, as the IMPORT-DERIVED logical name
+/// (`app.lib`) — the domain every resolvable path is spelled in.
+///
+/// The other domain is FILE-derived (`lib`, from `lib.k`), which is what
+/// `Flow.module` carries. Use the file-derived name only to compare two flows;
+/// use THIS for anything that mints a name something else has to resolve. A
+/// unit minted under the file name is addressed into a namespace nobody
+/// registered, and the program reports `unknown tor 'lib:__store_inserth_todos'`
+/// with the declaration sitting inside `app.lib` (115_018).
+///
+/// Two sources, because a store is visible in two states depending on transform
+/// order: already-coordinated (its generated apply tor carries the answer as
+/// its own qualifier) or still an untransformed `std/store:new` (the answer is
+/// the enclosing module's logical name). Null only when there is no such store.
+fn storeHome(alloc: std.mem.Allocator, prog: *const ast_find.Program, store: []const u8) ?[]const u8 {
+    const apply_name = std.fmt.allocPrint(alloc, "__store_apply_{s}", .{store}) catch unreachable;
+    if (findSynthDecl(prog.items, apply_name)) |ed| return ed.path.module_qualifier;
+    if (storeNewHomeIn(prog.items, store, null)) |m| return m;
+    if (storeViewHomeIn(prog.items, store, null)) |m| return m;
+    return null;
+}
+
+fn storeViewHomeIn(its: []const ast_find.Item, want: []const u8, enclosing: ?[]const u8) ?[]const u8 {
+    for (its) |*pi| {
+        if (pi.* == .flow) {
+            if (isStoreViewFor(&pi.flow, want)) return enclosing orelse pi.flow.module;
+        } else if (pi.* == .inline_code) {
+            const code = pi.inline_code.code;
+            const prefix = "// store-view ";
+            if (std.mem.startsWith(u8, code, prefix)) {
+                if (std.mem.indexOfScalar(u8, code, ':')) |colon| {
+                    const nm = std.mem.trim(u8, code[prefix.len..colon], " \t");
+                    if (std.mem.eql(u8, nm, want)) return enclosing orelse pi.inline_code.module;
+                }
+            }
+        } else if (pi.* == .module_decl) {
+            if (storeViewHomeIn(pi.module_decl.items, want, pi.module_decl.logical_name)) |m| return m;
+        }
+    }
+    return null;
+}
+
+fn isStoreViewFor(f: *const ast_find.Flow, want: []const u8) bool {
+    const inv = f.inv();
+    if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "view")) return false;
+    const mq = inv.path.module_qualifier orelse return false;
+    if (!std.mem.eql(u8, mq, "std.store")) return false;
+    for (inv.args) |a| {
+        if (std.mem.eql(u8, a.name, "expr")) {
+            var v = a.value;
+            if (v.len >= 2 and v[0] == '"') v = v[1 .. v.len - 1];
+            return std.mem.eql(u8, v, want);
+        }
+    }
+    return false;
+}
+
+/// `enclosing` is the containing module's logical name; top-level flows keep
+/// `f.module`, which is what the entry file is registered under.
+fn storeNewHomeIn(its: []const ast_find.Item, want: []const u8, enclosing: ?[]const u8) ?[]const u8 {
+    for (its) |*pi| {
+        if (pi.* == .flow) {
+            if (isStoreNewFor(&pi.flow, want)) return enclosing orelse pi.flow.module;
+        } else if (pi.* == .module_decl) {
+            if (storeNewHomeIn(pi.module_decl.items, want, pi.module_decl.logical_name)) |m| return m;
+        }
+    }
+    return null;
+}
+
+fn isStoreNewFor(f: *const ast_find.Flow, want: []const u8) bool {
+    const inv = f.inv();
+    if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "new")) return false;
+    const mq = inv.path.module_qualifier orelse return false;
+    if (!std.mem.eql(u8, mq, "std.store")) return false;
+    for (inv.args) |a| {
+        if (std.mem.eql(u8, a.name, "expr")) {
+            var v = a.value;
+            if (v.len >= 2 and v[0] == '"') v = v[1 .. v.len - 1];
+            return std.mem.eql(u8, v, want);
+        }
+    }
+    return false;
+}
+// ============================================================================
+// THE INDEXED STORE READ — one implementation, every position
+// ============================================================================
+// `pool[h].hp` is a handle-addressed read, and it lowers to the SoA column
+// (`(&__koru_store_pool.hp)[__koru_store_pool.__koru_resolve(h)]`). For a long
+// time it lowered in ONE position — inside a `stored` write block — because the
+// rewriter that does it was a private helper inside the `stored` transform's
+// own `H` struct, and `new`'s whole-program walk carries a DIFFERENT helper
+// struct that never had it. The result read as a language limitation: a guard,
+// a call argument or a `{{ }}` interpolation naming an indexed read failed with
+// `use of undeclared identifier 'pool'`, a Zig error naming no Koru construct
+// (690_250, 690_254).
+// A private helper struct inside a transform is a LOWERING BOUNDARY, however
+// much it reads as ordinary code organisation. So this lives at file scope,
+// where both transforms can reach it, and the copy that used to live in
+// `stored` now delegates here. See `concepts/frag-a-fix-lands-in-one-lowering-path.md`.
+/// The stores a rewrite may name, with the emitted-namespace prefix each one
+/// needs from the reader's position (`""` = same namespace).
+///
+/// Parallel slices rather than a map because both call sites already hold their
+/// names as a slice, and the recursive descent into an index expression has to
+/// carry the same answer down — an index may address a DIFFERENT store than the
+/// read it sits inside (`other[refs[i].h].v`).
+const StoreScope = struct {
+    names: []const []const u8,
+    prefixes: []const []const u8,
+
+    fn prefixFor(self: StoreScope, name: []const u8) []const u8 {
+        for (self.names, self.prefixes) |n, p| {
+            if (std.mem.eql(u8, n, name)) return p;
+        }
+        return "";
+    }
+};
+
+fn storeIdentChar(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-';
+}
+
+fn storeStripQuotes(n: []const u8) []const u8 {
+    return if (n.len >= 2 and n[0] == '"') n[1 .. n.len - 1] else n;
+}
+
+/// Every store name visible in the program — untransformed `new` sites plus the
+/// generated apply tors — so a read can name a store whose own transform has
+/// already run, or has not run yet.
+fn storeAllNames(alloc: std.mem.Allocator, prog: *const ast_find.Program) []const []const u8 {
+    var names = std.ArrayList([]const u8).initCapacity(alloc, 4) catch unreachable;
+    for (flatItems(alloc, prog.items)) |pi| {
+        switch (pi.*) {
+            .flow => |*f| {
+                if (f.body.node) |*n| {
+                    if (n.* == .invocation) {
+                        const inv = &n.invocation;
+                        if (inv.path.module_qualifier) |mq| {
+                            if (std.mem.eql(u8, mq, "std.store") and inv.path.segments.len == 1) {
+                                if (std.mem.eql(u8, inv.path.segments[0], "new") or std.mem.eql(u8, inv.path.segments[0], "view")) {
+                                    for (inv.args) |a| {
+                                        if (std.mem.eql(u8, a.name, "expr")) names.append(alloc, storeStripQuotes(a.value)) catch unreachable;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            .event_decl => |*ed| {
+                if (ed.path.segments.len == 1 and std.mem.startsWith(u8, ed.path.segments[0], "__store_apply_")) {
+                    names.append(alloc, ed.path.segments[0]["__store_apply_".len..]) catch unreachable;
+                }
+            },
+            .inline_code => |*ic| {
+                const prefix = "// store-view ";
+                if (std.mem.startsWith(u8, ic.code, prefix)) {
+                    if (std.mem.indexOfScalar(u8, ic.code, ':')) |colon| {
+                        const nm = std.mem.trim(u8, ic.code[prefix.len..colon], " \t");
+                        names.append(alloc, alloc.dupe(u8, nm) catch unreachable) catch unreachable;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    return names.toOwnedSlice(alloc) catch unreachable;
+}
+
+fn storeViewMembers(alloc: std.mem.Allocator, prog: *const ast_find.Program, view_name: []const u8) ?[]const []const u8 {
+    for (flatItems(alloc, prog.items)) |pi| {
+        if (pi.* == .inline_code) {
+            const code = pi.inline_code.code;
+            const prefix = "// store-view ";
+            if (!std.mem.startsWith(u8, code, prefix)) continue;
+            const colon = std.mem.indexOfScalar(u8, code, ':') orelse continue;
+            const nm = std.mem.trim(u8, code[prefix.len..colon], " \t");
+            if (!std.mem.eql(u8, nm, view_name)) continue;
+            var out = std.ArrayList([]const u8).initCapacity(alloc, 4) catch unreachable;
+            var toks = std.mem.splitScalar(u8, code[colon + 1 ..], ',');
+            while (toks.next()) |raw| {
+                const m = std.mem.trim(u8, raw, " \t\r\n");
+                if (m.len == 0) continue;
+                out.append(alloc, alloc.dupe(u8, m) catch unreachable) catch unreachable;
+            }
+            return out.toOwnedSlice(alloc) catch unreachable;
+        } else if (pi.* == .flow) {
+            const f = &pi.flow;
+            const inv = f.inv();
+            if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "view")) continue;
+            const mq = inv.path.module_qualifier orelse continue;
+            if (!std.mem.eql(u8, mq, "std.store")) continue;
+            var hit = false;
+            var source_text: ?[]const u8 = null;
+            for (inv.args) |a| {
+                if (std.mem.eql(u8, a.name, "expr") and std.mem.eql(u8, storeStripQuotes(a.value), view_name)) hit = true;
+                if (std.mem.eql(u8, a.name, "source")) source_text = if (a.source_value) |sv| sv.text else a.value;
+            }
+            if (!hit or source_text == null) continue;
+            var out = std.ArrayList([]const u8).initCapacity(alloc, 4) catch unreachable;
+            var toks = std.mem.tokenizeAny(u8, source_text.?, "\n\r,\t {}");
+            while (toks.next()) |raw| {
+                const m = std.mem.trim(u8, raw, " \t\r\n,{}");
+                if (m.len == 0) continue;
+                out.append(alloc, alloc.dupe(u8, m) catch unreachable) catch unreachable;
+            }
+            return out.toOwnedSlice(alloc) catch unreachable;
+        }
+    }
+    return null;
+}
+
+/// `<store>.<field>` → the cell path, boundary-aware, for ONE store.
+///
+/// `prefix` is the emitted-namespace qualifier the reader needs (`""` when the
+/// reader is in the declaring module's own namespace).
+///
+/// `is_identity` handles the one-column store, which has no field to name, so
+/// the store name IS the reference and resolves to the synthesized column.
+/// A following `[` is EXCLUDED from that case, and this exclusion is not
+/// cosmetic: `c[h]` is an index, never an identity read, and without the
+/// exclusion the identity rule eats the base before the indexed rewriter can
+/// see it. There were five copies of this function and only the two in scopes
+/// that ALSO had the indexed rewriter carried the exclusion — the two halves of
+/// one rule, split across scopes, each correct only beside the other.
+fn storeRefsText(alloc: std.mem.Allocator, text: []const u8, name: []const u8, prefix: []const u8, is_identity: bool) []const u8 {
+    // Absent name → the walk returns text unchanged; skip it (name × slot).
+    if (std.mem.indexOf(u8, text, name) == null) return text;
+    const expr_ctx = ast_find.expressionMask(alloc, text);
+    var out = std.ArrayList(u8).initCapacity(alloc, text.len + 32) catch unreachable;
+    var i: usize = 0;
+    while (i < text.len) {
+        const at_boundary = ast_find.identBoundaryBefore(text, i);
+        const starts = at_boundary and (i == 0 or text[i - 1] != '.') and std.mem.startsWith(u8, text[i..], name);
+        const after = i + name.len;
+        if (expr_ctx[i] and starts and after < text.len and text[after] == '.') {
+            out.appendSlice(alloc, prefix) catch unreachable;
+            out.appendSlice(alloc, "__koru_store_") catch unreachable;
+            out.appendSlice(alloc, name) catch unreachable;
+            i += name.len;
+        } else if (is_identity and expr_ctx[i] and starts and !isPrecededByIs(text, i) and
+            (after >= text.len or (!storeIdentChar(text[after]) and text[after] != '[')))
+        {
+            out.appendSlice(alloc, prefix) catch unreachable;
+            out.appendSlice(alloc, "__koru_store_") catch unreachable;
+            out.appendSlice(alloc, name) catch unreachable;
+            out.append(alloc, '.') catch unreachable;
+            out.appendSlice(alloc, ast_find.STORE_IDENTITY_COLUMN) catch unreachable;
+            i += name.len;
+        } else {
+            out.append(alloc, text[i]) catch unreachable;
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(alloc) catch unreachable;
+}
+/// A text slot, FULLY lowered: cell paths first, then indexed reads — the order
+/// `stored`'s value pass uses, so a cross-store index inside an indexed read is a cell path already.
+/// `bound` are names an enclosing binding shadows (a row binding makes
+/// `<store>.<field>` mean THE ROW); BOTH passes skip them — the indexed
+/// pass takes a filtered scope.
+/// The one function a walk calls per text slot. Every position an expression
+/// may stand in — guard, arg, captured expression, frozen template body,
+/// inline_code node, produce arm, branch payload — is the same lowering, and
+/// the store's reach gaps have all been a position that called some of it.
+fn storeLowerText(
+    alloc: std.mem.Allocator,
+    prog: *const ast_find.Program,
+    text: []const u8,
+    scope: StoreScope,
+    idents: []const []const u8,
+    bound: []const []const u8,
+) []const u8 {
+    var live_n = std.ArrayList([]const u8).initCapacity(alloc, scope.names.len) catch unreachable;
+    var live_p = std.ArrayList([]const u8).initCapacity(alloc, scope.names.len) catch unreachable;
+    var t = text;
+    for (scope.names, scope.prefixes) |nm, px| {
+        if (storeNameIn(bound, nm)) continue;
+        live_n.append(alloc, nm) catch unreachable;
+        live_p.append(alloc, px) catch unreachable;
+        t = storeRefsText(alloc, t, nm, px, storeNameIn(idents, nm));
+    }
+    return storeIndexedRefsIn(alloc, prog, t, .{ .names = live_n.items, .prefixes = live_p.items });
+}
+~part new
+~part hstruct
+~part view
+~part stored
+~part default
+~part watch
+~part insert
+~part rule
+~part query
+~part preorder
+~part take
+~part clear
+~part stripe
+~part qrewrite
+~part cursor
+~part qcaps
+~part pverbs
+~part sitetag
+~part explain
+~part sites
+~part leaf
+~part index
+~part indexwalk
+~part idecls
+~part qnone
+~part qmiss
+~part qmisskind
+~part gate
+~part bulk
+~part bulkemit
+~part bulkjoin
+~part plan
+~part drain
+~part expand
+~part kinds
+~part refs
+~part refhome
+~part refhomeapi
+~part keyed
+~part wait
+~part uncrossable
+~part cols
+~part csemit
+~part hostemit
+~part bulkdetect
+~part ixrefs
+~part prewrite
+~part srefscan

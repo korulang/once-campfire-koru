@@ -1,0 +1,253 @@
+~[compiler]
+
+// Compiler Context Module
+// Provides threading state and operations for compiler passes
+// All operations are Koru tors - composable, observable, overridable!
+
+// ============================================================
+// DATA STRUCTURES (Pure Zig, no methods)
+// ============================================================
+
+pub const SourceLocation = struct {
+    file: []const u8,
+    line: u32,
+    column: u32,
+};
+
+pub const CompilerError = struct {
+    message: []const u8,
+    location: SourceLocation,
+};
+
+pub const CompilerWarning = struct {
+    message: []const u8,
+    location: SourceLocation,
+};
+
+pub const ErrorPolicy = enum {
+    abort_on_first,  // Stop immediately when error is reported
+    collect_all,     // Collect all errors before stopping
+};
+
+pub const CompilerContext = struct {
+    // The AST being compiled (transformed through passes)
+    ast: Program,
+
+    // Allocator for dynamic allocations
+    allocator: std.mem.Allocator,
+
+    // Error and warning tracking
+    errors: std.ArrayList(CompilerError),
+    warnings: std.ArrayList(CompilerWarning),
+    error_policy: ErrorPolicy,
+
+    // Pass tracking and metrics
+    current_pass: ?[]const u8,
+    passes_completed: u32,
+};
+
+// ============================================================
+// CONTEXT OPERATIONS (Koru Tors - composable & observable!)
+// ============================================================
+
+// Create a new compiler context
+~pub tor init {
+    ast: std/compiler:Program,
+    allocator: std.mem.Allocator,
+    error_policy: ErrorPolicy
+} -> CompilerContext
+
+~proc init|zig {
+    var ctx = CompilerContext{
+        .ast = ast,
+        .allocator = allocator,
+        .errors = std.ArrayList(CompilerError).init(allocator),
+        .warnings = std.ArrayList(CompilerWarning).init(allocator),
+        .error_policy = error_policy,
+        .current_pass = null,
+        .passes_completed = 0,
+    };
+
+    return ctx;
+}
+
+// Begin a compilation pass (increments metrics, emits CCP tors)
+~pub tor begin-pass { ctx: CompilerContext, name: string } -> CompilerContext
+
+~proc begin-pass|zig {
+    var ctx = ctx;
+    ctx.current_pass = name;
+
+    // TODO: Emit CCP pass_started tor if --ccp flag is set
+    // if (CompilerEnv.hasFlag("ccp")) {
+    //     emit_ccp_event("pass_started", .{ .pass = name });
+    // }
+
+    return ctx;
+}
+
+// End a compilation pass (increments pass counter, emits CCP tors)
+~pub tor end-pass { ctx: CompilerContext } -> CompilerContext
+
+~proc end-pass|zig {
+    var ctx = ctx;
+
+    if (ctx.current_pass != null) {
+        ctx.passes_completed += 1;
+
+        // TODO: Emit CCP pass_completed tor if --ccp flag is set
+        // if (CompilerEnv.hasFlag("ccp")) {
+        //     emit_ccp_event("pass_completed", .{
+        //         .pass = ctx.current_pass.?,
+        //         .pass_number = ctx.passes_completed
+        //     });
+        // }
+    }
+
+    ctx.current_pass = null;
+    return ctx;
+}
+
+// Report a compilation error
+~pub tor report-error {
+    ctx: CompilerContext,
+    message: string,
+    location: SourceLocation
+} -> CompilerContext
+
+~proc report-error|zig {
+    var ctx = ctx;
+
+    // Append to errors list
+    ctx.errors.append(.{
+        .message = message,
+        .location = location,
+    }) catch {
+        // If we can't even record the error, print it immediately
+        std.debug.print("ERROR: {s} at {s}:{}:{}\n", .{
+            message,
+            location.file,
+            location.line,
+            location.column,
+        });
+    };
+
+    // Print the error immediately
+    std.debug.print("ERROR: {s} at {s}:{}:{}\n", .{
+        message,
+        location.file,
+        location.line,
+        location.column,
+    });
+
+    // TODO: Emit CCP error tor if --ccp flag is set
+
+    return ctx;
+}
+
+// Report a compilation warning
+~pub tor report-warning {
+    ctx: CompilerContext,
+    message: string,
+    location: SourceLocation
+} -> CompilerContext
+
+~proc report-warning|zig {
+    var ctx = ctx;
+
+    // Append to warnings list
+    ctx.warnings.append(.{
+        .message = message,
+        .location = location,
+    }) catch {
+        // If we can't record the warning, just print it
+        std.debug.print("WARNING: {s} at {s}:{}:{}\n", .{
+            message,
+            location.file,
+            location.line,
+            location.column,
+        });
+    };
+
+    // Print the warning immediately
+    std.debug.print("WARNING: {s} at {s}:{}:{}\n", .{
+        message,
+        location.file,
+        location.line,
+        location.column,
+    });
+
+    // TODO: Emit CCP warning tor if --ccp flag is set
+
+    return ctx;
+}
+
+// Report an informational message
+~pub tor info { ctx: CompilerContext, message: string } -> CompilerContext
+
+~proc info|zig {
+    // TODO: Check if --verbose flag is set before printing
+    // if (CompilerEnv.hasFlag("verbose")) {
+        std.debug.print("INFO: {s}\n", .{message});
+    // }
+
+    return ctx;
+}
+
+// Check if compilation should abort due to errors
+~pub tor should-abort { ctx: CompilerContext }
+| yes CompilerContext
+| no CompilerContext
+
+~proc should-abort|zig {
+    const ctx = ctx;
+
+    const should_abort = (ctx.error_policy == .abort_on_first and ctx.errors.items.len > 0);
+
+    if (should_abort) {
+        return .{ .yes = ctx };
+    } else {
+        return .{ .no = ctx };
+    }
+}
+
+// Query: Get current pass count
+~pub tor pass-count { ctx: CompilerContext } -> { ctx: CompilerContext, value: u32 }
+
+~proc pass-count|zig {
+    return .{
+        .ctx = ctx,
+        .value = ctx.passes_completed
+    };
+}
+
+// Query: Get error count
+~pub tor error-count { ctx: CompilerContext } -> { ctx: CompilerContext, value: u32 }
+
+~proc error-count|zig {
+    const err_count: u32 = @intCast(ctx.errors.items.len);
+    return .{
+        .ctx = ctx,
+        .value = err_count
+    };
+}
+
+// Query: Get warning count
+~pub tor warning-count { ctx: CompilerContext } -> { ctx: CompilerContext, value: u32 }
+
+~proc warning-count|zig {
+    const warn_count: u32 = @intCast(ctx.warnings.items.len);
+    return .{
+        .ctx = ctx,
+        .value = warn_count
+    };
+}
+
+// Update AST in context (used by transformation passes)
+~pub tor update-ast { ctx: CompilerContext, ast: std/compiler:Program } -> CompilerContext
+
+~proc update-ast|zig {
+    var ctx = ctx;
+    ctx.ast = ast;
+    return ctx;
+}

@@ -1,0 +1,41 @@
+// std/args — JavaScript implementation facet.
+//
+// Events are declared in the `args.k` companion (merged at import). This file
+// holds the `|js` proc bodies.
+//
+// Alignment with the Zig facet: Zig's argv is [program, ...userargs], but
+// node's process.argv is [node, script, ...userargs]. We drop node's leading
+// entry so Koru index 0 is the program/script and index i is process.argv[i+1]
+// — matching the Zig facet's indexing exactly.
+
+// GAP (2026-07-04): the JS emitter has no bare-return support yet
+// (js_emitter.zig never reads return_type). `all`/`count`/`rest` moved to
+// `-> T` in the single-return-form migration; these bodies return the bare
+// value symmetric with the Zig facet, UNVERIFIED against the JS backend
+// until it learns bare-return.
+
+~proc all|js {
+    return process.argv.slice(1);
+}
+
+~proc count|js {
+    return process.argv.length - 1;
+}
+
+// The branch tag is the Koru branch name VERBATIM, hyphens and all. The arm
+// the emitter writes is `result.tag === "out-of-bounds"` (js_emitter.zig:2759
+// interpolates `cont.branch` unlowered), and payload access brackets a
+// non-identifier key rather than lowering it (`writeMember`, :273). Spelling
+// it `out_of_bounds` here made the arm unreachable — silently, because the
+// flow just ran no branch at all. Caught by std/list:get, whose oob arm the
+// corpus does exercise; this one's does not.
+~proc get|js {
+    if (index + 1 >= process.argv.length) {
+        return { tag: "out-of-bounds" };
+    }
+    return { tag: "arg", arg: process.argv[index + 1] };
+}
+
+~proc rest|js {
+    return process.argv.slice(2);
+}

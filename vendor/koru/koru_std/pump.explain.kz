@@ -1,0 +1,301 @@
+// Koru Standard Library: the `explain` part of pump — joined via
+// `~part explain` in pump.kz; members land in koru_pump.
+//
+// The pump is the most distributed surface in the stdlib: participants
+// join from anywhere via `std/pump(name) ! step |> ...` and `run`
+// enumerates them by generated-decl name. Nothing in any single file
+// answers "who joined, which verbs each answers, does this pump ever
+// drain" — the explainer folds the source sites in document order with
+// the SAME checks the create/join/run transforms apply; a program that
+// refuses still explains itself, each refusal verbatim via the shared
+// `PM` messages. Callee spellings come from PH.lastInvocation — the same
+// read the join transform uses — and `PS.synthesized` names callees the
+// store transform will generate.
+
+const PX = struct {
+    const site_hash = @import("site_hash");
+    // One answered verb: the callee the arm ends in, or its refusal row.
+    // `site` is the arm's call invocation; `gen` is the `std/store:new` site
+    // that synthesized the callee — both land as `at` witnesses on the row.
+    const Verb = struct { callee: []const u8, status: ?[]const u8 = null, site: ?*const ast.Invocation = null, gen: ?*const ast.Invocation = null };
+
+    const Join = struct {
+        step: ?Verb = null,
+        live: ?Verb = null,
+        wait: ?Verb = null,
+        wait_bind: []const u8 = "i",
+        status: ?[]const u8 = null,
+    };
+
+    const Pump = struct {
+        name: []const u8,
+        declared: bool = false,
+        drained_armed: bool = false,
+        ran: bool = false,
+        idle_armed: bool = false,
+        joins: std.ArrayList(Join),
+        status: ?[]const u8 = null,
+    };
+
+    fn isPumpDoor(inv: *const ast.Invocation) ?[]const u8 {
+        const mq = inv.path.module_qualifier orelse return null;
+        if (!std.mem.eql(u8, mq, "std.pump") and !std.mem.eql(u8, mq, "std/pump")) return null;
+        if (inv.path.segments.len != 1) return null;
+        return inv.path.segments[0];
+    }
+
+    // A qualified callee spelled `home:name` — dotted, matching the
+    // catalog's `home:Name` convention (`element = explain_demo:Server`).
+    fn spellCallee(alloc: std.mem.Allocator, cont: *const ast.Continuation) []const u8 {
+        const li = PH.lastInvocation(cont) orelse return "∅";
+        var buf = std.ArrayList(u8).initCapacity(alloc, 48) catch unreachable;
+        if (li.path.module_qualifier) |q| {
+            for (q) |c| buf.append(alloc, if (c == '/') '.' else c) catch unreachable;
+            buf.append(alloc, ':') catch unreachable;
+        }
+        for (li.path.segments, 0..) |s, i| {
+            if (i > 0) buf.append(alloc, '.') catch unreachable;
+            buf.appendSlice(alloc, s) catch unreachable;
+        }
+        return buf.toOwnedSlice(alloc) catch unreachable;
+    }
+
+    fn refused(alloc: std.mem.Allocator, comptime msg: []const u8, args: anytype) []const u8 {
+        return std.fmt.allocPrint(alloc, "refused: " ++ msg, args) catch unreachable;
+    }
+
+    // The join transform's per-verb contract: callee declared, return
+    // shape — or synthesized by a store's armed verb (PS.synthesized).
+    fn checkVerb(alloc: std.mem.Allocator, prog: *const ast.Program, cont: *const ast.Continuation, home: []const u8, verb: []const u8, want: []const u8, name: []const u8) Verb {
+        const callee = spellCallee(alloc, cont);
+        const site = PH.lastInvocation(cont);
+        const cd = PH.calleeDecl(prog, cont, home) orelse {
+            if (PS.synthesized(prog, site)) |s|
+                return .{ .callee = std.fmt.allocPrint(alloc, "{s} ← synthesized by std/store:new({s})", .{ callee, s.store }) catch unreachable, .site = site, .gen = s.gen };
+            return .{ .callee = callee, .status = refused(alloc, PM.join_verb_needs_tor, .{ name, verb }), .site = site };
+        };
+        const rt = cd.return_type orelse
+            return .{ .callee = callee, .status = refused(alloc, PM.join_verb_no_return, .{ name, verb, want }), .site = site };
+        if (std.mem.eql(u8, verb, "wait")) {
+            if (PWait.classify(rt) == null)
+                return .{ .callee = callee, .status = refused(alloc, PM.join_wait_no_interest, .{ name, rt }), .site = site };
+        } else if (std.mem.indexOf(u8, rt, want) == null)
+            return .{ .callee = callee, .status = refused(alloc, PM.join_verb_wrong_return, .{ name, verb, rt, want }), .site = site };
+        return .{ .callee = callee, .site = site };
+    }
+
+    // emitVerb lives in the `wit` part (PW.emitVerb).
+    fn find(pumps: *std.ArrayList(Pump), name: []const u8) ?*Pump {
+        for (pumps.items) |*p| {
+            if (std.mem.eql(u8, p.name, name)) return p;
+        }
+        return null;
+    }
+
+    fn stub(alloc: std.mem.Allocator, name: []const u8, status: ?[]const u8) Pump {
+        return .{ .name = name, .joins = std.ArrayList(Join).initCapacity(alloc, 4) catch unreachable, .status = status };
+    }
+
+    fn foldCreate(alloc: std.mem.Allocator, fl: *const ast.Flow, inv: *const ast.Invocation, pumps: *std.ArrayList(Pump)) void {
+        const name = siteName(inv);
+        var p = stub(alloc, name, null);
+        if (find(pumps, name)) |existing| {
+            existing.status = refused(alloc, PM.create_dup, .{ name, name });
+            return;
+        }
+        p.declared = true;
+        var drained_seen = false;
+        for (fl.body.continuations) |*c| {
+            const cb = std.mem.trim(u8, c.branch, " ");
+            if (cb.len == 0) continue;
+            if (c.kind == .effect) {
+                p.status = refused(alloc, PM.create_effect_arm, .{ name, cb, name });
+                continue;
+            }
+            if (!std.mem.eql(u8, cb, "drained")) {
+                p.status = refused(alloc, PM.create_unknown_arm, .{ name, cb });
+                continue;
+            }
+            if (drained_seen) {
+                p.status = refused(alloc, PM.create_drained_once, .{name});
+                continue;
+            }
+            drained_seen = true;
+            if (c.node == null) {
+                p.status = refused(alloc, PM.create_drained_needs_body, .{name});
+            } else p.drained_armed = true;
+        }
+        pumps.append(alloc, p) catch unreachable;
+    }
+
+    fn foldJoin(alloc: std.mem.Allocator, prog: *const ast.Program, fl: *const ast.Flow, inv: *const ast.Invocation, pumps: *std.ArrayList(Pump)) void {
+        const name = siteName(inv);
+        const p = find(pumps, name) orelse {
+            pumps.append(alloc, stub(alloc, name, refused(alloc, PM.join_no_pump, .{ name, name, name }))) catch unreachable;
+            return;
+        };
+        var j = Join{};
+        if (p.ran) j.status = refused(alloc, PM.join_after_run, .{ name, name });
+        for (fl.body.continuations) |*c| {
+            const cb = std.mem.trim(u8, c.branch, " ");
+            if (cb.len == 0) continue;
+            if (c.kind != .effect) {
+                j.status = refused(alloc, PM.join_terminal_arm, .{ name, cb });
+                continue;
+            }
+            if (std.mem.eql(u8, cb, "step")) {
+                if (j.step != null) { j.status = refused(alloc, PM.join_one_step, .{name}); continue; }
+                if (c.binding != null) { j.status = refused(alloc, PM.join_step_binds_nothing, .{name}); continue; }
+                j.step = checkVerb(alloc, prog, c, fl.module, "step", "i32", name);
+            } else if (std.mem.eql(u8, cb, "live")) {
+                if (j.live != null) { j.status = refused(alloc, PM.join_one_live, .{name}); continue; }
+                j.live = checkVerb(alloc, prog, c, fl.module, "live", "i64", name);
+            } else if (std.mem.eql(u8, cb, "wait")) {
+                if (j.wait != null) { j.status = refused(alloc, PM.join_one_wait, .{name}); continue; }
+                if (c.binding) |b| j.wait_bind = b else j.status = refused(alloc, PM.join_wait_binds_index, .{name});
+                j.wait = checkVerb(alloc, prog, c, fl.module, "wait", "the interest contract: `i32` (fd), `i128` (re-poll ns), or `{ fd, wait_ns }`", name);
+            } else {
+                j.status = refused(alloc, PM.join_unknown_verb, .{ name, cb });
+            }
+        }
+        if (j.step == null and j.status == null) j.status = refused(alloc, PM.join_needs_step, .{name});
+        if (j.wait != null and j.live == null and j.status == null) j.status = refused(alloc, PM.join_wait_needs_live, .{name});
+        p.joins.append(alloc, j) catch unreachable;
+    }
+
+    fn foldRun(alloc: std.mem.Allocator, fl: *const ast.Flow, inv: *const ast.Invocation, pumps: *std.ArrayList(Pump)) void {
+        const name = siteName(inv);
+        const p = find(pumps, name) orelse {
+            var s = stub(alloc, name, refused(alloc, PMRun.run_no_pump, .{ name, name, name, name }));
+            s.ran = true;
+            pumps.append(alloc, s) catch unreachable;
+            return;
+        };
+        if (p.ran) {
+            p.status = refused(alloc, PMRun.run_already_ran, .{ name, name });
+            return;
+        }
+        p.ran = true;
+        for (fl.body.continuations) |*c| {
+            if (c.kind == .effect and std.mem.eql(u8, std.mem.trim(u8, c.branch, " "), "idle")) p.idle_armed = true;
+        }
+    }
+
+    fn foldSites(alloc: std.mem.Allocator, prog: *const ast.Program, items: []const ast.Item, pumps: *std.ArrayList(Pump)) void {
+        for (items) |entry| {
+            switch (entry) {
+                .flow => |*fl| {
+                    if (fl.body.node) |*node| {
+                        if (node.* == .invocation) {
+                            const door = isPumpDoor(&node.invocation) orelse continue;
+                            if (std.mem.eql(u8, door, "create")) {
+                                foldCreate(alloc, fl, &node.invocation, pumps);
+                            } else if (std.mem.eql(u8, door, "default")) {
+                                foldJoin(alloc, prog, fl, &node.invocation, pumps);
+                            } else if (std.mem.eql(u8, door, "run")) {
+                                foldRun(alloc, fl, &node.invocation, pumps);
+                            }
+                        }
+                    }
+                },
+                .module_decl => |*m| foldSites(alloc, prog, m.items, pumps),
+                else => {},
+            }
+        }
+    }
+};
+
+// @retain: explain_pump_event is referenced from generated code
+// (koruc's koru_explain_gather invokes every discovered [explainer]).
+~[comptime|explainer]pub tor explain-pump {
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> ExplainReport
+
+~proc explain-pump|zig {
+    const Entry = ast.ExplainReport.Entry;
+    const Section = ast.ExplainReport.Section;
+    const site_hash = @import("site_hash");
+
+    var pumps = std.ArrayList(PX.Pump).initCapacity(allocator, 4) catch unreachable;
+    PX.foldSites(allocator, program, program.items, &pumps);
+    const sites = site_hash.collectSites(allocator, program) catch &.{};
+
+    if (pumps.items.len == 0) {
+        return .{ .title = "std/pump", .sections = &.{ .{ .heading = "pumps", .entries = &.{
+            .{ .note = "no std/pump sites — nothing composes a driver" },
+        } } } };
+    }
+
+    var sections = std.ArrayList(Section).initCapacity(allocator, pumps.items.len) catch unreachable;
+    for (pumps.items) |*p| {
+        var entries = std.ArrayList(Entry).initCapacity(allocator, 8 + p.joins.items.len * 4) catch unreachable;
+        if (p.status) |s| {
+            entries.append(allocator, .{ .property = .{ .key = "status", .value = .{ .string = s } } }) catch unreachable;
+        }
+        entries.append(allocator, .{ .property = .{ .key = "participants", .value = .{ .integer = @intCast(p.joins.items.len) } } }) catch unreachable;
+        entries.append(allocator, .{ .property = .{ .key = "drained_arm", .value = .{ .bool = p.drained_armed } } }) catch unreachable;
+        entries.append(allocator, .{ .property = .{ .key = "run", .value = .{ .bool = p.ran } } }) catch unreachable;
+        if (!p.ran and p.status == null) {
+            entries.append(allocator, .{ .note = "never driven — the pump composes participants but nothing runs it" }) catch unreachable;
+        }
+
+        // Drain policy — run breaks when Σ live() is 0; a participant
+        // without `live` contributes 1 forever.
+        var immortals: usize = 0;
+        var waits: usize = 0;
+        for (p.joins.items) |*j| {
+            if (j.live == null) immortals += 1;
+            if (j.wait != null) waits += 1;
+        }
+        if (immortals == 0 and p.joins.items.len > 0) {
+            entries.append(allocator, .{ .property = .{ .key = "drains", .value = .{ .bool = true } } }) catch unreachable;
+            entries.append(allocator, .{ .note = "drains — every participant answers `live`" }) catch unreachable;
+        } else if (immortals > 0) {
+            entries.append(allocator, .{ .property = .{ .key = "drains", .value = .{ .bool = false } } }) catch unreachable;
+            entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "immortal — {d} participant(s) answer no `live`; this pump IS the program's event loop", .{immortals}) catch unreachable }) catch unreachable;
+        }
+
+        // Idle policy — armed `! idle` runs the arm; unarmed, the union
+        // wait; no waits at all breathes 1ms.
+        if (p.ran) {
+            if (p.idle_armed) {
+                entries.append(allocator, .{ .property = .{ .key = "idle", .value = .{ .string = "armed ! idle" } } }) catch unreachable;
+            } else if (waits > 0) {
+                entries.append(allocator, .{ .property = .{ .key = "idle", .value = .{ .string = std.fmt.allocPrint(allocator, "union wait over {d} interest(s)", .{waits}) catch unreachable } } }) catch unreachable;
+            } else {
+                entries.append(allocator, .{ .property = .{ .key = "idle", .value = .{ .string = "1ms breath — no interests declared" } } }) catch unreachable;
+            }
+        }
+
+        for (p.joins.items, 0..) |*j, ji| {
+            const k = std.fmt.allocPrint(allocator, "j{d}", .{ji}) catch unreachable;
+            if (j.status) |s| {
+                entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "join #{d} — {s}", .{ ji, s }) catch unreachable }) catch unreachable;
+                entries.append(allocator, .{ .property = .{ .key = std.fmt.allocPrint(allocator, "{s}.status", .{k}) catch unreachable, .value = .{ .string = s } } }) catch unreachable;
+                continue;
+            }
+            var verbs = std.ArrayList(u8).initCapacity(allocator, 48) catch unreachable;
+            if (j.step) |v| {
+                verbs.appendSlice(allocator, "step") catch unreachable;
+                PW.emitVerb(allocator, &entries, sites, k, ji, "step", v);
+            }
+            if (j.live) |v| {
+                verbs.appendSlice(allocator, " + live") catch unreachable;
+                PW.emitVerb(allocator, &entries, sites, k, ji, "live", v);
+            }
+            if (j.wait) |v| {
+                verbs.appendSlice(allocator, std.fmt.allocPrint(allocator, " + wait({s})", .{j.wait_bind}) catch unreachable) catch unreachable;
+                PW.emitVerb(allocator, &entries, sites, k, ji, "wait", v);
+            }
+            const mortal_note = if (j.live == null) " — immortal" else "";
+            entries.append(allocator, .{ .note = std.fmt.allocPrint(allocator, "join #{d}: {s}{s}", .{ ji, verbs.items, mortal_note }) catch unreachable }) catch unreachable;
+        }
+        sections.append(allocator, .{ .heading = p.name, .entries = entries.toOwnedSlice(allocator) catch &.{} }) catch unreachable;
+    }
+
+    return .{
+        .title = "std/pump",
+        .sections = sections.toOwnedSlice(allocator) catch &.{},
+    };
+}

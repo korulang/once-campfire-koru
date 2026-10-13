@@ -1,0 +1,63 @@
+// Koru Standard Library: the `ownedleaf` part of proto — the owned-leaf
+// field gate. Joined via `~part ownedleaf` in proto.kz; merged into the
+// proto module.
+//
+// An owned leaf — `*mod:Type<state!>` — names an obligation-bearing
+// pointer whose custody transits the whole value. The shape mirrors the
+// store's owned-column contract (store.new.kz): pointer + module-qualified
+// type + pinned `<state!>` — qualified so every consumer can locate the
+// type's canonical discharger, `!`-suffixed because a bare `<state>`
+// borrow is not owned. Like `ref(X)` the leaf is a REFERENCE — it joins
+// no expansion and no cycle walk — but unlike ref it carries a debt the
+// receiver must settle per path.
+
+/// One owned leaf of a proto — `fd: *mod:Type<state!>`.
+const OwnedLeaf = struct {
+    module: []const u8, // "app/lib/res"
+    type_name: []const u8, // "Resource"
+    state: []const u8, // "owned" — the '!' is stripped
+};
+const OwnedLeafVerdict = union(enum) {
+    none, // not an owned-leaf spelling — ordinary field vocabulary
+    owned: OwnedLeaf,
+    malformed: []const u8, // starts as owned (`*` or phantom) but mis-shaped
+};
+
+fn parseOwnedLeaf(alloc: std.mem.Allocator, field_name: []const u8, entry: []const u8, ftype: []const u8) OwnedLeafVerdict {
+    const t = std.mem.trim(u8, ftype, " \t");
+    const starred = std.mem.startsWith(u8, t, "*");
+    const has_phantom = std.mem.indexOfScalar(u8, t, '<') != null;
+    if (!starred and !has_phantom) return .none;
+    const malformed = struct {
+        fn say(a: std.mem.Allocator, en: []const u8, f: []const u8, ft: []const u8, why: []const u8) []const u8 {
+            return std.fmt.allocPrint(a, "std/proto({s}): field '{s}' is {s} — {s}", .{ en, f, ft, why }) catch unreachable;
+        }
+    }.say;
+    if (!starred or !has_phantom or t[t.len - 1] != '>') {
+        return .{ .malformed = malformed(alloc, entry, field_name, t, "an owned leaf must be a well-formed `*mod:Type<state!>` (pointer, module-qualified type, held obligation)") };
+    }
+    const lt = std.mem.indexOfScalar(u8, t, '<').?;
+    const type_part = std.mem.trim(u8, t[1..lt], " \t");
+    var phantom_part = std.mem.trim(u8, t[lt + 1 .. t.len - 1], " \t");
+    const tcolon = std.mem.lastIndexOfScalar(u8, type_part, ':') orelse {
+        return .{ .malformed = malformed(alloc, entry, field_name, t, "an owned leaf type must be module-qualified `*mod:Type<state!>` so consumers can locate its canonical discharger") };
+    };
+    if (phantom_part.len == 0 or phantom_part[phantom_part.len - 1] != '!') {
+        return .{ .malformed = malformed(alloc, entry, field_name, t, "an owned leaf must hold a live obligation `<state!>` (a bare `<state>` borrow is not owned)") };
+    }
+    phantom_part = phantom_part[0 .. phantom_part.len - 1];
+    const state = if (std.mem.lastIndexOfScalar(u8, phantom_part, ':')) |pc| phantom_part[pc + 1 ..] else phantom_part;
+    if (type_part.len == 0 or state.len == 0) {
+        return .{ .malformed = malformed(alloc, entry, field_name, t, "an owned leaf must be a well-formed `*mod:Type<state!>` (pointer, module-qualified type, held obligation)") };
+    }
+    return .{ .owned = .{
+        .module = alloc.dupe(u8, type_part[0..tcolon]) catch unreachable,
+        .type_name = alloc.dupe(u8, type_part[tcolon + 1 ..]) catch unreachable,
+        .state = alloc.dupe(u8, state) catch unreachable,
+    } };
+}
+
+fn isOwnedLeaf(ftype: []const u8) bool {
+    const t = std.mem.trim(u8, ftype, " \t");
+    return std.mem.startsWith(u8, t, "*") or std.mem.indexOfScalar(u8, t, '<') != null;
+}

@@ -1,0 +1,813 @@
+// Koru Standard Library: String Formatting
+//
+// Zero-overhead string formatting with Liquid-style templates.
+// Returns allocated strings with phantom obligation tracking.
+//
+// DESIGN: "Hidden but overridable"
+// - fmt.blk: Uses page_allocator internally, user never thinks about it
+// - fmt.blk.with_allocator: Explicit control when needed
+// - Auto-discharge handles cleanup via phantom obligations
+
+~[comptime|runtime]
+~part jsprec
+~part csprec
+
+const std = @import("std");
+
+// ============================================================================
+// FORMATTED TEXT - Carries both text and allocator for self-contained cleanup
+// ============================================================================
+
+pub const FormattedText = struct {
+    text: []const u8,
+    allocator: std.mem.Allocator,
+};
+
+// ============================================================================
+// FMT.DEALLOC - Discharge the <allocated!> obligation
+// ============================================================================
+
+~pub tor fmt.dealloc { formatted: *FormattedText<!allocated> }
+
+~proc fmt.dealloc|zig {
+    formatted.allocator.free(formatted.text);
+    koru_allocator().destroy(formatted);
+}
+
+// ============================================================================
+// FMT.BLK - Format with hidden default allocator (page_allocator)
+// ============================================================================
+//
+// Syntax:
+//   fmt.blk {
+//       Hello {{ name:s }}!
+//       Count: {{ count:d }}
+//   }
+//   : f |> ... use {{ f:s }} ...
+//
+// The `<allocated!>` string is bound with `: name` (bare-return rule) and
+// auto-discharge inserts fmt.dealloc / std/io:free accordingly; the caller
+// interpolates the text with `{{ f:s }}`.
+
+// The transform tor returns SiteResult (the rewritten site) — the single-return
+// form every `[transform]` decl lands as (frag-single-return-form-is-universal;
+// `ln` is the twin). The RUNTIME value is the allocated string; a caller binds
+// it with `: name` (`f` above), and legacy `| branch` sites get the `.formatted`
+// union the inline_body breaks with. The `<allocated!>` obligation rides that
+// runtime value, not the transform tor's own return.
+~[comptime|transform]pub tor fmt.blk {
+    source: Source,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[norun]pub tor fmt.blk.impl {
+    text: string,
+} -> string<std/io:allocated!>
+
+~proc fmt.blk|zig {
+    const ast = @import("ast");
+
+    // Helper: Check if identifier is a Zig keyword
+    const isZigKeyword = struct {
+        fn check(word: []const u8) bool {
+            const keywords = [_][]const u8{
+                "error", "type", "async", "await", "suspend", "resume",
+                "try", "catch", "if", "else", "switch", "while",
+                "for", "break", "continue", "return", "defer", "errdefer",
+                "test", "pub", "export", "extern", "packed", "inline",
+                "noinline", "comptime", "nosuspend", "volatile", "allowzero",
+                "align", "linksection", "callconv", "noalias",
+                "struct", "enum", "union", "opaque", "fn", "const",
+                "var", "anyframe", "anytype", "anyerror", "unreachable",
+                "undef", "null", "true", "false", "and", "or",
+                "orelse", "threadlocal",
+            };
+            for (keywords) |kw| {
+                if (std.mem.eql(u8, word, kw)) return true;
+            }
+            // Zig primitive names — a local may not shadow them, so they
+            // escape exactly like keywords (230_018).
+            const primitives = [_][]const u8{
+                "bool",         "void",     "noreturn", "anyopaque",
+                "usize",        "isize",    "f16",      "f32",
+                "f64",          "f80",      "f128",     "undefined",
+                "comptime_int", "comptime_float",       "c_char",
+                "c_short",      "c_ushort", "c_int",    "c_uint",
+                "c_long",       "c_ulong",  "c_longlong",
+                "c_ulonglong",  "c_longdouble",
+            };
+            for (primitives) |p| {
+                if (std.mem.eql(u8, word, p)) return true;
+            }
+            // u<digits> / i<digits> — the arbitrary-width integer family.
+            if (word.len >= 2 and (word[0] == 'u' or word[0] == 'i')) {
+                var all_digits = true;
+                for (word[1..]) |c| {
+                    if (c < '0' or c > '9') all_digits = false;
+                }
+                if (all_digits) return true;
+            }
+            return false;
+        }
+    }.check;
+
+    // Helper: Append path with escaped keywords
+    const appendEscapedPath = struct {
+        fn append(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, path: []const u8) void {
+            var start: usize = 0;
+            var pos: usize = 0;
+            var is_first = true;
+
+            while (pos <= path.len) {
+                if (pos == path.len or path[pos] == '.') {
+                    const segment = path[start..pos];
+                    if (!is_first) {
+                        buf.append(alloc, '.') catch unreachable;
+                        if (isZigKeyword(segment)) {
+                            buf.appendSlice(alloc, "@\"") catch unreachable;
+                            buf.appendSlice(alloc, segment) catch unreachable;
+                            buf.append(alloc, '"') catch unreachable;
+                        } else {
+                            buf.appendSlice(alloc, segment) catch unreachable;
+                        }
+                    } else if (isZigKeyword(segment)) {
+                        // A bare binding may legally collide with a Zig
+                        // keyword or primitive (`: u1` — 230_018); the first
+                        // segment escapes like any other.
+                        buf.appendSlice(alloc, "@\"") catch unreachable;
+                        buf.appendSlice(alloc, segment) catch unreachable;
+                        buf.append(alloc, '"') catch unreachable;
+                    } else {
+                        buf.appendSlice(alloc, segment) catch unreachable;
+                    }
+                    is_first = false;
+                    start = pos + 1;
+                }
+                pos += 1;
+            }
+        }
+    }.append;
+
+    // Already transformed — don't re-run (mirrors ln's guard)
+    if (invocation.inline_body != null) {
+        return .{};
+    }
+
+    // Get the flow from the item
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Position-agnostic: the runner lifts nested sites, so `invocation` IS
+    // the flow's own invocation at every depth. No position fork.
+    _ = program;
+
+    // Parse the Source content for {{ ... }} placeholders
+    var format_buf = std.ArrayList(u8).initCapacity(allocator, 256) catch unreachable;
+    var args_buf = std.ArrayList(u8).initCapacity(allocator, 128) catch unreachable;
+    var i: usize = 0;
+    var first_arg = true;
+
+    const content = source.text;
+
+    while (i < content.len) {
+        // Look for {{ ... }} placeholders
+        if (i + 1 < content.len and content[i] == '{' and content[i + 1] == '{') {
+            const placeholder_start = i + 2;
+            var ws_start = placeholder_start;
+            while (ws_start < content.len and (content[ws_start] == ' ' or content[ws_start] == '\t')) : (ws_start += 1) {}
+
+            var j = ws_start;
+            while (j + 1 < content.len and !(content[j] == '}' and content[j + 1] == '}')) : (j += 1) {}
+
+            if (j + 1 < content.len) {
+                var ws_end = j;
+                while (ws_end > ws_start and (content[ws_end - 1] == ' ' or content[ws_end - 1] == '\t')) : (ws_end -= 1) {}
+
+                const placeholder = content[ws_start..ws_end];
+                var var_name: []const u8 = placeholder;
+                var format_spec: []const u8 = "any";
+
+                if (std.mem.indexOf(u8, placeholder, ":")) |colon_pos| {
+                    var_name = placeholder[0..colon_pos];
+                    format_spec = placeholder[colon_pos + 1..];
+                }
+
+                // :S is the handle form (610_007): `.data` on the arg. :f
+                // collapses to `{}` — std/io's ln maps it the same (io.kz).
+                const zig_fmt_spec = if (std.mem.eql(u8, format_spec, "f")) "" else if (std.mem.eql(u8, format_spec, "S")) "s" else format_spec;
+                format_buf.append(allocator, '{') catch unreachable;
+                format_buf.appendSlice(allocator, zig_fmt_spec) catch unreachable;
+                format_buf.append(allocator, '}') catch unreachable;
+
+                if (!first_arg) {
+                    args_buf.appendSlice(allocator, ", ") catch unreachable;
+                }
+                appendEscapedPath(&args_buf, allocator, var_name);
+                if (std.mem.eql(u8, format_spec, "S")) args_buf.appendSlice(allocator, ".data") catch unreachable;
+                first_arg = false;
+                i = j + 2;
+            } else {
+                switch (content[i]) {
+                    '"' => format_buf.appendSlice(allocator, "\\\"") catch unreachable,
+                    '\\' => {
+                        // Koru escape: pass \X pair through verbatim to Zig
+                        format_buf.append(allocator, '\\') catch unreachable;
+                        if (i + 1 < content.len) {
+                            i += 1;
+                            format_buf.append(allocator, content[i]) catch unreachable;
+                        }
+                    },
+                    '\n' => format_buf.appendSlice(allocator, "\\n") catch unreachable,
+                    '\r' => format_buf.appendSlice(allocator, "\\r") catch unreachable,
+                    '\t' => format_buf.appendSlice(allocator, "\\t") catch unreachable,
+                    else => format_buf.append(allocator, content[i]) catch unreachable,
+                }
+                i += 1;
+            }
+        } else {
+            switch (content[i]) {
+                '{' => format_buf.appendSlice(allocator, "{{") catch unreachable,
+                '}' => format_buf.appendSlice(allocator, "}}") catch unreachable,
+                '"' => format_buf.appendSlice(allocator, "\\\"") catch unreachable,
+                '\\' => {
+                    // Koru escape: pass \X pair through verbatim to Zig
+                    format_buf.append(allocator, '\\') catch unreachable;
+                    if (i + 1 < content.len) {
+                        i += 1;
+                        format_buf.append(allocator, content[i]) catch unreachable;
+                    }
+                },
+                '\n' => format_buf.appendSlice(allocator, "\\n") catch unreachable,
+                '\r' => format_buf.appendSlice(allocator, "\\r") catch unreachable,
+                '\t' => format_buf.appendSlice(allocator, "\\t") catch unreachable,
+                else => format_buf.append(allocator, content[i]) catch unreachable,
+            }
+            i += 1;
+        }
+    }
+
+    // Allocate, then break to `__KORU_INLINE__` — the same placeholder `ln`
+    // uses. The emitter wraps the body in a labeled block and substitutes a
+    // unique label; a hard-coded `:__blk` is dangling (620_007).
+    //
+    // A `: name` bind yields the allocated STRING itself (`string<allocated!>`):
+    // the caller interpolates `{{ f:s }}` and auto-discharge inserts
+    // `std/io:free` — the one disposer for the `allocated` label (335_042/043
+    // ruling). `| formatted f` bound the same string behind the `.formatted`
+    // union variant; the grammar now binds bare returns with `: name` only.
+    const inline_code = if (flow.inv().return_binding != null)
+        std.fmt.allocPrint(
+            allocator,
+            \\{{
+            \\    const __fmt_alloc = koru_allocator();
+            \\    const __fmt_text = @import("std").fmt.allocPrint(__fmt_alloc, "{s}", .{{{s}}}) catch unreachable;
+            \\    break :__KORU_INLINE__ __fmt_text;
+            \\}}
+            ,
+            .{ format_buf.items, args_buf.items }
+        ) catch unreachable
+    else
+        std.fmt.allocPrint(
+            allocator,
+            \\{{
+            \\    const __fmt_alloc = koru_allocator();
+            \\    const __fmt_text = @import("std").fmt.allocPrint(__fmt_alloc, "{s}", .{{{s}}}) catch unreachable;
+            \\    const __BlkResult = union(enum) {{ formatted: []const u8 }};
+            \\    break :__KORU_INLINE__ @as(__BlkResult, .{{ .formatted = __fmt_text }});
+            \\}}
+            ,
+            .{ format_buf.items, args_buf.items }
+        ) catch unreachable;
+
+    // Position-agnostic: one write-back path at every depth (the runner lifts
+    // nested sites and grafts the result back).
+    // Create impl path for shape checking
+    const impl_segments = allocator.alloc([]const u8, 2) catch unreachable;
+    impl_segments[0] = allocator.dupe(u8, "fmt") catch unreachable;
+    impl_segments[1] = allocator.dupe(u8, "blk.impl") catch unreachable;
+    const impl_path = ast.DottedPath{
+        .module_qualifier = flow.inv().path.module_qualifier,
+        .segments = impl_segments,
+    };
+
+    const new_marks = allocator.alloc([]const u8, flow.inv().marks.len + 1) catch unreachable;
+    for (flow.inv().marks, 0..) |m, idx| new_marks[idx] = m;
+    new_marks[flow.inv().marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_invocation = ast.Invocation{
+        .path = impl_path,
+        .args = flow.inv().args,
+        .annotations = flow.inv().annotations,
+        .marks = new_marks,
+        .inserted_by_tap = flow.inv().inserted_by_tap,
+        .from_opaque_tap = flow.inv().from_opaque_tap,
+        .inline_body = allocator.dupe(u8, inline_code) catch unreachable,
+        // Preserve the site's `: f` bind so a bare-bound fmt.blk site binds its
+        // inline result for the following continuations (same path as ln, 620_002).
+        .return_binding = flow.inv().return_binding,
+    };
+
+    const transformed_flow = ast.Flow{
+        .body = ast.rootSite(new_invocation, flow.body.continuations, flow.location),
+        .annotations = flow.annotations,
+        .pre_label = flow.pre_label,
+        .super_shape = flow.super_shape,
+        .inline_body = inline_code,
+        .is_pure = flow.is_pure,
+        .is_transitively_pure = flow.is_transitively_pure,
+        .impl_of = flow.impl_of,
+        .location = flow.location,
+        .module = flow.module,
+    };
+
+    const new_item = ast.Item{ .flow = transformed_flow };
+
+    // Position-agnostic: hand the rewritten site back as a replacement; the pass
+    // runner grafts it (top-level or lifted-nested), same as ln.
+    return .{ .replacement = new_item };
+}
+// ============================================================================
+// FMT.BLK.WITH_ALLOCATOR - Explicit allocator control
+// ============================================================================
+//
+// For when you need a specific allocator (arena, etc.)
+//
+// Syntax:
+//   fmt.blk.with_allocator(allocator: my_arena) {
+//       Hello {{ name:s }}!
+//   }
+//   : f |> ...
+
+// TODO: fmt.blk.with_allocator - requires solving how user params
+// coexist with transform infrastructure params in the pass runner.
+// [comptime|transform]pub tor fmt.blk.with_allocator { ... }
+
+// ============================================================================
+// FMT.LN - One-line format with Liquid templates, returns text via continuation
+// ============================================================================
+//
+// Syntax:
+//   std/fmt:ln("Hello {{ name:s }}! Count: {{ count:d }}")
+//   : l |> ... use l.text ...
+//
+// Zero allocation: uses a thread-local buffer (safe across workers).
+// The {{ var:spec }} placeholders are resolved at compile time into
+// std.fmt.bufPrint calls that run at runtime in the caller's scope.
+
+~[comptime|transform]pub tor ln {
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[norun]pub tor ln.impl {
+    expr: string,
+} -> string
+
+~proc ln|zig {
+    const ast = @import("ast");
+
+    // Helper: Check if identifier is a Zig keyword
+    const isZigKeyword = struct {
+        fn check(word: []const u8) bool {
+            const keywords = [_][]const u8{
+                "error", "type", "async", "await", "suspend", "resume",
+                "try", "catch", "if", "else", "switch", "while",
+                "for", "break", "continue", "return", "defer", "errdefer",
+                "test", "pub", "export", "extern", "packed", "inline",
+                "noinline", "comptime", "nosuspend", "volatile", "allowzero",
+                "align", "linksection", "callconv", "noalias",
+                "struct", "enum", "union", "opaque", "fn", "const",
+                "var", "anyframe", "anytype", "anyerror", "unreachable",
+                "undef", "null", "true", "false", "and", "or",
+                "orelse", "threadlocal",
+            };
+            for (keywords) |kw| {
+                if (std.mem.eql(u8, word, kw)) return true;
+            }
+            // Zig primitive names — a local may not shadow them, so they
+            // escape exactly like keywords (230_018).
+            const primitives = [_][]const u8{
+                "bool",         "void",     "noreturn", "anyopaque",
+                "usize",        "isize",    "f16",      "f32",
+                "f64",          "f80",      "f128",     "undefined",
+                "comptime_int", "comptime_float",       "c_char",
+                "c_short",      "c_ushort", "c_int",    "c_uint",
+                "c_long",       "c_ulong",  "c_longlong",
+                "c_ulonglong",  "c_longdouble",
+            };
+            for (primitives) |p| {
+                if (std.mem.eql(u8, word, p)) return true;
+            }
+            // u<digits> / i<digits> — the arbitrary-width integer family.
+            if (word.len >= 2 and (word[0] == 'u' or word[0] == 'i')) {
+                var all_digits = true;
+                for (word[1..]) |c| {
+                    if (c < '0' or c > '9') all_digits = false;
+                }
+                if (all_digits) return true;
+            }
+            return false;
+        }
+    }.check;
+
+    // Helper: Append path with escaped keywords (e.g., err.error -> err.@"error")
+    const appendEscapedPath = struct {
+        fn append(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, path: []const u8) void {
+            var start: usize = 0;
+            var pos: usize = 0;
+            var is_first = true;
+
+            while (pos <= path.len) {
+                if (pos == path.len or path[pos] == '.') {
+                    const segment = path[start..pos];
+                    if (!is_first) {
+                        buf.append(alloc, '.') catch unreachable;
+                        if (isZigKeyword(segment)) {
+                            buf.appendSlice(alloc, "@\"") catch unreachable;
+                            buf.appendSlice(alloc, segment) catch unreachable;
+                            buf.append(alloc, '"') catch unreachable;
+                        } else {
+                            buf.appendSlice(alloc, segment) catch unreachable;
+                        }
+                    } else if (isZigKeyword(segment)) {
+                        // A bare binding may legally collide with a Zig
+                        // keyword or primitive (`: u1` — 230_018); the first
+                        // segment escapes like any other.
+                        buf.appendSlice(alloc, "@\"") catch unreachable;
+                        buf.appendSlice(alloc, segment) catch unreachable;
+                        buf.append(alloc, '"') catch unreachable;
+                    } else {
+                        buf.appendSlice(alloc, segment) catch unreachable;
+                    }
+                    is_first = false;
+                    start = pos + 1;
+                }
+                pos += 1;
+            }
+        }
+    }.append;
+
+    // Get the flow from the item
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Extract the expression string from the first invocation arg
+    const expr = if (invocation.args.len > 0) invocation.args[0].value else "";
+
+    // Parse the expression string for {{ ... }} placeholders
+    var format_buf = std.ArrayList(u8).initCapacity(allocator, 128) catch unreachable;
+    var args_buf = std.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+    var i: usize = 0;
+    var first_arg = true;
+
+    // Strip quotes
+    const start_pos: usize = if (expr.len > 0 and expr[0] == '"') 1 else 0;
+    const end_pos: usize = if (expr.len > 0 and expr[expr.len - 1] == '"') expr.len - 1 else expr.len;
+    const content = expr[start_pos..end_pos];
+
+    while (i < content.len) {
+        if (i + 1 < content.len and content[i] == '{' and content[i + 1] == '{') {
+            const placeholder_start = i + 2;
+            var ws_start = placeholder_start;
+            while (ws_start < content.len and (content[ws_start] == ' ' or content[ws_start] == '\t')) : (ws_start += 1) {}
+
+            var j = ws_start;
+            while (j + 1 < content.len and !(content[j] == '}' and content[j + 1] == '}')) : (j += 1) {}
+
+            if (j + 1 < content.len) {
+                var ws_end = j;
+                while (ws_end > ws_start and (content[ws_end - 1] == ' ' or content[ws_end - 1] == '\t')) : (ws_end -= 1) {}
+
+                const placeholder = content[ws_start..ws_end];
+                var var_name: []const u8 = placeholder;
+                var format_spec: []const u8 = "any";
+
+                if (std.mem.indexOf(u8, placeholder, ":")) |colon_pos| {
+                    var_name = placeholder[0..colon_pos];
+                    format_spec = placeholder[colon_pos + 1..];
+                }
+
+                // :S is the handle form (610_007). :f collapses to `{}`.
+                const zig_fmt_spec_ln = if (std.mem.eql(u8, format_spec, "f")) "" else if (std.mem.eql(u8, format_spec, "S")) "s" else format_spec;
+                format_buf.append(allocator, '{') catch unreachable;
+                format_buf.appendSlice(allocator, zig_fmt_spec_ln) catch unreachable;
+                format_buf.append(allocator, '}') catch unreachable;
+
+                if (!first_arg) {
+                    args_buf.appendSlice(allocator, ", ") catch unreachable;
+                }
+                appendEscapedPath(&args_buf, allocator, var_name);
+                if (std.mem.eql(u8, format_spec, "S")) args_buf.appendSlice(allocator, ".data") catch unreachable;
+                first_arg = false;
+                i = j + 2;
+            } else {
+                format_buf.append(allocator, content[i]) catch unreachable;
+                i += 1;
+            }
+        } else {
+            switch (content[i]) {
+                '{' => format_buf.appendSlice(allocator, "{{") catch unreachable,
+                '}' => format_buf.appendSlice(allocator, "}}") catch unreachable,
+                '"' => format_buf.appendSlice(allocator, "\\\"") catch unreachable,
+                '\\' => {
+                    // Koru escape: pass \X pair through verbatim to Zig
+                    format_buf.append(allocator, '\\') catch unreachable;
+                    if (i + 1 < content.len) {
+                        i += 1;
+                        format_buf.append(allocator, content[i]) catch unreachable;
+                    }
+                },
+                '\n' => format_buf.appendSlice(allocator, "\\n") catch unreachable,
+                '\r' => format_buf.appendSlice(allocator, "\\r") catch unreachable,
+                '\t' => format_buf.appendSlice(allocator, "\\t") catch unreachable,
+                else => format_buf.append(allocator, content[i]) catch unreachable,
+            }
+            i += 1;
+        }
+    }
+
+    // Generate inline code that formats into a thread-local buffer and breaks
+    // out with the line value. Uses __KORU_INLINE__ as label placeholder — the
+    // emitter replaces it with a unique label when wrapping in a labeled block.
+    //
+    // Result SHAPE follows the consumption form: the `: l` bare-return BIND
+    // needs the payload `struct { text }` directly, so `l.text` resolves
+    // (620_002); a `| line l` BRANCH (refused on bare returns — a legacy
+    // router-inline spelling) needs the `__LnResult` tagged union to switch on.
+    // Self-contained — no external module path references needed.
+    const inline_code = if (invocation.return_binding != null)
+        std.fmt.allocPrint(
+            allocator,
+            \\{{
+            \\    const __S = struct {{ threadlocal var __buf: [4096]u8 = undefined; }};
+            \\    const __text = @import("std").fmt.bufPrint(&__S.__buf, "{s}", .{{{s}}}) catch @panic("std/fmt:ln output exceeds the 4096-byte scratch buffer — use fmt.blk (allocates, no cap) for long lines");
+            \\    break :__KORU_INLINE__ .{{ .text = __text }};
+            \\}}
+            ,
+            .{ format_buf.items, args_buf.items }
+        ) catch unreachable
+    else
+        std.fmt.allocPrint(
+            allocator,
+            \\{{
+            \\    const __S = struct {{ threadlocal var __buf: [4096]u8 = undefined; }};
+            \\    const __text = @import("std").fmt.bufPrint(&__S.__buf, "{s}", .{{{s}}}) catch @panic("std/fmt:ln output exceeds the 4096-byte scratch buffer — use fmt.blk (allocates, no cap) for long lines");
+            \\    const __LnResult = union(enum) {{ line: struct {{ text: []const u8 }} }};
+            \\    break :__KORU_INLINE__ @as(__LnResult, .{{ .line = .{{ .text = __text }} }});
+            \\}}
+            ,
+            .{ format_buf.items, args_buf.items }
+        ) catch unreachable;
+
+    // Already transformed — don't re-run
+    if (invocation.inline_body != null) {
+        return .{};
+    }
+
+    // Build the replacement invocation: reroute to ln.impl, carry inline_body.
+    // This is the same regardless of where the invocation lives (top-level or pipeline).
+    const impl_segments = allocator.alloc([]const u8, 1) catch unreachable;
+    impl_segments[0] = allocator.dupe(u8, "ln.impl") catch unreachable;
+    const impl_path = ast.DottedPath{
+        .module_qualifier = invocation.path.module_qualifier,
+        .segments = impl_segments,
+    };
+
+    const new_marks = allocator.alloc([]const u8, invocation.marks.len + 1) catch unreachable;
+    for (invocation.marks, 0..) |m, idx| new_marks[idx] = m;
+    new_marks[invocation.marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_invocation = ast.Invocation{
+        .path = impl_path,
+        .args = invocation.args,
+        .annotations = invocation.annotations,
+        .marks = new_marks,
+        .inserted_by_tap = invocation.inserted_by_tap,
+        .from_opaque_tap = invocation.from_opaque_tap,
+        .inline_body = allocator.dupe(u8, inline_code) catch unreachable,
+        // Preserve the site's `: l` bind so the emitter binds the inline result
+        // (const l = …) for the following void continuations to reference (620_002).
+        .return_binding = invocation.return_binding,
+    };
+
+    // Position-agnostic: the runner lifts nested sites into a synthetic
+    // top-level flow, so `invocation` IS the flow's own invocation at every depth.
+    // One write-back path; the runner grafts nested results back.
+    const transformed_flow = ast.Flow{
+        .body = ast.rootSite(new_invocation, flow.body.continuations, flow.location),
+        .annotations = flow.annotations,
+        .pre_label = flow.pre_label,
+        .super_shape = flow.super_shape,
+        .inline_body = inline_code,
+        .is_pure = flow.is_pure,
+        .is_transitively_pure = flow.is_transitively_pure,
+        .location = flow.location,
+        .module = flow.module,
+        .impl_of = flow.impl_of,
+    };
+
+    const new_item = ast.Item{ .flow = transformed_flow };
+    return .{ .replacement = new_item };
+}
+
+// ============================================================================
+// LN|JS - JavaScript-target rendering of the SAME transform
+// ============================================================================
+// SECOND RENDERING, not a JS body. `ln` is `[comptime|transform]`: the body runs
+// inside koruc, so it is Zig on every target — io.kz:1721 states that rule and
+// `print.blk|js` is the worked example. What diverges is the OUTPUT written onto
+// `inline_body`: |zig's labeled block around `std.fmt.bufPrint` becomes a JS
+// `const` holding a `+`-concat. That is why the diagnosis was `@import` has no
+// JS lowering — the |zig rendering's product is Zig source, and on --lang=js the
+// JS emitter was being handed it to splice.
+//
+// TWO structural differences from |zig, both forced by the JS emitter:
+//
+//  1. NO LABELED BLOCK. `break :__KORU_INLINE__ <value>` has no JavaScript
+//     spelling, and js_emitter never substitutes the label — the placeholder is
+//     a Zig-only construct, unknown to that emitter. So the inline body cannot
+//     be an EXPRESSION the emitter binds; it must be STATEMENTS that DECLARE the
+//     formatted value under the name the site reads it through.
+//
+//  2. THE ARM BINDING IS OURS TO DECLARE. `emitInlineContinuationBody`
+//     (js_emitter.zig:1792) splices an arm's body WITHOUT its `| line l` bind —
+//     the `if`/`for` template renderings hoist their own binds for the same
+//     reason. So the `| line l` shape declares `l` here and hands off with a
+//     `__koru_continue_N` marker; the call-site-bind shape (`: l |> …`) declares
+//     `l` and leaves the arms to `emitUnconsumedContinuations`.
+//
+// `:s` / `:d` / `:f` / `:any` all collapse to nothing: JS `+` stringifies a
+// Number on concat, so there is no per-spec formatting left to carry.
+~proc ln|js {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Already transformed — don't re-run.
+    if (invocation.inline_body != null) {
+        return .{};
+    }
+
+    const expr = if (invocation.args.len > 0) invocation.args[0].value else "";
+
+    const openLit = struct {
+        fn call(b: *std.ArrayList(u8), a: std.mem.Allocator, f: *bool, il: *bool) void {
+            if (!il.*) {
+                if (!f.*) b.appendSlice(a, " + ") catch unreachable;
+                b.append(a, '"') catch unreachable;
+                il.* = true;
+                f.* = false;
+            }
+        }
+    }.call;
+
+    const closeLit = struct {
+        fn call(b: *std.ArrayList(u8), a: std.mem.Allocator, il: *bool) void {
+            if (il.*) {
+                b.append(a, '"') catch unreachable;
+                il.* = false;
+            }
+        }
+    }.call;
+
+    var buf = std.ArrayList(u8).initCapacity(allocator, 128) catch unreachable;
+    var first = true;
+    var in_literal = false;
+
+    // Strip the source quotes — same slice |zig takes.
+    const start_pos: usize = if (expr.len > 0 and expr[0] == '"') 1 else 0;
+    const end_pos: usize = if (expr.len > 0 and expr[expr.len - 1] == '"') expr.len - 1 else expr.len;
+    const content = expr[start_pos..end_pos];
+
+    var i: usize = 0;
+    while (i < content.len) {
+        if (i + 1 < content.len and content[i] == '{' and content[i + 1] == '{') {
+            const placeholder_start = i + 2;
+            var ws_start = placeholder_start;
+            while (ws_start < content.len and (content[ws_start] == ' ' or content[ws_start] == '\t')) : (ws_start += 1) {}
+
+            var j = ws_start;
+            while (j + 1 < content.len and !(content[j] == '}' and content[j + 1] == '}')) : (j += 1) {}
+
+            if (j + 1 < content.len) {
+                var ws_end = j;
+                while (ws_end > ws_start and (content[ws_end - 1] == ' ' or content[ws_end - 1] == '\t')) : (ws_end -= 1) {}
+
+                const placeholder = content[ws_start..ws_end];
+                closeLit(&buf, allocator, &in_literal);
+                if (!first) buf.appendSlice(allocator, " + ") catch unreachable;
+                first = false;
+                jsPlaceholder(&buf, allocator, placeholder);
+
+                i = j + 2;
+            } else {
+                openLit(&buf, allocator, &first, &in_literal);
+                buf.append(allocator, content[i]) catch unreachable;
+                i += 1;
+            }
+        } else {
+            openLit(&buf, allocator, &first, &in_literal);
+            switch (content[i]) {
+                '"' => buf.appendSlice(allocator, "\\\"") catch unreachable,
+                '\\' => {
+                    // The arg is a SOURCE string literal, so `\n` here is the
+                    // two-char escape, not a newline. JS double quotes read the
+                    // same escapes Koru writes, so pass the pair through — do NOT
+                    // double the backslash (that would print a literal `\n`).
+                    buf.append(allocator, '\\') catch unreachable;
+                    if (i + 1 < content.len) {
+                        i += 1;
+                        buf.append(allocator, content[i]) catch unreachable;
+                    }
+                },
+                '\n' => buf.appendSlice(allocator, "\\n") catch unreachable,
+                '\r' => buf.appendSlice(allocator, "\\r") catch unreachable,
+                '\t' => buf.appendSlice(allocator, "\\t") catch unreachable,
+                else => buf.append(allocator, content[i]) catch unreachable,
+            }
+            i += 1;
+        }
+    }
+    closeLit(&buf, allocator, &in_literal);
+    if (first) buf.appendSlice(allocator, "\"\"") catch unreachable;
+
+    // WHICH NAME does the site read the formatted text through, and who runs the
+    // arms? `: l |> …` binds at the CALL SITE and the emitter runs the arms after
+    // the splice. `| line l -> …` binds in the ARM, whose body only the marker
+    // reaches — so that shape declares the name AND hands off explicitly.
+    var bind_name: []const u8 = "";
+    var arm_index: ?usize = null;
+    if (invocation.return_binding) |rb| {
+        if (!std.mem.eql(u8, rb, "_")) bind_name = rb;
+    }
+    if (bind_name.len == 0) {
+        for (flow.body.continuations, 0..) |cont, idx| {
+            if (cont.kind != .terminal) continue;
+            arm_index = idx;
+            if (cont.binding) |b| {
+                if (!std.mem.eql(u8, b, "_")) bind_name = b;
+            }
+            break;
+        }
+    }
+
+    var code = std.ArrayList(u8).initCapacity(allocator, 192) catch unreachable;
+    if (bind_name.len > 0) {
+        code.appendSlice(allocator, "const ") catch unreachable;
+        code.appendSlice(allocator, bind_name) catch unreachable;
+        code.appendSlice(allocator, " = { text: ") catch unreachable;
+        code.appendSlice(allocator, buf.items) catch unreachable;
+        code.appendSlice(allocator, " };") catch unreachable;
+    }
+    if (arm_index) |idx| {
+        if (code.items.len > 0) code.append(allocator, '\n') catch unreachable;
+        const marker = std.fmt.allocPrint(allocator, "__koru_continue_{d}", .{idx}) catch unreachable;
+        code.appendSlice(allocator, marker) catch unreachable;
+    }
+    const inline_code = code.items;
+
+    // AST surgery is identical to |zig — only the spliced text differs. Reroute
+    // to `ln.impl` so the JS emitter never has to resolve a comptime tor, and
+    // keep the site's `: l` bind on the invocation for the machinery that reads
+    // it; the JS splice above has already declared the name itself.
+    const impl_segments = allocator.alloc([]const u8, 1) catch unreachable;
+    impl_segments[0] = allocator.dupe(u8, "ln.impl") catch unreachable;
+    const impl_path = ast.DottedPath{
+        .module_qualifier = invocation.path.module_qualifier,
+        .segments = impl_segments,
+    };
+
+    const new_marks = allocator.alloc([]const u8, invocation.marks.len + 1) catch unreachable;
+    for (invocation.marks, 0..) |m, idx| new_marks[idx] = m;
+    new_marks[invocation.marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_invocation = ast.Invocation{
+        .path = impl_path,
+        .args = invocation.args,
+        .annotations = invocation.annotations,
+        .marks = new_marks,
+        .inserted_by_tap = invocation.inserted_by_tap,
+        .from_opaque_tap = invocation.from_opaque_tap,
+        .inline_body = allocator.dupe(u8, inline_code) catch unreachable,
+        .return_binding = invocation.return_binding,
+    };
+
+    var transformed_flow = flow.*;
+    transformed_flow.body = ast.rootSite(new_invocation, flow.body.continuations, flow.location);
+    transformed_flow.inline_body = inline_code;
+
+    const new_item = ast.Item{ .flow = transformed_flow };
+    return .{ .replacement = new_item };
+}

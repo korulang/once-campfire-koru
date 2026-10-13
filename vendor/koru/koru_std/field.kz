@@ -1,0 +1,744 @@
+// std/field — a dense 1-bit-per-cell buffer (bitset) over a flat u64 word array,
+// with the same owned-handle ownership model as std/grid. Runtime-sized,
+// single-owner, in-place mutable. This is RUNG 1 of the std/field (codename
+// std/castles) vision: the bit-packed buffer primitive.
+//
+// What is Koru and what is the Zig leaf: the MARKING LOGIC (which cells, the
+// strided sweep, the prime guard) lives in Koru flow on top of this module. Only
+// the irreducible per-cell bit poke (set/test) and the popcount reduction (count)
+// are the Zig leaf — exactly parallel to std/grid:set / std/grid:count-nonzero.
+// The later cuts (the claims_descendants island that GENERATES the strided fill
+// so even the per-cell call disappears) sit ABOVE this primitive — see
+// docs/std_field_castles_vision.md.
+//
+// Ownership states (phantom on *Field):
+//   <field!>  - new issues the obligation: this field must be freed.
+//   <field>   - borrowed: read/mutate in place (set, test, count), obligation kept.
+//   <!field>  - consumed: free discharges the obligation.
+
+const std = @import("std");
+
+const SC_LEVEL1_DCACHE_SIZE: c_int = 190;
+fn l1dBytes() usize {
+    const S = struct { var v: usize = 0; };
+    if (S.v != 0) return S.v;
+    const b = @import("builtin");
+    if (comptime b.link_libc and b.os.tag == .linux) S.v = @intCast(@max(std.c.sysconf(SC_LEVEL1_DCACHE_SIZE), 0)) else if (comptime b.os.tag.isDarwin()) {
+        var n: usize = @sizeOf(usize);
+        if (std.c.sysctlbyname("hw.l1dcachesize", &S.v, &n, null, 0) != 0) S.v = 0;
+    }
+    if (S.v == 0) S.v = std.math.maxInt(usize);
+    return S.v;
+}
+
+pub const Field = struct {
+    data: []u64,
+    bits: usize,
+    allocator: std.mem.Allocator,
+    mm_rev: bool = false,
+    mm_alt: bool = false,
+
+    // Package-private — only free/auto-discharge calls this.
+    fn deinit(self: *Field) void {
+        self.allocator.free(self.data);
+        self.allocator.destroy(self);
+    }
+};
+
+// No-op allocator for STACK-placed fields: a stack Field stores this; `free`
+// then calls .free/.destroy on caller-frame pointers, which must be genuine
+// no-ops. NOT a FixedBufferAllocator: Zig 0.15's FBA.free asserts
+// `ownsSlice(buf)` (the pointer must live in ITS fixed buffer), so freeing a
+// caller-frame pointer through it aborts in Debug (silent wrong-owner free in
+// ReleaseFast) — the crash-134 class the Debug output default surfaced
+// (115_004/006/029, 2106-2112, 400_136). Lets `free` stay byte-identical for
+// heap and stack fields (no free-site rewrite) — the escape-driven allocation
+// lever. alloc/resize are unreachable by construction; a reach is a bug.
+const __field_noop = struct {
+    fn alloc(_: *anyopaque, len: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+        _ = len;
+        return null; // stack fields never allocate through this cut — a null is a fail-loud.
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {}
+};
+var __field_noop_self: u8 = undefined;
+var __field_noop_alloc = std.mem.Allocator{
+    .ptr = &__field_noop_self,
+    .vtable = &.{ .alloc = __field_noop.alloc, .resize = __field_noop.resize, .remap = __field_noop.remap, .free = __field_noop.free },
+};
+
+// ============================================
+// Construction
+// ============================================
+
+// `new` is a [transform]: at each call site it chooses the allocation strategy
+// (escape-driven — the first GENERAL local optimization done as a per-module
+// transform, per the castles plan). INCREMENT 1: it routes every site to the
+// heap constructor `new-heap`, byte-equivalent to the old behavior — proving the
+// transform conversion is transparent. INCREMENT 2 adds the stack lowering for
+// proven-local, comptime-sized fields. Mirrors std/list:new's
+// route-and-preserve-continuations shape (the `| field` / `| err` match carries
+// over to `new-heap` unchanged).
+~[comptime|transform]pub tor new {
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc new|zig {
+    const ast = @import("ast");
+    const flow = if (item.* == .flow) &item.flow else @panic("std/field:new: expected a flow site");
+
+    // BRICK 2 — automatic escape-driven placement. Read THIS site's obligation
+    // discharge (the obligation IS the lifetime). If the field is provably LOCAL —
+    // comptime-literal `bits`, the `<field!>` discharged by a `field:free` within the
+    // | field branch, and the binding never escaping (no branch-constructor / label-
+    // jump / non-field call carries it) — stack-place it (route to new-instack with a
+    // caller-frame preamble, exactly like new.on-stack). Otherwise → heap. CONSERVATIVE:
+    // any doubt → heap. A false "local" would be use-after-return; a missed "local"
+    // merely forgoes the optimization.
+    const Scan = struct {
+        bind: []const u8,
+        free_found: bool = false,
+        escapes: bool = false,
+
+        fn isFieldFree(inv: *const ast.Invocation) bool {
+            const segs = inv.path.segments;
+            return segs.len >= 1 and std.mem.eql(u8, segs[segs.len - 1], "free");
+        }
+        fn isFieldCall(inv: *const ast.Invocation) bool {
+            const mq = inv.path.module_qualifier orelse return false;
+            return std.mem.endsWith(u8, mq, "field");
+        }
+        fn isIdentChar(c: u8) bool {
+            return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+        }
+        fn usesIdent(self: *@This(), hay: []const u8) bool {
+            var i: usize = 0;
+            while (std.mem.indexOfPos(u8, hay, i, self.bind)) |p| {
+                const before_ok = p == 0 or !isIdentChar(hay[p - 1]);
+                const after = p + self.bind.len;
+                const after_ok = after >= hay.len or !isIdentChar(hay[after]);
+                if (before_ok and after_ok) return true;
+                i = p + 1;
+            }
+            return false;
+        }
+        fn scanInv(self: *@This(), inv: *const ast.Invocation) void {
+            var bind_in_args = false;
+            for (inv.args) |a| {
+                if (self.usesIdent(a.value)) bind_in_args = true;
+            }
+            if (!bind_in_args) return;
+            if (isFieldFree(inv)) {
+                self.free_found = true;
+            } else if (!isFieldCall(inv)) {
+                self.escapes = true; // handed to a non-field tor → may escape
+            }
+        }
+        fn scanNode(self: *@This(), node: *const ast.Node) void {
+            switch (node.*) {
+                .invocation => |*inv| self.scanInv(inv),
+                .label_with_invocation => |*lwi| self.scanInv(&lwi.invocation),
+                .label_jump => |*lj| {
+                    for (lj.args) |a| {
+                        if (self.usesIdent(a.value)) self.escapes = true;
+                    }
+                },
+                .branch_constructor => |*bc| {
+                    if (bc.plain_value) |pv| {
+                        if (self.usesIdent(pv)) self.escapes = true;
+                    }
+                    for (bc.fields) |fld| {
+                        if (fld.expression_str) |es| {
+                            if (self.usesIdent(es)) self.escapes = true;
+                        }
+                    }
+                },
+                .conditional_block => |*cb| {
+                    for (cb.nodes) |*n| self.scanNode(n);
+                },
+                .foreach => |*fe| {
+                    for (fe.branches) |*br| self.scanConts(br.body);
+                },
+                .conditional => |*c| {
+                    for (c.branches) |*br| self.scanConts(br.body);
+                },
+                .switch_result => |*sr| {
+                    for (sr.branches) |*br| self.scanConts(br.body);
+                },
+                else => {},
+            }
+        }
+        fn scanConts(self: *@This(), conts: []const ast.Continuation) void {
+            for (conts) |*c| {
+                if (c.node) |*n| self.scanNode(n);
+                self.scanConts(c.continuations);
+            }
+        }
+    };
+
+    var bind: ?[]const u8 = null;
+    var field_children: []const ast.Continuation = &[_]ast.Continuation{};
+    for (flow.body.continuations) |*c| {
+        if (std.mem.eql(u8, c.branch, "field")) {
+            bind = c.binding;
+            field_children = c.continuations;
+        }
+    }
+    const bits_expr = if (invocation.args.len >= 1) std.mem.trim(u8, invocation.args[0].value, " \t") else "";
+    var bits_is_literal = bits_expr.len > 0;
+    for (bits_expr) |ch| {
+        if (ch < '0' or ch > '9') bits_is_literal = false;
+    }
+
+    var local = false;
+    if (bind != null and bind.?.len > 0 and bits_is_literal) {
+        var s = Scan{ .bind = bind.? };
+        s.scanConts(field_children);
+        local = s.free_found and !s.escapes;
+    }
+
+    if (local) {
+        // STACK path — identical lowering to new.on-stack: route to new-instack with a
+        // caller-frame preamble; drop the now-impossible | err branch.
+        const L = flow.location.line;
+        const C = flow.location.column;
+        const preamble = std.fmt.allocPrint(allocator,
+            "var __fld_buf_{d}_{d}: [({s} + 63) / 64]u64 = undefined;\n" ++
+            "var __fld_self_{d}_{d}: koru_std.koru_field.Field = undefined;",
+            .{ L, C, bits_expr, L, C },
+        ) catch unreachable;
+        const seg2 = allocator.alloc([]const u8, 1) catch unreachable;
+        seg2[0] = allocator.dupe(u8, "new-instack") catch unreachable;
+        const args2 = allocator.alloc(ast.Arg, 3) catch unreachable;
+        args2[0] = .{ .name = "buf", .value = std.fmt.allocPrint(allocator, "__fld_buf_{d}_{d}[0..]", .{ L, C }) catch unreachable };
+        args2[1] = .{ .name = "slot", .value = std.fmt.allocPrint(allocator, "&__fld_self_{d}_{d}", .{ L, C }) catch unreachable };
+        args2[2] = .{ .name = "bits", .value = allocator.dupe(u8, bits_expr) catch unreachable };
+        const anns2 = allocator.alloc([]const u8, 1) catch unreachable;
+        anns2[0] = allocator.dupe(u8, "@preamble_then_call") catch unreachable;
+        const inv2 = ast.Invocation{
+            .path = ast.DottedPath{
+                .module_qualifier = if (invocation.path.module_qualifier) |mq| allocator.dupe(u8, mq) catch unreachable else null,
+                .segments = seg2,
+            },
+            .args = args2,
+            .marks = anns2,
+        };
+        var kept = std.ArrayList(ast.Continuation){};
+        var inv2_bound = inv2;
+        for (flow.body.continuations) |c| {
+            if (std.mem.eql(u8, c.branch, "err")) continue;
+            if (std.mem.eql(u8, c.branch, "field")) {
+                // new-instack is bare-return (-> *Field<field!>): the user's
+                // `| field f |> <chain>` becomes a call-site `: f` bind and
+                // the handler body rides as a void-chain continuation.
+                inv2_bound.return_binding = c.binding;
+                var chain = c;
+                chain.branch = "";
+                chain.binding = null;
+                kept.append(allocator, chain) catch unreachable;
+                continue;
+            }
+            kept.append(allocator, c) catch unreachable;
+        }
+        var stack_flow = flow.*;
+        stack_flow.body = ast.rootSite(inv2_bound, kept.toOwnedSlice(allocator) catch unreachable, flow.location);
+        stack_flow.preamble_code = preamble;
+        stack_flow.inline_body = null;
+        return .{ .replacement = ast.Item{ .flow = stack_flow } };
+    }
+
+    // HEAP path — route to the concrete heap constructor, preserving | field / | err.
+    const seg = allocator.alloc([]const u8, 1) catch unreachable;
+    seg[0] = allocator.dupe(u8, "new-heap") catch unreachable;
+    const new_inv = ast.Invocation{
+        .path = ast.DottedPath{
+            .module_qualifier = if (invocation.path.module_qualifier) |mq| allocator.dupe(u8, mq) catch unreachable else null,
+            .segments = seg,
+        },
+        .args = invocation.args,
+    };
+    var heap_flow = flow.*;
+    heap_flow.body = ast.rootSite(new_inv, flow.body.continuations, flow.location);
+    heap_flow.preamble_code = null;
+    heap_flow.inline_body = null;
+    return .{ .replacement = ast.Item{ .flow = heap_flow } };
+}
+
+// Heap constructor — the concrete runtime allocation. `new` routes here unless
+// the escape pass proves the field local (then it's stack-built at the call
+// site). The Field carries its allocator, so `free` is allocator-agnostic.
+~pub tor new-heap { bits: usize }
+| field *Field<field!>
+| ?!err string
+
+~proc new-heap|zig {
+    const allocator = koru_allocator();
+    const self = allocator.create(Field) catch {
+        return .{ .err = "allocation failed" };
+    };
+    const words = (bits + 63) / 64;
+    const data = allocator.alloc(u64, words) catch {
+        allocator.destroy(self);
+        return .{ .err = "allocation failed" };
+    };
+    if (comptime @import("builtin").link_libc) struct { extern "c" fn bzero(p: *anyopaque, n: usize) void; }.bzero(@ptrCast(data.ptr), data.len * @sizeOf(u64)) else @memset(data, 0);
+    const alt = words * @sizeOf(u64) > l1dBytes();
+    self.* = .{ .data = data, .bits = bits, .allocator = allocator, .mm_rev = alt, .mm_alt = alt };
+    return .{ .field = self };
+}
+
+// EXPLICIT stack constructor (Brick 1 of escape-driven allocation). Places the
+// Field and its word buffer in the CALLER's frame — no heap, no per-pass page
+// fault. Bare-return (`-> *Field`, no `err`: a stack buffer can't OOM). Must be a
+// [transform]: stack memory cannot be returned from a callee, so the construction
+// is inlined at the call site. `bits` must be comptime (Zig errors otherwise —
+// the array size is comptime). `free` rides the no-op allocator, unchanged.
+// Brick 2 will route a provably-local `new` here automatically.
+~[comptime|transform]pub tor new.on-stack { bits: usize, reporter: *std/compiler:ErrorReporter } -> *Field<field!>
+
+~[transform]proc new.on-stack|zig {
+    const ast = @import("ast");
+    if (item.* != .flow) @panic("std/field:new.on-stack: expected a flow site");
+    const flow = &item.flow;
+
+    if (invocation.args.len < 1) {
+        reporter.addErrorAtLocation(.KORU169, flow.location, "std/field:new.on-stack requires (bits)", .{}) catch {};
+        var nf = flow.*;
+        nf.inline_body = std.fmt.allocPrint(allocator, "@compileError(\"std/field:new.on-stack requires (bits)\")", .{}) catch unreachable;
+        return .{ .transformed = .{ .replacement = ast.Item{ .flow = nf } } };
+    }
+    const bits_expr = invocation.args[0].value;
+    const L = flow.location.line;
+    const C = flow.location.column;
+
+    // Caller-frame stack storage (comptime-sized). new-instack zeroes + wires it.
+    // Emitted by preamble_code, in the enclosing scope, so it outlives the
+    // continuations (until scope exit). `bits` must be comptime (Zig array size).
+    const preamble = std.fmt.allocPrint(allocator,
+        "var __fld_buf_{d}_{d}: [({s} + 63) / 64]u64 = undefined;\n" ++
+        "var __fld_self_{d}_{d}: koru_std.koru_field.Field = undefined;",
+        .{ L, C, bits_expr, L, C },
+    ) catch unreachable;
+
+    // Route to the concrete stack-wiring constructor. It carries <field!> on its
+    // signature, so the obligation survives the transform — same trick as
+    // list:new→new-i64. The preamble vars are passed by reference/slice.
+    const seg = allocator.alloc([]const u8, 1) catch unreachable;
+    seg[0] = allocator.dupe(u8, "new-instack") catch unreachable;
+    const args = allocator.alloc(ast.Arg, 3) catch unreachable;
+    args[0] = .{ .name = "buf", .value = std.fmt.allocPrint(allocator, "__fld_buf_{d}_{d}[0..]", .{ L, C }) catch unreachable };
+    args[1] = .{ .name = "slot", .value = std.fmt.allocPrint(allocator, "&__fld_self_{d}_{d}", .{ L, C }) catch unreachable };
+    args[2] = .{ .name = "bits", .value = allocator.dupe(u8, bits_expr) catch unreachable };
+    // Mark the routed call so the emitter emits our preamble (stack vars) and then
+    // STILL makes the normal handler call — unlike const/for/if/capture, which
+    // set preamble_code to REPLACE the call. Without this marker the emitter would
+    // skip the new-instack call and the field binding would be undeclared.
+    const anns = allocator.alloc([]const u8, 1) catch unreachable;
+    anns[0] = allocator.dupe(u8, "@preamble_then_call") catch unreachable;
+    const new_inv = ast.Invocation{
+        .path = ast.DottedPath{
+            .module_qualifier = if (invocation.path.module_qualifier) |mq| allocator.dupe(u8, mq) catch unreachable else null,
+            .segments = seg,
+        },
+        .args = args,
+        .marks = anns,
+    };
+
+    var kept = std.ArrayList(ast.Continuation){};
+    var new_inv_bound = new_inv;
+    for (flow.body.continuations) |c| {
+        if (std.mem.eql(u8, c.branch, "field")) {
+            // Same bind rewrite as new|zig's stack path: bare-return
+            // new-instack takes the user's `| field f` as a `: f` bind.
+            new_inv_bound.return_binding = c.binding;
+            var chain = c;
+            chain.branch = "";
+            chain.binding = null;
+            kept.append(allocator, chain) catch unreachable;
+            continue;
+        }
+        kept.append(allocator, c) catch unreachable;
+    }
+    var new_flow = flow.*;
+    new_flow.body = ast.rootSite(new_inv_bound, kept.toOwnedSlice(allocator) catch unreachable, flow.location);
+    new_flow.preamble_code = preamble;
+    new_flow.inline_body = null;
+
+    return .{ .transformed = .{ .replacement = ast.Item{ .flow = new_flow } } };
+}
+
+// Concrete stack-wiring constructor for `new.on-stack`. The transform's preamble
+// declares a caller-frame word buffer + Field slot and passes them here; this
+// zeroes the buffer and wires the Field with the no-op allocator (so `free` is a
+// safe no-op — no free-site rewrite). Carries <field!> so the obligation survives
+// the transform. Not meant to be called directly.
+~pub tor new-instack { buf: []u64, slot: *Field, bits: usize } -> *Field<field!>
+
+~proc new-instack|zig {
+    if (comptime @import("builtin").link_libc) struct { extern "c" fn bzero(p: *anyopaque, n: usize) void; }.bzero(@ptrCast(buf.ptr), buf.len * @sizeOf(u64)) else @memset(buf, 0);
+    const alt = buf.len * @sizeOf(u64) > l1dBytes();
+    slot.* = .{ .data = buf, .bits = bits, .allocator = __field_noop_alloc, .mm_rev = alt, .mm_alt = alt };
+    return slot;
+}
+
+// ============================================
+// Mutation (borrow — obligation untouched)
+// ============================================
+
+// Set bit i to 1. Void, chains with `|>`. The irreducible per-cell poke.
+~pub tor set { f: *Field<field>, i: usize }
+
+~proc set|zig {
+    f.data[i >> 6] |= (@as(u64, 1) << @as(u6, @intCast(i & 63)));
+}
+
+// Set every bit in the arithmetic progression {from, from+stride, ...} <= limit.
+// The IR's AP-write access pattern, fused: one tight strided bit-fill instead of a
+// per-cell `set` call through the flow. Word-blocking (precomputed per-stride
+// patterns) is a later refinement; this is the simple fused loop.
+~pub tor strike { f: *Field<field>, from: usize, stride: usize, limit: usize }
+
+~proc strike|zig {
+    // Word-wise stepMask marking: precompute the per-phase word masks for this
+    // stride, then OR one mask per 64-bit word (cyclically, SIMD-lowered) instead
+    // of one store per bit. 7x faster than per-bit scatter on dense strides
+    // (measured, identical result), the prime-sieve hot path. For stride >= 64 the
+    // mask holds <1 bit so we fall back to per-word scatter. (Algorithm: the
+    // odds-only stepMask sieve, PlummersSoftwareLLC/Primes solution_5.)
+    const data = f.data;
+    const bitCount: usize = limit + 1;
+    const start = from;
+    if (start >= bitCount) return;
+    if (stride >= 64) {
+        // Sparse (<1 bit/word): 8-way-unrolled byte scatter. Precompute 8 marks'
+        // byte-offsets + bit-masks (the pattern repeats every 8 strides = `stride`
+        // bytes), OR 8 independent bytes per iteration so they pipeline. 4x the
+        // dominant large-prime cost vs bit-at-a-time (measured). (solution_5.)
+        const bytes = std.mem.sliceAsBytes(data);
+        var bi = start;
+        const step8 = stride * 8;
+        var masks: [8]u8 = undefined;
+        var offs: [8]usize = undefined;
+        const base = bi >> 3;
+        for (0..8) |i| {
+            const mb = bi + stride * i;
+            masks[i] = @as(u8, 1) << @as(u3, @intCast(mb & 7));
+            offs[i] = (mb >> 3) - base;
+        }
+        var byteIdx = base;
+        const ge = if (bitCount > stride * 7) bitCount - stride * 7 else 0;
+        while (bi < ge) {
+            const q = byteIdx;
+            bytes[q + offs[0]] |= masks[0];
+            bytes[q + offs[1]] |= masks[1];
+            bytes[q + offs[2]] |= masks[2];
+            bytes[q + offs[3]] |= masks[3];
+            bytes[q + offs[4]] |= masks[4];
+            bytes[q + offs[5]] |= masks[5];
+            bytes[q + offs[6]] |= masks[6];
+            bytes[q + offs[7]] |= masks[7];
+            byteIdx += stride;
+            bi += step8;
+        }
+        while (bi < bitCount) : (bi += stride) bytes[bi >> 3] |= @as(u8, 1) << @as(u3, @intCast(bi & 7));
+        return;
+    }
+    const delta = 64 % stride;
+    const advance = if (delta == 0) @as(usize, 0) else stride - delta;
+    const startPosAbs = start % 64;
+    var firstMod = startPosAbs % stride;
+    var stepMasks = [_]u64{0} ** 64;
+    for (0..stride) |phase| {
+        var m: u64 = 0;
+        var pos = phase;
+        while (pos < 64) : (pos += stride) m |= (@as(u64, 1) << @as(u6, @intCast(pos)));
+        stepMasks[phase] = m;
+    }
+    const fullWords = bitCount / 64;
+    var wi = start / 64;
+    if (startPosAbs != 0 and wi < fullWords) {
+        var mask = stepMasks[firstMod];
+        mask &= ~((@as(u64, 1) << @as(u6, @intCast(startPosAbs))) - 1);
+        data[wi] |= mask;
+        wi += 1;
+        firstMod += advance;
+        if (firstMod >= stride) firstMod -= stride;
+    }
+    var cycleMasks = [_]u64{0} ** 64;
+    var cycleLen: usize = 0;
+    {
+        var mod = firstMod;
+        while (true) {
+            cycleMasks[cycleLen] = stepMasks[mod];
+            cycleLen += 1;
+            mod += advance;
+            if (mod >= stride) mod -= stride;
+            if (mod == firstMod or cycleLen >= stride) break;
+        }
+    }
+    // Quadruple the cycle so the SIMD loop uses @Vector(4,u64) with no tail
+    // (4*cycleLen is always a multiple of 4). LLVM lowers @Vector(4,u64) to ldp/stp
+    // paired instructions (256 bits per op), halving memory-instruction count vs a
+    // doubled @Vector(2,u64) loop and issuing two independent 128-bit ORs per step.
+    // Measured +8% on M-series NEON. The post-loop scalar fixup handles the
+    // remainder (firstMod is unchanged since 4*cycleLen is a multiple of cycleLen).
+    var cycleMasks4 = [_]u64{0} ** 256;
+    for (0..cycleLen) |j| {
+        cycleMasks4[j] = cycleMasks[j];
+        cycleMasks4[cycleLen + j] = cycleMasks[j];
+        cycleMasks4[2 * cycleLen + j] = cycleMasks[j];
+        cycleMasks4[3 * cycleLen + j] = cycleMasks[j];
+    }
+    const quad = cycleLen * 4;
+    if (cycleLen > 0) {
+        while (wi + quad <= fullWords) {
+            var idx: usize = 0;
+            while (idx < quad) : (idx += 4) {
+                const v: @Vector(4, u64) = data[wi + idx ..][0..4].*;
+                const m: @Vector(4, u64) = cycleMasks4[idx ..][0..4].*;
+                data[wi + idx ..][0..4].* = v | m;
+            }
+            wi += quad;
+        }
+    }
+    while (wi < fullWords) : (wi += 1) {
+        data[wi] |= stepMasks[firstMod];
+        firstMod += advance;
+        if (firstMod >= stride) firstMod -= stride;
+    }
+    const tailBits = bitCount % 64;
+    if (tailBits > 0 and wi == fullWords) {
+        var mask = stepMasks[firstMod];
+        mask &= (@as(u64, 1) << @as(u6, @intCast(tailBits))) - 1;
+        data[wi] |= mask;
+    }
+}
+
+// Wheel-strided strike: for a prime `p`, set every bit `p*w` where `w` is a wheel
+// position (the residues in `wheel`, repeated every `period`) with `w >= p` and
+// `p*w <= limit`. The composite wheel positions of `p` are exactly `p * (wheel
+// positions >= p)`, so this marks only coprime-to-period multiples — `period/φ`
+// fewer strikes than the full `strike`. Assumes `wheel[0] == 1` (the unit residue),
+// used for the cheap per-block early-out.
+~pub tor strike-wheel { f: *Field<field>, p: usize, wheel: []const usize, period: usize, limit: usize }
+
+~proc strike-wheel|zig {
+    var j: usize = 0;
+    while (true) : (j += 1) {
+        const base = period * j;
+        if (p * (base + 1) > limit) break; // smallest position in this block already exceeds
+        for (wheel) |res| {
+            const w = base + res;
+            if (w < p) continue; // only excludes a prefix in block 0
+            const m = p * w;
+            if (m > limit) break; // residues ascending -> the rest of this block exceeds too
+            f.data[m >> 6] |= (@as(u64, 1) << @as(u6, @intCast(m & 63)));
+        }
+    }
+}
+
+// Mark every multiple of `stride` in [from, limit] — set the whole strided
+// residue class. Unlike `strike` (an arbitrary AP from `from`), this is a
+// [transform]: the COMPILER GENERATES a specialized, fully-unrolled marker per
+// stride and dispatches at runtime. Same move as regex->DFA, kernel->SIMD: a
+// restricted access pattern compiled to specialized native code. (v1: plumbing
+// proof — emits one simple correct marker; the per-stride unrolled codegen lands
+// next.)
+~[comptime|transform]pub tor mark-multiples { f: *Field<field>, from: usize, stride: usize, limit: usize, reporter: *std/compiler:ErrorReporter }
+
+~[transform]proc mark-multiples|zig {
+    const ast = @import("ast");
+    if (item.* != .flow) @panic("mark-multiples transform: containing item is not a flow");
+    const flow = &item.flow;
+
+    if (invocation.args.len < 4) {
+        reporter.addErrorAtLocation(.KORU169, flow.location, "std/field:mark-multiples requires (f, from, stride, limit)", .{}) catch {};
+        const msg = std.fmt.allocPrint(allocator, "comptime {{ @compileError(\"std/field:mark-multiples requires (f, from, stride, limit)\"); }}", .{}) catch unreachable;
+        var nf = flow.*;
+        nf.inline_body = msg;
+        return .{ .transformed = .{ .replacement = ast.Item{ .flow = nf } } };
+    }
+    const f_expr = invocation.args[0].value;
+    const from_expr = invocation.args[1].value;
+    const stride_expr = invocation.args[2].value;
+    const limit_expr = invocation.args[3].value;
+
+    const L = flow.location.line;
+    const C = flow.location.column;
+
+    // top-level generated functions (appended as inline_code)
+    var code = std.ArrayList(u8){};
+    // wordMask(p, r): in-word mask for residue class (p-1)/2 mod p, for a word
+    // whose base bit-index is r mod p. Composite multiples of prime p occupy
+    // exactly that residue class — so for comptime p the per-word pattern is
+    // fixed (period p) and bakes to immediate masks. (Proven in ceil_probe.)
+    const WM = struct {
+        fn mask(p: usize, r: usize) u64 {
+            const ii = (p - 1) / 2;
+            var m: u64 = 0;
+            for (0..64) |j| if ((r + j) % p == ii % p) { m |= (@as(u64, 1) << @as(u6, @intCast(j))); };
+            return m;
+        }
+    };
+    // DENSE_LIMIT: how far the fully-unrolled dense-marker generation extends before
+    // falling back to the sparse 8-way byte-scatter path. This is a GENERAL parameter
+    // of the transform, not a benchmark-tuned constant: the dense/sparse split exists
+    // because dense markers avoid the sparse path's per-element scatter overhead, at
+    // the cost of one generated function per odd stride. The LUT-based dispatch (not
+    // a switch) means unused dense functions never get pulled into I-cache, so the
+    // only real cost of widening this is generated-code size and compile time, not
+    // runtime I-cache pressure. Doubled from the original word-width-driven 64 (one
+    // marker fits one u64 word's worth of residues) to 128, the next natural
+    // power-of-two step — not copied from any specific rival's cutoff or workload.
+    const DENSE_LIMIT: usize = 128;
+    // one fully-unrolled marker per dense stride (3,5,...,DENSE_LIMIT-1), masks baked literal
+    for (0..(DENSE_LIMIT - 2) / 2) |k| {
+        const p = 3 + 2 * k;
+        const i = (p - 1) / 2;
+        const rstep = 64 % p;
+        const h = std.fmt.allocPrint(allocator, "fn __mm_{d}_{d}_{d}(data: [*]u64, fullWords: usize, tailBits: usize, rev: bool) void {{\n    const wm = [_]u64{{ ", .{ L, C, p }) catch unreachable;
+        code.appendSlice(allocator, h) catch unreachable;
+        for (0..p) |r| code.appendSlice(allocator, std.fmt.allocPrint(allocator, "0x{x}, ", .{WM.mask(p, r)}) catch unreachable) catch unreachable;
+        var blk = std.ArrayList(u8){};
+        for (0..p) |c| blk.appendSlice(allocator, std.fmt.allocPrint(allocator, "            data[w + {d}] |= 0x{x};\n", .{ c, WM.mask(p, (c * rstep) % p) }) catch unreachable) catch unreachable;
+        const tl = std.fmt.allocPrint(allocator, "}};\n    const kb = fullWords / {d};\n    const wt = kb * {d};\n    if (!rev) {{\n        for (0..kb) |kbi| {{\n            const w = kbi * {d};\n{s}        }}\n    }}\n    var r: usize = (wt * {d}) % {d};\n    for (wt..fullWords) |wi| {{ data[wi] |= wm[r]; r = (r + {d}) % {d}; }}\n    if (tailBits > 0) data[fullWords] |= wm[r] & ((@as(u64, 1) << @as(u6, @intCast(tailBits))) - 1);\n    if (rev) {{\n        for (0..kb) |j| {{\n            const w = (kb - 1 - j) * {d};\n{s}        }}\n    }}\n    data[{d}] &= ~(@as(u64, 1) << {d});\n}}\n\n", .{ p, p, p, blk.items, rstep, p, rstep, p, p, blk.items, i >> 6, i & 63 }) catch unreachable;
+        code.appendSlice(allocator, tl) catch unreachable;
+    }
+    // sparse path (stride >= 64): 8-way byte scatter
+    // sparse path (stride >= 64): residue-specialized 8-way byte scatter. One marker
+    // per (from&7, stride&7) — lane `n`'s bit position (from + n*stride)&7 =
+    // (fr + n*st)&7 is fixed by the two residues, so its 8 masks become COMPILE-TIME
+    // IMMEDIATES. That removes the masks[8] array load which, together with offs[8],
+    // overflowed the 14 GP registers and spilled every iteration — the sol3-parity
+    // lever (perf: L1 loads/pass 456K->247K, instructions 648K->450K). The 8-lane
+    // step (8*stride bits = stride bytes) is what keeps each lane's bit position
+    // invariant across the loop; the per-lane byte offsets (o0..o7) stay runtime but
+    // now fit in registers without the masks array.
+    for (0..64) |fs| {
+        const fr = fs / 8;
+        const st = fs % 8;
+        {
+            const sh = std.fmt.allocPrint(allocator,
+                "fn __mm_sp_{d}_{d}_{d}_{d}(data: []u64, from: usize, stride: usize, limit: usize, rev: bool) void {{\n" ++
+                "    const bitCount = limit + 1; const bytes = @import(\"std\").mem.sliceAsBytes(data);\n" ++
+                "    var bi = from; const step8 = stride * 8; const base = bi >> 3;\n", .{ L, C, fr, st }) catch unreachable;
+            code.appendSlice(allocator, sh) catch unreachable;
+            for (0..8) |n| code.appendSlice(allocator, std.fmt.allocPrint(allocator, "    const o{d} = ((bi + stride * {d}) >> 3) - base;\n", .{ n, n }) catch unreachable) catch unreachable;
+            var lanes = std.ArrayList(u8){};
+            for (0..8) |n| lanes.appendSlice(allocator, std.fmt.allocPrint(allocator, "            bytes[byteIdx + o{d}] |= 0x{x};\n", .{ n, @as(usize, 1) << @as(u6, @intCast((fr + n * st) & 7)) }) catch unreachable) catch unreachable;
+            code.appendSlice(allocator, std.fmt.allocPrint(allocator, "    const ge = if (bitCount > stride * 7) bitCount - stride * 7 else 0;\n    const kn = if (ge > bi) (ge - bi + step8 - 1) / step8 else 0;\n    const bt = bi + kn * step8;\n    const kt = if (bitCount > bt) (bitCount - bt + stride - 1) / stride else 0;\n    if (rev) {{\n        for (0..kt) |j| {{ const b = bt + (kt - 1 - j) * stride; bytes[b >> 3] |= @as(u8, 1) << @as(u3, @intCast(b & 7)); }}\n        var byteIdx = base + kn * stride;\n        for (0..kn) |_| {{\n            byteIdx -= stride;\n{s}        }}\n        return;\n    }}\n    var byteIdx = base;\n    for (0..kn) |_| {{\n{s}        byteIdx += stride;\n    }}\n    bi = bt;\n    for (0..kt) |_| {{ bytes[bi >> 3] |= @as(u8, 1) << @as(u3, @intCast(bi & 7)); bi += stride; }}\n}}\n\n", .{ lanes.items, lanes.items }) catch unreachable) catch unreachable;
+        }
+    }
+    // sparse dispatch LUT: 64 fn pointers indexed by (from&7)*8 + (stride&7).
+    const splut_open = std.fmt.allocPrint(allocator, "const __mm_splut_{d}_{d} = [_]*const fn ([]u64, usize, usize, usize, bool) void{{ ", .{ L, C }) catch unreachable;
+    code.appendSlice(allocator, splut_open) catch unreachable;
+    for (0..64) |fs| code.appendSlice(allocator, std.fmt.allocPrint(allocator, "__mm_sp_{d}_{d}_{d}_{d}, ", .{ L, C, fs / 8, fs % 8 }) catch unreachable) catch unreachable;
+    code.appendSlice(allocator, "};\n\n") catch unreachable;
+    // dispatch via FUNCTION-POINTER LUT, not switch: a switch inlines every generated
+    // marker body into one function and thrashes the i-cache (3-5% measured);
+    // a compact indirect call through a LUT avoids that and beats hand-tuned Zig.
+    const lut_open = std.fmt.allocPrint(allocator, "const __mm_lut_{d}_{d} = blk: {{ var t = [_]?*const fn ([*]u64, usize, usize, bool) void{{null}} ** {d};\n", .{ L, C, DENSE_LIMIT }) catch unreachable;
+    code.appendSlice(allocator, lut_open) catch unreachable;
+    for (0..(DENSE_LIMIT - 2) / 2) |k| code.appendSlice(allocator, std.fmt.allocPrint(allocator, "    t[{d}] = __mm_{d}_{d}_{d};\n", .{ 3 + 2 * k, L, C, 3 + 2 * k }) catch unreachable) catch unreachable;
+    const disp = std.fmt.allocPrint(allocator,
+        "    break :blk t; }};\n" ++
+        "fn __mm_disp_{d}_{d}(data: []u64, from: usize, stride: usize, limit: usize, rev: bool) void {{\n" ++
+        "    if (stride >= {d}) {{ __mm_splut_{d}_{d}[(from & 7) * 8 + (stride & 7)](data, from, stride, limit, rev); return; }}\n" ++
+        "    const bitCount = limit + 1; const fullWords = bitCount / 64; const tailBits = bitCount % 64;\n" ++
+        "    if (__mm_lut_{d}_{d}[stride]) |f| f(data.ptr, fullWords, tailBits, rev) else __mm_splut_{d}_{d}[(from & 7) * 8 + (stride & 7)](data, from, stride, limit, rev);\n" ++
+        "}}\n\n", .{ L, C, DENSE_LIMIT, L, C, L, C, L, C }) catch unreachable;
+    code.appendSlice(allocator, disp) catch unreachable;
+
+    // call-site dispatch (inline_body) referencing the lowered args
+    const body = std.fmt.allocPrint(allocator, "//@koru:inline_stmt\n{{ const __mf = ({s}); __mm_disp_{d}_{d}(__mf.data, {s}, {s}, {s}, __mf.mm_rev); __mf.mm_rev = __mf.mm_rev != __mf.mm_alt; }}", .{ f_expr, L, C, from_expr, stride_expr, limit_expr }) catch unreachable;
+
+    // rebuild the flow: same invocation marked @pass_ran, inline_body = dispatch
+    const new_marks = allocator.alloc([]const u8, flow.inv().marks.len + 1) catch unreachable;
+    for (flow.inv().marks, 0..) |m, k| new_marks[k] = m;
+    new_marks[flow.inv().marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+    const new_inv = ast.Invocation{
+        .path = flow.inv().path,
+        .args = flow.inv().args,
+        .annotations = flow.inv().annotations,
+        .marks = new_marks,
+        .inserted_by_tap = flow.inv().inserted_by_tap,
+        .from_opaque_tap = flow.inv().from_opaque_tap,
+    };
+    var new_flow = flow.*;
+    new_flow.body = ast.rootSite(new_inv, flow.body.continuations, flow.location);
+    new_flow.inline_body = body;
+
+    const appended = allocator.alloc(ast.Item, 1) catch unreachable;
+    appended[0] = ast.Item{ .inline_code = ast.InlineCode{
+        .code = code.toOwnedSlice(allocator) catch unreachable,
+        .location = flow.location,
+        .module = flow.module,
+    } };
+    return .{ .transformed = .{ .replacement = ast.Item{ .flow = new_flow }, .appended = appended } };
+}
+
+// Zero every bit — reset a field for reuse without reallocating. The lever for
+// alloc-once sieve loops: `new` once, `clear` each pass instead of new/free per
+// pass (the per-pass allocation/page-fault tax is the dominant cost once marking
+// is wheel-strided).
+~pub tor clear { f: *Field<field> }
+
+~proc clear|zig {
+    if (comptime @import("builtin").link_libc) struct { extern "c" fn bzero(p: *anyopaque, n: usize) void; }.bzero(@ptrCast(f.data.ptr), f.data.len * @sizeOf(u64)) else @memset(f.data, 0);
+    f.mm_rev = f.mm_alt;
+}
+
+// ============================================
+// Read (borrow)
+// ============================================
+
+// 1 if bit i is set, else 0.
+~pub tor test { f: *Field<field>, i: usize } -> i64
+
+~proc test|zig {
+    return @as(i64, @intCast((f.data[i >> 6] >> @as(u6, @intCast(i & 63))) & 1));
+}
+
+// Count of UNSET bits in [lo, hi). Word-wise @popCount over the aligned middle —
+// the IR's "1-bit (+,0) reduction recognized as popcount", made real.
+~pub tor count-zeros { f: *Field<field>, lo: usize, hi: usize } -> i64
+
+~proc count-zeros|zig {
+    const total_bits: i64 = @intCast(hi - lo);
+    var set_bits: i64 = 0;
+    // Head: bits up to the first 64-aligned index (or hi, whichever is first).
+    const head_end = @min(hi, (lo + 63) & ~@as(usize, 63));
+    for (lo..head_end) |i| {
+        set_bits += @as(i64, @intCast((f.data[i >> 6] >> @as(u6, @intCast(i & 63))) & 1));
+    }
+    if (head_end < hi) {
+        // Aligned middle: whole words, @popCount each. head_end is 64-aligned here.
+        const w1 = hi >> 6;
+        for (f.data[head_end >> 6 .. w1]) |word| {
+            set_bits += @as(i64, @intCast(@popCount(word)));
+        }
+        // Tail: the partial word past the last full one.
+        for (w1 << 6 .. hi) |i| {
+            set_bits += @as(i64, @intCast((f.data[i >> 6] >> @as(u6, @intCast(i & 63))) & 1));
+        }
+    }
+    return total_bits - set_bits;
+}
+
+// ============================================
+// Teardown (consume — discharges <!field>)
+// ============================================
+
+~pub tor free { f: *Field<!field> }
+
+~proc free|zig {
+    f.deinit();
+}

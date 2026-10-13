@@ -1,0 +1,85 @@
+// Koru Standard Library: the `flowsrc` part of interpreter.kz — how a run
+// gets a parsed Flow: the per-thread parse cache, and the full-parser
+// fallback for source the fast path declines. Joined via `~part flowsrc`
+// in interpreter.kz; merged into the interpreter module at load.
+
+pub const InterpreterFlowCache = struct {
+    threadlocal var inited: bool = false;
+    threadlocal var arena: std.heap.ArenaAllocator = undefined;
+    threadlocal var source_hash: u64 = 0;
+    threadlocal var source_len: usize = 0;
+    threadlocal var source_copy: []const u8 = &[_]u8{};
+    threadlocal var flow: ast.Flow = undefined;
+    threadlocal var has_flow: bool = false;
+
+    pub fn getOrParse(source: []const u8) ?*const ast.Flow {
+        if (!inited) {
+            arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            inited = true;
+        }
+        const hash = std.hash.Wyhash.hash(0, source);
+        if (has_flow and source_len == source.len and source_hash == hash and std.mem.eql(u8, source, source_copy)) {
+            return &flow;
+        }
+
+        _ = arena.reset(.retain_capacity);
+        const allocator = arena.allocator();
+        source_copy = allocator.dupe(u8, source) catch {
+            has_flow = false;
+            return null;
+        };
+        const parse_result = flow_parser.parseFlow(allocator, source_copy);
+        switch (parse_result) {
+            .flow => |f| {
+                flow = f;
+                has_flow = true;
+                source_len = source.len;
+                source_hash = hash;
+                return &flow;
+            },
+            .err => {
+                has_flow = false;
+                return null;
+            },
+        }
+    }
+};
+
+/// What a fresh parse hands back: the first flow in the source, or the parse
+/// error the run proc relays as `parse-error`.
+pub const FreshFlow = union(enum) {
+    flow: *const ast.Flow,
+    err: struct { message: []const u8, line: u32, column: u32 },
+};
+
+/// The full-parser path for source the cache/fast path declined: a real
+/// Parser with a real reporter, so error positions are honest. Shared by
+/// `run` (whose fast parser re-checks here) and `run-cached` (whose cache
+/// miss lands here) — one fallback, one set of diagnostics.
+fn freshFlow(allocator: std.mem.Allocator, source: []const u8, fail_fast: bool) FreshFlow {
+    const koru_errors = @import("koru_errors");
+    var reporter = koru_errors.ErrorReporter.init(allocator, "interpreter", source) catch {
+        return .{ .err = .{ .message = "Failed to initialize error reporter", .line = 0, .column = 0 } };
+    };
+    defer reporter.deinit();
+    var parser = koru_parser.Parser.init(allocator, source, "runtime_input", &[_][]const u8{}, null) catch {
+        return .{ .err = .{ .message = "Failed to initialize parser", .line = 0, .column = 0 } };
+    };
+    defer parser.deinit();
+    parser.fail_fast = fail_fast;
+    const parse_result = parser.parse() catch {
+        if (parser.reporter.hasErrors()) {
+            const err = parser.reporter.errors.items[0];
+            return .{ .err = .{
+                .message = std.heap.page_allocator.dupe(u8, err.message) catch "parse error",
+                .line = @intCast(err.location.line),
+                .column = @intCast(err.location.column),
+            } };
+        }
+        return .{ .err = .{ .message = "Parse failed", .line = 0, .column = 0 } };
+    };
+    for (parse_result.source_file.items) |*item| {
+        if (item.* == .flow) return .{ .flow = &item.flow };
+    }
+    return .{ .err = .{ .message = "No flow found in source", .line = 0, .column = 0 } };
+}

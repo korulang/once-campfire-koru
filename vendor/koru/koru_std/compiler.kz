@@ -1,0 +1,2694 @@
+~[comptime]
+
+~import std/testing
+~import std/inter
+~import std/deps
+~import std/optimizer
+~import std/rules
+
+~part flags
+~part control
+~part paths
+~part context
+~part dump
+~part directives
+~part stages
+// Compiler system dependencies
+~std/deps:requires.system {
+    "name": "zig",
+    "check": "zig version",
+    "min_version": "0.15.0",
+    "brew": "zig",
+    "apt": "zig",
+    "pacman": "zig",
+    "apk": "zig"
+}
+
+const std = @import("std");
+const ast = @import("ast");
+const Program = ast.Program;
+const Item = ast.Item;
+const Source = ast.Source;
+const Allocator = std.mem.Allocator;
+
+// Compiler backend build requirements are defined below via requires
+
+// Simplified Koru Compiler Library
+// A working implementation that can actually be injected and used
+
+// ============================================================
+// BUILD REQUIREMENTS - Self-documenting build dependencies
+// ============================================================
+// Modules declare their build requirements for backend.zig compilation.
+// The frontend collects these during compilation and generates build.zig.
+//
+// Usage:
+//   compiler:requires {
+//     exe.linkSystemLibrary("sqlite3");
+//   }
+//
+// The declarations themselves live in compiler.directives.kz.
+
+// Core compiler modules needed for backend compilation
+// This replaces the manual temp_build.zig generation in run_regression.sh
+~requires {
+    // Calculate relative path from test directory to repo root
+    // This will be baked into the generated build.zig
+    const REL_TO_ROOT = "${REL_TO_ROOT}";
+
+    const errors_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/errors.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const log_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/log.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const ast_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/ast.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_module.addImport("errors", errors_module);
+
+    // AST ⇄ JSON reflective round-trip. The backend reads the per-user program AST
+    // from `program.ast.json` at runtime and deserializes it via this module — the
+    // AST is no longer compiled into the backend binary, so backend.zig stays
+    // byte-identical across user programs AND the built binary is reusable across
+    // any program with the same handler set.
+    const ast_json_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/ast_json.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_json_module.addImport("ast", ast_module);
+
+    // Compiler env module - static toolchain file; per-invocation state loads as runtime JSON.
+    const compiler_env_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/compiler_env.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Lexer module - tokenization
+    const lexer_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/lexer.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Annotation parser - parses parametrized annotations
+    const annotation_parser_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/annotation_parser.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Type registry - type metadata tracking
+    const type_registry_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/type_registry.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    type_registry_module.addImport("ast", ast_module);
+    type_registry_module.addImport("log", log_module);
+
+    // Keyword registry — [keyword] resolution, callable from the test transform
+    const keyword_registry_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/keyword_registry.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    keyword_registry_module.addImport("ast", ast_module);
+    keyword_registry_module.addImport("log", log_module);
+    keyword_registry_module.addImport("annotation_parser", annotation_parser_module);
+
+    // Expression parser
+    const expression_parser_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/expression_parser.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    expression_parser_module.addImport("lexer", lexer_module);
+    expression_parser_module.addImport("ast", ast_module);
+
+    // Comptime evaluator — the comptime Koru interpreter (fold-comptime pass)
+    const comptime_eval_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/comptime_eval.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    comptime_eval_module.addImport("ast", ast_module);
+    comptime_eval_module.addImport("expression_parser", expression_parser_module);
+
+    // Union collector
+    const union_collector_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/union_collector.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    union_collector_module.addImport("ast", ast_module);
+
+    // Config module - project configuration
+    const config_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/config.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    config_module.addImport("log", log_module);
+
+    // File types module - canonical Koru extension list + helpers
+    const file_types_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/file_types.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Module resolver - resolves import paths
+    const module_resolver_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/module_resolver.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    module_resolver_module.addImport("config", config_module);
+    module_resolver_module.addImport("log", log_module);
+    module_resolver_module.addImport("file_types", file_types_module);
+
+    // Parse-time name normalizer (kebab -> snake). Shares ast_module for type identity.
+    const ast_mangle_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/ast_mangle.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_mangle_module.addImport("ast", ast_module);
+
+    // Parser module - source parsing
+    const parser_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/parser.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    parser_module.addImport("ast", ast_module);
+    parser_module.addImport("ast_mangle", ast_mangle_module);
+    parser_module.addImport("lexer", lexer_module);
+    parser_module.addImport("errors", errors_module);
+    parser_module.addImport("log", log_module);
+    parser_module.addImport("type_registry", type_registry_module);
+    parser_module.addImport("expression_parser", expression_parser_module);
+    parser_module.addImport("comptime_eval", comptime_eval_module);
+    parser_module.addImport("annotation_parser", annotation_parser_module);
+    parser_module.addImport("union_collector", union_collector_module);
+    parser_module.addImport("module_resolver", module_resolver_module);
+    parser_module.addImport("file_types", file_types_module);
+
+    // Phantom parser
+    const phantom_parser_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/koru_std/phantom_parser.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Type inference
+    const type_inference_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/type_inference.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    type_inference_module.addImport("ast", ast_module);
+    type_inference_module.addImport("errors", errors_module);
+
+    // Branch checker - pure branch name validation
+    const branch_checker_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/branch_checker.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Shape checker - validates tor/branch structures
+    const shape_checker_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/shape_checker.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    shape_checker_module.addImport("ast", ast_module);
+    shape_checker_module.addImport("errors", errors_module);
+    shape_checker_module.addImport("log", log_module);
+    shape_checker_module.addImport("phantom_parser", phantom_parser_module);
+    shape_checker_module.addImport("type_inference", type_inference_module);
+    shape_checker_module.addImport("branch_checker", branch_checker_module);
+    shape_checker_module.addImport("type_registry", type_registry_module);
+
+    // Flow checker - validates control flow
+    const flow_checker_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/flow_checker.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    flow_checker_module.addImport("ast", ast_module);
+    flow_checker_module.addImport("errors", errors_module);
+    flow_checker_module.addImport("log", log_module);
+    flow_checker_module.addImport("branch_checker", branch_checker_module);
+    flow_checker_module.addImport("annotation_parser", annotation_parser_module);
+    flow_checker_module.addImport("expression_parser", expression_parser_module);
+    flow_checker_module.addImport("phantom_parser", phantom_parser_module);
+
+    // AST desugars — the point-free pyramid, the bind pun + type thread, and the
+    // flow return terminus. They run in the ELABORATE segment, after
+    // resolve-with-scopes, because every one of them looks a declaration up by
+    // path and a `[with]`-scoped bare name is not resolvable until then.
+    const ast_transform_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/ast_transform.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_transform_module.addImport("ast", ast_module);
+    ast_transform_module.addImport("errors", errors_module);
+
+    // Release gate - rejects [prototype] modules under --release (the production gate)
+    const release_gate_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/release_gate.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    release_gate_module.addImport("ast", ast_module);
+    release_gate_module.addImport("errors", errors_module);
+
+    // Phantom semantic checker - validates phantom type states
+    const phantom_semantic_checker_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/phantom_semantic_checker.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    phantom_semantic_checker_module.addImport("ast", ast_module);
+    phantom_semantic_checker_module.addImport("errors", errors_module);
+    phantom_semantic_checker_module.addImport("log", log_module);
+    phantom_semantic_checker_module.addImport("phantom_parser", phantom_parser_module);
+
+    // Purity analyzer - tracks [pure] annotations
+    const purity_analyzer_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/compiler_passes/purity_analyzer.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    purity_analyzer_module.addImport("ast", ast_module);
+
+    // AST functional utilities
+    const ast_functional_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/ast_functional.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_functional_module.addImport("ast", ast_module);
+    phantom_semantic_checker_module.addImport("ast_functional", ast_functional_module);
+
+    // Auto-discharge inserter - inserts disposal calls before terminators
+    const auto_discharge_inserter_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/auto_discharge_inserter.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    auto_discharge_inserter_module.addImport("ast", ast_module);
+    auto_discharge_inserter_module.addImport("ast_functional", ast_functional_module);
+    auto_discharge_inserter_module.addImport("errors", errors_module);
+    auto_discharge_inserter_module.addImport("log", log_module);
+    auto_discharge_inserter_module.addImport("phantom_parser", phantom_parser_module);
+    auto_discharge_inserter_module.addImport("annotation_parser", annotation_parser_module);
+
+    // Dead strip pass - removes unreachable tors/procs from AST
+    const dead_strip_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/dead_strip.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    dead_strip_module.addImport("ast", ast_module);
+    dead_strip_module.addImport("log", log_module);
+
+    // Codegen utilities - keyword escaping, identifier helpers
+    const codegen_utils_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/codegen_utils.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Continuation codegen - reusable code generation for transforms
+    const continuation_codegen_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/continuation_codegen.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    continuation_codegen_module.addImport("ast", ast_module);
+    continuation_codegen_module.addImport("codegen_utils", codegen_utils_module);
+
+    // Template utils - template lookup and interpolation for metaprogramming
+    const template_utils_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/template_utils.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    template_utils_module.addImport("ast", ast_module);
+
+    // Liquid template engine - runtime Liquid-style templating
+    const liquid_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/liquid.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Struct-literal projector - parses Koru `{ name: expr }` into ordered field
+    // pairs / a liquid record. Used by the capture transform to interpret the
+    // opaque `captured({...})` payload (docs/PARSER_PALETTE.md).
+    const struct_literal_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/struct_literal.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    struct_literal_module.addImport("liquid", liquid_module);
+
+    // Site hash — fuzzy hierarchical program addresses (module→item→site→detail)
+    const site_hash_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/site_hash.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    site_hash_module.addImport("ast", ast_module);
+    site_hash_module.addImport("errors", errors_module);
+
+    // AST printer — canonical AST → Koru source; explainers print the items
+    // a transform wrote (the elaborated view) through printItemSource.
+    const ast_printer_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/ast_printer.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_printer_module.addImport("ast", ast_module);
+
+    // Compiler config
+    const compiler_config_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/compiler_config.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Emitter helpers - code generation utilities
+    const emitter_helpers_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/emitter_helpers.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    emitter_helpers_module.addImport("ast", ast_module);
+    emitter_helpers_module.addImport("errors", errors_module);
+    emitter_helpers_module.addImport("log", log_module);
+    emitter_helpers_module.addImport("compiler_config", compiler_config_module);
+    emitter_helpers_module.addImport("type_registry", type_registry_module);
+    emitter_helpers_module.addImport("codegen_utils", codegen_utils_module);
+    emitter_helpers_module.addImport("annotation_parser", annotation_parser_module);
+    emitter_helpers_module.addImport("struct_literal", struct_literal_module);
+    parser_module.addImport("struct_literal", struct_literal_module);
+    flow_checker_module.addImport("struct_literal", struct_literal_module);
+
+    // Tap pattern matcher
+    const glob_pattern_matcher_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/glob_pattern_matcher.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_module.addImport("glob_pattern_matcher", glob_pattern_matcher_module);
+    shape_checker_module.addImport("glob_pattern_matcher", glob_pattern_matcher_module);
+
+    // Tap registry - tap/observer system
+    const tap_registry_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/tap_registry.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    tap_registry_module.addImport("ast", ast_module);
+    tap_registry_module.addImport("errors", errors_module);
+    tap_registry_module.addImport("log", log_module);
+    tap_registry_module.addImport("glob_pattern_matcher", glob_pattern_matcher_module);
+
+    // Runtime registry - runtime scope collection
+    const runtime_registry_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/runtime_registry.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Tap transformer - inserts tap invocations into AST
+    const tap_transformer_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/tap_transformer.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    tap_transformer_module.addImport("ast", ast_module);
+    tap_transformer_module.addImport("log", log_module);
+    tap_transformer_module.addImport("tap_registry", tap_registry_module);
+    tap_transformer_module.addImport("emitter_helpers", emitter_helpers_module);
+
+    // Template processor - renders `[template]` proc bodies through Liquid.
+    const template_processor_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/template_processor.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    template_processor_module.addImport("ast", ast_module);
+    template_processor_module.addImport("liquid", liquid_module);
+    template_processor_module.addImport("log", log_module);
+    template_processor_module.addImport("errors", errors_module);
+    template_processor_module.addImport("annotation_parser", annotation_parser_module);
+    template_processor_module.addImport("struct_literal", struct_literal_module);
+    template_processor_module.addImport("codegen_utils", codegen_utils_module);
+    auto_discharge_inserter_module.addImport("template_processor", template_processor_module);
+    // Purity helpers
+    const purity_helpers_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/compiler_passes/purity_helpers.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    purity_helpers_module.addImport("ast", ast_module);
+    purity_helpers_module.addImport("lexer", lexer_module);
+    tap_transformer_module.addImport("compiler_passes/purity_helpers", purity_helpers_module);
+    emitter_helpers_module.addImport("tap_registry", tap_registry_module);
+    emitter_helpers_module.addImport("compiler_passes/purity_helpers", purity_helpers_module);
+
+    // Visitor emitter - code generation visitor pattern
+    const visitor_emitter_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/visitor_emitter.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    visitor_emitter_module.addImport("ast", ast_module);
+    visitor_emitter_module.addImport("log", log_module);
+    visitor_emitter_module.addImport("emitter_helpers", emitter_helpers_module);
+    visitor_emitter_module.addImport("tap_registry", tap_registry_module);
+    visitor_emitter_module.addImport("type_registry", type_registry_module);
+    visitor_emitter_module.addImport("annotation_parser", annotation_parser_module);
+    visitor_emitter_module.addImport("codegen_utils", codegen_utils_module);
+    visitor_emitter_module.addImport("file_types", file_types_module);
+    visitor_emitter_module.addImport("comptime_eval", comptime_eval_module);
+    visitor_emitter_module.addImport("struct_literal", struct_literal_module);
+    // JS-target emitter (spike): minimal AST→JS for pump.kz. Gated behind
+    // --lang=js in emit-zig; the default Zig path never references it.
+    const js_emitter_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/js_emitter.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    js_emitter_module.addImport("ast", ast_module);
+    js_emitter_module.addImport("log", log_module);
+    js_emitter_module.addImport("file_types", file_types_module);
+    js_emitter_module.addImport("annotation_parser", annotation_parser_module);
+    // The ONE struct-literal projector. A `-> { a.x, b.y }` produce is a Koru
+    // struct literal under the pun law, and reading it with a second brace-splitter
+    // is how two hosts' answers drift — the `no koruStructToZig text surgery` rule
+    // in control.kz's capture seed and template_processor's lowerScrutinee both name
+    // that reason.
+    js_emitter_module.addImport("struct_literal", struct_literal_module);
+    // The ONE Koru expression lowering. It used to be a private method on this
+    // emitter, which is exactly why a `std/store` guard and a `std/kernel` op
+    // body reached `node` unlowered — the pass was reachable only from text the
+    // emitter wrote itself. It now lives in codegen_utils and this emitter is one
+    // of its callers.
+    js_emitter_module.addImport("codegen_utils", codegen_utils_module);
+    // C#-target emitter (K# vertical spike): minimal AST→C# for the
+    // print.ln/~if-shaped subset. Gated behind --lang=cs; the default Zig
+    // path never references it.
+    const cs_emitter_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/cs_emitter.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    cs_emitter_module.addImport("ast", ast_module);
+    cs_emitter_module.addImport("log", log_module);
+    cs_emitter_module.addImport("file_types", file_types_module);
+    cs_emitter_module.addImport("annotation_parser", annotation_parser_module);
+    cs_emitter_module.addImport("struct_literal", struct_literal_module);
+    cs_emitter_module.addImport("codegen_utils", codegen_utils_module);
+    cs_emitter_module.addImport("emitter_helpers", emitter_helpers_module);
+    // Build.zig emission
+    const emit_build_zig_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/emit_build_zig.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    emit_build_zig_module.addImport("log", log_module);
+
+    const compiler_requires_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/compiler_requires.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_requires_module.addImport("ast", ast_module);
+    compiler_requires_module.addImport("log", log_module);
+
+    const import_pipeline_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/import_pipeline.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    import_pipeline_module.addImport("ast", ast_module);
+    import_pipeline_module.addImport("parser", parser_module);
+    import_pipeline_module.addImport("module_resolver", module_resolver_module);
+    import_pipeline_module.addImport("log", log_module);
+    import_pipeline_module.addImport("errors", errors_module);
+    import_pipeline_module.addImport("file_types", file_types_module);
+
+    const post_transform_weld_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/post_transform_weld.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    post_transform_weld_module.addImport("ast", ast_module);
+    post_transform_weld_module.addImport("config", config_module);
+    post_transform_weld_module.addImport("module_resolver", module_resolver_module);
+    post_transform_weld_module.addImport("import_pipeline", import_pipeline_module);
+    post_transform_weld_module.addImport("compiler_requires", compiler_requires_module);
+    post_transform_weld_module.addImport("emit_build_zig", emit_build_zig_module);
+    post_transform_weld_module.addImport("log", log_module);
+    post_transform_weld_module.addImport("compiler_env", compiler_env_module);
+    const canonicalize_names_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/canonicalize_names.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    canonicalize_names_module.addImport("ast", ast_module);
+    canonicalize_names_module.addImport("log", log_module);
+    post_transform_weld_module.addImport("canonicalize_names", canonicalize_names_module);
+
+    // AST serializer (for --ast-json and debugging)
+    const ast_serializer_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/ast_serializer.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_serializer_module.addImport("ast", ast_module);
+
+    // Transform pass runner - recursive AST walker for transform handlers
+    // Also handles [expand] tors via template lookup and interpolation
+    const transform_pass_runner_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/transform_pass_runner.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    transform_pass_runner_module.addImport("ast", ast_module);
+    transform_pass_runner_module.addImport("log", log_module);
+    transform_pass_runner_module.addImport("annotation_parser", annotation_parser_module);
+    transform_pass_runner_module.addImport("template_utils", template_utils_module);
+    transform_pass_runner_module.addImport("ast_functional", ast_functional_module);
+    transform_pass_runner_module.addImport("liquid", liquid_module);
+    transform_pass_runner_module.addImport("glob_pattern_matcher", glob_pattern_matcher_module);
+
+    // Add all imports to the backend executable
+    // Backend_output_emitted as its own compilation unit, linked via addObject.
+    // This is the slice-B move: backend.zig no longer @import-s this file, so
+    // it doesn't get fused into backend.zig's compilation unit.
+    // Regex engine (std/regex) — compile-time NFA/DFA matcher generator used by
+    // the `match` transform. Pure std, no deps.
+    const regex_engine_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/regex_engine.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const backend_output_module = b.createModule(.{
+        .root_source_file = b.path("backend_output_emitted.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    backend_output_module.addImport("ast", ast_module);
+    backend_output_module.addImport("regex_engine", regex_engine_module);
+    backend_output_module.addImport("log", log_module);
+    backend_output_module.addImport("emitter_helpers", emitter_helpers_module);
+    backend_output_module.addImport("compiler_env", compiler_env_module);
+    backend_output_module.addImport("tap_registry", tap_registry_module);
+    backend_output_module.addImport("annotation_parser", annotation_parser_module);
+    backend_output_module.addImport("type_registry", type_registry_module);
+    backend_output_module.addImport("codegen_utils", codegen_utils_module);
+    backend_output_module.addImport("transform_pass_runner", transform_pass_runner_module);
+    backend_output_module.addImport("parser", parser_module);
+    backend_output_module.addImport("ast_functional", ast_functional_module);
+    backend_output_module.addImport("flow_checker", flow_checker_module);
+    backend_output_module.addImport("ast_transform", ast_transform_module);
+    backend_output_module.addImport("shape_checker", shape_checker_module);
+    backend_output_module.addImport("release_gate", release_gate_module);
+    backend_output_module.addImport("phantom_semantic_checker", phantom_semantic_checker_module);
+    backend_output_module.addImport("auto_discharge_inserter", auto_discharge_inserter_module);
+    backend_output_module.addImport("dead_strip", dead_strip_module);
+    backend_output_module.addImport("purity_analyzer", purity_analyzer_module);
+    backend_output_module.addImport("visitor_emitter", visitor_emitter_module);
+    backend_output_module.addImport("js_emitter", js_emitter_module);
+    backend_output_module.addImport("cs_emitter", cs_emitter_module);
+    backend_output_module.addImport("emit_build_zig", emit_build_zig_module);
+    backend_output_module.addImport("post_transform_weld", post_transform_weld_module);
+    backend_output_module.addImport("ast_serializer", ast_serializer_module);
+    backend_output_module.addImport("runtime_registry", runtime_registry_module);
+    backend_output_module.addImport("tap_transformer", tap_transformer_module);
+    backend_output_module.addImport("template_processor", template_processor_module);
+    backend_output_module.addImport("expression_parser", expression_parser_module);
+    backend_output_module.addImport("comptime_eval", comptime_eval_module);
+    backend_output_module.addImport("errors", errors_module);
+    backend_output_module.addImport("continuation_codegen", continuation_codegen_module);
+    backend_output_module.addImport("template_utils", template_utils_module);
+    backend_output_module.addImport("liquid", liquid_module);
+    backend_output_module.addImport("struct_literal", struct_literal_module);
+    backend_output_module.addImport("site_hash", site_hash_module);
+    backend_output_module.addImport("ast_printer", ast_printer_module);
+    backend_output_module.addImport("keyword_registry", keyword_registry_module);
+
+    // backend_output_emitted as a MODULE of the exe (single compilation unit =
+    // single std). Previously a separate `b.addObject` + `exe.addObject`, which
+    // gave backend_output its OWN std — so `std.os.environ` (and every std global)
+    // was duplicated: `start` set the exe's environ, but the emitted pipeline's
+    // getenv read the object's uninitialized copy → 0xAA → segfault on Linux
+    // (no-libc reads the global directly; macOS hid it by routing getenv via libc).
+    // One compilation = one std = one environ.
+    exe.root_module.addImport("backend_output", backend_output_module);
+
+    exe.root_module.addImport("ast", ast_module);
+    exe.root_module.addImport("ast_json", ast_json_module);
+    exe.root_module.addImport("compiler_env", compiler_env_module);
+    exe.root_module.addImport("ast_functional", ast_functional_module);
+    exe.root_module.addImport("ast_serializer", ast_serializer_module);
+    exe.root_module.addImport("log", log_module);
+    exe.root_module.addImport("emitter_helpers", emitter_helpers_module);
+    exe.root_module.addImport("tap_registry", tap_registry_module);
+    exe.root_module.addImport("runtime_registry", runtime_registry_module);
+    exe.root_module.addImport("tap_transformer", tap_transformer_module);
+    exe.root_module.addImport("template_processor", template_processor_module);
+    exe.root_module.addImport("visitor_emitter", visitor_emitter_module);
+    exe.root_module.addImport("parser", parser_module);
+    exe.root_module.addImport("expression_parser", expression_parser_module);
+    exe.root_module.addImport("comptime_eval", comptime_eval_module);
+    exe.root_module.addImport("emit_build_zig", emit_build_zig_module);
+    exe.root_module.addImport("post_transform_weld", post_transform_weld_module);
+    exe.root_module.addImport("shape_checker", shape_checker_module);
+    exe.root_module.addImport("flow_checker", flow_checker_module);
+    exe.root_module.addImport("ast_transform", ast_transform_module);
+    exe.root_module.addImport("release_gate", release_gate_module);
+    exe.root_module.addImport("phantom_semantic_checker", phantom_semantic_checker_module);
+    exe.root_module.addImport("auto_discharge_inserter", auto_discharge_inserter_module);
+    exe.root_module.addImport("dead_strip", dead_strip_module);
+    exe.root_module.addImport("purity_analyzer", purity_analyzer_module);
+    exe.root_module.addImport("errors", errors_module);
+    exe.root_module.addImport("type_registry", type_registry_module);
+    exe.root_module.addImport("annotation_parser", annotation_parser_module);
+    exe.root_module.addImport("transform_pass_runner", transform_pass_runner_module);
+    exe.root_module.addImport("codegen_utils", codegen_utils_module);
+    exe.root_module.addImport("continuation_codegen", continuation_codegen_module);
+    exe.root_module.addImport("template_utils", template_utils_module);
+    exe.root_module.addImport("liquid", liquid_module);
+    exe.root_module.addImport("struct_literal", struct_literal_module);
+    exe.root_module.addImport("site_hash", site_hash_module);
+}
+
+// ============================================================
+// COMPILER FLAGS - Self-documenting feature flags
+// ============================================================
+// Modules declare their compiler flags with inline documentation.
+// The frontend collects these during --help to build flag documentation.
+//
+// Usage:
+//   compiler:flag.declare {
+//     "name": "fusion",
+//     "description": "Enable tor fusion optimization",
+//     "type": "boolean"
+//   }
+//
+// [norun] annotation prevents auto-execution - --help reads from AST instead.
+// This makes help metacircular - discovered by parsing, not hardcoded!
+
+~[comptime|norun]pub tor flag.declare { source: Source }
+
+// ============================================================
+// IMPORT PATH ALIASES - what the program says about where it lives
+// ============================================================
+// A program declares its own import aliases, in itself. In pure `.k` there is no
+// tilde — this is a Koru feature, not a host-embedding one:
+//
+//   std/compiler:paths {
+//       domain: ./test_lib/domain
+//       toolkit: {{ flag:target }}/toolkit
+//   }
+//
+// A host-embedding file (`.kz`, `.kjs`, …) writes the same block as
+// `std/compiler:paths { .. }`. Diagnostics render whichever spelling the file
+// being compiled actually uses.
+//
+// One `alias: path` per line. `{{ ENTRY }}`, `{{ KORU_HOME }}` and
+// `{{ flag:name }}` interpolate; a flag with no value supplied is refused at the
+// declaration rather than resolved into whatever happens to be on disk.
+//
+// [norun] for the same reason as flag.declare: the declaration never executes.
+// Unlike flag.declare it is not harvested after the parse either — the frontend
+// reads it DURING the parse, because parse and import resolution are one pass and
+// an alias has to exist before the import that uses it is read. That is why this
+// only has effect in the entry file, above its first use.
+~[comptime|norun]pub tor paths { source: Source }
+
+~flag.declare {
+  "name": "ccp",
+  "description": "Enable Compiler Communication Protocol for AI observability",
+  "type": "boolean"
+}
+
+~flag.declare {
+  "name": "verbose",
+  "description": "Enable verbose compiler output and debug logging",
+  "type": "boolean"
+}
+
+~flag.declare {
+  "name": "debug",
+  "description": "Debug build: keep unwind tables and symbols for stack traces on panic",
+  "type": "boolean"
+}
+
+// ============================================================
+// COMPILER COMMANDS - User-definable CLI commands
+// ============================================================
+// Modules can declare CLI commands that run instead of normal compilation.
+// Commands have full AST access and run in the backend compilation phase.
+//
+// Usage (in your module, e.g. package.kz):
+//   import std/compiler
+//
+//   std/compiler:command.declare {
+//     "name": "i",
+//     "alias": "install",
+//     "description": "Install npm packages from requires.npm declarations"
+//   }
+//
+//   [comptime|command]pub tor install { program, allocator, argv: []string }
+//   proc install { /* full AST access - walk program for requires.npm, etc. */ }
+//
+// Invoke: koruc main.kz install [args...]  (or the alias: koruc main.kz i)
+//
+// Commands appear in --help under "Commands:"; [norun] prevents auto-execution.
+
+~[comptime|norun]pub tor command.declare { source: Source }
+
+// ============================================================
+// COMPILER COORDINATION - User-overridable compilation pipeline
+// ============================================================
+
+// The compiler coordinator (user-overridable)
+// Abstract: Users can override with std/compiler:coordinate = ...
+~[comptime|abstract] pub tor coordinate { program_ast: *const Program, allocator: std.mem.Allocator }
+| coordinated { ast: *const Program, code: string, metrics: string }
+| error string
+
+// Default implementation of the compiler coordinator
+// Users who don't override get this standard pipeline
+
+~coordinate = context-create(program_ast, allocator): c0 |> elaborate(ctx: c0): c1 |> analysis(ctx: c1)
+| ctx c2 |> test-generation(ctx: c2): c3 |> std/optimizer:optimize(ctx: c3): c4 |> emission(ctx: c4): c5 |> metrics-format(c5.ctx.passes_completed, allocator): m |> std/inter:start(contexts: [
+      c0,
+      c1,
+      c2,
+      c3,
+      c4,
+      c5.ctx
+    ])
+  | launched => coordinated { c5.ctx.ast, c5.code, metrics: m }
+  | skipped => coordinated { c5.ctx.ast, c5.code, metrics: m }
+| failed f => error f.message
+
+// Composable pipeline segments - users can mix and match!
+
+// Helper: Create CompilerContext from ast and allocator
+~pub tor context-create { program_ast: *const Program, allocator: std.mem.Allocator } -> CompilerContext
+
+~proc context-create|zig {
+    // The seed AST is deserialized from `program.ast.json` onto the compile arena
+    // in the backend's main() — it is already writable heap memory, so the
+    // metacircular pipeline's in-place mutations (`@constCast` template inline_body
+    // writes, auto-discharge binding-annotation stamps) are safe with no clone.
+    // (This is why the old rodata-SIGSEGV heap-clone hack is gone: there is no
+    // longer a `pub const PROGRAM_AST` in read-only `.rodata` to mutate.)
+
+    // The compilation's one reporter, minted here so every pass downstream —
+    // and every transform that declares `reporter:` — speaks through the SAME
+    // channel, bound to the user's file. The file these diagnostics render
+    // previews from is the first location the AST carries: one reporter renders
+    // one file, which is what koruc has always done — a multi-module program
+    // previews the main one only.
+    const reporter_path = blk: {
+        for (program_ast.items) |item| {
+            const file = switch (item) {
+                .flow => |f| f.location.file,
+                .proc_decl => |p| p.location.file,
+                .event_decl => |e| e.location.file,
+                else => "",
+            };
+            if (file.len > 0) break :blk file;
+        }
+        break :blk "";
+    };
+    const reporter_source = if (reporter_path.len > 0)
+        std.fs.cwd().readFileAlloc(allocator, reporter_path, 16 * 1024 * 1024) catch ""
+    else
+        "";
+    const reporter = allocator.create(ErrorReporter) catch {
+        @panic("context-create: out of memory allocating the compilation's diagnostic reporter");
+    };
+    reporter.* = ErrorReporter.init(allocator, reporter_path, reporter_source) catch {
+        @panic("context-create: could not initialise the compilation's diagnostic reporter");
+    };
+    // Continuation/source locations were recorded by the FRONTEND in its
+    // INJECTED-buffer coordinates — it auto-prepends `import std/compiler`
+    // (one line) and the frontend's own reporter knows to translate, while
+    // this backend reporter reads the user file raw. Apply the same user-source
+    // translation when the frontend injected (same condition as src/main.zig),
+    // or every continuation-located diagnostic (unknown branch, when-clause,
+    // missing input…) points one line past the arm (210_201).
+    const backend_injected = std.mem.indexOf(u8, reporter_source, "~import std/compiler") == null and
+        std.mem.indexOf(u8, reporter_source, "import std/compiler") == null;
+    if (backend_injected) reporter.setUserSource(reporter_source, 1) catch {};
+
+    const ctx = CompilerContext{
+        .ast = program_ast,
+        .original_ast = program_ast,  // Initially same as ast, preserved across filtering
+        .allocator = allocator,
+        .errors = std.ArrayList(CompilerError){},
+        .warnings = std.ArrayList(CompilerWarning){},
+        .error_policy = .collect_all,
+        .current_pass = "init",
+        .passes_completed = 0,
+        .tap_registry = null,
+        .reporter = reporter,
+    };
+    return ctx;
+}
+
+~part with
+
+~part desugars
+
+// Comptime interpreter fold: partial evaluation of [comptime] flows whose
+// head tor has a pure-Koru bare-return impl. The interpreter (comptime_eval)
+// evaluates the head at Stage C and rewrites the flow to its runtime residue
+// with the folded value spliced in. Failure is LOUD: an unfoldable foldable
+// flow is a compile error carrying the evaluator's diagnostic, never a silent
+// pass-through. See docs/comptime_core_ast_inventory.md.
+~pub tor fold-comptime { ctx: CompilerContext } -> CompilerContext
+
+~proc fold-comptime|zig {
+    const comptime_eval = @import("comptime_eval");
+    var folder = comptime_eval.Folder.init(ctx.allocator);
+    // THE THUNK LAW: hand the walker the Stage A-generated dispatch table so
+    // interpreted comptime Koru can call the natively-compiled handlers.
+    // Same @hasDecl pattern as the comptime_main call — the table only
+    // exists when the user program has thunkable comptime tors.
+    const backend_output = @import("backend_output_emitted.zig");
+    if (@hasDecl(backend_output, "koru_comptime_thunks")) {
+        folder.setThunks(&backend_output.koru_comptime_thunks);
+    }
+    const folded = folder.fold(ctx.ast) catch {
+        log.err("comptime fold failed: {s}\n", .{folder.diag()});
+        @panic("comptime evaluation failed — see the diagnostic above");
+    };
+
+    var updated_ctx = ctx;
+    updated_ctx.ast = folded;
+    updated_ctx.passes_completed += 1;
+    updated_ctx.current_pass = "fold_comptime";
+    return updated_ctx;
+}
+
+// Elaboration segment: resolve names, expand templates, fold comptime — the AST
+// arrives as written and leaves in the core form the later segments validate and
+// emit. Abstract, can be overridden.
+//
+// NOT the frontend: `koruc` (src/main.zig) is the frontend, and it parses and
+// validates before any of this runs. This segment is the first phase of the
+// BACKEND compiler, which is why it can see resolved names at all.
+~[comptime|abstract] pub tor elaborate { ctx: CompilerContext } -> CompilerContext
+
+// `desugar-chains()` runs TWICE, and the second run is the point. The first sits
+// left of every transform stage, so it only ever sees AUTHOR-written arms; a
+// branch a transform synthesizes later — which is every std/store arm — is minted
+// after the thread has gone home and could never offer its payload at any arity.
+// Re-entry is safe because the fill is idempotent: `isOpenThreadSlot`
+// (ast_transform.zig:1232) returns false for any slot already carrying an
+// argument, so the second run can only fill what the first could not see.
+~elaborate = process-ccp-commands(ctx) |> resolve-with-scopes() |> desugar-chains() |> run-pre-transforms() |> process-template-procs() |> fold-comptime() |> evaluate-comptime()
+
+// Analysis segment: Validation passes (abstract, can be overridden)
+~[comptime|abstract] pub tor analysis { ctx: CompilerContext }
+| ctx CompilerContext
+| failed { ctx: CompilerContext, message: string }
+
+~analysis = check-release-gate
+  |> check-structure
+  |> check-phantom-signatures
+  |> check-phantom-args
+  |> pass-auto-discharge
+  |> check-flow
+  |> check-phantom-semantic
+  |> check-purity
+| failed f => failed { f.ctx, f.message }
+
+// Tap transformation segment: Insert tap invocations into AST
+// This converts taps from emission-time code injection to AST nodes,
+// enabling the optimizer to see and optimize them (zero-cost abstraction!)
+// (abstract, can be overridden)
+~[comptime|abstract] pub tor transform-taps { ctx: CompilerContext } -> CompilerContext
+
+~proc transform-taps|zig {
+    // Build tap registry from AST (before transformation removes taps)
+    const tap_registry_module = @import("tap_registry");
+    const registry_ptr = ctx.allocator.create(tap_registry_module.TapRegistry) catch unreachable;
+    registry_ptr.* = tap_registry_module.buildTapRegistry(
+        ctx.ast.items,
+        ctx.allocator
+    ) catch unreachable;
+    // Don't defer deinit - we need the registry to persist for emission
+
+    // Transform AST - insert tap invocations as regular flow code
+    const tap_transformer = @import("tap_transformer");
+    const emitter_helpers = @import("emitter_helpers");
+    const transformed_ast = tap_transformer.transformAst(
+        ctx.ast,
+        registry_ptr,
+        emitter_helpers.EmitMode.runtime_only,
+        ctx.allocator
+    ) catch unreachable;
+
+    // Update context with transformed AST and tap registry
+    var updated_ctx = ctx;
+    updated_ctx.ast = transformed_ast;
+    updated_ctx.tap_registry = registry_ptr;
+    updated_ctx.passes_completed += 1;
+    updated_ctx.current_pass = "transform_taps";
+
+    return updated_ctx;
+}
+
+// Test generation segment: Generates Zig test blocks from test declarations
+// Runs AFTER analysis (purity is propagated) but BEFORE optimization
+// This uses the SAME emitter as emission - no hand-rolled code generation!
+~[comptime|abstract] pub tor test-generation { ctx: CompilerContext } -> CompilerContext
+
+// Test generation implementation
+// Finds test invocations in AST and generates Zig test blocks
+~proc test-generation|zig {
+    var mutable_ctx = ctx;
+    mutable_ctx.current_pass = "test_generation";
+
+    // Import needed modules
+    const ast_mod = @import("ast");
+
+    // Storage for the tests we will generate, keyed by INDEX rather than by
+    // pointer.
+    //
+    // WHY NOT POINTERS (fixed 2026-08-06): `for (slice) |item|` binds `item` BY
+    // VALUE, so `&item.flow` is the address of a loop-local copy that dies at the
+    // end of the iteration. This pass collected such addresses in one loop and
+    // compared them against freshly-taken addresses in a SECOND loop below, so the
+    // comparison could never be true. `should_replace` was structurally always
+    // false: every generated test block was built and then silently discarded, and
+    // the pass looked like it was doing nothing at all. A top-level item's index
+    // into `ast.items` is its stable identity — nothing can copy it out from under
+    // us — and pairing the index with its generated code makes the substitution
+    // order impossible to desynchronise.
+    const PendingTest = struct { idx: usize, code: ast_mod.Item };
+    var pending = std.ArrayList(PendingTest).initCapacity(mutable_ctx.allocator, 8) catch unreachable;
+
+    // Scan AST for test invocations
+    // A test invocation is a flow that calls the "test" tor from std.testing
+    for (mutable_ctx.ast.items, 0..) |*item, idx| {
+        if (item.* == .flow) {
+            const flow = &item.flow;
+            // Check if this is a test invocation
+            if (isTestInvocation(flow.inv())) {
+                // Found a test! Process it
+                const inline_code = processTestFlow(flow, mutable_ctx.ast, mutable_ctx.allocator);
+                if (inline_code) |code| {
+                    pending.append(mutable_ctx.allocator, .{ .idx = idx, .code = code }) catch {};
+                }
+            }
+        }
+        // Tests nested inside a `module_decl` are deliberately NOT handled here.
+        // The replacement below rebuilds only the TOP-LEVEL item list, so a
+        // module-nested flow has no slot to be substituted into. Generating code
+        // for one and dropping it is what previously let the inline-code cursor
+        // drift out of step with the replacement order — the next top-level test
+        // would then be replaced with a *different* test's block. Named as a gap
+        // rather than left half-done.
+    }
+
+    // If we found tests, build new AST with them replaced
+    if (pending.items.len > 0) {
+        log.verbose("[TEST-GEN] Found {} test(s) to generate\n", .{pending.items.len});
+
+        // Build new items array with test flows replaced by inline_codes.
+        // `pending` is populated in ascending index order by the scan above, so a
+        // single cursor walks it in step with the item list — no search, no pointer
+        // comparison, and the code that lands at an index is by construction the
+        // code generated FOR that index.
+        var new_items = std.ArrayList(ast_mod.Item).initCapacity(mutable_ctx.allocator, mutable_ctx.ast.items.len) catch unreachable;
+        var next: usize = 0;
+
+        for (mutable_ctx.ast.items, 0..) |item, idx| {
+            if (next < pending.items.len and pending.items[next].idx == idx) {
+                new_items.append(mutable_ctx.allocator, pending.items[next].code) catch {};
+                next += 1;
+            } else {
+                new_items.append(mutable_ctx.allocator, item) catch {};
+            }
+        }
+
+        // Create new Program with updated items
+        const new_program = mutable_ctx.allocator.create(ast_mod.Program) catch unreachable;
+        new_program.* = ast_mod.Program{
+            .items = new_items.items,
+            .module_annotations = mutable_ctx.ast.module_annotations,
+            .main_module_name = mutable_ctx.ast.main_module_name,
+            .allocator = mutable_ctx.allocator,
+        };
+        mutable_ctx.ast = new_program;
+    }
+
+    mutable_ctx.passes_completed += 1;
+    return mutable_ctx;
+}
+
+// Helper: Check if an invocation is calling the test tor
+const isTestInvocation = struct {
+    fn call(inv: *const @import("ast").Invocation) bool {
+        // Check if path is "test" from std.testing
+        if (inv.path.segments.len == 1 and std.mem.eql(u8, inv.path.segments[0], "test")) {
+            return true;
+        }
+        // Could also check for module-qualified: std_testing:test
+        if (inv.path.module_qualifier) |mq| {
+            if (std.mem.indexOf(u8, mq, "testing") != null and
+                inv.path.segments.len == 1 and
+                std.mem.eql(u8, inv.path.segments[0], "test"))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+}.call;
+
+// Helper: Process a test flow and generate Zig test block
+// Uses the REAL emitter infrastructure - not hand-rolled code!
+const processTestFlow = struct {
+    fn call(flow: *const @import("ast").Flow, program: *const @import("ast").Program, allocator: std.mem.Allocator) ?@import("ast").Item {
+        const ast_mod = @import("ast");
+        const ast_functional = @import("ast_functional");
+        const parser_impl = @import("parser");
+        const emitter_helpers = @import("emitter_helpers");
+        // Suppress unused import warnings (these are used in nested functions)
+        _ = &ast_functional;
+
+        // Get test name from invocation args (first arg named "expr")
+        var test_name: []const u8 = "unnamed test";
+        for (flow.inv().args) |arg| {
+            if (std.mem.eql(u8, arg.name, "expr")) {
+                test_name = arg.value;
+                break;
+            }
+        }
+
+        // Get source body from invocation args - stored in source_value field
+        var source_text: []const u8 = "";
+        var source_ptr: ?*const ast_mod.Source = null;
+        for (flow.inv().args) |arg| {
+            if (arg.source_value) |src| {
+                source_text = src.text;
+                source_ptr = src;
+                break;
+            }
+        }
+
+        if (source_text.len == 0) {
+            log.verbose("[TEST-GEN] Warning: No source body found for test '{s}'\n", .{test_name});
+            return null;
+        }
+
+        log.verbose("[TEST-GEN] Processing test '{s}' with {d} bytes of source\n", .{test_name, source_text.len});
+
+        // Parse the source body
+        // The test body has no file of its own. It inherits the ENCLOSING file's
+        // DIALECT — and only the dialect. A `.k` is pure Koru with no ``; the
+        // invented "__test__.kz" told the parser this was host-embedded, so every
+        // line of the body parsed as HOST TEXT, nothing was collected, and the
+        // emitted test block came out EMPTY — a pass with zero assertions in it
+        // (395_002, 395_009).
+        //
+        // The synthetic NAME is kept deliberately. A filename answers two
+        // questions in Parser.init — the dialect (parser.zig:707) and the MODULE
+        // NAME (parser.zig:696-705) — and handing it the real path fixes the
+        // first while silently renaming the module, which took 395_005 and
+        // 395_010 red. Same disease as std/runtime:parse.source, seen from the
+        // other side: one parameter, two questions. So: synthetic name for the
+        // module, real extension for the dialect, set after init because is_k is
+        // read during parse and never during init.
+        //
+        // Ruled by Lars 2026-08-07: "use the same extension and semantics as the
+        // original file... Writing `` inside a `.k`-file makes no sense, that is
+        // literally the actual rule."
+        var parser = parser_impl.Parser.init(allocator, source_text, "__test__.kz", &[_][]const u8{}, null) catch {
+            log.verbose("[TEST-GEN] Failed to init parser for test '{s}'\n", .{test_name});
+            return null;
+        };
+        if (source_ptr) |sp| parser.is_k = std.mem.endsWith(u8, sp.location.file, ".k");
+        defer parser.deinit();
+
+        var parse_result = parser.parse() catch {
+            log.verbose("[TEST-GEN] Failed to parse source for test '{s}'\n", .{test_name});
+            return null;
+        };
+        defer parse_result.deinit();
+
+        // Clone parsed items to owned memory (survive parser deinit)
+        var mocks = std.ArrayList(ast_mod.Item).initCapacity(allocator, 8) catch unreachable;
+        var test_flows = std.ArrayList(ast_mod.Item).initCapacity(allocator, 8) catch unreachable;
+
+        for (parse_result.source_file.items) |*parsed_item| {
+            switch (parsed_item.*) {
+                .immediate_impl => {
+                    // This is a mock! Clone it
+                    const cloned = ast_functional.cloneItem(allocator, parsed_item) catch continue;
+                    mocks.append(allocator, cloned) catch {};
+                },
+                .flow => {
+                    // This is a test flow - clone it
+                    const cloned = ast_functional.cloneItem(allocator, parsed_item) catch continue;
+                    test_flows.append(allocator, cloned) catch {};
+                },
+                else => {},
+            }
+        }
+
+        log.verbose("[TEST-GEN] Parsed {d} mocks and {d} flows\n", .{mocks.items.len, test_flows.items.len});
+
+        // Validate mock shapes via testing module
+        if (source_ptr) |src| {
+            const backend_output = @import("backend_output_emitted.zig");
+            const validation_result = backend_output.koru_std.koru_testing.validate_mocks_event.handler(.{
+                .program = program,
+                .mocks = mocks.items,
+                .source = src,
+                .allocator = allocator,
+            });
+            if (validation_result == .failed) {
+                @panic(validation_result.failed);
+            }
+        }
+
+        // Build mock lookup map (tor path -> branch constructor)
+        var mock_map = std.StringHashMap(ast_mod.BranchConstructor).init(allocator);
+        for (mocks.items) |mock_item| {
+            if (mock_item == .immediate_impl) {
+                const sf = mock_item.immediate_impl;
+                // Build tor path string
+                var path_buf = std.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+                for (sf.event_path.segments, 0..) |seg, i| {
+                    if (i > 0) path_buf.append(allocator, '.') catch {};
+                    path_buf.appendSlice(allocator, seg) catch {};
+                }
+                mock_map.put(path_buf.items, sf.value) catch {};
+            }
+        }
+
+        // Walk test flows and check purity
+        var impure_events = std.ArrayList([]const u8).initCapacity(allocator, 8) catch unreachable;
+        for (test_flows.items) |flow_item| {
+            if (flow_item == .flow) {
+                walkFlowForPurity(&flow_item.flow, &mock_map, &impure_events, program.items, allocator);
+            }
+        }
+
+        // If there are impure tors without mocks, error. One line, names
+        // comma-separated — kept byte-identical to the transform-pass twin in
+        // koru_std/testing.kz so which producer fired is never something a
+        // reader (or a pinned regression) has to know.
+        if (impure_events.items.len > 0) {
+            var err_msg = std.ArrayList(u8).initCapacity(allocator, 256) catch unreachable;
+            err_msg.appendSlice(allocator, "Test '") catch {};
+            err_msg.appendSlice(allocator, test_name) catch {};
+            err_msg.appendSlice(allocator, "' has impure events without mocks: ") catch {};
+            for (impure_events.items, 0..) |event_path, i| {
+                if (i > 0) err_msg.appendSlice(allocator, ", ") catch {};
+                err_msg.appendSlice(allocator, event_path) catch {};
+            }
+            @panic(err_msg.items);
+        }
+
+        // Now emit the test using REAL emitter infrastructure
+        // Growable: generated test code has no natural size ceiling.
+        var code_emitter = emitter_helpers.CodeEmitter.initGrowable(allocator, 16 * 1024) catch return null;
+
+        // Set up emission context
+        var emit_ctx = emitter_helpers.EmissionContext{
+            .allocator = allocator,
+            .indent_level = 1,  // Inside test block
+            .ast_items = program.items,
+            .main_module_name = "input",
+            .is_sync = true,
+        };
+        code_emitter.indent_level = 1;
+
+        // Emit each test flow, substituting mocks
+        var mock_counter: usize = 0;
+        for (test_flows.items) |flow_item| {
+            if (flow_item == .flow) {
+                emitFlowWithMocks(&code_emitter, &emit_ctx, &flow_item.flow, &mock_map, &mock_counter) catch {};
+            }
+        }
+
+        const flow_code = code_emitter.getOutput();
+
+        // Build final test block
+        const test_code = std.fmt.allocPrint(
+            allocator,
+            \\test "{s}" {{
+            \\{s}}}
+            ,
+            .{ test_name, flow_code }
+        ) catch return null;
+
+        return ast_mod.Item{
+            .inline_code = ast_mod.InlineCode{
+                .code = test_code,
+                .location = flow.location,
+                .module = allocator.dupe(u8, flow.module) catch "",
+            }
+        };
+    }
+}.call;
+
+// Helper: Walk a flow checking for impure tors without mocks
+const walkFlowForPurity = struct {
+    fn call(
+        flow_to_walk: *const @import("ast").Flow,
+        mocks: *const std.StringHashMap(@import("ast").BranchConstructor),
+        impure_list: *std.ArrayList([]const u8),
+        all_items: []const @import("ast").Item,
+        allocator: std.mem.Allocator,
+    ) void {
+        const emitter_helpers = @import("emitter_helpers");
+
+        // Get invocation path as string
+        var path_buf = std.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+        if (flow_to_walk.inv().path.module_qualifier) |mq| {
+            path_buf.appendSlice(allocator, mq) catch {};
+            path_buf.append(allocator, ':') catch {};
+        }
+        for (flow_to_walk.inv().path.segments, 0..) |seg, i| {
+            if (i > 0) path_buf.append(allocator, '.') catch {};
+            path_buf.appendSlice(allocator, seg) catch {};
+        }
+        const inv_path = path_buf.items;
+
+        // Check if this invocation has a mock
+        if (mocks.get(inv_path)) |_| {
+            // Has mock - walk only matching continuation
+            // (mock value is known, prune other branches)
+            return;
+        }
+
+        // Subflow/composed tors: walk the implementation body instead of
+        // flagging the outer tor.
+        if (emitter_helpers.findImplByPath(all_items, &flow_to_walk.inv().path)) |found_impl| {
+            switch (found_impl) {
+                .immediate_impl => return,
+                .flow => |impl_flow| {
+                    call(impl_flow, mocks, impure_list, all_items, allocator);
+                    return;
+                },
+            }
+        }
+
+        // No mock - check if tor/proc is pure
+        if (emitter_helpers.findProcDeclByPath(all_items, &flow_to_walk.inv().path)) |proc| {
+            if (!proc.is_pure) {
+                // Impure proc without mock!
+                var already_added = false;
+                for (impure_list.items) |existing| {
+                    if (std.mem.eql(u8, existing, inv_path)) {
+                        already_added = true;
+                        break;
+                    }
+                }
+                if (!already_added) {
+                    impure_list.append(allocator, inv_path) catch {};
+                }
+            }
+        } else if (emitter_helpers.findEventDeclByPath(all_items, &flow_to_walk.inv().path)) |event| {
+            if (!event.is_pure) {
+                var already_added = false;
+                for (impure_list.items) |existing| {
+                    if (std.mem.eql(u8, existing, inv_path)) {
+                        already_added = true;
+                        break;
+                    }
+                }
+                if (!already_added) {
+                    impure_list.append(allocator, inv_path) catch {};
+                }
+            }
+        }
+
+        // Walk continuations recursively
+        for (flow_to_walk.body.continuations) |cont| {
+            walkContinuation(&cont, mocks, impure_list, all_items, allocator);
+        }
+    }
+
+    fn walkContinuation(
+        cont: *const @import("ast").Continuation,
+        mocks: *const std.StringHashMap(@import("ast").BranchConstructor),
+        impure_list: *std.ArrayList([]const u8),
+        all_items: []const @import("ast").Item,
+        allocator: std.mem.Allocator,
+    ) void {
+        const ast_mod = @import("ast");
+        if (cont.node) |node| {
+            switch (node) {
+                .invocation => {
+                    // Wrap the site as a flow to walk (same core, thin wrapper)
+                    const temp_flow = ast_mod.Flow{
+                        .body = cont.*,
+                        .location = cont.location,
+                        .module = "",
+                        .is_pure = true,
+                        .is_transitively_pure = false,
+                    };
+                    call(&temp_flow, mocks, impure_list, all_items, allocator);
+                },
+                else => {
+                    for (cont.continuations) |nested| {
+                        walkContinuation(&nested, mocks, impure_list, all_items, allocator);
+                    }
+                },
+            }
+        } else {
+            for (cont.continuations) |nested| {
+                walkContinuation(&nested, mocks, impure_list, all_items, allocator);
+            }
+        }
+    }
+}.call;
+
+// Helper: Emit a flow with mock substitution using REAL emitter
+const emitFlowWithMocks = struct {
+    fn call(
+        code_emitter: *@import("emitter_helpers").CodeEmitter,
+        ctx: *@import("emitter_helpers").EmissionContext,
+        flow_to_emit: *const @import("ast").Flow,
+        mocks: *const std.StringHashMap(@import("ast").BranchConstructor),
+        counter: *usize,
+    ) !void {
+        const ast_mod = @import("ast");
+        const emitter_helpers = @import("emitter_helpers");
+
+        // Get invocation path as string
+        var path_buf = std.ArrayList(u8).initCapacity(ctx.allocator, 64) catch unreachable;
+        for (flow_to_emit.inv().path.segments, 0..) |seg, i| {
+            if (i > 0) try path_buf.append(ctx.allocator, '.');
+            try path_buf.appendSlice(ctx.allocator, seg);
+        }
+        const inv_path = path_buf.items;
+
+        // Check if this invocation has a mock
+        if (mocks.get(inv_path)) |bc| {
+            // Emit mock value directly
+            const result_var = try std.fmt.allocPrint(ctx.allocator, "__mock_result_{d}", .{counter.*});
+            counter.* += 1;
+
+            try code_emitter.writeIndent();
+            try code_emitter.write("const ");
+            try code_emitter.write(result_var);
+            try code_emitter.write(" = ");
+            try emitter_helpers.emitBranchConstructor(code_emitter, ctx, &bc, true);
+            try code_emitter.write(";\n");
+
+            // Emit matching continuation
+            for (flow_to_emit.body.continuations) |cont| {
+                if (std.mem.eql(u8, cont.branch, bc.branch_name)) {
+                    if (cont.binding) |binding| {
+                        // Emit binding extraction: const x = result.branch;
+                        try code_emitter.writeIndent();
+                        try code_emitter.write("const ");
+                        try code_emitter.write(binding);
+                        try code_emitter.write(" = ");
+                        try code_emitter.write(result_var);
+                        try code_emitter.write(".");
+                        try code_emitter.write(bc.branch_name);
+                        try code_emitter.write(";\n");
+                        // Suppress unused binding warning
+                        try code_emitter.writeIndent();
+                        try code_emitter.write("_ = &");
+                        try code_emitter.write(binding);
+                        try code_emitter.write(";\n");
+                    }
+                    // Emit nested flows
+                    if (cont.node) |node| {
+                        if (node == .invocation) {
+                            const nested_flow = ast_mod.Flow{
+                                .body = cont,
+                                .location = cont.location,
+                                .module = "",
+                                .is_pure = true,
+                                .is_transitively_pure = false,
+                            };
+                            try call(code_emitter, ctx, &nested_flow, mocks, counter);
+                        }
+                    }
+                    break;
+                }
+            }
+
+            try code_emitter.writeIndent();
+            try code_emitter.write("_ = &");
+            try code_emitter.write(result_var);
+            try code_emitter.write(";\n");
+        } else {
+            // No mock - emit flow normally using real emitter
+            try emitter_helpers.emitFlow(code_emitter, ctx, flow_to_emit);
+        }
+    }
+}.call;
+
+// Emission segment: Final code generation (abstract, can be overridden)
+~[comptime|abstract] pub tor emission { ctx: CompilerContext } -> { ctx: CompilerContext, code: string }
+
+~emission = inject-ccp(ctx): c1 |> pass-dead-strip(ctx: c1): c2 |> emit-zig(ctx: c2): c3 -> { c3.ctx, c3.code }
+
+// Parser service - makes the Koru parser available at backend comptime
+// This enables dynamic module loading during compilation passes
+~pub tor parse { source: string, module_name: string }
+| parsed []Item
+| failed string
+
+// Zig code emission tor - the final step of compilation!
+~pub tor emit-zig { ctx: CompilerContext } -> { ctx: CompilerContext, code: string }
+
+// Comptime evaluation pass - executes tors with Program/Source parameters
+~pub tor evaluate-comptime { ctx: CompilerContext } -> CompilerContext
+
+// Structural shape checking - validates tors/branches exist, base types match
+// Release gate - rejects [prototype] modules under --release (runs first in analysis)
+~pub tor check-release-gate { ctx: CompilerContext }
+| ctx CompilerContext
+| failed { ctx: CompilerContext, message: string }
+
+~pub tor check-structure { ctx: CompilerContext }
+| ctx CompilerContext
+| failed { ctx: CompilerContext, message: string }
+
+// Flow checking - validates control flow properties (when-clause exhaustiveness, etc.)
+~pub tor check-flow { ctx: CompilerContext }
+| ctx CompilerContext
+| failed { ctx: CompilerContext, message: string }
+
+// Phantom SIGNATURE validation - declaration-shape checks on tor signatures
+// (phantom syntax, obligation polarity: KORU033, unknown phantom modules: KORU040).
+// Runs BEFORE pass-auto-discharge: an illegal polarity on an tor's own
+// declaration must be rejected before any obligation-FLOW analysis reasons
+// about programs using that tor (otherwise auto-discharge halts first with
+// a spurious KORU030 leak and the declaration error stays dormant).
+~pub tor check-phantom-signatures { ctx: CompilerContext }
+| ctx CompilerContext
+| failed { ctx: CompilerContext, message: string }
+
+// Phantom ARGUMENT validation - the argument-located call-site checks (state
+// threading, per-argument "Phantom state mismatch", use-after-discharge).
+// Runs BEFORE pass-auto-discharge: a call-site mismatch the user can point at
+// must surface with its precise, argument-located diagnostic — not be
+// preempted by the inserter's generic "was not discharged" wall, which never
+// acknowledges the explicit discharge already present in the source. The
+// flow-EXIT obligation-balance walls stay in check-phantom-semantic, after
+// insertion, where the inserted disposal calls exist to be credited.
+~pub tor check-phantom-args { ctx: CompilerContext }
+| ctx CompilerContext
+| failed { ctx: CompilerContext, message: string }
+
+// Auto-discharge insertion - inserts disposal calls before terminators
+// Runs BEFORE check-phantom-semantic so checker validates the inserted calls
+~pub tor pass-auto-discharge { ctx: CompilerContext }
+| ctx CompilerContext
+| failed { ctx: CompilerContext, message: string }
+
+// Semantic phantom type checking - validates type-state compatibility using
+// the default Koru semantic checker (module-qualified phantom states)
+~pub tor check-phantom-semantic { ctx: CompilerContext }
+| ctx CompilerContext
+| failed { ctx: CompilerContext, message: string }
+
+// Purity checking - trusts [pure] annotations as developer assertions
+~pub tor check-purity { ctx: CompilerContext }
+| ctx CompilerContext
+| failed { ctx: CompilerContext, message: string }
+
+// Dead strip pass - removes unreachable tors/flows from the AST
+// Walks from entry points, marks reachable tors, prunes the rest
+~pub tor pass-dead-strip { ctx: CompilerContext } -> CompilerContext
+
+// CCP observability pass - injects universal observability taps into user AST
+// When enabled, this makes every compiled program self-observing by adding:
+// - emit_json tor/proc for JSON output
+// - Universal tap (* -> *) that emits transition events
+~pub tor inject-ccp { ctx: CompilerContext } -> CompilerContext
+
+// Implementation of Zig code emission - this IS ComptimeEmitter as a Koru proc!
+~proc emit-zig|zig {
+    // NEW VISITOR-BASED IMPLEMENTATION!
+    // Replaces the 2184-line procedural emitter with visitor orchestrator
+
+    // DUMP POINT 5: AST at emission entry (after all passes)
+    const backend_output = @import("backend_output_emitted.zig");
+    backend_output.dumpAST(ctx.ast, "5-emit-zig", ctx.allocator);
+
+    // Import libraries needed for emission
+    const emitter_lib = @import("emitter_helpers");
+    const visitor_emitter_lib = @import("visitor_emitter");
+    const tap_registry_module = @import("tap_registry");
+
+    // Growable emitter: generated code has no natural size ceiling (a large
+    // regex DFA alone can pass a fixed 256KB — pinned by 640_004). The buffer
+    // is heap-allocated (we return a slice into it via getOutput) and grows
+    // on demand; reads go through code_emitter.buffer, never a stale local.
+    var code_emitter = emitter_lib.CodeEmitter.initGrowable(ctx.allocator, 256 * 1024) catch unreachable;
+
+    // Use tap registry from context (built during transform_taps pass)
+    // If no registry exists, build one from current AST (shouldn't happen in normal flow)
+    const tap_registry = if (ctx.tap_registry) |registry|
+        registry
+    else blk: {
+        const registry_ptr = ctx.allocator.create(tap_registry_module.TapRegistry) catch unreachable;
+        registry_ptr.* = tap_registry_module.buildTapRegistry(
+            ctx.ast.items,
+            ctx.allocator
+        ) catch unreachable;
+        break :blk registry_ptr;
+    };
+
+    // Build type registry from ORIGINAL canonicalized AST (before filtering)
+    // The original_ast contains ALL tors (including comptime ones) so TypeRegistry has complete metadata
+    const type_registry_module = @import("type_registry");
+    var type_registry = type_registry_module.TypeRegistry.init(ctx.allocator);
+    defer type_registry.deinit();
+    type_registry.populateFromAST(ctx.original_ast.items) catch unreachable;
+
+    // Create visitor orchestrator with tap registry and type registry
+    // Use .runtime_only mode to emit only modules WITHOUT [comptime] annotation
+    var visitor_emitter = visitor_emitter_lib.VisitorEmitter.init(
+        ctx.allocator,
+        &code_emitter,
+        ctx.ast.items,
+        tap_registry,
+        &type_registry,
+        .runtime_only
+    );
+    visitor_emitter.library = CompilerEnv.library;
+
+    // Emit using visitor pattern!
+    visitor_emitter.emit(ctx.ast) catch unreachable;
+
+    // Get the emitted code
+    const visitor_code = code_emitter.getOutput();
+
+    // JS-target spike: when --lang=js, replace the visitor's Zig output with the
+    // real AST→JS emitter (src/js_emitter.zig). It walks ctx.ast and emits
+    // runnable JavaScript for the event-pump subset (tors, |js proc bodies,
+    // effect handlers, terminal branches, flows). Gated behind CompilerEnv.lang
+    // so the default Zig path is untouched. CompilerEnv is already in scope at
+    // file level in the generated backend_output_emitted.zig (re-exported pub
+    // const) — reference it directly rather than re-importing, which would
+    // shadow that declaration.
+    const final_code = if (@import("std").mem.eql(u8, CompilerEnv.lang, "js")) blk: {
+        const js_emitter = @import("js_emitter");
+        // Fail loud: a JS-emit failure must surface, not silently fall back to
+        // Zig. A refusal is a USER error — some tor has no JavaScript
+        // implementation on this target (a zig-only proc, an unmodelled
+        // construct) — so it becomes a clean, located diagnostic (the
+        // js_emitter already printed WHICH tor) and exit 1. The old
+        // std.debug.panic made every refusal read as a compiler bug: SIGABRT,
+        // a raw error name, and a backtrace that buried the reason. Pinned by
+        // 400_191_zig_only_proc_js_build_refuses.
+        break :blk js_emitter.emit(ctx.allocator, ctx.ast, CompilerEnv.library) catch |err| {
+            std.debug.print("error[KORU047]: JS emission failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    } else if (@import("std").mem.eql(u8, CompilerEnv.lang, "cs")) blk: {
+        const cs_emitter = @import("cs_emitter");
+        // K# vertical spike: same fail-loud contract as the JS arm — an
+        // unmodelled construct or unlowered builtin refuses here, never
+        // falls back to the Zig visitor's output.
+        break :blk cs_emitter.emit(ctx.allocator, ctx.ast, CompilerEnv.library) catch |err| {
+            std.debug.print("error[KORU047]: CS emission failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    } else visitor_code;
+
+    var updated_ctx = ctx;
+    updated_ctx.passes_completed += 1;
+    updated_ctx.current_pass = "emission";
+    return .{ .ctx = updated_ctx, .code = final_code };
+}
+
+// Parser service implementation - wraps the Koru parser for comptime use
+~proc parse|zig {
+    const Parser = @import("parser").Parser;
+    // Note: 'std' is already imported at top level by the emitter
+
+    // Use a comptime-friendly allocator
+    // Note: In actual comptime context, we'd use a fixed buffer allocator
+    // For now, we use the standard allocator which works at comptime
+    var buffer: [1024 * 1024]u8 = undefined; // 1MB buffer for parsing
+    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    const allocator = fba.allocator();
+
+    // Initialize parser (empty compiler flags, no resolver for standalone parsing)
+    var parser = Parser.init(allocator, source, module_name, &[_][]const u8{}, null) catch {
+        return .{ .failed = "Failed to initialize parser" };
+    };
+    defer parser.deinit();
+
+    // Parse the source
+    const parse_result = parser.parse() catch {
+        // Try to get error details if available
+        if (parser.reporter.hasErrors()) {
+            return .{ .failed = "Parse error - see compiler output" };
+        }
+        return .{ .failed = "Failed to parse source" };
+    };
+
+    // Return the parsed items
+    // Note: The items are allocated in our buffer, which is stack-allocated
+    // This is fine for comptime usage where everything gets evaluated away
+    return .{ .parsed = parse_result.source_file.items };
+}
+
+// Comptime evaluation pass - executes tors with Program/Source parameters
+// This runs BEFORE emission so comptime tors can transform the AST
+~proc evaluate-comptime|zig {
+    // Comptime-only means "takes the compiler's own AST" — a Program param.
+    // Source/Expression carry captured text, not timing.
+    const comptime_scan = struct {
+        fn isProgramType(raw_type: []const u8) bool {
+            var t = raw_type;
+            while (true) {
+                t = std.mem.trimLeft(u8, t, " \t");
+                if (std.mem.startsWith(u8, t, "*")) {
+                    t = t[1..];
+                    continue;
+                }
+                if (std.mem.startsWith(u8, t, "const")) {
+                    t = t["const".len..];
+                    continue;
+                }
+                break;
+            }
+            return std.mem.endsWith(u8, t, "Program");
+        }
+
+        fn record(event_decl: anytype, qualifier: ?[]const u8, allocator: Allocator,
+                  comptime_events: *[64][]const u8, comptime_count: *usize) void {
+            // [comptime]/[norun] decls count, not Program params alone —
+            // field-keyed alone dropped std/build:config and KORU022'd its call sites.
+            const ann = @import("annotation_parser").hasPart;
+            var is_comptime = ann(event_decl.annotations, "comptime") or ann(event_decl.annotations, "norun");
+            for (event_decl.input.fields) |field| {
+                if (isProgramType(field.type)) { is_comptime = true; break; }
+            }
+            if (!is_comptime or comptime_count.* >= 64) return;
+            const path_str = joinPathAlloc(allocator, event_decl.path.segments);
+            const event_name = if (qualifier) |q|
+                std.fmt.allocPrint(allocator, "{s}:{s}", .{q, path_str}) catch path_str
+            else
+                path_str;
+            comptime_events[comptime_count.*] = event_name;
+            comptime_count.* += 1;
+        }
+
+        fn run(items: []const Item, allocator: Allocator,
+               comptime_events: *[64][]const u8, comptime_count: *usize) void {
+            for (items) |item| {
+                switch (item) {
+                    .event_decl => |event_decl| {
+                        record(event_decl, event_decl.path.module_qualifier, allocator,
+                               comptime_events, comptime_count);
+                    },
+                    .module_decl => |module| {
+                        for (module.items) |mod_item| {
+                            if (mod_item == .event_decl) {
+                                const qualifier: ?[]const u8 = if (module.logical_name.len > 0)
+                                    module.logical_name else null;
+                                record(mod_item.event_decl, qualifier, allocator,
+                                       comptime_events, comptime_count);
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+
+    // Phase 1: Build map of comptime-only tors (Program params)
+    var comptime_events: [64][]const u8 = undefined;
+    var comptime_count: usize = 0;
+    comptime_scan.run(ctx.ast.items, ctx.allocator, &comptime_events, &comptime_count);
+
+    // Phase 2: Walk flows and find comptime tor invocations
+    // std.debug.print("  Phase 2: Scanning flows for comptime invocations...\n", .{});
+    for (ctx.ast.items) |item| {
+        if (item == .flow) {
+            const flow = item.flow;
+            // For module-qualified flows, include the module name: "std.build:requires"
+            const path_str = joinPathAlloc(ctx.allocator, flow.inv().path.segments);
+            const inv_path = if (flow.inv().path.module_qualifier) |mq|
+                std.fmt.allocPrint(ctx.allocator, "{s}:{s}", .{mq, path_str}) catch path_str
+            else
+                path_str;
+            // std.debug.print("    Flow invokes: {s}\n", .{inv_path});
+
+            // Check if this invocation is to a comptime tor
+            for (0..comptime_count) |i| {
+                if (std.mem.eql(u8, inv_path, comptime_events[i])) {
+                    // Found a comptime tor invocation!
+                    // std.debug.print("  ✓ Found comptime invocation: {s}\n", .{inv_path});
+
+                    // TODO: Call the comptime handler!
+                    // const handler_result = callComptimeHandler(inv_path, ctx.ast);
+                    // For now, just print that we called it
+                    // TODO: Use result to transform flow/AST
+                    // switch (handler_result) {
+                    //     .none => {
+                    //         // std.debug.print("  WARNING: Handler not found for: {s}\n", .{inv_path});
+                    //     },
+                    // }
+
+                    break;
+                }
+            }
+        }
+    }
+
+    // std.debug.print("  Detected {} comptime tors, {} invocations\n", .{comptime_count, invocations_found});
+
+    const backend_output = @import("backend_output_emitted.zig");
+
+    // Phase 2.3.5: Early comptime_main pass — registers build-time configuration
+    // (build:variants, build:config) into emitter_helpers registries so that Phase 2.4
+    // transforms can dispatch through the populated registry. Phase 2.5 runs
+    // comptime_main again for post-transform work (tap injection etc.). This
+    // double-execution is a known wart; the cleaner fix is to segregate
+    // build-config flows into a dedicated pre_transform_main() at codegen time.
+    if (@hasDecl(backend_output, "comptime_main")) {
+        log.debug("[PHASE 2.3.5] Early comptime_main() — registering build-time variants/config\n", .{});
+        _ = backend_output.comptime_main(ctx.ast, ctx.allocator);
+    }
+
+    // Phase 2.4: Execute transform handlers FIRST (if they exist)
+    // NOTE: Transforms run BEFORE comptime tors so that comptime tors
+    // (like tap injection) can see the fully-transformed AST
+    const transform_updated_ctx = if (@hasDecl(backend_output, "run_pass")) blk: {
+        log.debug("[PHASE 2.4] Calling run_pass for transforms\\n", .{});
+
+        // DUMP POINT 3: AST before transform handlers
+        backend_output.dumpAST(ctx.ast, "3-pre-transform", ctx.allocator);
+
+        // The ctx handed to the transforms is the one this block returns, so
+        // anything a transform records on it survives the call.
+        var transform_ctx = ctx;
+
+        const post_transform_ast = backend_output.run_pass("transform", ctx.ast, ctx.allocator, @ptrCast(&transform_ctx)) catch |err| {
+            if (err == error.TransformContinuationPositionUnsupported) {
+                // The runner already emitted a located error[KORU124] koru
+                // diagnostic. This proc returns a ctx (no clean error channel),
+                // so stop the pipeline cleanly rather than leaking the
+                // ICE-shaped @panic + host stack trace.
+                std.process.exit(1);
+            }
+            // Transforms either complete or fail loudly. Continuing with the
+            // untransformed AST used to mask the failure behind a cascade of
+            // downstream KORU021/022 errors about tors the transform should
+            // have rewritten away.
+            log.err("FATAL: transform pass failed ({s}). The pipeline cannot continue with a partially-transformed AST.\n", .{@errorName(err)});
+            @panic("transform pass failed — see error above");
+        };
+
+        // A transform that spoke through the compilation's reporter has said
+        // something a later pass must not talk over. Drain HERE, at the end of
+        // the phase that produced it: a store declaring an undrainable column
+        // is a fact about the DECLARATION, and letting the pipeline run on
+        // means the analysis passes report the consequences instead — the
+        // author gets KORU030 at a call site that is perfectly fine, and the
+        // sentence naming the real fix is never reached at all.
+        if (ctx.reporter) |rep| {
+            if (rep.hasErrors()) {
+                rep.printErrors(@import("errors").FileSink.stderr()) catch {};
+                std.process.exit(1);
+            }
+        }
+
+        // DUMP POINT 4: AST after transform handlers
+        backend_output.dumpAST(post_transform_ast, "4-post-transform", ctx.allocator);
+
+        const post_transform_weld = @import("post_transform_weld");
+        post_transform_weld.weldAfterTransform(@constCast(post_transform_ast), ctx.allocator) catch |err| {
+            log.err("FATAL: post-transform import weld failed ({s}).\n", .{@errorName(err)});
+            @panic("post-transform import weld failed — see error above");
+        };
+
+        transform_ctx.ast = post_transform_ast;
+        break :blk transform_ctx;
+    } else ctx;
+
+    // Phase 2.5: Execute comptime flows AFTER transforms (if they exist)
+    // comptime_main() calls all comptime_flowN() functions at Zig RUNTIME (when ./backend runs)
+    // Now sees the transformed AST, enabling comptime tors to do post-transform work
+    // Returns *const Program — comptime flows may modify the AST
+    const comptime_updated_ctx = if (@hasDecl(backend_output, "comptime_main")) blk: {
+        log.debug("[PHASE 2.5] Executing comptime_main() - running comptime flows\n", .{});
+        const post_comptime_ast = backend_output.comptime_main(transform_updated_ctx.ast, transform_updated_ctx.allocator);
+        log.debug("[PHASE 2.5] Comptime flows complete ({} items)\n", .{post_comptime_ast.items.len});
+        var comptime_ctx = transform_updated_ctx;
+        comptime_ctx.ast = post_comptime_ast;
+        break :blk comptime_ctx;
+    } else transform_updated_ctx;
+
+    // Phase 2.6: Rebuild comptime_events list from transformed AST
+    // Transforms may have added/removed tors, so we need to rescan
+    log.debug("[PHASE 2.6] Rescanning transformed AST ({} items)\n", .{comptime_updated_ctx.ast.items.len});
+    comptime_count = 0;  // Reset counter
+    comptime_scan.run(comptime_updated_ctx.ast.items, ctx.allocator, &comptime_events, &comptime_count);
+    log.debug("[PHASE 2.6] Rescan complete: {} comptime events found\n", .{comptime_count});
+    for (0..comptime_count) |i| {
+        log.debug("  [{}] {s}\n", .{i, comptime_events[i]});
+    }
+
+    // Phase 3: Build new AST without comptime flows, procs, and modules (AST TRANSFORMATION!)
+    // Count non-comptime items first
+    var count_non_comptime: usize = 0;
+    for (comptime_updated_ctx.ast.items) |item| {
+        var should_keep = true;
+        if (item == .flow) {
+            const flow = item.flow;
+            // For module-qualified flows, include the module name: "std.build:requires"
+            const path_str = joinPathAlloc(ctx.allocator, flow.inv().path.segments);
+            const inv_path = if (flow.inv().path.module_qualifier) |mq|
+                std.fmt.allocPrint(ctx.allocator, "{s}:{s}", .{mq, path_str}) catch path_str
+            else
+                path_str;
+
+            // Check if comptime flow
+            for (0..comptime_count) |i| {
+                if (std.mem.eql(u8, inv_path, comptime_events[i])) {
+                    var transformed = false;
+                    if (flow.inline_body != null or flow.preamble_code != null) {
+                        transformed = true;
+                    } else {
+                        for (flow.inv().marks) |mark| {
+                            if (std.mem.eql(u8, mark, "@pass_ran(\"transform\")")) {
+                                transformed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!transformed) {
+                        should_keep = false;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Filter out comptime procs (they were already executed)
+        // Note: [raw] annotation only affects emission style, not filtering
+        if (item == .proc_decl) {
+            const proc = item.proc_decl;
+
+            // Check if this proc is comptime (in comptime_events list)
+            const proc_path_str = joinPathAlloc(ctx.allocator, proc.path.segments);
+            const proc_path = if (proc.path.module_qualifier) |mq|
+                std.fmt.allocPrint(ctx.allocator, "{s}:{s}", .{mq, proc_path_str}) catch proc_path_str
+            else
+                proc_path_str;
+            for (0..comptime_count) |i| {
+                if (std.mem.eql(u8, proc_path, comptime_events[i])) {
+                    // This is a comptime proc - filter it out (already executed)
+                    should_keep = false;
+                    break;
+                }
+            }
+        }
+
+        // NOTE: Don't filter modules based on [comptime] annotation here.
+        // Modules with [comptime] may contain [runtime] tors that need to be emitted.
+        // The visitor_emitter handles this correctly by checking if the module contains
+        // any emittable items before filtering the module itself.
+
+        if (should_keep) {
+            count_non_comptime += 1;
+        }
+    }
+
+    // Build new array with exact size (now allocated at runtime)
+    const new_items = ctx.allocator.alloc(Item, count_non_comptime) catch {
+        // Allocation failed - return original AST unchanged
+        return ctx;
+    };
+    var idx: usize = 0;
+    for (comptime_updated_ctx.ast.items) |item| {
+        var should_keep = true;
+        if (item == .flow) {
+            const flow = item.flow;
+            // For module-qualified flows, include the module name: "std.build:requires"
+            const path_str2 = joinPathAlloc(ctx.allocator, flow.inv().path.segments);
+            const inv_path = if (flow.inv().path.module_qualifier) |mq|
+                std.fmt.allocPrint(ctx.allocator, "{s}:{s}", .{mq, path_str2}) catch path_str2
+            else
+                path_str2;
+
+            // Check if comptime flow
+            for (0..comptime_count) |i| {
+                if (std.mem.eql(u8, inv_path, comptime_events[i])) {
+                    var transformed = false;
+                    if (flow.inline_body != null or flow.preamble_code != null) {
+                        transformed = true;
+                    } else {
+                        for (flow.inv().marks) |mark| {
+                            if (std.mem.eql(u8, mark, "@pass_ran(\"transform\")")) {
+                                transformed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!transformed) {
+                        should_keep = false;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Filter out comptime procs (they were already executed)
+        // Note: [raw] annotation only affects emission style, not filtering
+        if (item == .proc_decl) {
+            const proc = item.proc_decl;
+
+            // Check if this proc is comptime (in comptime_events list)
+            const proc_path_str = joinPathAlloc(ctx.allocator, proc.path.segments);
+            const proc_path = if (proc.path.module_qualifier) |mq|
+                std.fmt.allocPrint(ctx.allocator, "{s}:{s}", .{mq, proc_path_str}) catch proc_path_str
+            else
+                proc_path_str;
+            for (0..comptime_count) |i| {
+                if (std.mem.eql(u8, proc_path, comptime_events[i])) {
+                    // This is a comptime proc - filter it out (already executed)
+                    should_keep = false;
+                    break;
+                }
+            }
+        }
+
+        // NOTE: Don't filter modules based on [comptime] annotation here.
+        // Modules with [comptime] may contain [runtime] tors that need to be emitted.
+        // The visitor_emitter handles this correctly by checking if the module contains
+        // any emittable items before filtering the module itself.
+
+        if (should_keep) {
+            new_items[idx] = item;
+            idx += 1;
+        }
+    }
+
+    const transformed_ast = ctx.allocator.create(Program) catch {
+        // Allocation failed - return original AST unchanged
+        return ctx;
+    };
+    transformed_ast.* = Program{
+        .items = new_items,
+        .module_annotations = ctx.ast.module_annotations,
+        .main_module_name = ctx.ast.main_module_name,
+        .allocator = ctx.allocator,
+    };
+
+    // Update context with transformed AST
+    // IMPORTANT: Keep original_ast unchanged - it preserves comptime tor metadata!
+    var updated_ctx = ctx;
+    updated_ctx.ast = transformed_ast;  // Filtered AST for emission
+    // updated_ctx.original_ast stays the same - unfiltered AST for TypeRegistry
+    updated_ctx.passes_completed += 1;
+    updated_ctx.current_pass = "evaluate_comptime";
+
+    return updated_ctx;
+}
+
+// Structural shape checker implementation
+// Release gate: reject a [prototype] module built with --release (the production
+// gate). Runs FIRST in analysis and only under --release, so prototype code is
+// dismissed up front rather than leniently compiled. Dev builds (no --release)
+// skip it entirely and keep the prototype affordance. See release_gate.zig +
+// concepts/frag-prototype-mode-panic-holes.md.
+~proc check-release-gate|zig {
+    var mutable_ctx = ctx;
+    mutable_ctx.current_pass = "check_release_gate";
+
+    // Only release builds gate. Dev builds allow [prototype].
+    if (!CompilerEnv.hasFlag("release")) {
+        return .{ .ctx = mutable_ctx };
+    }
+
+    const release_gate = @import("release_gate");
+
+    // THE COMPILATION'S reporter, bound to the user's file AND source at
+    // context-create. Minting one here as `init(alloc, "release_gate", "")` put
+    // the PASS NAME where the filename goes and left no source to render a
+    // snippet from, so KORU029 could only ever point at `release_gate:<line>`.
+    const reporter = mutable_ctx.reporter orelse {
+        @panic("check-release-gate: the compilation carries no diagnostic reporter");
+    };
+    // Only diagnostics THIS pass adds — the compilation's reporter accumulates,
+    // so a later pass must not re-report an earlier one's errors.
+    const err_base = reporter.errors.items.len;
+
+    var gate = release_gate.ReleaseGate.init(reporter);
+    gate.check(mutable_ctx.ast) catch |err| {
+        // Render through the reporter itself — it owns the code frame, the hint
+        // and the source preview.
+        reporter.printErrors(@import("errors").FileSink.stderr()) catch {};
+        for (reporter.errors.items[err_base..]) |reporter_err| {
+            mutable_ctx.errors.append(mutable_ctx.allocator, .{
+                .message = mutable_ctx.allocator.dupe(u8, reporter_err.message) catch reporter_err.message,
+                .location = .{
+                    .file = mutable_ctx.allocator.dupe(u8, reporter_err.location.file) catch reporter_err.location.file,
+                    .line = @intCast(reporter_err.location.line),
+                    .column = @intCast(reporter_err.location.column),
+                },
+            }) catch {};
+        }
+
+        const err_msg = switch (err) {
+            error.ReleaseRejectsPrototype => "prototype module rejected in release build",
+            else => "release gate error",
+        };
+
+        return .{ .failed = .{ .ctx = mutable_ctx, .message = err_msg } };
+    };
+
+    mutable_ctx.passes_completed += 1;
+    return .{ .ctx = mutable_ctx };
+}
+
+~proc check-structure|zig {
+    // Need mutable ctx to append errors
+    var mutable_ctx = ctx;
+    mutable_ctx.current_pass = "check_structure";
+
+    // Surface any diagnostics an ELABORATION pass already recorded (name resolution
+    // has no `.failed` arm of its own — `resolve-with-scopes` reports the KORU140
+    // `[with]` pick-wall into ctx.errors, and analysis is the first boundary that
+    // can halt cleanly). Print and fail BEFORE structural checking, so the real
+    // diagnostic wins instead of a downstream "unknown tor" for the name
+    // elaboration deliberately left unresolved.
+    if (mutable_ctx.errors.items.len > 0) {
+        for (mutable_ctx.errors.items) |e| {
+            std.debug.print("{s}\n  --> {s}:{}:{}\n\n", .{
+                e.message,
+                e.location.file,
+                e.location.line,
+                e.location.column,
+            });
+        }
+        return .{ .failed = .{ .ctx = mutable_ctx, .message = mutable_ctx.errors.items[0].message } };
+    }
+
+    // Use the Zig shape_checker library for structural validation
+    const shape_checker = @import("shape_checker");
+
+    // THE COMPILATION'S reporter, bound to the user's file AND source at
+    // context-create. Minting one here as `init(alloc, "structural_check", "")`
+    // put the PASS NAME where the filename goes and left no source to render a
+    // snippet from — the whole KORU021/022/028/102/130/131 family could only
+    // ever point at `structural_check:<line>`.
+    const reporter = mutable_ctx.reporter orelse {
+        @panic("check-structure: the compilation carries no diagnostic reporter");
+    };
+    // Only diagnostics THIS pass adds — the compilation's reporter accumulates,
+    // so a later pass must not re-report an earlier one's errors.
+    const err_base = reporter.errors.items.len;
+
+    // Create shape checker
+    var checker = shape_checker.ShapeChecker.init(
+        ctx.allocator,
+        reporter
+    ) catch {
+        // Report error to context
+        mutable_ctx.errors.append(mutable_ctx.allocator, .{
+            .message = "Failed to initialize shape checker",
+            .location = .{ .file = "compiler", .line = 0, .column = 0 },
+        }) catch {};
+        return .{ .ctx = mutable_ctx };
+    };
+    defer checker.deinit();
+
+    // [prototype]: relax required terminal-branch exhaustiveness so unhandled
+    // `|` branches become synthesized @panic holes (see ShapeChecker.prototype_mode).
+    for (mutable_ctx.ast.module_annotations) |ann| {
+        if (std.mem.eql(u8, ann, "prototype")) {
+            checker.prototype_mode = true;
+        }
+    }
+
+    // Run structural validation
+    checker.checkSourceFile(mutable_ctx.ast) catch |err| {
+        // Render through the reporter itself — it owns the code frame, the hint
+        // and the source preview.
+        reporter.printErrors(@import("errors").FileSink.stderr()) catch {};
+        for (reporter.errors.items[err_base..]) |reporter_err| {
+            mutable_ctx.errors.append(mutable_ctx.allocator, .{
+                .message = mutable_ctx.allocator.dupe(u8, reporter_err.message) catch reporter_err.message,
+                .location = .{
+                    .file = mutable_ctx.allocator.dupe(u8, reporter_err.location.file) catch reporter_err.location.file,
+                    .line = @intCast(reporter_err.location.line),
+                    .column = @intCast(reporter_err.location.column),
+                },
+            }) catch {};
+        }
+
+        // Generate error message based on error type
+        const err_msg = switch (err) {
+            error.UnknownEvent => "Unknown tor referenced",
+            error.IncompleteBranchCoverage => "Incomplete branch coverage",
+            error.ProcWithoutEvent => "Proc without matching event",
+            error.SubflowWithoutEvent => "Subflow without matching event",
+            error.DuplicateBranchHandler => "Duplicate branch handler at same indentation level",
+            error.ValidationFailed => "Validation failed (see errors above)",
+            error.InvalidPath => "Invalid path",
+            error.DuplicateLabel => "Duplicate label defined",
+            error.UnknownLabel => "Unknown label referenced",
+            error.DeprecatedInlineFlowPath => "Deprecated inline flow path",
+            error.LabelRequiresParameters => "Label requires parameters",
+            error.LabelDoesNotAcceptParameters => "Label does not accept parameters",
+            error.InvalidBranchConstructor => "Invalid branch constructor",
+            else => "Structural validation failed (unknown error)",
+        };
+
+        // Return failed branch - stops the pipeline!
+        return .{ .failed = .{ .ctx = mutable_ctx, .message = err_msg } };
+    };
+
+    // Validation succeeded
+    mutable_ctx.passes_completed += 1;
+    return .{ .ctx = mutable_ctx };
+}
+
+// Flow checker implementation
+// Validates control flow properties like when-clause exhaustiveness
+~proc check-flow|zig {
+    // Need mutable ctx to append errors
+    var mutable_ctx = ctx;
+    mutable_ctx.current_pass = "check_flow";
+
+    // Use the Zig flow_checker library for flow validation
+    const flow_checker = @import("flow_checker");
+
+    // THE COMPILATION'S reporter, bound to the user's file AND source at
+    // context-create. Minting one here as `init(alloc, "flow_check", "")` put
+    // the PASS NAME where the filename goes and left no source to render a
+    // snippet from — a when-clause exhaustiveness rejection could only ever
+    // point at `flow_check:<line>`.
+    const reporter = mutable_ctx.reporter orelse {
+        @panic("check-flow: the compilation carries no diagnostic reporter");
+    };
+    // Only diagnostics THIS pass adds — the compilation's reporter accumulates,
+    // so a later pass must not re-report an earlier one's errors.
+    const err_base = reporter.errors.items.len;
+
+    // Create flow checker
+    var checker = flow_checker.FlowChecker.init(
+        ctx.allocator,
+        reporter
+    ) catch {
+        // Report error to context
+        mutable_ctx.errors.append(mutable_ctx.allocator, .{
+            .message = "Failed to initialize flow checker",
+            .location = .{ .file = "compiler", .line = 0, .column = 0 },
+        }) catch {};
+        return .{ .ctx = mutable_ctx };
+    };
+    defer checker.deinit();
+
+    // [prototype]: relax required terminal-branch exhaustiveness (see
+    // FlowChecker.prototype_mode). Consistent with check-structure; by this pass
+    // the auto-discharge synthesis has usually already filled the hole arm.
+    for (mutable_ctx.ast.module_annotations) |ann| {
+        if (std.mem.eql(u8, ann, "prototype")) {
+            checker.prototype_mode = true;
+        }
+    }
+
+    // Run flow validation
+    checker.checkSourceFile(mutable_ctx.ast) catch |err| {
+        // Render through the reporter itself — it owns the code frame, the hint
+        // and the source preview.
+        reporter.printErrors(@import("errors").FileSink.stderr()) catch {};
+        for (reporter.errors.items[err_base..]) |reporter_err| {
+            mutable_ctx.errors.append(mutable_ctx.allocator, .{
+                .message = mutable_ctx.allocator.dupe(u8, reporter_err.message) catch reporter_err.message,
+                .location = .{
+                    .file = mutable_ctx.allocator.dupe(u8, reporter_err.location.file) catch reporter_err.location.file,
+                    .line = @intCast(reporter_err.location.line),
+                    .column = @intCast(reporter_err.location.column),
+                },
+            }) catch {};
+        }
+
+        // Generate error message based on error type
+        const err_msg = switch (err) {
+            error.FlowValidationFailed => "Flow validation failed",
+            error.DuplicateBranchHandler => "Duplicate branch handler at same indentation level",
+            else => "Flow validation error",
+        };
+
+        // Return failed branch - stops the pipeline!
+        return .{ .failed = .{ .ctx = mutable_ctx, .message = err_msg } };
+    };
+
+    // Validation succeeded
+    mutable_ctx.passes_completed += 1;
+    return .{ .ctx = mutable_ctx };
+}
+
+// Auto-discharge inserter implementation
+// Inserts disposal calls before terminators when exactly one disposal option exists
+
+// Phantom signature validation implementation
+// Declaration-shape checks only (polarity, phantom syntax, phantom module
+// resolution) — the obligation-FLOW analysis stays in check-phantom-semantic,
+// which runs after auto-discharge so it validates the inserted disposal calls.
+~proc check-phantom-signatures|zig {
+    var mutable_ctx = ctx;
+    mutable_ctx.current_pass = "check_phantom_signatures";
+
+    const phantom_semantic_checker = @import("phantom_semantic_checker");
+
+    // THE COMPILATION'S reporter, bound to the user's file AND source at
+    // context-create. Minting one here as
+    // `init(alloc, "phantom_signature_check", "")` put the PASS NAME where the
+    // filename goes and left no source to render a snippet from — an illegal
+    // polarity on an tor's own signature (KORU033/KORU040) could only ever
+    // point at `phantom_signature_check:<line>`.
+    const reporter = mutable_ctx.reporter orelse {
+        @panic("check-phantom-signatures: the compilation carries no diagnostic reporter");
+    };
+    // Only diagnostics THIS pass adds — the compilation's reporter accumulates,
+    // so a later pass must not re-report an earlier one's errors.
+    const err_base = reporter.errors.items.len;
+
+    // Create phantom semantic checker (signature-only entry point)
+    var checker = phantom_semantic_checker.PhantomSemanticChecker.init(
+        ctx.allocator,
+        reporter
+    ) catch {
+        mutable_ctx.errors.append(mutable_ctx.allocator, .{
+            .message = "Failed to initialize phantom semantic checker",
+            .location = .{ .file = "compiler", .line = 0, .column = 0 },
+        }) catch {};
+        return .{ .ctx = mutable_ctx };
+    };
+    defer checker.deinit();
+
+    // Run signature validation only — no obligation-flow analysis here
+    checker.checkSignatures(mutable_ctx.ast) catch |err| {
+        // Render through the reporter itself — it owns the code frame, the hint
+        // and the source preview.
+        reporter.printErrors(@import("errors").FileSink.stderr()) catch {};
+        for (reporter.errors.items[err_base..]) |reporter_err| {
+            mutable_ctx.errors.append(mutable_ctx.allocator, .{
+                .message = mutable_ctx.allocator.dupe(u8, reporter_err.message) catch reporter_err.message,
+                .location = .{
+                    .file = mutable_ctx.allocator.dupe(u8, reporter_err.location.file) catch reporter_err.location.file,
+                    .line = @intCast(reporter_err.location.line),
+                    .column = @intCast(reporter_err.location.column),
+                },
+            }) catch {};
+        }
+
+        // Generic phantom-checker banner — identical to check-phantom-semantic's.
+        // Both passes drive the SAME PhantomSemanticChecker library; the specific
+        // KORU0xx line above carries the real diagnostic. Keeping the banner
+        // uniform means a declaration-shape rejection reads the same whether it
+        // surfaces in the signature pass or the flow pass (330_034 asserts it).
+        const err_msg = switch (err) {
+            error.ValidationFailed => "Phantom semantic validation failed",
+            else => "Phantom semantic validation error",
+        };
+
+        // Return failed branch - stops the pipeline!
+        return .{ .failed = .{ .ctx = mutable_ctx, .message = err_msg } };
+    };
+
+    mutable_ctx.passes_completed += 1;
+    return .{ .ctx = mutable_ctx };
+}
+
+// Phantom argument validation implementation
+// The argument-located call-site slice of the phantom checker (state
+// threading + per-argument mismatch + use-after-discharge), run BEFORE
+// auto-discharge so the precise "Phantom state mismatch" diagnostics preempt
+// the inserter's generic "was not discharged" wall. The flow-EXIT
+// obligation-balance walls stay in check-phantom-semantic (post-insertion).
+~proc check-phantom-args|zig {
+    var mutable_ctx = ctx;
+    mutable_ctx.current_pass = "check_phantom_args";
+
+    const phantom_semantic_checker = @import("phantom_semantic_checker");
+
+    // THE COMPILATION'S reporter, minted at context-create and bound to the
+    // user's file AND source. This pass used to mint its own as
+    // `init(alloc, "phantom_args_check", "")` — the pass name where the FILENAME
+    // goes and no source at all, which is why its KORU030 rendered as
+    // `--> phantom_args_check:72:0` with no line and no snippet the author could
+    // act on. The location on the node was fine the whole time; the reporter had
+    // no file to resolve it against.
+    const reporter = mutable_ctx.reporter orelse {
+        @panic("check-phantom-args: the compilation carries no diagnostic reporter");
+    };
+    // Only diagnostics THIS pass adds — the compilation's reporter accumulates,
+    // so a later pass must not re-report an earlier one's errors.
+    const err_base = reporter.errors.items.len;
+
+    // Create phantom semantic checker (argument-only entry point)
+    var checker = phantom_semantic_checker.PhantomSemanticChecker.init(
+        ctx.allocator,
+        reporter
+    ) catch {
+        mutable_ctx.errors.append(mutable_ctx.allocator, .{
+            .message = "Failed to initialize phantom semantic checker",
+            .location = .{ .file = "compiler", .line = 0, .column = 0 },
+        }) catch {};
+        return .{ .ctx = mutable_ctx };
+    };
+    defer checker.deinit();
+
+    // [prototype]: same relaxation as check-phantom-semantic (400_165) — the
+    // argument slice walks the same continuations, so the same doodle arms
+    // must slide here too.
+    for (mutable_ctx.ast.module_annotations) |ann| {
+        if (std.mem.eql(u8, ann, "prototype")) {
+            checker.prototype_mode = true;
+        }
+    }
+
+    // Run argument-located validation only — no exit-balance walls here
+    checker.checkArguments(mutable_ctx.ast, mutable_ctx.original_ast) catch |err| {
+        // Render through the reporter itself — it owns the code frame, the hint
+        // and the source preview. Hand-formatting here is what made this pass's
+        // diagnostics render plainer than every other pass's.
+        reporter.printErrors(@import("errors").FileSink.stderr()) catch {};
+        for (reporter.errors.items[err_base..]) |reporter_err| {
+
+            mutable_ctx.errors.append(mutable_ctx.allocator, .{
+                .message = mutable_ctx.allocator.dupe(u8, reporter_err.message) catch reporter_err.message,
+                .location = .{
+                    .file = mutable_ctx.allocator.dupe(u8, reporter_err.location.file) catch reporter_err.location.file,
+                    .line = @intCast(reporter_err.location.line),
+                    .column = @intCast(reporter_err.location.column),
+                },
+            }) catch {};
+        }
+
+        // Generic phantom-checker banner — identical to check-phantom-semantic's.
+        // All three phantom passes drive the SAME PhantomSemanticChecker library;
+        // the specific KORU0xx line above carries the real diagnostic (see the
+        // banner-parity note in check-phantom-signatures, 330_034).
+        const err_msg = switch (err) {
+            error.ValidationFailed => "Phantom semantic validation failed",
+            else => "Phantom semantic validation error",
+        };
+
+        // Return failed branch - stops the pipeline!
+        return .{ .failed = .{ .ctx = mutable_ctx, .message = err_msg } };
+    };
+
+    mutable_ctx.passes_completed += 1;
+    return .{ .ctx = mutable_ctx };
+}
+
+// Flags for auto-discharge control (co-located with implementation!)
+~flag.declare {
+  "name": "auto-discharge=disable",
+  "description": "Disable automatic disposal insertion - phantom errors will fire for unsatisfied obligations",
+  "type": "boolean"
+}
+
+~flag.declare {
+  "name": "auto-discharge=warn",
+  "description": "Emit warnings when auto-discharge inserts disposal calls (for debugging obligation handling)",
+  "type": "boolean"
+}
+
+~proc pass-auto-discharge|zig {
+    // Check if auto-discharge is disabled entirely. Disabling means "do not
+    // INSERT disposal calls — let phantom errors fire"; it never means the
+    // discard shapes go invisible. The pass still runs in normalize-only mode
+    // below so an obligation-carrying bare call (`open()` discarding a
+    // `-> T<state!>` return) is materialized into its explicit `: _ |> _`
+    // form and the phantom checker can fire KORU030 on the leak.
+    const insertion_disabled = CompilerEnv.hasFlag("auto-discharge=disable");
+
+    // Honor the `strict` module-level convention.
+    // `strict` is an opaque annotation word, not a fixed semantics: each pass
+    // that cares reads it and renders it into its own domain. For auto-discharge,
+    // strict means "do not guess the single cleanup — require it explicitly",
+    // so a module marked [strict] opts out of insertion and the phantom checker
+    // fires KORU030 for any undischarged obligation. Other passes (ours and
+    // third-party) may read the same word and honor it in their own lane.
+    var strict_module = false;
+    for (ctx.ast.module_annotations) |ann| {
+        if (std.mem.eql(u8, ann, "strict")) {
+            strict_module = true;
+        }
+    }
+
+    // Check if warnings are enabled for auto-discharge
+    const warn_mode = CompilerEnv.hasFlag("auto-discharge=warn");
+
+    // Crash-surface map (strict mode): --panic-branches=strict makes every
+    // unhandled panic branch (| ?!...) a compile error (KORU022), enumerating
+    // where the program can crash on a rare failure. Dev build (flag off) stays
+    // silent — the synthesized @panic is still there at runtime; production/audit
+    // build (flag on) blocks compilation until each is handled or explicitly
+    // muted (`| <name> _ |> ...`). Same source, flag flips it.
+    const strict_panic_branches = CompilerEnv.hasFlag("panic-branches=strict");
+
+    // `[prototype]`: module opt-in to compile-and-run INCOMPLETE. An unhandled
+    // required TERMINAL branch becomes a synthesized @panic hole (same body as
+    // an unhandled `| ?!`) instead of a KORU022 exhaustiveness error — so a
+    // half-shaped program runs its built paths now and crashes loudly at a hole.
+    // Read like `strict` (an opaque module-annotation word), but it does NOT
+    // early-return: the pass runs WITH the flag so synthesis fills the holes.
+    // Never leaks to production — without the annotation this stays false and
+    // exhaustiveness is enforced.
+    var prototype_mode = false;
+    for (ctx.ast.module_annotations) |ann| {
+        if (std.mem.eql(u8, ann, "prototype")) {
+            prototype_mode = true;
+        }
+    }
+
+    var mutable_ctx = ctx;
+    mutable_ctx.current_pass = "auto_discharge";
+
+    const auto_discharge_inserter = @import("auto_discharge_inserter");
+
+    // THE COMPILATION'S reporter, bound to the user's file AND source at
+    // context-create. Minting one here as `init(alloc, "auto_discharge", "")`
+    // put the PASS NAME where the filename goes and left no source to render a
+    // snippet from — "Resource 'x' obligation was not discharged", the single
+    // most common obligation diagnostic, could only ever point at
+    // `auto_discharge:<line>`. The inserter also renders through this reporter
+    // itself (auto_discharge_inserter.zig:787, :834), so those paths gain the
+    // file and the snippet with it.
+    const reporter = mutable_ctx.reporter orelse {
+        @panic("insert-auto-discharge: the compilation carries no diagnostic reporter");
+    };
+    // Only diagnostics THIS pass adds — the compilation's reporter accumulates,
+    // so a later pass must not re-report an earlier one's errors.
+    const err_base = reporter.errors.items.len;
+
+    var inserter = auto_discharge_inserter.AutoDischargeInserter.init(
+        ctx.allocator, reporter, warn_mode, strict_panic_branches, prototype_mode,
+        CompilerEnv.lang,
+    ) catch {
+        mutable_ctx.errors.append(mutable_ctx.allocator, .{
+            .message = "Failed to initialize auto-discharge inserter",
+            .location = .{ .file = "compiler", .line = 0, .column = 0 },
+        }) catch {};
+        return .{ .ctx = mutable_ctx };
+    };
+    defer inserter.deinit();
+
+    // Run the pass - may modify AST. Insertion opted out (flag or [strict])
+    // still normalizes head discards so downstream enforcement sees them.
+    const run_result = if (insertion_disabled or strict_module)
+        inserter.runNormalizeOnly(mutable_ctx.ast)
+    else
+        inserter.run(mutable_ctx.ast);
+    const new_ast = run_result catch |err| {
+        // Render through the reporter itself — it owns the code frame, the hint
+        // and the source preview. This is the ONLY render for most of the
+        // inserter's failure paths (auto_discharge_inserter.zig:1178, :1764,
+        // :2123, :2267, :2397, :3852 all return without printing). The gates
+        // that DO print for themselves (the hasErrors bail-outs in run() and
+        // runNormalizeOnly()) do NOT double up: printErrors carries a
+        // printed-count watermark, so this call emits only diagnostics no
+        // earlier render has shown.
+        reporter.printErrors(@import("errors").FileSink.stderr()) catch {};
+        for (reporter.errors.items[err_base..]) |reporter_err| {
+            mutable_ctx.errors.append(mutable_ctx.allocator, .{
+                .message = mutable_ctx.allocator.dupe(u8, reporter_err.message) catch reporter_err.message,
+                .location = .{
+                    .file = mutable_ctx.allocator.dupe(u8, reporter_err.location.file) catch reporter_err.location.file,
+                    .line = @intCast(reporter_err.location.line),
+                    .column = @intCast(reporter_err.location.column),
+                },
+            }) catch {};
+        }
+
+        const err_msg = switch (err) {
+            error.ValidationFailed => "Auto-discharge failed (multiple disposal options or no disposal event)",
+            else => "Auto-discharge pass error",
+        };
+
+        return .{ .failed = .{ .ctx = mutable_ctx, .message = err_msg } };
+    };
+
+    // Update AST with potentially modified version
+    mutable_ctx.ast = new_ast;
+    mutable_ctx.passes_completed += 1;
+    return .{ .ctx = mutable_ctx };
+}
+
+// Semantic phantom type checker implementation
+// Validates module-qualified phantom states and their compatibility
+~proc check-phantom-semantic|zig {
+    log.debug("\n[PHANTOM-KORU] Starting phantom check proc...\n", .{});
+    // Need mutable ctx to append errors
+    var mutable_ctx = ctx;
+    mutable_ctx.current_pass = "check_phantom";
+
+    // Use the Zig phantom_semantic_checker library for phantom state validation
+    const phantom_semantic_checker = @import("phantom_semantic_checker");
+
+    // THE COMPILATION'S reporter, bound to the user's file AND source at
+    // context-create. Minting one here as
+    // `init(alloc, "phantom_semantic_check", "")` put the PASS NAME where the
+    // filename goes and left no source to render a snippet from — the flow-exit
+    // obligation-balance walls, the diagnostics an author most needs to act on,
+    // could only ever point at `phantom_semantic_check:<line>`.
+    const reporter = mutable_ctx.reporter orelse {
+        @panic("check-phantom-semantic: the compilation carries no diagnostic reporter");
+    };
+    // Only diagnostics THIS pass adds — the compilation's reporter accumulates,
+    // so a later pass must not re-report an earlier one's errors.
+    const err_base = reporter.errors.items.len;
+
+    // Create phantom semantic checker
+    var checker = phantom_semantic_checker.PhantomSemanticChecker.init(
+        ctx.allocator,
+        reporter
+    ) catch {
+        // Report error to context
+        mutable_ctx.errors.append(mutable_ctx.allocator, .{
+            .message = "Failed to initialize phantom semantic checker",
+            .location = .{ .file = "compiler", .line = 0, .column = 0 },
+        }) catch {};
+        return .{ .ctx = mutable_ctx };
+    };
+    defer checker.deinit();
+
+    // [prototype]: relax the "handled a branch the tor doesn't produce" wall
+    // (KORU030) for terminal continuations — the doodle where handler arms lead
+    // the declaration (see PhantomSemanticChecker.prototype_mode, 400_165).
+    // Consistent with check-structure / check-flow.
+    for (mutable_ctx.ast.module_annotations) |ann| {
+        if (std.mem.eql(u8, ann, "prototype")) {
+            checker.prototype_mode = true;
+        }
+    }
+
+    // Run phantom semantic validation
+    checker.check(mutable_ctx.ast, mutable_ctx.original_ast) catch |err| {
+        // Render through the reporter itself — it owns the code frame, the hint
+        // and the source preview.
+        reporter.printErrors(@import("errors").FileSink.stderr()) catch {};
+        for (reporter.errors.items[err_base..]) |reporter_err| {
+            mutable_ctx.errors.append(mutable_ctx.allocator, .{
+                .message = mutable_ctx.allocator.dupe(u8, reporter_err.message) catch reporter_err.message,
+                .location = .{
+                    .file = mutable_ctx.allocator.dupe(u8, reporter_err.location.file) catch reporter_err.location.file,
+                    .line = @intCast(reporter_err.location.line),
+                    .column = @intCast(reporter_err.location.column),
+                },
+            }) catch {};
+        }
+
+        // Generate error message based on error type
+        const err_msg = switch (err) {
+            error.ValidationFailed => "Phantom semantic validation failed",
+            else => "Phantom semantic validation error",
+        };
+
+        // Return failed branch - stops the pipeline!
+        return .{ .failed = .{ .ctx = mutable_ctx, .message = err_msg } };
+    };
+
+    // Validation succeeded
+    mutable_ctx.passes_completed += 1;
+    return .{ .ctx = mutable_ctx };
+}
+
+// Purity checker implementation
+// Tracks [pure] annotations - developer assertion, trusted without verification
+~proc check-purity|zig {
+    var mutable_ctx = ctx;
+    mutable_ctx.current_pass = "check_purity";
+
+    // Purity is determined by [pure] annotation only
+    // We don't analyze host (Zig) code - if you say it's pure, we trust you
+
+    mutable_ctx.passes_completed += 1;
+    return .{ .ctx = mutable_ctx };
+}
+
+// Dead Strip Pass
+// Removes unreachable tors and flows from the AST
+// Walks from entry points (top-level flows), marks reachable tors, prunes the rest
+~proc pass-dead-strip|zig {
+    var mutable_ctx = ctx;
+    mutable_ctx.current_pass = "dead_strip";
+
+    const dead_strip = @import("dead_strip");
+
+    var pass = dead_strip.DeadStripPass.init(ctx.allocator);
+    defer pass.deinit();
+    // A library keeps its exports; a program keeps what it calls. The flag
+    // rides CompilerEnv for the same reason `lang` does — this pass runs
+    // across the metacircular boundary and sees per-user state only there.
+    pass.library_roots = CompilerEnv.library;
+
+    const new_ast = pass.run(mutable_ctx.ast, mutable_ctx.original_ast) catch {
+        return mutable_ctx;
+    };
+
+    mutable_ctx.ast = new_ast;
+    mutable_ctx.passes_completed += 1;
+    return mutable_ctx;
+}
+
+~part ccp

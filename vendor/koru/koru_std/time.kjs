@@ -1,0 +1,24 @@
+// std/time — JavaScript implementation facet.
+//
+// Events are declared in the `time.kz` companion (merged at import). This file
+// holds the `|js` proc bodies.
+//
+// The clock is `performance.now()` — monotonic, present in node >= 16 and every
+// browser. It resolves microseconds (browsers may coarsen it for Spectre), not
+// the nanoseconds the Zig facet's Instant reads — sub-ms durations on the JS
+// target carry that floor and nothing here hides it. The i128 contract is met
+// by a double, the JS numeric model everywhere; ns magnitudes stay exact past
+// 100 days of uptime.
+~proc now|js {
+    return Math.round(performance.now() * 1000000);
+}
+
+~proc elapsed|js {
+    const ns = Math.round(performance.now() * 1000000) - start;
+    return {
+        ns: ns,
+        us: ns / 1000,
+        ms: ns / 1000000,
+        s: ns / 1000000000,
+    };
+}

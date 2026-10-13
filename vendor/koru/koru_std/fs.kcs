@@ -1,0 +1,71 @@
+// std/fs — C# implementation facet.
+//
+// Events are declared in the `fs.kz` companion (merged at import); this file
+// holds the `|cs` proc bodies. `~import std/fs` merges all same-stem facets
+// into one module, so the contract in `fs.kz` is in scope here.
+//
+// Alignment with the Zig facet: File.ReadAllText is the honest twin of the
+// Zig body's readToEndAlloc slurp — same `aspirational` gap (bounded by RAM,
+// not streaming), deliberately NOT fixed here. .NET fuses open and read into
+// one throw, so the exception type is demultiplexed back onto the Zig
+// switches: open-class exceptions take the open strings, read-class the read
+// strings, and anything unmapped falls to "Failed to open file" — the open
+// switch's `else =>`, which is where an unrecognised failure of a fused call
+// most likely came from. Directory.Exists is checked up front because .NET
+// reports a directory path as UnauthorizedAccessException — "Access denied"
+// — while Zig's openFile names it IsDir; the check keeps the loud string.
+//
+// HYGIENE: this body INLINES into the consumer's frame (effect lowering), so
+// locals carry the same __koru_rl_ prefix the Zig facet uses, for the same
+// reason — never collide with user bindings in the surrounding flow.
+
+~proc read-lines|cs {
+    string __koru_rl_content;
+    if (global::System.IO.Directory.Exists(path)) {
+        return new Output { tag = "failed", failed = "Path is a directory" };
+    }
+    try {
+        __koru_rl_content = global::System.IO.File.ReadAllText(path);
+    } catch (global::System.IO.FileNotFoundException) {
+        return new Output { tag = "failed", failed = "File not found" };
+    } catch (global::System.IO.DirectoryNotFoundException) {
+        return new Output { tag = "failed", failed = "File not found" };
+    } catch (global::System.UnauthorizedAccessException) {
+        return new Output { tag = "failed", failed = "Access denied" };
+    } catch (global::System.OutOfMemoryException) {
+        return new Output { tag = "failed", failed = "Out of memory reading file" };
+    } catch (global::System.IO.IOException) {
+        return new Output { tag = "failed", failed = "Failed to read file" };
+    } catch (global::System.Exception) {
+        return new Output { tag = "failed", failed = "Failed to open file" };
+    }
+    long __koru_rl_n = 0;
+    var __koru_rl_lines = __koru_rl_content.Split('\n');
+    for (long __koru_rl_i = 0; __koru_rl_i < __koru_rl_lines.Length; __koru_rl_i++) {
+        var __koru_rl_raw = __koru_rl_lines[__koru_rl_i];
+        // A trailing newline yields one final empty slice — not a line.
+        if (__koru_rl_raw.Length == 0 && __koru_rl_i == __koru_rl_lines.Length - 1) break;
+        var __koru_rl_l = (__koru_rl_raw.Length > 0 && __koru_rl_raw[__koru_rl_raw.Length - 1] == '\r') ? __koru_rl_raw.Substring(0, __koru_rl_raw.Length - 1) : __koru_rl_raw;
+        line(__koru_rl_l);
+        __koru_rl_n += 1;
+    }
+    return new Output { tag = "done", done = __koru_rl_n };
+}
+
+~proc write|cs {
+    if (global::System.IO.Directory.Exists(path)) {
+        return new Output { tag = "failed", failed = "Path is a directory" };
+    }
+    try {
+        global::System.IO.File.WriteAllText(path, content);
+    } catch (global::System.IO.FileNotFoundException) {
+        return new Output { tag = "failed", failed = "File not found" };
+    } catch (global::System.IO.DirectoryNotFoundException) {
+        return new Output { tag = "failed", failed = "File not found" };
+    } catch (global::System.UnauthorizedAccessException) {
+        return new Output { tag = "failed", failed = "Access denied" };
+    } catch (global::System.Exception) {
+        return new Output { tag = "failed", failed = "Failed to write file" };
+    }
+    return new Output { tag = "written", written = new { } };
+}

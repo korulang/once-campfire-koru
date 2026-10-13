@@ -1,0 +1,57 @@
+// Koru Standard Library: the `context` part of compiler.kz — the
+// compile-time context and diagnostic surface. Joined via `~part context`
+// in compiler.kz; merged into the compiler module at load.
+//
+// `CompilerContext` threads state for all passes; `ErrorReporter` is the
+// diagnostic channel re-exported under this module's name so a pass or a
+// `[comptime|transform]` tor can spell it `std/compiler:ErrorReporter`.
+// `std`, `ast` and `Program` are imported by the parent's preamble.
+
+// The diagnostic channel, re-exported under this module's name so a pass or a
+// `[comptime|transform]` tor can spell it `std/compiler:ErrorReporter`.
+// `CompilerError` below is message-plus-location; this carries the code, the
+// hint and the source preview that make a koru diagnostic look like one.
+pub const ErrorReporter = @import("errors").ErrorReporter;
+
+// ============================================================
+// COMPILER CONTEXT - Threading state for all passes
+// ============================================================
+
+pub const SourceLocation = struct {
+    file: []const u8,
+    line: u32,
+    column: u32,
+};
+
+pub const CompilerError = struct {
+    message: []const u8,
+    location: SourceLocation,
+};
+
+pub const CompilerWarning = struct {
+    message: []const u8,
+    location: SourceLocation,
+};
+
+pub const ErrorPolicy = enum {
+    abort_on_first,
+    collect_all,
+};
+
+pub const CompilerContext = struct {
+    ast: *const Program,
+    original_ast: *const Program,  // Unfiltered AST for metadata queries (TypeRegistry, etc.)
+    allocator: std.mem.Allocator,
+    errors: std.ArrayList(CompilerError),
+    warnings: std.ArrayList(CompilerWarning),
+    error_policy: ErrorPolicy,
+    current_pass: ?[]const u8,
+    passes_completed: u32,
+    tap_registry: ?*@import("tap_registry").TapRegistry,
+    /// The compilation's ONE diagnostic reporter, bound to the user's source
+    /// file at `context-create` and shared by every pass downstream. A pass
+    /// that wants a code, a hint or a source preview reaches for this rather
+    /// than appending to `errors` — same pipeline, one grade of diagnostic.
+    /// Null only on a context built outside the pipeline head.
+    reporter: ?*ErrorReporter,
+};

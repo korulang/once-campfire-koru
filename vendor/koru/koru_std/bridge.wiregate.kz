@@ -1,0 +1,106 @@
+// Koru Standard Library: the `wiregate` part of bridge.kz — the
+// scope-directed gate and the dispatch that consumes its canonical form.
+// Joined via `~part wiregate` in bridge.kz; merged into the bridge module
+// at load.
+//
+// One scanner, two duties, same lookups: `wireGate` admits — a value
+// position's declared field type (from the scope's input_fn, or this file's
+// host table for the introspection verbs) decides whether captured text is
+// legal there — and `dispatchThroughScope` normalizes the same way, so what
+// the gate admits is exactly what dispatch executes. `expr: a + b` on an
+// Expression field becomes `expr: "a + b"`; `note: <prose>` fills note's
+// lone Source field. Untyped scopes see the flat grammar unchanged.
+
+const GateRejection = struct { message: []const u8, line: u32, column: u32, not_invocation: bool };
+
+// The introspection-granted host verbs' field vocabularies — one table the
+// scanner, the dispatch, and the prompt render all read. note's text is
+// captured text — raw prose is the point of the observer channel — and
+// bind's value is whatever datum the harness hands back, rendered.
+// vocabulary/grammar take none.
+const HostVerbSpec = struct { name: []const u8, fields: []const Runtime.InputFieldSpec, doc: []const u8 = "" };
+const host_verbs = [_]HostVerbSpec{
+    .{ .name = "vocabulary", .fields = &.{} },
+    .{ .name = "grammar", .fields = &.{} },
+    .{ .name = "bind", .fields = &.{
+        .{ .name = "name", .type_name = "string" },
+        .{ .name = "value", .type_name = "Source" },
+    } },
+    .{ .name = "note", .fields = &.{
+        .{ .name = "text", .type_name = "Source" },
+    }, .doc = " — speaks to the observer, not the user: reasoning, plans, and \"why I'm stuck\" go here" },
+};
+
+fn hostInputLookup(verb: []const u8) ?[]const Runtime.InputFieldSpec {
+    for (host_verbs) |v| {
+        if (std.mem.eql(u8, verb, v.name)) return v.fields;
+    }
+    return null;
+}
+
+// The verbs introspection grants, rendered in `vocabulary`/`grammar` and
+// exported for the agent's prompt doc — derived at comptime from the table
+// the gate enforces: the prompt, the parser, and the dispatch read the same
+// declaration, typed fields spelled the way scope verbs spell theirs.
+pub const introspection_verbs: []const u8 = blk: {
+    var text: []const u8 = "";
+    for (host_verbs) |v| {
+        if (text.len > 0) text = text ++ "\n";
+        text = text ++ v.name ++ "(";
+        for (v.fields, 0..) |f, i| {
+            if (i > 0) text = text ++ ", ";
+            text = text ++ f.name ++ ": " ++ f.type_name;
+        }
+        text = text ++ ")" ++ v.doc;
+    }
+    break :blk text;
+};
+
+fn scopeInputFn(br: *Bridge) ?Runtime.InputLookupFn {
+    return switch (Runtime.get_scope_event.handler(.{ .name = br.scope })) {
+        .scope => |s| s.input_fn,
+        .not_found => null,
+    };
+}
+
+// The wire grammar check, shared by the single-item gate and the per-item
+// gate a sequenced turn runs on every slice: one predicate, two surfaces —
+// a one-item turn returns the refusal as the turn's verdict; a multi-item
+// turn reports it as a `step N/M parse-error` line and runs on. A grammar
+// that only held on the first item of a turn is the convention the wire
+// ruling retired — the unit of enforcement is the item. (440_021; kopium
+// bridge-mirror 2026-09-12-wire-gate-scope)
+fn wireGate(br: *Bridge, source: []const u8) ?GateRejection {
+    return switch (Runtime.parse_wire_event.handler(.{
+        .source = source,
+        .input_fn = scopeInputFn(br),
+        .host_input_fn = hostInputLookup,
+    })) {
+        .parsed => null,
+        .parse_error => |e| .{ .message = e.message, .line = e.line, .column = e.column, .not_invocation = e.not_invocation },
+    };
+}
+
+/// One wire item dispatched through the session: the runtime run with the
+/// bridge's pool, defined-flows table, and — when the model has introspection —
+/// the host verbs, plus the session binder so every link gets its `rN`.
+/// Typed positions were admitted by the gate; here they normalize to
+/// canonical quoted wire so eval sees one representation.
+fn dispatchThroughScope(br: *Bridge, src: []const u8) Runtime.run_event.Output {
+    // Page-backed like the rest of the wire layer — the normalized text
+    // must outlive the whole dispatch, and the arena dies at prepare().
+    const wire = Runtime.wireNormalize(std.heap.page_allocator, src, scopeInputFn(br), hostInputLookup);
+    return Runtime.run_event.handler(.{
+        .source = wire,
+        .scope = br.scope,
+        .handle_pool = &br.pool,
+        .auto_discharge = false,
+        .defined = br.defined,
+        .lenient = true,
+        .host_dispatch = if (br.introspection) @as(?Interp.HostDispatchFn, hostDispatch) else null,
+        .session_env = br.session_env,
+        .session_bind_fn = @as(?Interp.SessionBindFn, sessionBindAdapter),
+        .session_bind_env = br.session_env,
+        .session_bind_counter = &br.bound_count,
+    });
+}

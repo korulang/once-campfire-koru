@@ -1,0 +1,192 @@
+// Koru Standard Library: the `fpga` part of kernel.kz — `self|fpga` port
+// shapes. Joined via `~part fpga` in kernel.kz; merged into the kernel
+// module. This file reads the |fpga facet's scoped meet and answers the
+// one question the emitters ask: what port does this field need — bit
+// width, signedness, saturation claim. kernel.fpgaemit.kz turns the
+// answer into the module; kernel.fpgatb.kz into the gating testbench.
+//
+// WIDTH SEMANTICS, ruled refine's own way — bounds judge, clamp
+// normalizes: bare bounds size the port and overflow wraps (the bench
+// notes "truncated"); a `clamp(lo,hi)` term in the meet claims the
+// boundary saturates, so the emitter generates saturating logic and the
+// bench notes "saturated". SIGNEDNESS is read the same way: a met range
+// that admits negatives (`lo < 0` after clamp intersection, `== -N`, or
+// an unbounded i64) is a signed port; `lo >= 0` is unsigned. The host
+// stays unbounded i64 either way — divergence prints, never silently.
+
+// `kast` is kernel.scan.kz's `ast` import — module-scope, shared.
+
+// A `std/proto`-door invocation naming `name`? Local copy of refine's own
+// test — this part reaches koru_refine only through the guarded
+// `metFields` fold call below.
+fn fpgaIsProtoDoor(inv: *const kast.Invocation) bool {
+    if (inv.path.segments.len != 1) return false;
+    const verb = inv.path.segments[0];
+    const mq = inv.path.module_qualifier orelse return false;
+    const proto_mh = std.mem.eql(u8, mq, "std.proto") or std.mem.eql(u8, mq, "std/proto");
+    if (std.mem.eql(u8, verb, "default") and proto_mh) return true;
+    return std.mem.eql(u8, verb, "proto") and
+        (proto_mh or std.mem.eql(u8, mq, "std.types") or std.mem.eql(u8, mq, "std/types"));
+}
+
+fn fpgaInvName(inv: *const kast.Invocation) []const u8 {
+    if (inv.args.len == 0) return "";
+    var text = std.mem.trim(u8, inv.args[0].value, " \t");
+    if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') {
+        text = text[1 .. text.len - 1];
+    }
+    return std.mem.trim(u8, text, " \t");
+}
+
+// The home a `|fpga` facet on `name` is minted under: the enclosing module
+// of the proto it refines (a refine block's scope IS its proto's home —
+// bare `std/refine(S)` never addresses across homes). The canonical
+// facet_decl is the strongest evidence — it already carries the minted
+// home; a live proto door is the fallback.
+fn fpgaProtoHome(items: []const kast.Item, scope_home: []const u8, name: []const u8) ?[]const u8 {
+    for (items) |entry| {
+        switch (entry) {
+            .facet_decl => |*fd| {
+                if (std.mem.eql(u8, fd.name, name) and
+                    fd.target != null and std.mem.eql(u8, fd.target.?, "fpga")) return fd.module;
+            },
+            .flow => |fl| {
+                if (fl.body.node) |*node| {
+                    if (node.* == .invocation and fpgaIsProtoDoor(&node.invocation) and
+                        std.mem.eql(u8, fpgaInvName(&node.invocation), name)) return scope_home;
+                }
+            },
+            .module_decl => |m| {
+                if (fpgaProtoHome(m.items, m.logical_name, name)) |h| return h;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+// A port is a width AND a signedness — both read off the met range.
+const FpgaPort = struct { bits: u8, sign: bool };
+
+// Smallest unsigned width carrying values 0..hi (hi=255 -> 8, hi=3 -> 2).
+fn fpgaBitsNeeded(hi: u64) u8 {
+    if (hi <= 1) return 1;
+    return @as(u8, 64) - @as(u8, @intCast(@clz(hi)));
+}
+
+// Smallest two's-complement width holding all of [lo,hi] — [-128,127] is
+// 8, [-10,200] is 9. Callers guarantee lo < 0 (else fpgaBitsNeeded).
+fn fpgaSignedBits(lo: i64, hi: i64) u8 {
+    var w: u8 = 1;
+    while (w < 64) : (w += 1) {
+        const half = @as(i64, 1) << @intCast(w - 1);
+        if (lo >= -half and hi <= half - 1) return w;
+    }
+    return 64;
+}
+
+// The effective [lo,hi] after exclusivity bumps and clamp intersection —
+// the range the port must carry, and (when clamp claimed it) the range
+// the saturating map holds. Null when the meet leaves a side unbounded.
+fn fpgaEffBounds(mf_lo: ?i64, mf_lo_ex: bool, mf_hi: ?i64, mf_hi_ex: bool, mf_clamp: ?[2]i64) ?[2]i64 {
+    var lo_eff = mf_lo;
+    var hi_eff = mf_hi;
+    if (lo_eff) |l| lo_eff = l + @as(i64, if (mf_lo_ex) 1 else 0);
+    if (hi_eff) |h| hi_eff = h - @as(i64, if (mf_hi_ex) 1 else 0);
+    if (mf_clamp) |c| {
+        lo_eff = if (lo_eff) |l| @max(l, c[0]) else c[0];
+        hi_eff = if (hi_eff) |h| @min(h, c[1]) else c[1];
+    }
+    if (lo_eff) |l| {
+        if (hi_eff) |h| {
+            if (h >= l) return .{ l, h };
+        }
+    }
+    return null;
+}
+
+// A field's port from its scoped-facet meet. `==N` sizes to the constant;
+// a met [lo,hi] is unsigned when lo>=0 and two's-complement signed when
+// lo<0; an unbounded i64 is the honest signed [63:0] — except a bare
+// `>=0`, which claims nonneg: unsigned 64, negatives refused at the
+// boundary like any narrow unsigned port.
+fn fpgaFieldPort(mf_lo: ?i64, mf_lo_ex: bool, mf_hi: ?i64, mf_hi_ex: bool, mf_eq: ?i64, mf_clamp: ?[2]i64) FpgaPort {
+    if (mf_eq) |v| {
+        if (v >= 0) return .{ .bits = fpgaBitsNeeded(@intCast(v)), .sign = false };
+        return .{ .bits = fpgaSignedBits(v, v), .sign = true };
+    }
+    if (fpgaEffBounds(mf_lo, mf_lo_ex, mf_hi, mf_hi_ex, mf_clamp)) |eb| {
+        if (eb[0] >= 0) return .{ .bits = fpgaBitsNeeded(@intCast(eb[1])), .sign = false };
+        return .{ .bits = fpgaSignedBits(eb[0], eb[1]), .sign = true };
+    }
+    return .{ .bits = 64, .sign = mf_lo == null or mf_lo.? < 0 };
+}
+
+// A bound as the port literal the wire actually carries — signed ports
+// spell `-8'sd3`, unsigned `8'd3`. (sign_prefix, width, 's', magnitude)
+fn fpgaPortLit(v: i64, p: FpgaPort) struct { neg: []const u8, bits: u8, s: []const u8, mag: u64 } {
+    if (p.sign) {
+        return .{ .neg = if (v < 0) "-" else "", .bits = p.bits, .s = "s", .mag = @abs(v) };
+    }
+    const carried: u64 = if (v < 0)
+        (if (p.bits >= 64) @as(u64, @bitCast(v)) else @intCast(@mod(v, @as(i64, 1) << @intCast(p.bits))))
+    else
+        @intCast(v);
+    return .{ .neg = "", .bits = p.bits, .s = "", .mag = carried };
+}
+
+// `name: <int>` field values per init element, aligned to shape_fields —
+// the testbench's stimulus. A non-literal or absent field value is a loud
+// KORU123: the bench drives exactly what init declares, nothing guessed.
+fn fpgaParseDataset(alloc: std.mem.Allocator, dataset: []const u8, shape_fields: []const kast.Field, type_name: []const u8) [][]i64 {
+    var elems = std.ArrayList([]i64).initCapacity(alloc, 8) catch unreachable;
+    var block_iter = std.mem.splitSequence(u8, dataset, "}");
+    var any_block = false;
+    while (block_iter.next()) |block_raw| {
+        const content = if (std.mem.indexOf(u8, block_raw, "{")) |bi| blk: {
+            any_block = true;
+            break :blk block_raw[bi + 1 ..];
+        } else if (!any_block and elems.items.len == 0 and block_iter.peek() == null)
+            block_raw // single-element init: the whole dataset is the block
+        else
+            continue;
+        const vals = alloc.alloc(i64, shape_fields.len) catch unreachable;
+        var seen = alloc.alloc(bool, shape_fields.len) catch unreachable;
+        @memset(seen, false);
+        var fit = std.mem.splitSequence(u8, content, ",");
+        while (fit.next()) |fr| {
+            const f = std.mem.trim(u8, fr, " \t\n\r");
+            if (f.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, f, ':') orelse {
+                std.debug.print("error[KORU123]: `self|fpga` init element for {s} must spell `name: <int>` per field — got `{s}`\n", .{ type_name, f });
+                std.process.exit(1);
+            };
+            const fname = std.mem.trim(u8, f[0..colon], " \t");
+            const fval = std.mem.trim(u8, f[colon + 1 ..], " \t");
+            var matched = false;
+            for (shape_fields, 0..) |sf, sfi| {
+                if (std.mem.eql(u8, sf.name, fname)) {
+                    vals[sfi] = std.fmt.parseInt(i64, fval, 10) catch {
+                        std.debug.print("error[KORU123]: `self|fpga` needs integer init literals — `{s}: {s}` on {s} is not a plain int (the testbench drives the dataset; expressions are a later rung)\n", .{ fname, fval, type_name });
+                        std.process.exit(1);
+                    };
+                    seen[sfi] = true;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                std.debug.print("error[KORU123]: `self|fpga` init element names `{s}` — not a field of {s}\n", .{ fname, type_name });
+                std.process.exit(1);
+            }
+        }
+        for (shape_fields, 0..) |sf, sfi| {
+            if (!seen[sfi]) {
+                std.debug.print("error[KORU123]: `self|fpga` init element has no `{s}` literal — the bench drives every port\n", .{sf.name});
+                std.process.exit(1);
+            }
+        }
+        elems.append(alloc, vals) catch unreachable;
+    }
+    return elems.toOwnedSlice(alloc) catch unreachable;
+}

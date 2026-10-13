@@ -1,0 +1,44 @@
+// Koru Standard Library: the `wirelex` part of runtime — the wire
+// grammar's character predicates, rejection builders, and the
+// line/column diagnostic. Joined via `~part wirelex` in runtime.kz;
+// merged into the runtime module at load.
+
+pub fn wireIdentStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+
+pub fn wireIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
+}
+
+/// A bare literal token: digits, letters, and the `.`/`+`/`-`/`_` that carry
+/// numbers (`42`, `-0.25`), bool/null words, and bound references (`h`,
+/// `r.user_id`). `,` `)` whitespace terminate it.
+fn wireBareValueChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.' or c == '+';
+}
+
+fn wireReject(comptime fmt: []const u8, args: anytype, byte: usize) WireRejection {
+    // Rejection messages are page-backed and intentionally never freed — the
+    // same tolerance the interpreter's own parse-error messages carry.
+    const message = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch @panic("wire: OOM building rejection");
+    return .{ .message = message, .byte = byte, .not_invocation = false };
+}
+
+fn wireRejectResidue(comptime fmt: []const u8, args: anytype, byte: usize) WireRejection {
+    var r = wireReject(fmt, args, byte);
+    r.not_invocation = true;
+    return r;
+}
+
+fn wireLineColumn(s: []const u8, byte: usize) struct { line: u32, column: u32 } {
+    var line: u32 = 1;
+    var line_start: usize = 0;
+    for (s[0..@min(byte, s.len)], 0..) |c, j| {
+        if (c == '\n') {
+            line += 1;
+            line_start = j + 1;
+        }
+    }
+    return .{ .line = line, .column = @intCast(byte - line_start + 1) };
+}

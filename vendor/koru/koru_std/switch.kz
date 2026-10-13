@@ -1,0 +1,146 @@
+~[comptime]
+
+// Koru Standard Library: switch — compile-time exact-value dispatch as control
+// flow. Sibling of std/regex:match: same branch surface, but dispatches on a
+// single scalar value with a native Zig switch instead of a regex DFA.
+//
+//   std/switch:char(ch)
+//   | `a` c |> got-a(c)
+//   | `b` c |> got-b(c)
+//   | no-match |> other()
+//
+// The branch head is the opaque backtick string. The transform parses it as:
+//   - single char:  `a`
+//   - inclusive range: `a-z`
+//   - set of chars: `aeiou`
+// and emits a Zig switch on the dispatched value. First matching arm wins;
+// `no-match` is the optional fallback.
+
+const std = @import("std");
+
+// The tor declares the USER surface: any raw-name branch carries the matched
+// char (bind or discard with `_`), plus an optional void `no-match` fallback.
+// The shape checker enforces this contract; the transform owns pattern parsing
+// and code emission.
+~[comptime|transform]pub tor char { expr: Expression, reporter: *std/compiler:ErrorReporter }
+| `*` *
+| ?no-match
+
+~[transform]proc char|zig {
+    const ast = @import("ast");
+
+    // The walker hands transforms the containing item of the matched invocation;
+    // a switch invocation always lives in a flow. A non-flow item means the
+    // dispatch contract broke upstream — crash loudly.
+    if (item.* != .flow) @panic("switch char transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+    const conts = flow.body.continuations;
+
+    // The value expression is the char invocation's first argument.
+    if (invocation.args.len == 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU167, flow.location, flow.module, "std/switch:char requires a value argument: char(<expression>)", .{}) } };
+    }
+    const value_expr: []const u8 = invocation.args[0].value;
+
+    // The dispatch text is host code spliced into the emitted program — zig
+    // gets a `switch` prong table; cs gets the semantically identical
+    // if/else-if chain (first match wins, same contract). C# pattern syntax
+    // would carry `and`/`when` words that the host-text lowerer rewrites; the
+    // chain needs neither.
+    const host_is_cs = std.mem.eql(u8, CompilerEnv.lang, "cs");
+
+    // Site-unique name for the dispatched value, so nested switches do not shadow
+    // each other's binding.
+    const value_name = std.fmt.allocPrint(allocator, "__koru_switch_value_{d}_{d}", .{ flow.location.line, flow.location.column }) catch unreachable;
+
+    var dispatch = std.ArrayList(u8){};
+    appendSwitchHead(allocator, &dispatch, value_expr, value_name, host_is_cs);
+
+    var nomatch_idx: ?usize = null;
+    var first_arm = true;
+    for (conts, 0..) |c, i| {
+        const name = c.branch;
+        if (std.mem.eql(u8, name, "no-match")) {
+            nomatch_idx = i;
+            continue;
+        }
+
+        // Every non-`no-match` branch IS a pattern. The parser stored the INNER
+        // content of the backtick string as the branch name.
+        if (name.len == 0) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU167, flow.location, flow.module, "std/switch:char: empty branch pattern", .{}) } };
+        }
+        if (name.len == 3 and name[1] == '-' and name[0] > name[2]) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU167, flow.location, flow.module, "std/switch:char: invalid range `{s}` (low > high)", .{name}) } };
+        }
+
+        if (host_is_cs) {
+            appendCsArm(allocator, &dispatch, name, i, value_name, &first_arm);
+            continue;
+        }
+
+        if (name.len == 3 and name[1] == '-') {
+            // Range: a-z  (inclusive both ends)
+            const lo = name[0];
+            const hi = name[2];
+            const lo_lit = charLiteral(allocator, lo);
+            const hi_lit = charLiteral(allocator, hi);
+            const range = std.fmt.allocPrint(allocator, "{s}...{s}", .{ lo_lit, hi_lit }) catch unreachable;
+            dispatch.appendSlice(allocator, range) catch unreachable;
+        } else if (name.len == 1) {
+            // Single char
+            const lit = charLiteral(allocator, name[0]);
+            dispatch.appendSlice(allocator, lit) catch unreachable;
+        } else {
+            // Set: each char is a separate value
+            for (name, 0..) |ch, k| {
+                if (k > 0) dispatch.appendSlice(allocator, ", ") catch unreachable;
+                const lit = charLiteral(allocator, ch);
+                dispatch.appendSlice(allocator, lit) catch unreachable;
+            }
+        }
+
+        // Arm body: hand off to the branch's continuation, passing the matched
+        // char as the payload. `__koru_inline_<i>` resolves to `{ const <binding>
+        // = <arg>; <body> }` in statement context.
+        const arm = std.fmt.allocPrint(allocator, " => __koru_inline_{d}({s}), ", .{ i, value_name }) catch unreachable;
+        dispatch.appendSlice(allocator, arm) catch unreachable;
+    }
+
+    // Zig switch requires an else prong. Route to the `no-match` continuation if
+    // the user supplied one, otherwise fall through with an empty else.
+    if (host_is_cs) {
+        appendCsTail(allocator, &dispatch, nomatch_idx, first_arm);
+    } else {
+        if (nomatch_idx) |ni| {
+            const tail = std.fmt.allocPrint(allocator, "else => __koru_continue_{d}, ", .{ni}) catch unreachable;
+            dispatch.appendSlice(allocator, tail) catch unreachable;
+        } else {
+            dispatch.appendSlice(allocator, "else => {}, ") catch unreachable;
+        }
+        dispatch.appendSlice(allocator, "} }") catch unreachable;
+    }
+
+    // Rebuild the flow: same invocation marked @pass_ran (so it isn't
+    // re-transformed), inline_body = the dispatch, continuations kept.
+    const new_marks = allocator.alloc([]const u8, flow.inv().marks.len + 1) catch unreachable;
+    for (flow.inv().marks, 0..) |m, k| new_marks[k] = m;
+    new_marks[flow.inv().marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_inv = ast.Invocation{
+        .path = flow.inv().path,
+        .args = flow.inv().args,
+        .annotations = flow.inv().annotations,
+        .marks = new_marks,
+        .inserted_by_tap = flow.inv().inserted_by_tap,
+        .from_opaque_tap = flow.inv().from_opaque_tap,
+    };
+
+    var new_flow = flow.*;
+    new_flow.body = ast.rootSite(new_inv, flow.body.continuations, flow.location);
+    new_flow.inline_body = dispatch.toOwnedSlice(allocator) catch unreachable;
+
+    return .{ .transformed = .{ .replacement = ast.Item{ .flow = new_flow } } };
+}
+
+~part emit

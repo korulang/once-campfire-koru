@@ -1,0 +1,143 @@
+// std/string — C# implementation facet.
+//
+// Events are declared in the `string.kz` companion (merged at import, because
+// same-stem facets are one module). This file holds only the `|cs` proc bodies
+// — the `string.kjs` twin for the K# target.
+//
+// THE REPRESENTATION matches the JS facet, not the Zig struct:
+//
+//   Zig                          C#
+//   ---------------------------  --------------------------------
+//   *String                      new __KoruBox { data = <string> }
+//   []const u8 / []u8            a string (System.String)
+//   allocator                    absent — GC is the implementation
+//
+// The handle is a `__KoruBox` (the emitter's mutable carrier class) with a
+// `data` field because the declarative tors (`~read -> s.data`, `~take -> s`)
+// emit `s.data` verbatim on every host — `s` arrives as `dynamic`, so member
+// access resolves at runtime against whatever shape the creator produced.
+// NOT an anonymous object: C# anonymous members are read-only, and
+// `append`/`clear`/`pop-char` reassign the FIELD (s.data = …) — handle
+// identity survives the write, as `take`/`release` rely on.
+//
+// The allocator is gone and so is every error arm that reported its failure:
+// `| err "allocation failed"` is unreachable here. The arm stays in the
+// contract because the Zig facet needs it; the C# bodies simply never take it.
+//
+// KNOWN PORT GAP: the declarative `~len -> s.data.len` emits `s.data.len`
+// verbatim, which binds at RUNTIME (dynamic) and throws
+// RuntimeBinderException if invoked — System.String spells it `.Length`.
+// Compiles because the binder check is deferred; fails loudly if called.
+
+// ============================================
+// Creation
+// ============================================
+
+// The `allocator` parameter is part of the contract for the Zig facet's sake
+// and is ignored here.
+~proc new|cs {
+    return new Output { tag = "ok", ok = new __KoruBox { data = text } };
+}
+
+~proc from-page|cs {
+    return new Output { tag = "ok", ok = new __KoruBox { data = text } };
+}
+
+// ============================================
+// Cleanup
+// ============================================
+
+~proc free|cs {
+    // GC is the implementation. There is no allocator to hand the bytes back
+    // to, so the honest body is empty — this is a port, not a stub.
+}
+
+// ============================================
+// Query / transform
+// ============================================
+
+// Zig's `std.fmt.parseInt(i64, _, 10)` is strict: optional sign, then base-10
+// digits, nothing else. `long.Parse` is not (it takes whitespace and culture
+// baggage), so the shape is pinned by the regex before the conversion runs —
+// the |js discipline, ported.
+~proc parse-int|cs {
+    if (!global::System.Text.RegularExpressions.Regex.IsMatch(s.data, "^[+-]?[0-9]+$")) {
+        return new Output { tag = "err", err = "not an integer" };
+    }
+    return new Output { tag = "ok", ok = long.Parse(s.data) };
+}
+
+~proc from-int|cs {
+    return new Output { tag = "ok", ok = new __KoruBox { data = "" + n } };
+}
+
+~proc contains|cs {
+    if (s.data.Contains(needle)) {
+        return new Output { tag = "yes" };
+    }
+    return new Output { tag = "no" };
+}
+
+~proc index-of|cs {
+    var idx = s.data.IndexOf(needle);
+    if (idx >= 0) {
+        return new Output { tag = "found", found = idx };
+    }
+    return new Output { tag = "not-found" };
+}
+
+// A fresh handle, not a view into `s` — `Substring` copies, matching the Zig
+// facet's `alloc` + `@memcpy`. (js `slice(start, end)` is end-exclusive, so
+// the length argument is `end - start`.)
+~proc substring|cs {
+    if (start > end || end > s.data.Length) {
+        return new Output { tag = "err", err = "range out of bounds" };
+    }
+    return new Output { tag = "ok", ok = new __KoruBox { data = s.data.Substring(start, end - start) } };
+}
+
+// ============================================
+// Split — effect-stream over separated pieces
+// ============================================
+
+// `String.Split` on a non-empty separator matches `std.mem.splitSequence`
+// piece for piece, including the empty pieces at the ends. The
+// empty-separator guard mirrors the Zig facet's: one piece, the whole slice.
+~proc split|cs {
+    if (sep.Length == 0) {
+        piece(s);
+        return new Output { tag = "done", done = 1 };
+    }
+    var parts = s.Split(sep);
+    foreach (var p in parts) {
+        piece(p);
+    }
+    return new Output { tag = "done", done = parts.Length };
+}
+
+// ============================================
+// Write operations
+// ============================================
+
+~proc append|cs {
+    s.data = s.data + text;
+    return new Output { tag = "ok" };
+}
+
+// `ch` is a byte, not a one-character string — 610_022 calls
+// `append-char(s, ch: 99)`. The Zig facet stores the byte; the C# facet
+// stores the character that byte denotes (string + char concatenates).
+~proc append-char|cs {
+    s.data = s.data + (char)ch;
+    return new Output { tag = "ok" };
+}
+
+~proc pop-char|cs {
+    if (s.data.Length > 0) {
+        s.data = s.data.Substring(0, s.data.Length - 1);
+    }
+}
+
+~proc clear|cs {
+    s.data = "";
+}

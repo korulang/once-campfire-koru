@@ -1,0 +1,152 @@
+// Koru Standard Library: the `runcached` part of interpreter — the cached
+// fast path. Joined via `~part runcached` in interpreter.kz; merged into
+// the interpreter module at load.
+//
+// `run-cached` reuses a parsed flow for identical source input — the same
+// contract as `run`, minus the parse.
+
+~[retain]pub tor run-cached {
+    source: string,
+    dispatcher: DispatchFn,
+    cost_fn: ?CostFn,  // Optional cost lookup (null = default cost 1)
+    creates_obligations_fn: ?ObligationsArrayFn,   // tor -> []obligations it creates
+    discharges_obligations_fn: ?ObligationsArrayFn, // tor -> []obligations it discharges
+    discharge_event_fn: ?DischargeEventFn,         // obligation -> tor that discharges it
+    creates_spec_fn: ?CreatesSpecFn = null,        // tor -> []CreateSpec with field names
+    discharges_spec_fn: ?DischargesSpecFn = null,  // tor -> []DischargeSpec with arg names
+    budget: ?u64,  // Optional budget limit (null = unlimited)
+    handle_pool: ?*HandlePool,  // Optional external pool (for bridges)
+    fail_fast: bool = true,
+    scope_name: string = "default",  // Scope name for handle isolation
+    auto_discharge: bool = true,  // Auto-discharge undischarged handles at end
+    defined: ?*DefinedFlows = null, input_fn: ?InputLookupFn = null,  // REPL define; tor -> declared input fields
+    lenient: bool = false,  // 430_056: under-handling hands back `unhandled-branch`
+    host_dispatch: ?HostDispatchFn = null,
+    session_env: ?*Environment = null,
+    session_bind_fn: ?SessionBindFn = null,
+    session_bind_env: ?*Environment = null,
+    session_bind_counter: ?*u64 = null
+}
+| result { value: Value, used: u64, handles: u32, bound: string, trace: string }
+| unhandled-branch { branch: string, payload: string, handles: string }
+| exhausted { used: u64, last_event: string, handles: u32 }
+| parse-error { message: string, line: u32, column: u32 }
+| validation-error string
+| dispatch-error { event_name: string, message: string, trace: string }
+
+// Cached fast path: reuse parsed flow when the source string matches.
+// Falls back to the full parser if parsing fails.
+~proc run-cached|zig {
+    if (findHostTilde(source)) |t| {
+        return .{ .parse_error = .{
+            .message = "`~` is not legal in interpreter source. It switches a host-embedded file (.kz/.kjs) from the host language into Koru; interpreter source is already pure Koru, so it marks nothing. Drop it: write `open(path: \"x\")`, not `~open(path: \"x\")`.",
+            .line = t.line,
+            .column = t.column,
+        }};
+    }
+
+    const allocator = InterpreterThreadState.prepare();
+    const cached_flow = InterpreterFlowCache.getOrParse(source) orelse switch (freshFlow(allocator, source, fail_fast)) {
+        .flow => |f| f,
+        .err => |e| return .{ .parse_error = .{
+            .message = e.message, .line = e.line, .column = e.column,
+        } },
+    };
+
+    if (validateFlow(cached_flow, allocator, input_fn, defined, session_env)) |validation_err| {
+        return .{ .validation_error = std.heap.page_allocator.dupe(u8, validation_err.message) catch "validation error" };
+    }
+
+    const env = &InterpreterThreadState.env;
+    const expr_bindings = &InterpreterThreadState.expr_bindings;
+
+    // Seed the session's durable bindings into this run's env — the wire's
+    // `r3.user_id` on turn 9 names a value a turn 4 call bound. Session
+    // values were copied into session memory at bind time, so a shallow
+    // transplant is safe: the arena reset cannot reach them.
+    if (session_env) |se| {
+        var sit = se.bindings.iterator();
+        while (sit.next()) |e| env.bind(e.key_ptr.*, e.value_ptr.*) catch {};
+    }
+
+    var budget_state = BudgetState.init(budget);
+
+    const using_external_pool = handle_pool != null;
+    var local_pool = if (handle_pool == null) HandlePool.init(allocator) else undefined;
+    defer if (!using_external_pool) local_pool.deinit();
+    const active_pool: *HandlePool = if (handle_pool) |ext| ext else &local_pool;
+
+    var ctx = InterpreterContext{
+        .env = env,
+        .expr_bindings = expr_bindings,
+        .allocator = allocator,
+        .dispatcher = dispatcher,
+        .cost_fn = cost_fn,
+        .creates_obligations_fn = creates_obligations_fn,
+        .discharges_obligations_fn = discharges_obligations_fn,
+        .discharge_event_fn = discharge_event_fn,
+        .creates_spec_fn = creates_spec_fn,
+        .discharges_spec_fn = discharges_spec_fn,
+        .budget = &budget_state,
+        .handle_pool = active_pool,
+        .scope_name = scope_name,
+        .defined = defined,
+        .input_fn = input_fn,
+        .host_dispatch = host_dispatch,
+        .session_env = session_env,
+        .session_bind_fn = session_bind_fn,
+        .session_bind_env = session_bind_env,
+        .session_bind_counter = session_bind_counter,
+        .unhandled_outcome = null,
+    };
+
+    const result_value = executeFlow(cached_flow, &ctx) catch |err| {
+        if (err == error.BudgetExhausted) {
+            autoDischargeHandles(
+                auto_discharge,
+                using_external_pool,
+                active_pool,
+                discharges_spec_fn,
+                dispatcher,
+                allocator,
+            );
+            const stable_last_event = std.heap.page_allocator.dupe(u8, budget_state.last_event) catch budget_state.last_event;
+            return .{ .exhausted = .{
+                .used = budget_state.used,
+                .last_event = stable_last_event,
+                .handles = @intCast(active_pool.countUndischarged()),
+            }};
+        }
+        return .{ .dispatch_error = .{
+            .event_name = ctx.failing_event_name orelse persistentEventName(cached_flow.inv()),
+            .message = ctx.error_detail orelse @errorName(err),
+            .trace = renderTrace(&ctx.trace, allocator),
+        }};
+    };
+
+    // Under-handled fragment: hand back (430_056, same shape as run above).
+    if (ctx.unhandled_outcome) |u| {
+        if (!lenient) {
+            return .{ .dispatch_error = .{
+                .event_name = ctx.failing_event_name orelse persistentEventName(cached_flow.inv()),
+                .message = "NoBranchMatch",
+                .trace = renderTrace(&ctx.trace, allocator),
+            } };
+        }
+        return .{ .unhandled_branch = .{
+            .branch = u.branch,
+            .payload = u.toJsonBuf(),
+            .handles = renderHeldHandles(active_pool),
+        } };
+    }
+
+    const stable_value = result_value.clonePersistent();
+    return .{ .result = .{
+        .value = stable_value,
+        .used = budget_state.used,
+        .handles = @intCast(active_pool.countUndischarged()),
+        .bound = lastBound(&ctx.trace),
+        .trace = renderTrace(&ctx.trace, allocator),
+    }};
+}
+

@@ -1,0 +1,116 @@
+// Koru Standard Library: the `bulkemit` part of store.kz.
+// Joined via `~part bulkemit` in store.kz; merged into the module at load.
+//
+// The bulk-append emit half — token scanners, the insert-field match, and
+// the host text itself. Zig and C# (`emit`/`emitCs`); the caller gates
+// `host_is_js`, and C# declines indexed stores in `match` (the index join
+// is Zig-only).
+// ------------------------------------------------------------------
+const BulkEmit = struct {
+    const ast = @import("ast");
+    const struct_literal = @import("struct_literal");
+    const codegen_utils = @import("codegen_utils");
+
+    /// A masked-token occurrence — `word` at an identifier boundary on
+    /// both sides, in code position (strings/comments masked; `_` is an
+    /// identifier char, so `__koru_store_marks` cannot hit `marks`).
+    fn tokenIn(alloc: std.mem.Allocator, t: []const u8, word: []const u8) bool {
+        const mask = ast.expressionMask(alloc, t);
+        var i: usize = 0;
+        while (i + word.len <= t.len) : (i += 1) {
+            if (!mask[i] or !ast.identBoundaryBefore(t, i)) continue;
+            if (!std.mem.startsWith(u8, t[i..], word)) continue;
+            const end = i + word.len;
+            if (end == t.len or !Gate.isIdentCh(t[end])) return true;
+        }
+        return false;
+    }
+
+    /// Is `word` REFERENCED in `t` — a real use of the each-binding,
+    /// not a token hit. Excludes `.word` (member access — `..word` in
+    /// `0..i` stays a use) and `word:` (struct-literal key). Both
+    /// directions must be right: an emitted `const i` nobody uses is a
+    /// Zig error, and so is a dropped `const i` a field expr reads.
+    /// Expression text only — field values cannot declare a local.
+    fn useOf(alloc: std.mem.Allocator, t: []const u8, word: []const u8) bool {
+        const mask = ast.expressionMask(alloc, t);
+        var i: usize = 0;
+        while (i + word.len <= t.len) : (i += 1) {
+            if (!mask[i] or !ast.identBoundaryBefore(t, i)) continue;
+            if (!std.mem.startsWith(u8, t[i..], word)) continue;
+            const end = i + word.len;
+            if (end < t.len and Gate.isIdentCh(t[end])) continue;
+            if (i > 0 and t[i - 1] == '.' and (i < 2 or t[i - 2] != '.')) continue;
+            var k = end;
+            while (k < t.len and (t[k] == ' ' or t[k] == '\t')) k += 1;
+            if (k < t.len and t[k] == ':') continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// The each arm's single node is a `std/store:insert` on THIS store
+    /// with the complete flat field list and zero continuations — a
+    /// `| row`, `| full`, or piped next step declines. Field order is
+    /// `storeInsertOrder`, the same list the insert transform reads.
+    fn insertFields(alloc: std.mem.Allocator, prog: *const ast.Program, each: *const ast.Continuation, store: []const u8) ?[]const struct_literal.StructField {
+        if (each.continuations.len != 0) return null;
+        if (each.condition != null or each.is_catchall) return null;
+        if (each.destructure.len != 0) return null;
+        if (each.node == null) return null;
+        const n: *const ast.Node = &each.node.?;
+        if (n.* != .invocation) return null;
+        const iv = &n.invocation;
+        const door = SX.isStoreDoor(iv) orelse return null;
+        if (!std.mem.eql(u8, door, "insert")) return null;
+        if (iv.variant != null or iv.return_binding != null or iv.return_destructure.len != 0 or
+            iv.inline_body != null or iv.preamble_code != null) return null;
+        var expr: ?[]const u8 = null;
+        var src: ?[]const u8 = null;
+        for (iv.args) |a| {
+            if (std.mem.eql(u8, a.name, "expr")) {
+                expr = a.value;
+                continue;
+            }
+            if (std.mem.eql(u8, a.name, "source")) {
+                src = a.value;
+                continue;
+            }
+            return null;
+        }
+        if (!std.mem.eql(u8, storeStripQuotes(expr orelse return null), store)) return null;
+        const order = storeInsertOrder(alloc, prog, store) orelse return null;
+        // A one-column identity store takes a bare value, not a field
+        // block — a different shape this lowering does not emit.
+        if (order.len == 1 and std.mem.eql(u8, order[0], ast.STORE_IDENTITY_COLUMN)) return null;
+        const braced = std.fmt.allocPrint(alloc, "{{{s}}}", .{src orelse return null}) catch unreachable;
+        const flds = struct_literal.parseFields(alloc, braced) catch return null;
+        if (flds.len != order.len) return null;
+        for (flds) |f| {
+            // Proto leaf writes (`left.health:`) and any column the
+            // block does not name decline — the check is set equality
+            // against the insert order, so a missing/extra name fails.
+            if (std.mem.indexOfScalar(u8, f.name, '.') != null) return null;
+            var hit = false;
+            for (order) |col| {
+                if (std.mem.eql(u8, f.name, col)) hit = true;
+            }
+            if (!hit) return null;
+            // The value must not observe the store mid-fill nor reach
+            // a door — masked-token scans, conservative on unparseable.
+            if (tokenIn(alloc, f.value, store)) return null;
+            for ([_][]const u8{ "insert", "take", "clear", "std" }) |bad| {
+                if (tokenIn(alloc, f.value, bad)) return null;
+            }
+            if (std.mem.indexOf(u8, f.value, "__koru_") != null) return null;
+        }
+        return flds;
+    }
+
+    fn annotate(alloc: std.mem.Allocator, iv: *ast.Invocation) void {
+        const anns = alloc.alloc([]const u8, iv.marks.len + 1) catch unreachable;
+        @memcpy(anns[0..iv.marks.len], iv.marks);
+        anns[iv.marks.len] = "@pass_ran(\"transform\")";
+        iv.marks = anns;
+    }
+};

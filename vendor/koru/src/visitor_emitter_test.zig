@@ -1,0 +1,538 @@
+const std = @import("std");
+const testing = std.testing;
+const ast = @import("ast");
+const emitter_helpers = @import("emitter_helpers");
+const VisitorEmitter = @import("visitor_emitter").VisitorEmitter;
+const tap_registry_module = @import("tap_registry");
+const type_registry_module = @import("type_registry");
+
+// ============================================================================
+// VISITOR-BASED ORCHESTRATION TESTS
+// These test the high-level visitor that orchestrates emission
+// ============================================================================
+
+test "visitor emits only user code, not compiler infrastructure" {
+    // This is the KEY test - the whole reason for this refactor
+    // Given an AST with:
+    // - compiler.emit.zig event (with [compiler] annotation)
+    // - user's hello event (without annotation)
+    //
+    // Should emit ONLY the user code (hello event)
+    // Should NOT emit compiler.* items
+
+    // 16 KB, not 4 KB, and the number has a reason. This emitter writes the
+    // program PREAMBLE — the allocator spine and the leak check — before it
+    // writes anything this test is about, and that preamble measured 2,965
+    // bytes before `koru_leak_check` was extracted into it. At 4,096 the
+    // headroom over scaffolding nobody here is asserting on was under a third,
+    // and adding ten lines to the preamble broke a test about EVENT ORDERING
+    // with `error.BufferOverflow` — a failure that names neither the preamble
+    // nor the size. A fixed buffer sized just above today's output turns every
+    // future preamble line into an unrelated-looking red.
+    var buffer: [16384]u8 = undefined;
+    var code_emitter = emitter_helpers.CodeEmitter.init(&buffer);
+
+    // Create compiler event with [compiler] annotation
+    var compiler_input_fields = [_]ast.Field{
+        .{ .name = "ast", .type = "ProgramAST", .is_file = false, .is_embed_file = false, .is_source = false, .phantom = null, .expression = null, .expression_str = null, .owns_expression = false },
+    };
+    var compiler_output_fields = [_]ast.Field{
+        .{ .name = "code", .type = "[]const u8", .is_file = false, .is_embed_file = false, .is_source = false, .phantom = null, .expression = null, .expression_str = null, .owns_expression = false },
+    };
+    var compiler_branches = [_]ast.Branch{
+        .{ .name = "emitted", .payload = .{ .fields = &compiler_output_fields }, .is_optional = false },
+    };
+    const compiler_event = ast.EventDecl{
+        .path = .{ .module_qualifier = null, .segments = @constCast(&[_][]const u8{ "compiler", "emit", "zig" }) },
+        .input = .{ .fields = &compiler_input_fields },
+        .branches = &compiler_branches,
+        .is_public = true,
+        .is_implicit_flow = false,
+        .annotations = @constCast(&[_][]const u8{"compiler"}), // [compiler] annotation
+        .location = .{ .line = 1, .column = 0, .file = "compiler_bootstrap.kz" },
+        .module = "compiler_bootstrap",
+    };
+
+    // Create user event WITHOUT [compiler] annotation
+    var user_fields = [_]ast.Field{};
+    var user_output_fields = [_]ast.Field{};
+    var user_branches = [_]ast.Branch{
+        .{ .name = "done", .payload = .{ .fields = &user_output_fields }, .is_optional = false },
+    };
+    const user_event = ast.EventDecl{
+        .path = .{ .module_qualifier = null, .segments = @constCast(&[_][]const u8{"hello"}) },
+        .input = .{ .fields = &user_fields },
+        .branches = &user_branches,
+        .is_public = true,
+        .is_implicit_flow = false,
+        .annotations = @constCast(&[_][]const u8{}), // NO annotation
+        .location = .{ .line = 1, .column = 0, .file = "input.kz" },
+        .module = "input",
+    };
+
+    // Create AST with both events
+    var items = [_]ast.Item{
+        .{ .event_decl = compiler_event },
+        .{ .event_decl = user_event },
+    };
+    const source_file = ast.Program{
+        .items = &items,
+        .module_annotations = &[_][]const u8{},
+        .allocator = testing.allocator,
+    };
+
+    // Emit using visitor (with empty tap registry and type registry)
+    var tap_registry = tap_registry_module.TapRegistry.init(testing.allocator);
+    defer tap_registry.deinit();
+    var type_registry = type_registry_module.TypeRegistry.init(testing.allocator);
+    defer type_registry.deinit();
+    var visitor_emitter = VisitorEmitter.init(testing.allocator, &code_emitter, &items, &tap_registry, &type_registry, .all);
+    try visitor_emitter.emit(&source_file);
+
+    const output = code_emitter.getOutput();
+
+    // Should contain user event
+    try testing.expect(std.mem.indexOf(u8, output, "hello_event") != null);
+
+    // Should NOT contain compiler event struct (word "compiler" may appear in tap comments)
+    try testing.expect(std.mem.indexOf(u8, output, "compiler_emit_zig_event") == null);
+    try testing.expect(std.mem.indexOf(u8, output, "emit_zig_event") == null);
+}
+
+test "visitor filters out host_lines from compiler_bootstrap module" {
+    // Host lines like "const emitter_lib = @import(\"emitter\");"
+    // that come from compiler_bootstrap.kz should be filtered out
+
+    // 16 KB, not 4 KB, and the number has a reason. This emitter writes the
+    // program PREAMBLE — the allocator spine and the leak check — before it
+    // writes anything this test is about, and that preamble measured 2,965
+    // bytes before `koru_leak_check` was extracted into it. At 4,096 the
+    // headroom over scaffolding nobody here is asserting on was under a third,
+    // and adding ten lines to the preamble broke a test about EVENT ORDERING
+    // with `error.BufferOverflow` — a failure that names neither the preamble
+    // nor the size. A fixed buffer sized just above today's output turns every
+    // future preamble line into an unrelated-looking red.
+    var buffer: [16384]u8 = undefined;
+    var code_emitter = emitter_helpers.CodeEmitter.init(&buffer);
+
+    // Create host_line from compiler_bootstrap (should be filtered)
+    const compiler_host_line = ast.HostLine{
+        .content = "const emitter_lib = @import(\"emitter\");",
+        .location = .{ .line = 10, .column = 0, .file = "compiler_bootstrap.kz" },
+        .module = "compiler_bootstrap",
+    };
+
+    // Create host_line from user code (should be preserved)
+    const user_host_line = ast.HostLine{
+        .content = "const std = @import(\"std\");",
+        .location = .{ .line = 1, .column = 0, .file = "input.kz" },
+        .module = "input",
+    };
+
+    // Create AST with both host lines
+    var items = [_]ast.Item{
+        .{ .host_line = compiler_host_line },
+        .{ .host_line = user_host_line },
+    };
+    const source_file = ast.Program{
+        .items = &items,
+        .module_annotations = &[_][]const u8{},
+        .allocator = testing.allocator,
+    };
+
+    // Emit using visitor (with empty tap registry and type registry)
+    var tap_registry = tap_registry_module.TapRegistry.init(testing.allocator);
+    defer tap_registry.deinit();
+    var type_registry = type_registry_module.TypeRegistry.init(testing.allocator);
+    defer type_registry.deinit();
+    var visitor_emitter = VisitorEmitter.init(testing.allocator, &code_emitter, &items, &tap_registry, &type_registry, .all);
+    try visitor_emitter.emit(&source_file);
+
+    const output = code_emitter.getOutput();
+
+    // Should contain user host_line
+    try testing.expect(std.mem.indexOf(u8, output, "const std = @import(\"std\");") != null);
+
+    // Should NOT contain compiler_bootstrap host_line
+    try testing.expect(std.mem.indexOf(u8, output, "emitter_lib") == null);
+}
+
+test "visitor preserves host_lines from user code" {
+    // Host lines like "const std = @import(\"std\");"
+    // from user's input.kz should be preserved
+
+    // 16 KB, not 4 KB, and the number has a reason. This emitter writes the
+    // program PREAMBLE — the allocator spine and the leak check — before it
+    // writes anything this test is about, and that preamble measured 2,965
+    // bytes before `koru_leak_check` was extracted into it. At 4,096 the
+    // headroom over scaffolding nobody here is asserting on was under a third,
+    // and adding ten lines to the preamble broke a test about EVENT ORDERING
+    // with `error.BufferOverflow` — a failure that names neither the preamble
+    // nor the size. A fixed buffer sized just above today's output turns every
+    // future preamble line into an unrelated-looking red.
+    var buffer: [16384]u8 = undefined;
+    var code_emitter = emitter_helpers.CodeEmitter.init(&buffer);
+
+    // Create multiple host_lines from user code
+    const user_host_line1 = ast.HostLine{
+        .content = "const std = @import(\"std\");",
+        .location = .{ .line = 1, .column = 0, .file = "input.kz" },
+        .module = "input",
+    };
+
+    const user_host_line2 = ast.HostLine{
+        .content = "const my_lib = @import(\"my_lib\");",
+        .location = .{ .line = 2, .column = 0, .file = "input.kz" },
+        .module = "input",
+    };
+
+    // Create AST with user host lines
+    var items = [_]ast.Item{
+        .{ .host_line = user_host_line1 },
+        .{ .host_line = user_host_line2 },
+    };
+    const source_file = ast.Program{
+        .items = &items,
+        .module_annotations = &[_][]const u8{},
+        .allocator = testing.allocator,
+    };
+
+    // Emit using visitor (with empty tap registry and type registry)
+    var tap_registry = tap_registry_module.TapRegistry.init(testing.allocator);
+    defer tap_registry.deinit();
+    var type_registry = type_registry_module.TypeRegistry.init(testing.allocator);
+    defer type_registry.deinit();
+    var visitor_emitter = VisitorEmitter.init(testing.allocator, &code_emitter, &items, &tap_registry, &type_registry, .all);
+    try visitor_emitter.emit(&source_file);
+
+    const output = code_emitter.getOutput();
+
+    // Should contain both user host_lines
+    try testing.expect(std.mem.indexOf(u8, output, "const std = @import(\"std\");") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "const my_lib = @import(\"my_lib\");") != null);
+}
+
+test "visitor emits events in correct order" {
+    // Events should be emitted in the order they appear in user code
+
+    // 16 KB, not 4 KB, and the number has a reason. This emitter writes the
+    // program PREAMBLE — the allocator spine and the leak check — before it
+    // writes anything this test is about, and that preamble measured 2,965
+    // bytes before `koru_leak_check` was extracted into it. At 4,096 the
+    // headroom over scaffolding nobody here is asserting on was under a third,
+    // and adding ten lines to the preamble broke a test about EVENT ORDERING
+    // with `error.BufferOverflow` — a failure that names neither the preamble
+    // nor the size. A fixed buffer sized just above today's output turns every
+    // future preamble line into an unrelated-looking red.
+    var buffer: [16384]u8 = undefined;
+    var code_emitter = emitter_helpers.CodeEmitter.init(&buffer);
+
+    // Create three events in specific order
+    var empty_fields = [_]ast.Field{};
+    var empty_branches = [_]ast.Branch{
+        .{ .name = "done", .payload = .{ .fields = &empty_fields }, .is_optional = false },
+    };
+
+    const event1 = ast.EventDecl{
+        .path = .{ .module_qualifier = null, .segments = @constCast(&[_][]const u8{"first"}) },
+        .input = .{ .fields = &empty_fields },
+        .branches = &empty_branches,
+        .is_public = true,
+        .is_implicit_flow = false,
+        .annotations = @constCast(&[_][]const u8{}),
+        .location = .{ .line = 1, .column = 0, .file = "input.kz" },
+        .module = "input",
+    };
+
+    const event2 = ast.EventDecl{
+        .path = .{ .module_qualifier = null, .segments = @constCast(&[_][]const u8{"second"}) },
+        .input = .{ .fields = &empty_fields },
+        .branches = &empty_branches,
+        .is_public = true,
+        .is_implicit_flow = false,
+        .annotations = @constCast(&[_][]const u8{}),
+        .location = .{ .line = 5, .column = 0, .file = "input.kz" },
+        .module = "input",
+    };
+
+    const event3 = ast.EventDecl{
+        .path = .{ .module_qualifier = null, .segments = @constCast(&[_][]const u8{"third"}) },
+        .input = .{ .fields = &empty_fields },
+        .branches = &empty_branches,
+        .is_public = true,
+        .is_implicit_flow = false,
+        .annotations = @constCast(&[_][]const u8{}),
+        .location = .{ .line = 10, .column = 0, .file = "input.kz" },
+        .module = "input",
+    };
+
+    // Create AST with events in order
+    var items = [_]ast.Item{
+        .{ .event_decl = event1 },
+        .{ .event_decl = event2 },
+        .{ .event_decl = event3 },
+    };
+    const source_file = ast.Program{
+        .items = &items,
+        .module_annotations = &[_][]const u8{},
+        .allocator = testing.allocator,
+    };
+
+    // Emit using visitor (with empty tap registry and type registry)
+    var tap_registry = tap_registry_module.TapRegistry.init(testing.allocator);
+    defer tap_registry.deinit();
+    var type_registry = type_registry_module.TypeRegistry.init(testing.allocator);
+    defer type_registry.deinit();
+    var visitor_emitter = VisitorEmitter.init(testing.allocator, &code_emitter, &items, &tap_registry, &type_registry, .all);
+    try visitor_emitter.emit(&source_file);
+
+    const output = code_emitter.getOutput();
+
+    // Find positions of each event in output
+    const first_pos = std.mem.indexOf(u8, output, "first_event") orelse return error.TestFailed;
+    const second_pos = std.mem.indexOf(u8, output, "second_event") orelse return error.TestFailed;
+    const third_pos = std.mem.indexOf(u8, output, "third_event") orelse return error.TestFailed;
+
+    // Verify they appear in the correct order
+    try testing.expect(first_pos < second_pos);
+    try testing.expect(second_pos < third_pos);
+}
+
+test "visitor handles modules correctly" {
+    // Test that modules are emitted as nested structs
+
+    // TODO: Implement when visitor exists
+    return error.SkipZigTest;
+}
+
+test "visitor handles flows with label loops" {
+    // Test emission of ~#label syntax and @label jumps
+
+    // TODO: Implement when visitor exists
+    return error.SkipZigTest;
+}
+
+test "visitor emits complete valid program" {
+    // End-to-end test: given a simple program AST,
+    // emit complete valid Zig code that compiles
+
+    // 16 KB, not 4 KB, and the number has a reason. This emitter writes the
+    // program PREAMBLE — the allocator spine and the leak check — before it
+    // writes anything this test is about, and that preamble measured 2,965
+    // bytes before `koru_leak_check` was extracted into it. At 4,096 the
+    // headroom over scaffolding nobody here is asserting on was under a third,
+    // and adding ten lines to the preamble broke a test about EVENT ORDERING
+    // with `error.BufferOverflow` — a failure that names neither the preamble
+    // nor the size. A fixed buffer sized just above today's output turns every
+    // future preamble line into an unrelated-looking red.
+    var buffer: [16384]u8 = undefined;
+    var code_emitter = emitter_helpers.CodeEmitter.init(&buffer);
+
+    // Create a simple complete program:
+    // - host_line for imports
+    // - simple event with no inputs
+    const host_line = ast.HostLine{
+        .content = "const std = @import(\"std\");",
+        .location = .{ .line = 1, .column = 0, .file = "input.kz" },
+        .module = "input",
+    };
+
+    var empty_fields = [_]ast.Field{};
+    var branches = [_]ast.Branch{
+        .{ .name = "done", .payload = .{ .fields = &empty_fields }, .is_optional = false },
+    };
+    const simple_event = ast.EventDecl{
+        .path = .{ .module_qualifier = null, .segments = @constCast(&[_][]const u8{"hello"}) },
+        .input = .{ .fields = &empty_fields },
+        .branches = &branches,
+        .is_public = true,
+        .is_implicit_flow = false,
+        .annotations = @constCast(&[_][]const u8{}),
+        .location = .{ .line = 3, .column = 0, .file = "input.kz" },
+        .module = "input",
+    };
+
+    // Create AST
+    var items = [_]ast.Item{
+        .{ .host_line = host_line },
+        .{ .event_decl = simple_event },
+    };
+    const source_file = ast.Program{
+        .items = &items,
+        .module_annotations = &[_][]const u8{},
+        .allocator = testing.allocator,
+    };
+
+    // Emit using visitor (with empty tap registry and type registry)
+    var tap_registry = tap_registry_module.TapRegistry.init(testing.allocator);
+    defer tap_registry.deinit();
+    var type_registry = type_registry_module.TypeRegistry.init(testing.allocator);
+    defer type_registry.deinit();
+    var visitor_emitter = VisitorEmitter.init(testing.allocator, &code_emitter, &items, &tap_registry, &type_registry, .all);
+    try visitor_emitter.emit(&source_file);
+
+    const output = code_emitter.getOutput();
+
+    // Verify output contains expected elements
+    try testing.expect(std.mem.indexOf(u8, output, "const std = @import(\"std\");") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "hello_event") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "done") != null);
+}
+
+// ============================================================================
+// CodeEmitter.writeZigStringLiteral
+// Annotations like `build("cortex_m4")` and other user-supplied strings get
+// embedded into generated Zig string literals; quotes/backslashes/control
+// chars must be escaped or the emitted Zig fails to parse.
+// ============================================================================
+
+test "writeZigStringLiteral: plain ascii passes through" {
+    var buffer: [128]u8 = undefined;
+    var ce = emitter_helpers.CodeEmitter.init(&buffer);
+    try ce.writeZigStringLiteral("hello");
+    try testing.expectEqualStrings("\"hello\"", ce.getOutput());
+}
+
+test "writeZigStringLiteral: escapes inner double quotes" {
+    var buffer: [128]u8 = undefined;
+    var ce = emitter_helpers.CodeEmitter.init(&buffer);
+    try ce.writeZigStringLiteral("build(\"cortex_m4\")");
+    try testing.expectEqualStrings("\"build(\\\"cortex_m4\\\")\"", ce.getOutput());
+}
+
+test "writeZigStringLiteral: escapes backslash and control chars" {
+    var buffer: [128]u8 = undefined;
+    var ce = emitter_helpers.CodeEmitter.init(&buffer);
+    try ce.writeZigStringLiteral("a\\b\nc\rd\te");
+    try testing.expectEqualStrings("\"a\\\\b\\nc\\rd\\te\"", ce.getOutput());
+}
+
+test "writeZigStringLiteral: empty string" {
+    var buffer: [16]u8 = undefined;
+    var ce = emitter_helpers.CodeEmitter.init(&buffer);
+    try ce.writeZigStringLiteral("");
+    try testing.expectEqualStrings("\"\"", ce.getOutput());
+}
+
+// ============================================================================
+// AST-TYPE PREFIXING — the alias decides, and it should not
+// ============================================================================
+//
+// `writeFieldType` rewrites bare AST type names to `__koru_ast.<Type>`, and
+// skips the rewrite when the text already contains "ast." — a SUBSTRING test,
+// not a check of what the module was actually imported as. So the rewrite is
+// governed by the spelling of the caller's alias:
+//
+//     const ast     = @import("ast");   ->  "ast.Flow"      untouched, compiles
+//     const ast_mod = @import("ast");   ->  "ast_mod.Flow"  becomes
+//                                          "ast_mod.__koru_ast.Flow", which does not
+//
+// Both name the same module. `koru_std/runtime.kz` used the second spelling and
+// could not declare a tor returning a Flow until it was renamed to match
+// `interpreter.kz` (2026-08-07). Nothing warns; the failure surfaces as a Zig
+// error in generated code naming a member the ast module does not have.
+//
+// Both tests below pin CURRENT behaviour, so the trap is visible and a fix has
+// to come here and say so. The second one is the defect.
+
+test "writeFieldType: an `ast`-spelled alias is left alone" {
+    var buffer: [256]u8 = undefined;
+    var ce = emitter_helpers.CodeEmitter.init(&buffer);
+    const field = ast.Field{ .name = "flow", .type = "*const ast.Flow" };
+    try emitter_helpers.writeFieldType(&ce, field, null);
+    try testing.expectEqualStrings("*const ast.Flow", ce.getOutput());
+}
+
+test "writeFieldType: any other alias for the same module is mangled" {
+    // Documents the defect rather than endorsing it — see the block comment.
+    var buffer: [256]u8 = undefined;
+    var ce = emitter_helpers.CodeEmitter.init(&buffer);
+    const field = ast.Field{ .name = "flow", .type = "*const ast_mod.Flow" };
+    try emitter_helpers.writeFieldType(&ce, field, null);
+    try testing.expectEqualStrings("*const ast_mod.__koru_ast.Flow", ce.getOutput());
+}
+
+test "writeFieldType: a bare host type qualifies to its declaring module" {
+    var homes = type_registry_module.HostTypeHomes.init(testing.allocator);
+    defer homes.deinit();
+    try homes.put("Token", "app.holder");
+    emitter_helpers.host_type_homes = &homes;
+    defer emitter_helpers.host_type_homes = null;
+
+    var buffer: [256]u8 = undefined;
+    var ce = emitter_helpers.CodeEmitter.init(&buffer);
+    const field = ast.Field{ .name = "t", .type = "*Token" };
+    try emitter_helpers.writeFieldType(&ce, field, null);
+    try testing.expectEqualStrings("*koru_app.koru_holder.Token", ce.getOutput());
+}
+
+test "writeFieldType: a top-level host type stays bare" {
+    var homes = type_registry_module.HostTypeHomes.init(testing.allocator);
+    defer homes.deinit();
+    try homes.put("Token", "");
+    emitter_helpers.host_type_homes = &homes;
+    defer emitter_helpers.host_type_homes = null;
+
+    var buffer: [256]u8 = undefined;
+    var ce = emitter_helpers.CodeEmitter.init(&buffer);
+    const field = ast.Field{ .name = "t", .type = "*Token" };
+    try emitter_helpers.writeFieldType(&ce, field, null);
+    try testing.expectEqualStrings("*Token", ce.getOutput());
+}
+
+test "writeFieldType: module-local bare resolves to the WRITING module, not the first-wins home" {
+    // The yyjson repro as a unit: two providers of `Value`; the homes map's
+    // first-wins winner is the module collected first (interpreter). The
+    // writer (yyjson) declares the name itself, so its bare `*Value` must emit
+    // against ITS OWN declaration — import order must not rewrite a bystander
+    // module's signatures.
+    var homes = type_registry_module.HostTypeHomes.init(testing.allocator);
+    defer homes.deinit();
+    try homes.put("Value", "std.interpreter");
+    emitter_helpers.host_type_homes = &homes;
+    defer emitter_helpers.host_type_homes = null;
+
+    var sites = type_registry_module.HostTypeDeclSites.init(testing.allocator);
+    defer type_registry_module.deinitHostTypeDeclSites(testing.allocator, &sites);
+    for ([_][]const u8{ "std.interpreter", "koru.yyjson" }) |mod| {
+        const gop = try sites.getOrPut("Value");
+        if (!gop.found_existing) gop.value_ptr.* = try std.ArrayList([]const u8).initCapacity(testing.allocator, 0);
+        try gop.value_ptr.append(testing.allocator, mod);
+    }
+    emitter_helpers.host_type_decl_sites = &sites;
+    defer emitter_helpers.host_type_decl_sites = null;
+    emitter_helpers.current_writer_module = "koru.yyjson";
+    defer emitter_helpers.current_writer_module = null;
+
+    var buffer: [256]u8 = undefined;
+    var ce = emitter_helpers.CodeEmitter.init(&buffer);
+    const field = ast.Field{ .name = "doc", .type = "*Value" };
+    try emitter_helpers.writeFieldType(&ce, field, null);
+    try testing.expectEqualStrings("*koru_koru.koru_yyjson.Value", ce.getOutput());
+}
+
+test "writeFieldType: a top-level writer's own declaration keeps the bare spelling" {
+    // Top level declares `Token` AND a module does: the top-level spelling
+    // wins a collision, and the top-level writer emits bare (file scope).
+    var homes = type_registry_module.HostTypeHomes.init(testing.allocator);
+    defer homes.deinit();
+    try homes.put("Token", "");
+    emitter_helpers.host_type_homes = &homes;
+    defer emitter_helpers.host_type_homes = null;
+
+    var sites = type_registry_module.HostTypeDeclSites.init(testing.allocator);
+    defer type_registry_module.deinitHostTypeDeclSites(testing.allocator, &sites);
+    for ([_][]const u8{ "", "app.holder" }) |mod| {
+        const gop = try sites.getOrPut("Token");
+        if (!gop.found_existing) gop.value_ptr.* = try std.ArrayList([]const u8).initCapacity(testing.allocator, 0);
+        try gop.value_ptr.append(testing.allocator, mod);
+    }
+    emitter_helpers.host_type_decl_sites = &sites;
+    defer emitter_helpers.host_type_decl_sites = null;
+
+    var buffer: [256]u8 = undefined;
+    var ce = emitter_helpers.CodeEmitter.init(&buffer);
+    const field = ast.Field{ .name = "t", .type = "*Token" };
+    try emitter_helpers.writeFieldType(&ce, field, null);
+    try testing.expectEqualStrings("*Token", ce.getOutput());
+}

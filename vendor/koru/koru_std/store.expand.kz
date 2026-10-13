@@ -1,0 +1,130 @@
+// Koru Standard Library: compound-expansion machinery — joined via
+// `~part expand` in store.kz; members land in koru_store.
+//
+// ProtoExpander does the recursive flatten of a compound seed member
+// into leaf columns (with `<:` parents merged ahead of the block) and
+// records each leaf's provenance for insert's facet guards and the
+// explainer's enforcement row. MemberRef/TermRef stay in store.leaf.kz.
+
+const StoreExpand = struct {
+    const ast = @import("ast");
+    const ast_functional = @import("ast_functional");
+    const struct_literal = @import("struct_literal");
+
+    // A leaf column's provenance: which proto field it expands. `insert`'s
+    // facet guards and the explainer's enforcement row both read this —
+    // the column `left.health` IS `Limb.health`, so `std/refine(Limb)`
+    // bounds on `health` are this column's contract.
+    const ColProv = struct { col: []const u8, proto: []const u8, field: []const u8, scope: []const u8 };
+    const ProtoParent = struct { proto: []const u8, scope: []const u8 };
+    const ProtoExpander = struct {
+        const FlatFields = struct {
+            names: [][]const u8,
+            types: [][]const u8,
+            scope: []const u8,
+        };
+        fn getFlat(alloc: std.mem.Allocator, prog: *const ast.Program, ftype: []const u8, scope_home: []const u8) ?FlatFields {
+            var ext_stack = std.ArrayList([]const u8).initCapacity(alloc, 4) catch unreachable;
+            return getFlatInner(alloc, prog, ftype, scope_home, &ext_stack);
+        }
+        /// A live `<:` decl's `text` carries only its LOCAL fields — the
+        /// parents' sets union ahead of them (markers arrive already flat).
+        /// `ext_stack` guards the walk: an ungated `A <: B / B <: A` pair
+        /// truncates instead of hanging — the declaration gate owns the loud
+        /// refusal; this walk just never loops.
+        fn getFlatInner(alloc: std.mem.Allocator, prog: *const ast.Program, ftype: []const u8, scope_home: []const u8, ext_stack: *std.ArrayList([]const u8)) ?FlatFields {
+            const member = SL.MemberRef.fieldsOf(prog, ftype, scope_home) orelse return null;
+            var names = std.ArrayList([]const u8).initCapacity(alloc, 4) catch unreachable;
+            var types = std.ArrayList([]const u8).initCapacity(alloc, 4) catch unreachable;
+            if (member.parents) |spec| {
+                const want = SL.TermRef.bareName(ftype);
+                var on_stack = false;
+                for (ext_stack.items) |s| {
+                    if (std.mem.eql(u8, s, want)) {
+                        on_stack = true;
+                        break;
+                    }
+                }
+                if (!on_stack) {
+                    ext_stack.append(alloc, want) catch unreachable;
+                    var ptoks = std.mem.tokenizeScalar(u8, spec, '+');
+                    while (ptoks.next()) |praw| {
+                        const psub = getFlatInner(alloc, prog, std.mem.trim(u8, praw, " \t"), member.scope, ext_stack);
+                        if (psub) |ps| {
+                            for (ps.names, ps.types) |pn, pt| {
+                                var dup = false;
+                                for (names.items) |en| {
+                                    if (std.mem.eql(u8, en, pn)) {
+                                        dup = true;
+                                        break;
+                                    }
+                                }
+                                if (!dup) {
+                                    names.append(alloc, pn) catch unreachable;
+                                    types.append(alloc, pt) catch unreachable;
+                                }
+                            }
+                        }
+                    }
+                    _ = ext_stack.pop();
+                }
+            }
+            var toks = std.mem.tokenizeAny(u8, member.text, "\n,");
+            while (toks.next()) |raw| {
+                const seg = std.mem.trim(u8, raw, " \t\r,");
+                if (seg.len == 0) continue;
+                const colon = std.mem.indexOfScalar(u8, seg, ':') orelse continue;
+                const lname = std.mem.trim(u8, seg[0..colon], " \t");
+                const ltype = std.mem.trim(u8, seg[colon + 1 ..], " \t,");
+                if (lname.len > 0 and ltype.len > 0) {
+                    var dup = false;
+                    for (names.items) |en| {
+                        if (std.mem.eql(u8, en, lname)) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (dup) continue;
+                    names.append(alloc, alloc.dupe(u8, lname) catch unreachable) catch unreachable;
+                    types.append(alloc, alloc.dupe(u8, ltype) catch unreachable) catch unreachable;
+                }
+            }
+            return .{ .names = names.toOwnedSlice(alloc) catch unreachable, .types = types.toOwnedSlice(alloc) catch unreachable, .scope = member.scope };
+        }
+        fn leafOut(a: std.mem.Allocator, col: []const u8, ftype: []const u8, fname: []const u8, parent: ?ProtoParent, provs: *std.ArrayList(ColProv), out_fields: *std.ArrayList(struct_literal.StructField)) void {
+            out_fields.append(a, .{ .name = col, .value = ftype }) catch unreachable;
+            if (parent) |p| provs.append(a, .{ .col = col, .proto = p.proto, .field = fname, .scope = p.scope }) catch unreachable;
+        }
+        fn expand(alloc: std.mem.Allocator, prog: *const ast.Program, scope_home: []const u8, prefix: []const u8, fname: []const u8, ftype: []const u8, stack: *std.ArrayList([]const u8), parent: ?ProtoParent, out_fields: *std.ArrayList(struct_literal.StructField), provs: *std.ArrayList(ColProv)) void {
+            const full = if (prefix.len == 0)
+                alloc.dupe(u8, fname) catch unreachable
+            else if (fname.len == 0)
+                alloc.dupe(u8, prefix) catch unreachable
+            else
+                std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, fname }) catch unreachable;
+            const bare = SL.TermRef.bareName(ftype);
+            for (stack.items) |s| {
+                if (std.mem.eql(u8, s, bare)) {
+                    leafOut(alloc, full, ftype, fname, parent, provs, out_fields);
+                    return;
+                }
+            }
+            const maybe_sub = getFlat(alloc, prog, ftype, scope_home);
+            if (maybe_sub == null) {
+                leafOut(alloc, full, ftype, fname, parent, provs, out_fields);
+                return;
+            }
+            const sub = maybe_sub.?;
+            if (sub.names.len == 0) {
+                leafOut(alloc, full, ftype, fname, parent, provs, out_fields);
+                return;
+            }
+            stack.append(alloc, bare) catch unreachable;
+            const inner = if (full.len == 0) "" else std.fmt.allocPrint(alloc, "{s}.", .{full}) catch unreachable;
+            for (sub.names, sub.types) |sn, st| {
+                expand(alloc, prog, scope_home, inner, sn, st, stack, .{ .proto = bare, .scope = sub.scope }, out_fields, provs);
+            }
+            _ = stack.pop();
+        }
+    };
+};

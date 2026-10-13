@@ -1,0 +1,417 @@
+// Koru Standard Library: the host-language facet of refine.k — a same-stem
+// sibling merged by the stem-facet merge on `import std/refine`.
+//
+// The facet grammar and the meet: `name: base & atom…` lines parse into
+// per-field bounds and normalizers (`>N`/`>=N`/`<N`/`<=N`/`==N` are claims a
+// consumer TESTS; `clamp(lo, hi)` is a claim about the representation — the
+// boundary saturates the value into range, and bounds judge the post-clamp
+// result). Sibling blocks and canonical facet_decl nodes fold onto one
+// meet; an empty meet is a loud KORU205 refusal, never last-wins.
+// The transform proc in refine.k is the driver — every helper lives here
+// at module scope.
+const std = @import("std");
+const ast = @import("ast");
+const af = @import("ast_functional");
+
+~part terminal
+~part body
+~part fold
+~part explain
+~part alts
+
+const Bound = struct {
+    value: i64,
+    exclusive: bool,
+    src: []const u8,
+};
+const Clamp = struct {
+    lo: i64,
+    hi: i64,
+    src: []const u8,
+};
+const Field = struct {
+    name: []const u8,
+    base: []const u8,
+    lo: ?Bound = null,
+    hi: ?Bound = null,
+    eq: ?Bound = null,
+    clamp: ?Clamp = null,
+    // Two clamps intersecting to nothing — the disagreeing pair.
+    clamp_conflict: ?[2][]const u8 = null,
+    // Two equalities that disagree — the disagreeing pair. Equality is the
+    // one atom that cannot fold by strength (`==1` and `==2` have no
+    // winner), so like an empty clamp intersection it is RECORDED and
+    // judged by emptyField, never resolved by declaration order.
+    eq_conflict: ?[2][]const u8 = null,
+    // A disjunction's values: ascending, deduplicated. Two sets meet by
+    // intersection — the same rule as everything else here — and a set that
+    // lands on one value IS that equality, which is why the canonical form
+    // is `eq` for a singleton and `alts` for two or more: one lattice
+    // element, two spellings, never both at once.
+    alts: ?[]const i64 = null,
+    // The canonical spelling of `alts` (`*1 | 2 | 3`), kept for the marker
+    // text and for naming a disagreement.
+    alts_src: ?[]const u8 = null,
+    // The value marked `*`. It is not a term any boundary judges — it is
+    // what a boundary that SUPPLIES a value falls back to, so it rides the
+    // facet and is reported, never enforced.
+    alt_default: ?i64 = null,
+    // Two disjunctions intersecting to nothing — the disagreeing pair.
+    alts_conflict: ?[2][]const u8 = null,
+};
+const ProtoField = struct { name: []const u8, base: []const u8 };
+const Op = enum { gt, ge, lt, le, eq };
+const Want = struct { home: []const u8, name: []const u8 };
+
+// The scope owning a declaration flow: the enclosing module's
+// logical name, or the entry module for top-level flows.
+fn scopeOfFlow(prog: *const ast.Program, target: *const ast.Flow) []const u8 {
+    const Finder = struct {
+        fn find(items: []const ast.Item, needle: *const ast.Flow, scope: []const u8) ?[]const u8 {
+            for (items) |*entry| {
+                switch (entry.*) {
+                    .flow => |*f| {
+                        if (f == needle) return scope;
+                    },
+                    .module_decl => |*m| {
+                        if (find(m.items, needle, m.logical_name)) |s| return s;
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        }
+    };
+    return Finder.find(prog.items, target, prog.main_module_name) orelse prog.main_module_name;
+}
+
+fn bareName(value: []const u8) []const u8 {
+    var text = std.mem.trim(u8, value, " \t");
+    if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') {
+        text = text[1 .. text.len - 1];
+    }
+    return std.mem.trim(u8, text, " \t");
+}
+
+fn isProtoDoor(inv: *const ast.Invocation) bool {
+    if (inv.path.segments.len != 1) return false;
+    const verb = inv.path.segments[0];
+    const mq = inv.path.module_qualifier orelse return false;
+    return (std.mem.eql(u8, verb, "default") and
+        (std.mem.eql(u8, mq, "std.proto") or std.mem.eql(u8, mq, "std/proto"))) or
+        (std.mem.eql(u8, verb, "proto") and
+        (std.mem.eql(u8, mq, "std.types") or std.mem.eql(u8, mq, "std/types") or
+        std.mem.eql(u8, mq, "std.proto") or std.mem.eql(u8, mq, "std/proto")));
+}
+
+fn isRefineDoor(inv: *const ast.Invocation) bool {
+    if (inv.path.segments.len != 1) return false;
+    const verb = inv.path.segments[0];
+    const mq = inv.path.module_qualifier orelse return false;
+    return (std.mem.eql(u8, verb, "default") or std.mem.eql(u8, verb, "refine")) and
+        (std.mem.eql(u8, mq, "std.refine") or std.mem.eql(u8, mq, "std/refine"));
+}
+
+fn invName(inv: *const ast.Invocation) []const u8 {
+    if (inv.args.len == 0) return "";
+    return bareName(inv.args[0].value);
+}
+
+// The qualified entry name `home/path:Name` arrives through the
+// named-arg channel — the parser binds `name=home/path`,
+// `value=Name`, `had_explicit_label`. A bare `Name` (or an explicit
+// `expr: Name`) answers to the invocation's own home.
+fn invWant(alloc: std.mem.Allocator, inv: *const ast.Invocation, scope_home: []const u8) Want {
+    var w = Want{ .home = scope_home, .name = invName(inv) };
+    if (inv.args.len > 0) {
+        const a = inv.args[0];
+        if (a.had_explicit_label and a.name.len > 0 and
+            !std.mem.eql(u8, a.name, "expr"))
+        {
+            const dotted = alloc.dupe(u8, a.name) catch unreachable;
+            for (dotted) |*c| {
+                if (c.* == '/') c.* = '.';
+            }
+            w.home = dotted;
+        }
+    }
+    return w;
+}
+
+fn invSource(inv: *const ast.Invocation) []const u8 {
+    for (inv.args) |a| {
+        if (a.source_value) |sv| return sv.text;
+    }
+    return "";
+}
+
+// Parse `name: base & atom…` lines (or comma-joined marker text)
+// into a meet keyed by field name. `strict` refuses loudly on
+// malformed input (this block's own text); contributor text parses
+// leniently — a malformed sibling block is refused by its own
+// transform when it runs.
+fn parseInto(
+    alloc: std.mem.Allocator,
+    rep: ?*koru_std.koru_compiler.ErrorReporter,
+    fl: ?*const ast.Flow,
+    entry_name: []const u8,
+    text: []const u8,
+    fields: *std.ArrayList(Field),
+    strict: bool,
+) ?SiteResult {
+    // Field lines split on newlines and commas — but a comma inside
+    // parens is an argument separator (`clamp(0, 100)`), not a line
+    // break, so the scan tracks depth.
+    var pos: usize = 0;
+    while (pos < text.len) {
+        const start = pos;
+        var depth: usize = 0;
+        while (pos < text.len) : (pos += 1) {
+            const ch = text[pos];
+            if (ch == '(') depth += 1;
+            if (ch == ')') {
+                if (depth > 0) depth -= 1;
+            }
+            if (depth == 0 and (ch == '\n' or ch == ',')) break;
+        }
+        const raw = text[start..pos];
+        if (pos < text.len) pos += 1;
+        const line = std.mem.trim(u8, raw, " \t\r,");
+        if (line.len == 0) continue;
+
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse {
+            if (!strict) continue;
+            return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): field line '{s}' has no ':' — each field must be `name: type [& constraint…]`", .{ entry_name, line }) };
+        };
+        const fname = std.mem.trim(u8, line[0..colon], " \t");
+        const rest = line[colon + 1 ..];
+
+        var segs = std.mem.splitScalar(u8, rest, '&');
+        const base = std.mem.trim(u8, segs.next().?, " \t");
+        if (fname.len == 0 or base.len == 0) {
+            if (!strict) continue;
+            return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): field line '{s}' is missing a name or a type", .{ entry_name, line }) };
+        }
+
+        var idx_opt: ?usize = null;
+        for (fields.items, 0..) |f, i| {
+            if (std.mem.eql(u8, f.name, fname)) {
+                idx_opt = i;
+                break;
+            }
+        }
+        const idx = idx_opt orelse blk: {
+            fields.append(alloc, .{ .name = fname, .base = base }) catch unreachable;
+            break :blk fields.items.len - 1;
+        };
+        const f = &fields.items[idx];
+        if (!std.mem.eql(u8, f.base, base)) {
+            if (!strict) continue;
+            return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): field '{s}' declared with base '{s}' but already met as '{s}' — a meet needs one base, not two", .{ entry_name, fname, base, f.base }) };
+        }
+
+        while (segs.next()) |seg| {
+            const atom = std.mem.trim(u8, seg, " \t");
+            if (atom.len == 0) continue;
+
+            // A disjunction atom: a set of alternatives, at most one marked
+            // as the fallback. It meets by intersection like every other term;
+            // the grammar and the canonicalization live in the `alts` part.
+            if (isAltsAtom(atom)) {
+                if (parseAltsAtom(alloc, rep, fl, entry_name, atom, f, strict)) |r| return r;
+                continue;
+            }
+
+            var op: Op = undefined;
+            var digits: []const u8 = undefined;
+            var op_str: []const u8 = undefined;
+            if (std.mem.startsWith(u8, atom, "clamp(") and std.mem.endsWith(u8, atom, ")")) {
+                // A normalizer term, not a bound: the boundary
+                // saturates the value into [lo, hi] — bounds on the
+                // same field judge the post-clamp result. Scalar
+                // legality is judged on the met field, not per-atom —
+                // the driver's legality pass resolves terminal bases.
+                const inner = std.mem.trim(u8, atom[6 .. atom.len - 1], " \t");
+                const comma = std.mem.indexOfScalar(u8, inner, ',') orelse {
+                    if (!strict) continue;
+                    return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): '{s}' needs two bounds — the spelling is `clamp(lo, hi)`", .{ entry_name, atom }) };
+                };
+                const lo_n = std.fmt.parseInt(i64, std.mem.trim(u8, inner[0..comma], " \t"), 10) catch {
+                    if (!strict) continue;
+                    return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): clamp bound '{s}' needs an integer literal", .{ entry_name, inner[0..comma] }) };
+                };
+                const hi_n = std.fmt.parseInt(i64, std.mem.trim(u8, inner[comma + 1 ..], " \t"), 10) catch {
+                    if (!strict) continue;
+                    return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): clamp bound '{s}' needs an integer literal", .{ entry_name, inner[comma + 1 ..] }) };
+                };
+                if (lo_n > hi_n) {
+                    if (!strict) continue;
+                    return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): clamp({d}, {d}) is empty — lo exceeds hi", .{ entry_name, lo_n, hi_n }) };
+                }
+                const ccanon = std.fmt.allocPrint(alloc, "clamp({d},{d})", .{ lo_n, hi_n }) catch unreachable;
+                if (f.clamp) |c| {
+                    // Clamps meet by intersection — [max(lo), min(hi)].
+                    const mlo = @max(c.lo, lo_n);
+                    const mhi = @min(c.hi, hi_n);
+                    if (mlo > mhi) f.clamp_conflict = .{ ccanon, c.src };
+                    f.clamp = .{ .lo = mlo, .hi = mhi, .src = ccanon };
+                } else {
+                    f.clamp = .{ .lo = lo_n, .hi = hi_n, .src = ccanon };
+                }
+                continue;
+            }
+            if (std.mem.startsWith(u8, atom, ">=")) {
+                op = .ge; digits = atom[2..]; op_str = ">=";
+            } else if (std.mem.startsWith(u8, atom, "<=")) {
+                op = .le; digits = atom[2..]; op_str = "<=";
+            } else if (std.mem.startsWith(u8, atom, "==")) {
+                op = .eq; digits = atom[2..]; op_str = "==";
+            } else if (std.mem.startsWith(u8, atom, ">")) {
+                op = .gt; digits = atom[1..]; op_str = ">";
+            } else if (std.mem.startsWith(u8, atom, "<")) {
+                op = .lt; digits = atom[1..]; op_str = "<";
+            } else {
+                if (!strict) continue;
+                return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): constraint atom '{s}' is not a bound — refine understands >N >=N <N <=N ==N over integer literals", .{ entry_name, atom }) };
+            }
+
+            const n = std.fmt.parseInt(i64, std.mem.trim(u8, digits, " \t"), 10) catch {
+                if (!strict) continue;
+                return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): bound '{s}' needs an integer literal — '{s}' does not parse", .{ entry_name, atom, digits }) };
+            };
+            const canon = std.fmt.allocPrint(alloc, "{s}{d}", .{ op_str, n }) catch unreachable;
+
+            switch (op) {
+                .gt, .ge => {
+                    const excl = op == .gt;
+                    if (f.lo == null or n > f.lo.?.value or
+                        (n == f.lo.?.value and excl and !f.lo.?.exclusive))
+                    {
+                        f.lo = .{ .value = n, .exclusive = excl, .src = canon };
+                    }
+                },
+                .lt, .le => {
+                    const excl = op == .lt;
+                    if (f.hi == null or n < f.hi.?.value or
+                        (n == f.hi.?.value and excl and !f.hi.?.exclusive))
+                    {
+                        f.hi = .{ .value = n, .exclusive = excl, .src = canon };
+                    }
+                },
+                .eq => {
+                    if (f.eq) |e| {
+                        if (e.value != n) {
+                            if (strict) {
+                                return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): field '{s}' refines to nothing — '{s}' contradicts '{s}'", .{ entry_name, fname, canon, e.src }) };
+                            }
+                            // Contributor text parses leniently, but a
+                            // disagreement is not malformed text — it is an
+                            // empty meet. Record it so the refusal does not
+                            // depend on which block's transform fires first.
+                            f.eq_conflict = .{ canon, e.src };
+                        }
+                    } else {
+                        f.eq = .{ .value = n, .exclusive = false, .src = canon };
+                    }
+                },
+            }
+        }
+    }
+    return null;
+}
+
+// Emptiness of one met interval — returns the two disagreeing
+// bound strings on conflict.
+fn emptyField(f: *const Field) ?[2][]const u8 {
+    if (f.clamp_conflict) |pair| return pair;
+    if (f.eq_conflict) |pair| return pair;
+    if (f.alts_conflict) |pair| return pair;
+    if (f.clamp) |c| {
+        // Stored values live in [c.lo, c.hi]; a bound no value in
+        // that range can satisfy refines the field to nothing.
+        if (f.eq) |e| {
+            if (e.value < c.lo or e.value > c.hi) return .{ e.src, c.src };
+        }
+        if (f.lo) |lo| {
+            if (c.hi < lo.value or (c.hi == lo.value and lo.exclusive)) return .{ c.src, lo.src };
+        }
+        if (f.hi) |hi| {
+            if (c.lo > hi.value or (c.lo == hi.value and hi.exclusive)) return .{ c.src, hi.src };
+        }
+    }
+    if (f.lo != null and f.hi != null) {
+        const lo = f.lo.?;
+        const hi = f.hi.?;
+        if (lo.value > hi.value or
+            (lo.value == hi.value and (lo.exclusive or hi.exclusive)))
+        {
+            return .{ lo.src, hi.src };
+        }
+    }
+    if (f.eq) |e| {
+        if (f.lo) |lo| {
+            if (e.value < lo.value or (e.value == lo.value and lo.exclusive)) {
+                return .{ e.src, lo.src };
+            }
+        }
+        if (f.hi) |hi| {
+            if (e.value > hi.value or (e.value == hi.value and hi.exclusive)) {
+                return .{ e.src, hi.src };
+            }
+        }
+    }
+    return null;
+}
+
+fn protoFieldsInto(alloc: std.mem.Allocator, text: []const u8, out: *std.ArrayList(ProtoField)) void {
+    var toks = std.mem.tokenizeAny(u8, text, "\n,");
+    while (toks.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r,");
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const nm = std.mem.trim(u8, line[0..colon], " \t");
+        const base = std.mem.trim(u8, line[colon + 1 ..], " \t,");
+        if (nm.len == 0 or base.len == 0) continue;
+        out.append(alloc, .{ .name = nm, .base = base }) catch unreachable;
+    }
+}
+
+// The proto anchor: a live `std/proto` invocation or an erased
+// `// proto Name: …` marker in the addressed home — either order of
+// dissolution resolves.
+fn walkProto(alloc: std.mem.Allocator, items: []const ast.Item, scope_home: []const u8, w: Want, out: *std.ArrayList(ProtoField), found: *bool) void {
+    for (items) |entry| {
+        switch (entry) {
+            .flow => |candidate| {
+                if (candidate.body.node) |*node| {
+                    if (node.* == .invocation and isProtoDoor(&node.invocation) and
+                        std.mem.eql(u8, scope_home, w.home) and
+                        std.mem.eql(u8, invName(&node.invocation), w.name))
+                    {
+                        found.* = true;
+                        protoFieldsInto(alloc, invSource(&node.invocation), out);
+                    }
+                }
+            },
+            .inline_code => |ic| {
+                if (!std.mem.eql(u8, scope_home, w.home)) continue;
+                var lines = std.mem.splitScalar(u8, ic.code, '\n');
+                while (lines.next()) |raw| {
+                    const line = std.mem.trimLeft(u8, raw, " \t");
+                    const prefix = "// proto ";
+                    if (!std.mem.startsWith(u8, line, prefix)) continue;
+                    const colon = std.mem.indexOfScalar(u8, line[prefix.len..], ':') orelse continue;
+                    const nm = std.mem.trim(u8, line[prefix.len .. prefix.len + colon], " \t");
+                    if (!std.mem.eql(u8, nm, w.name)) continue;
+                    found.* = true;
+                    protoFieldsInto(alloc, line[prefix.len + colon + 1 ..], out);
+                }
+            },
+            .module_decl => |module| {
+                walkProto(alloc, module.items, module.logical_name, w, out, found);
+            },
+            else => {},
+        }
+    }
+}
+

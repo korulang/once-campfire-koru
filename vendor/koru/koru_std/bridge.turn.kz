@@ -1,0 +1,92 @@
+// Koru Standard Library: the `turn` part of bridge.kz — the wire gate and
+// the multi-item turn machinery. Joined via `~part turn` in bridge.kz;
+// merged into the bridge module at load.
+//
+// `wireGate` — the wire grammar check shared by the single-item gate and
+// the per-item gate a sequenced turn runs on every slice — lives in the
+// `wiregate` part: one predicate, two surfaces, the item is the unit of
+// enforcement. (440_021; kopium bridge-mirror 2026-09-12-wire-gate-scope)
+
+/// A turn slice: byte offsets into the turn source.
+const TurnItem = struct { start: usize, end: usize };
+
+/// Split a turn into items. A new item opens at a non-blank line that is
+/// not a `|` arm, not inside an open string or unbalanced delimiter, and
+/// not the impl head/arms of a `tor ` define (matched by declared name).
+/// This is a ROUTER, not a validator: every slice still passes the wire
+/// gate's full validation, so mis-segmentation fails loud as today's
+/// parse-errors, never silent wrongness.
+fn segmentTurn(allocator: std.mem.Allocator, source: []const u8) ![]TurnItem {
+    var items = std.ArrayList(TurnItem){};
+    errdefer items.deinit(allocator);
+    var i: usize = 0;
+    var line_start: usize = 0;
+    var cur_start: ?usize = null;
+    var paren: i32 = 0;
+    var brace: i32 = 0;
+    var bracket: i32 = 0;
+    var in_string: ?u8 = null;
+    var in_define: bool = false;
+    var define_name: []const u8 = "";
+    var in_colon: bool = false;
+    while (i <= source.len) : (i += 1) {
+        if (i != source.len and source[i] != '\n') continue;
+        const raw = source[line_start..i];
+        const line = std.mem.trim(u8, raw, " \t\r");
+        // A `verb: <prose>` item is a block: it ends only at the next
+        // invocation head. Stray quotes/delimiters inside prose are text,
+        // not code — discard the state they would have carried over.
+        const ends_colon = in_colon and line.len > 0 and isInvocationHead(line);
+        if (ends_colon) {
+            paren = 0;
+            brace = 0;
+            bracket = 0;
+            in_string = null;
+        }
+        const depth_open = paren + brace + bracket;
+        const in_str = in_string != null;
+        scanLineChars(raw, &paren, &brace, &bracket, &in_string);
+        if (line.len == 0) {
+            line_start = i + 1;
+            continue;
+        }
+        if (cur_start == null) {
+            cur_start = line_start;
+            in_colon = !in_define and isColonHead(line);
+            if (std.mem.startsWith(u8, line, "tor ")) {
+                in_define = true;
+                define_name = defineName(line);
+            }
+        } else if (in_colon) {
+            if (ends_colon) {
+                try items.append(allocator, .{ .start = cur_start.?, .end = line_start });
+                cur_start = line_start;
+                in_colon = isColonHead(line);
+                in_define = std.mem.startsWith(u8, line, "tor ");
+                if (in_define) define_name = defineName(line);
+            }
+        } else if (!in_str and depth_open == 0 and !std.mem.startsWith(u8, line, "|")) {
+            if (in_define and isImplHead(line, define_name)) {
+                in_define = false;
+            } else {
+                try items.append(allocator, .{ .start = cur_start.?, .end = line_start });
+                cur_start = line_start;
+                in_colon = isColonHead(line);
+                if (std.mem.startsWith(u8, line, "tor ")) {
+                    in_define = true;
+                    define_name = defineName(line);
+                } else {
+                    in_define = false;
+                }
+            }
+        }
+        line_start = i + 1;
+    }
+    if (cur_start) |s| {
+        try items.append(allocator, .{ .start = s, .end = source.len });
+    }
+    return items.toOwnedSlice(allocator);
+}
+
+
+

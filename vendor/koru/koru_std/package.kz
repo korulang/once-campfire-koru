@@ -1,0 +1,163 @@
+// package.kz - Package manager integration for Koru
+//
+// This module provides tors for declaring Koru package dependencies
+// distributed via various package managers (npm, cargo, go, pip).
+//
+// NOTE: These are for importing KORU PACKAGES that happen to be distributed
+// through these package managers, not for importing native JS/Rust/Go/Python
+// code directly into Koru.
+//
+// Usage:
+//   std/package:requires.npm {
+//       "@korulang/sqlite3": "^0.0.1",
+//       "@koru/graphics": "^1.0.0"
+//   }
+//
+// Then run: koruc main.kz i
+// Or:       koruc main.kz install
+//
+// This will:
+//   1. Collect all package:requires.npm invocations from your code
+//   2. Generate package.json
+//   3. Run npm install
+
+
+~import std/compiler
+
+~[comptime]
+
+// ============================================================
+// INSTALL COMMAND - Install npm packages from requires.npm
+// ============================================================
+
+~std/compiler:command.declare {
+    "name": "i",
+    "alias": "install",
+    "description": "Install npm packages from requires.npm declarations"
+}
+
+~[comptime|command]pub tor install {
+    program: *const std/compiler:Program,
+    allocator: __koru_std.mem.Allocator,
+    argv: []string,
+}
+
+~proc install|zig {
+    // argv is available for future use (e.g., --production flag)
+
+    const std = @import("std");
+
+    // Walk AST to collect requires.npm invocations
+    var npm_packages = std.ArrayListUnmanaged([]const u8){};
+    defer npm_packages.deinit(allocator);
+
+    // Imported libraries declare their own npm packages, so this must reach
+    // through `.module_decl` — `program.items` alone is only the entry file.
+    // Same defect `std/deps` had: a library's declaration was never collected.
+    const ast_pkg = @import("ast");
+    const pkg_flows = ast_pkg.allFlows(allocator, program);
+    defer allocator.free(pkg_flows);
+    for (pkg_flows) |flow| {
+        {
+            if (flow.inv().path.module_qualifier) |mq| {
+                // Check for std.package:requires.npm
+                if (std.mem.eql(u8, mq, "std.package") and
+                    flow.inv().path.segments.len == 2 and
+                    std.mem.eql(u8, flow.inv().path.segments[0], "requires") and
+                    std.mem.eql(u8, flow.inv().path.segments[1], "npm"))
+                {
+                    // Extract source parameter (the JSON-like content)
+                    for (flow.inv().args) |arg| {
+                        if (std.mem.eql(u8, arg.name, "source")) {
+                            npm_packages.append(allocator, arg.value) catch {
+                                std.debug.print("✗ Out of memory\n", .{});
+                                return;
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (npm_packages.items.len == 0) {
+        std.debug.print("No npm packages declared. Use ~std.package:requires.npm {{ ... }}\n", .{});
+        return;
+    }
+
+    std.debug.print("Found {d} npm package declaration(s)\n", .{npm_packages.items.len});
+
+    // Generate package.json
+    const file = std.fs.cwd().createFile("package.json", .{}) catch |err| {
+        std.debug.print("✗ Failed to create package.json: {}\n", .{err});
+        return;
+    };
+    defer file.close();
+
+    file.writeAll("{\n  \"dependencies\": {\n") catch return;
+    for (npm_packages.items, 0..) |pkg_source, idx| {
+        // pkg_source is the raw content like: "@koru/sqlite": "^1.0.0"
+        file.writeAll("    ") catch return;
+        file.writeAll(pkg_source) catch return;
+        if (idx < npm_packages.items.len - 1) {
+            file.writeAll(",") catch return;
+        }
+        file.writeAll("\n") catch return;
+    }
+    file.writeAll("  }\n}\n") catch return;
+
+    std.debug.print("✓ Generated package.json\n", .{});
+
+    // Run npm install
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "npm", "install" },
+    }) catch |err| {
+        std.debug.print("✗ Failed to run npm install: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (result.stdout.len > 0) {
+        std.debug.print("{s}", .{result.stdout});
+    }
+    if (result.stderr.len > 0) {
+        std.debug.print("{s}", .{result.stderr});
+    }
+
+    if (result.term.Exited == 0) {
+        std.debug.print("✓ npm install complete\n", .{});
+    } else {
+        std.debug.print("✗ npm install failed\n", .{});
+    }
+}
+
+// Koru packages distributed via npm
+~[comptime|norun]pub tor requires.npm { source: Source }
+
+~proc requires.npm|zig {
+    // Void tor - no return value needed
+    // The compiler collects these during post-semantic analysis
+}
+
+// Koru packages distributed via Cargo
+~[comptime|norun]pub tor requires.cargo { source: Source }
+
+~proc requires.cargo|zig {
+    // Void tor - collected by compiler
+}
+
+// Koru packages distributed via Go modules
+~[comptime|norun]pub tor requires.go { source: Source }
+
+~proc requires.go|zig {
+    // Void tor - collected by compiler
+}
+
+// Koru packages distributed via pip
+~[comptime|norun]pub tor requires.pip { source: Source }
+
+~proc requires.pip|zig {
+    // Void tor - collected by compiler
+}

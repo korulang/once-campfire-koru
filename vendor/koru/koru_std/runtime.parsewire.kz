@@ -1,0 +1,37 @@
+// Koru Standard Library: the `parsewire` part of runtime.kz.
+// Joined via `~part parsewire` in runtime.kz; merged into the runtime
+// module at load.
+// ============================================================================
+// PARSE.WIRE - the wire grammar: one flow, arms included
+// ============================================================================
+//
+// A model's turn is `verb(field: "value", ...)` with `|` arms chaining the
+// fresh outcomes (`| ok h |> verb(handle: h)` binds what the call just
+// issued — the composition partial programs are). Quoted string values;
+// prose and trailing text are refused at PARSE time, with a diagnostic
+// written to be fed back to the model that emitted it.
+//
+// Two things are deliberately NOT checked here:
+//
+// - **Vocabulary membership.** An in-shape call naming a verb outside the
+//   scope is `event-denied` at dispatch — "a real verb that is not yours",
+//   a different and load-bearing meaning from "that was not Koru" (430_055
+//   pins the confusion this split exists to prevent).
+// - **Field membership.** An unknown field on a known verb is
+//   `validation-error` at dispatch, for the same reason.
+//
+// Validation only shapes the line; the AST is still built by the
+// interpreter's own parser, so the wire can never accept a shape that eval
+// would execute differently.
+
+// The wire's shape rules and the validator that enforces them —
+// WIRE_GRAMMAR_TEXT and wireValidate — live in the `wireval` part; the
+// two must move together or the prompt starts lying about the parser.
+// The type-directed scanner (wireScan) and this tor's proc live in the
+// `wirescan` part — declared field types decide what a value position
+// admits, and admitted captured text is normalized to canonical quoted
+// wire before parse_event sees it.
+
+~[retain]pub tor parse.wire { source: string, input_fn: ?InputLookupFn, host_input_fn: ?InputLookupFn }
+| parsed { flow: *const ast.Flow, wire: string }
+| parse-error { message: string, line: u32, column: u32, not_invocation: bool }

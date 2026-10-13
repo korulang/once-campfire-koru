@@ -1,0 +1,116 @@
+// Koru Standard Library: the `csemit` part of store.kz.
+// Joined via `~part csemit` in store.kz; merged into the module at load.
+
+// ------------------------------------------------------------------
+// The C#-target emit bodies, lifted out of their topical parts as the
+// third backend's arms grew them past the line wall: the handle-table
+// struct slice (`hstructEmitCs`, once `HStruct.emitCs`) and the
+// bulk-append emit (`bulkEmitCs`, once `BulkEmit.emitCs`). Each fn is
+// reached through a member alias left on its home struct.
+// ------------------------------------------------------------------
+//
+/// The cs twin: same fields, same encoding — C# has real 64-bit shifts,
+/// so `slot | brand << 24 | gen << 32` carries over bitwise where JS had
+/// to re-pack by multiplication. `__koru_row_of` answers -1 for absent
+/// (rows are >= 0) — the js `null`/zig `?usize` sentinel — and
+/// `__koru_resolve` throws what zig panics. Members are statics of the
+/// cell's `static class`, so bodies here read them bare.
+fn hstructEmitCs(allocator: std.mem.Allocator, cap: usize, ordinal: usize, store_name: []const u8) []const u8 {
+    return std.fmt.allocPrint(allocator,
+        \\    public static long[] __koru_hslot_row = new long[{d}];
+        \\    public static long[] __koru_hslot_gen = new long[{d}];
+        \\    public static long[] __koru_row_hslot = new long[{d}];
+        \\    public static long[] __koru_hslot_free = new long[{d}];
+        \\    public static long __koru_hslot_free_len = 0;
+        \\    public static long __koru_hslot_next = 0;
+        \\    public static long __koru_brand = {d};
+        \\    public static bool __koru_ident = true;
+        \\    public static bool __koru_gen0 = true;
+        \\    public static void __koru_materialize() {{
+        \\        if (!__koru_ident) return;
+        \\        for (long __i = 0; __i < len; __i++) {{ __koru_hslot_row[__i] = __i; __koru_row_hslot[__i] = __i; }}
+        \\        __koru_ident = false;
+        \\    }}
+        \\    public static long __koru_row_of(long h) {{
+        \\        if (h < 0) return -1;
+        \\        ulong __u = (ulong)h;
+        \\        long __slot32 = (long)(__u & 0xFFFFFFFFUL);
+        \\        if ((__slot32 >> 24) != __koru_brand) return -1;
+        \\        long __slot = __slot32 & 0xFFFFFF;
+        \\        if (__slot >= __koru_hslot_next) return -1;
+        \\        if (__koru_gen0) {{ if ((__u >> 32) != 0) return -1; return __slot; }}
+        \\        if ((long)(__u >> 32) != __koru_hslot_gen[__slot]) return -1;
+        \\        if (__koru_ident) return __slot;
+        \\        long __r = __koru_hslot_row[__slot];
+        \\        if (__r >= len) return -1;
+        \\        return __r;
+        \\    }}
+        \\    public static long __koru_resolve(long h) {{
+        \\        if (h >= 0) {{
+        \\            ulong __u = (ulong)h;
+        \\            long __slot32 = (long)(__u & 0xFFFFFFFFUL);
+        \\            if ((__slot32 >> 24) != __koru_brand) throw new global::System.Exception("std/store: '{s}[...]' does not address a row - the value is not a handle this store issued (handles come from `| row` and row cursors)");
+        \\            long __slot = __slot32 & 0xFFFFFF;
+        \\            if (__koru_gen0) {{
+        \\                if ((__u >> 32) != 0 && __slot < __koru_hslot_next) throw new global::System.Exception("std/store: stale row handle into store '{s}' - the row it addressed was removed (stale-handle trap pinned at 690_115)");
+        \\            }} else if (__slot < __koru_hslot_next && (long)(__u >> 32) != __koru_hslot_gen[__slot]) throw new global::System.Exception("std/store: stale row handle into store '{s}' - the row it addressed was removed (stale-handle trap pinned at 690_115)");
+        \\        }}
+        \\        long __r = __koru_row_of(h);
+        \\        if (__r < 0) throw new global::System.Exception("std/store: '{s}[...]' does not address a row - the value is not a handle this store issued (handles come from `| row` and row cursors)");
+        \\        return __r;
+        \\    }}
+        \\    public static long __koru_handle_of(long dense) {{
+        \\        if (__koru_gen0) return dense | (__koru_brand << 24);
+        \\        long __slot = dense;
+        \\        if (!__koru_ident) __slot = __koru_row_hslot[dense];
+        \\        return (__slot | (__koru_brand << 24)) | (__koru_hslot_gen[__slot] << 32);
+        \\    }}
+        \\
+    , .{ cap, cap, cap, cap, ordinal, store_name, store_name, store_name, store_name }) catch unreachable;
+}
+
+/// The C# twin of `emit` — same hoisted capacity check, same freelist
+/// minting, same `__koru_continue_1` hand-off. Differences are spelling:
+/// `var` for `const`, a counted `for` for the range, `throw` for
+/// `@panic`, and the `blk_hm` labeled-break slot pick becomes an
+/// if/else statement (C# has no block expressions). The `std/indexes`
+/// join is NOT ported — its register-carry machinery is Zig-shaped
+/// (`ArrayListUnmanaged`, pointer bucket tails); `match` declines
+/// indexed stores on this target.
+fn bulkEmitCs(alloc: std.mem.Allocator, prog: *const ast_find.Program, store: []const u8, cap: usize, range: Bulk.Range, bind: ?[]const u8, flds: []const struct_literal_store.StructField, handles: bool) []const u8 {
+    var b = std.ArrayList(u8).initCapacity(alloc, 384) catch unreachable;
+    const w = b.writer(alloc);
+    w.print("//@koru:inline_stmt\n{{\n    var __koru_bulk_lo = ({s});\n    var __koru_bulk_hi = ({s});\n    var __koru_bulk_n = __koru_bulk_hi - __koru_bulk_lo;\n    if (__koru_bulk_n > {d} - __koru_store_{s}.len) throw new global::System.Exception(\"std/store: store '{s}' is full (capacity {d}) - declared capacity and the `| full` branch are pinned at 690_011\");\n    var __koru_bulk_base = __koru_store_{s}.len;\n", .{ range.lo, range.hi, cap, store, store, cap, store }) catch unreachable;
+    if (handles) {
+        w.print("    var __koru_bulk_frem = __koru_store_{s}.__koru_hslot_free_len;\n    var __koru_bulk_fresh = __koru_store_{s}.__koru_hslot_next;\n    var __koru_bulk_idt = __koru_store_{s}.__koru_ident;\n", .{ store, store, store }) catch unreachable;
+    }
+    w.print("    for (var __koru_bulk_j = 0L; __koru_bulk_j < __koru_bulk_n; __koru_bulk_j++) {{\n", .{}) catch unreachable;
+    if (handles) {
+        w.print("        long __koru_bulk_slot;\n        if (__koru_bulk_j < __koru_bulk_frem) {{ __koru_bulk_slot = __koru_store_{s}.__koru_hslot_free[__koru_bulk_frem - 1 - __koru_bulk_j]; }} else {{ __koru_bulk_slot = __koru_bulk_fresh; __koru_bulk_fresh += 1; }}\n        if (!__koru_bulk_idt) {{\n            __koru_store_{s}.__koru_row_hslot[__koru_bulk_base + __koru_bulk_j] = __koru_bulk_slot;\n            __koru_store_{s}.__koru_hslot_row[__koru_bulk_slot] = __koru_bulk_base + __koru_bulk_j;\n        }}\n", .{ store, store, store }) catch unreachable;
+    }
+    if (bind) |bb| {
+        var used = false;
+        for (flds) |f| {
+            if (BulkEmit.useOf(alloc, f.value, bb)) used = true;
+        }
+        if (used) {
+            w.print("        var {s} = __koru_bulk_lo + __koru_bulk_j;\n", .{codegen_utils_store.mangleCsIdent(alloc, bb) catch bb}) catch unreachable;
+        }
+    }
+    for (flds) |f| {
+        const col = codegen_utils_store.HostShape.csMember(alloc, f.name);
+        if (StoreRefHome.refTargetOf(alloc, prog, store, f.name) != null) w.print("        __koru_home_{s}_{s}({s});\n", .{ store, f.name, f.value }) catch unreachable;
+        w.print("        __koru_store_{s}.{s}[__koru_bulk_base + __koru_bulk_j] = {s};\n", .{ store, col, f.value }) catch unreachable;
+    }
+    if (handles) {
+        // `frem -| n` saturates — the freelist only ever fronts `frem`
+        // slots, the rest mint fresh; a plain `-` would drag
+        // `hslot_free_len` negative and the next take would index below
+        // zero (690_338 measured this on C#).
+        w.print("    }}\n    __koru_store_{s}.__koru_hslot_free_len = global::System.Math.Max(0, __koru_bulk_frem - __koru_bulk_n);\n    __koru_store_{s}.__koru_hslot_next = __koru_bulk_fresh;\n    __koru_store_{s}.len += __koru_bulk_n;\n}}\n", .{ store, store, store }) catch unreachable;
+    } else {
+        w.print("    }}\n    __koru_store_{s}.len += __koru_bulk_n;\n}}\n", .{store}) catch unreachable;
+    }
+    w.print("__koru_continue_{d}\n", .{1}) catch unreachable;
+    return b.items;
+}

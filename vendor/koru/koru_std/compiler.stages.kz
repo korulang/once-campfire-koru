@@ -1,0 +1,61 @@
+// Koru Standard Library: the `stages` part of compiler.kz.
+// Joined via `~part stages` in compiler.kz; merged into the compiler module at load.
+//
+// The pre-emission AST stage procs: the per-call template pass and the
+// `.pre` transform stage that must run before it. They live apart from the
+// pass-runner body because they are a named family — graft-aware ordering
+// is their whole contract.
+
+// Template processor: walks AST, renders any proc whose variant chain
+// starts with `template|...` through Liquid, then strips the `template`
+// tag so downstream emission sees a plain host-language proc. See
+// memory project_proc_variant_pipeline / docs/EFFECT_BRANCHES for the
+// `host[:processor]` story this implements.
+~pub tor process-template-procs { ctx: CompilerContext } -> CompilerContext
+
+~proc process-template-procs|zig {
+    const tp = @import("template_processor");
+    // Thread the build language into the per-call template pass. Per-call
+    // (`[template]`) procs are spliced inline HERE, upstream of the emitter's
+    // variant pick — so the renderer, not the emitter, must select the
+    // `|zig` vs `|js` body. CompilerEnv.lang is the user's `--lang` flag
+    // ("zig" default, "js" for JS builds), globally available in the backend.
+    tp.processTemplateProcs(ctx.ast, ctx.allocator, CompilerEnv.lang) catch unreachable;
+
+    var updated_ctx = ctx;
+    updated_ctx.passes_completed += 1;
+    updated_ctx.current_pass = "process_template_procs";
+    return updated_ctx;
+}
+
+// Pre-stage transforms: run the transform runner's `.pre` stage BEFORE the
+// template pass. A transform that GRAFTS templated code — e.g. std/constructor
+// dissolving into a comptime list plus a `for` over the var it just defined —
+// must dissolve FIRST, so the template pass then processes the graft as ordinary
+// code. Only `.pre`-tagged transforms fire here; `.main`/`.post` still run at
+// Phase 2.4 (evaluate-comptime). `.pre` transforms carry @pass_ran, so that later
+// all-stages run re-visits them as no-ops. This is the named-stage design: the
+// pipeline sprinkles transform stages where they belong, deliberately.
+~pub tor run-pre-transforms { ctx: CompilerContext } -> CompilerContext
+
+~proc run-pre-transforms|zig {
+    const backend_output = @import("backend_output_emitted.zig");
+    var updated_ctx = ctx;
+    if (@hasDecl(backend_output, "run_pass")) {
+        const pre_ast = backend_output.run_pass("pre", ctx.ast, ctx.allocator, @ptrCast(&updated_ctx)) catch |err| {
+            if (err == error.TransformContinuationPositionUnsupported) {
+                // The runner already emitted a located error[KORU124] koru
+                // diagnostic. evaluate/run-pre have no clean error channel
+                // (they return a ctx), so stop the pipeline cleanly rather than
+                // leaking the ICE-shaped @panic + host stack trace.
+                std.process.exit(1);
+            }
+            log.err("FATAL: pre-stage transform pass failed ({s}). The pipeline cannot continue with a partially-transformed AST.\n", .{@errorName(err)});
+            @panic("pre-stage transform pass failed — see error above");
+        };
+        updated_ctx.ast = pre_ast;
+    }
+    updated_ctx.passes_completed += 1;
+    updated_ctx.current_pass = "run_pre_transforms";
+    return updated_ctx;
+}

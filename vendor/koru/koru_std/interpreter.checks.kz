@@ -1,0 +1,124 @@
+// Koru Standard Library: the `checks` part of interpreter — the flow-check
+// internals. Joined via `~part checks` in interpreter.kz; merged into
+// the interpreter module at load.
+//
+// Argument-vocabulary checking (checkInvocationArgs + its seed helpers,
+// called by checkFlowArgs in the args part) and the recursive binding-
+// shadow walk called by validateFlow in the validate part.
+
+fn checkInvocationArgs(
+    cont: *const ast.Continuation,
+    input_fn: ?InputLookupFn,
+    defined: ?*DefinedFlows,
+    bound: *std.StringHashMap(void),
+    allocator: std.mem.Allocator,
+) ?ValidationError {
+    // Destructures are not implemented in interpreted flows — eval binds only
+    // `| <branch> name`, so `{ … }` (and any annotation on a field) drops
+    // silently. Refuse rather than accept a binder that binds nothing.
+    if (cont.destructure.len > 0) {
+        return .{
+            .message = std.fmt.allocPrint(allocator, "destructure '{{ … }}' is not implemented in an interpreted flow — bind the payload by name (`| <branch> {s} |>`)", .{cont.destructure[0].name}) catch "destructure not implemented",
+            .binding_name = cont.destructure[0].name,
+        };
+    }
+    if (cont.node) |*n| {
+        switch (n.*) {
+            .invocation => |*inv| {
+                const event_name = if (inv.path.segments.len > 0) inv.path.segments[0] else "";
+                const is_defined = if (defined) |d| findDefinedFlow(d, event_name) != null else false;
+                if (!is_defined) {
+                    if (input_fn) |f| {
+                        if (f(event_name)) |spec| {
+                            for (inv.args) |arg| {
+                                var declared = false;
+                                for (spec) |field| {
+                                    if (std.mem.eql(u8, field.name, arg.name)) {
+                                        declared = true;
+                                        break;
+                                    }
+                                }
+                                if (!declared) {
+                                    return .{
+                                        .message = std.fmt.allocPrint(allocator, "unknown field '{s}' on '{s}'", .{ arg.name, event_name }) catch "unknown field",
+                                        .binding_name = arg.name,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                for (inv.args) |arg| {
+                    if (unboundRefName(arg.value, bound)) |name| {
+                        return .{
+                            .message = std.fmt.allocPrint(allocator, "unbound '{s}' on '{s}' — bind it with an arm (`| <branch> {s} |>`) or quote it for a literal", .{ name, event_name, name }) catch "unbound identifier",
+                            .binding_name = name,
+                        };
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    // Each arm's own bindings scope to that arm's subtree — seed before
+    // descending, lift after. An arm that re-binds an outer name is the
+    // shadowing check's refusal, already answered above; names we did not
+    // add are left alone.
+    for (cont.continuations) |*arm| {
+        var added = std.ArrayList([]const u8){};
+        defer added.deinit(allocator);
+        if (arm.binding) |b| seedBound(bound, &added, b, allocator);
+        seedDestructure(bound, &added, arm.destructure, allocator);
+        const r = checkInvocationArgs(arm, input_fn, defined, bound, allocator);
+        for (added.items) |name| _ = bound.remove(name);
+        if (r) |e| return e;
+    }
+    return null;
+}
+
+// `name` enters the bound set unless an outer scope already bound it —
+// then it stays bound (and the duplicate is the shadowing check's call).
+fn seedBound(bound: *std.StringHashMap(void), added: *std.ArrayList([]const u8), name: []const u8, allocator: std.mem.Allocator) void {
+    if (bound.contains(name)) return;
+    bound.put(name, {}) catch return;
+    added.append(allocator, name) catch {};
+}
+
+fn seedDestructure(bound: *std.StringHashMap(void), added: *std.ArrayList([]const u8), fields: []const ast.DestructureField, allocator: std.mem.Allocator) void {
+    for (fields) |f| {
+        if (f.sub.len > 0) {
+            seedDestructure(bound, added, f.sub, allocator);
+        } else {
+            seedBound(bound, added, f.name, allocator);
+        }
+    }
+}
+
+
+
+fn validateFlowRecursive(flow: *const ast.Flow, seen: *std.StringHashMap(void)) ?ValidationError {
+    // Check each continuation for bindings
+    for (flow.body.continuations) |cont| {
+        if (cont.binding) |binding_name| {
+            // Check for shadowing
+            if (seen.contains(binding_name)) {
+                return .{
+                    .message = "Shadowing not allowed: binding already exists",
+                    .binding_name = binding_name,
+                };
+            }
+            // Record this binding
+            seen.put(binding_name, {}) catch {
+                return .{
+                    .message = "Validation internal error",
+                    .binding_name = binding_name,
+                };
+            };
+        }
+
+        // Note: AST structure changed - cont.node is now ?Node not *Flow
+        // Nested continuations are in cont.continuations, handled in the outer loop
+    }
+
+    return null; // Valid!
+}

@@ -1,0 +1,8 @@
+// std/panic — C# implementation facet.
+//
+// Events are declared in `panic.kz`. C# has no panic verb — the synthesized
+// hole throws System.Exception; `die` matches it: an owned, messaged throw.
+
+~proc die|cs {
+    throw new global::System.Exception(msg);
+}

@@ -1,0 +1,58 @@
+// Koru Standard Library: Reactive Stores — query miss kind classification.
+// Joined via `~part qmisskind` in store.kz; merged into the store module at load.
+//
+// The fourth and fifth misses under "unknown plural store": the name IS
+// declared — as a tor or a store view — or is genuinely absent / a flow-local
+// binding this module-scope scan cannot see. KORU161's dominant corpus
+// sub-family (~30 rows, 69% teach-miss) was exactly this conflation: query()
+// aimed at a name that exists but isn't a container, told only that no
+// `std/store:new` exists — which taught "the name is wrong" when the tier
+// was. Naming the kind is the fix: a tor is called, a view is a projection,
+// neither sweeps.
+
+const QueryMissKind = struct {
+    // Container scope, not module scope — same discipline as QueryMiss.
+    const ast = @import("ast");
+
+    // The last two misses in one call — the declared-as-another-kind refusal
+    // when it applies, else the undeclared-name fallback that teaches the tiers.
+    fn refuseTail(alloc: std.mem.Allocator, rep: anytype, prog: *const ast_find.Program, flow: *const ast_find.Flow, store_name: []const u8) ast.SiteResult {
+        if (refuseDeclared(alloc, rep, prog, flow, store_name)) |r| return r;
+        return refuseUnknown(alloc, rep, flow, store_name);
+    }
+
+    // The refusal for a name declared as a tor or a store view, or null when
+    // the name declares nothing this scan can see.
+    fn refuseDeclared(alloc: std.mem.Allocator, rep: anytype, prog: *const ast_find.Program, flow: *const ast_find.Flow, store_name: []const u8) ?ast.SiteResult {
+        for (flatItems(alloc, prog.items)) |pi| {
+            if (pi.* == .event_decl) {
+                const ed = &pi.event_decl;
+                if (ed.path.segments.len > 0 and std.mem.eql(u8, ed.path.segments[ed.path.segments.len - 1], store_name)) {
+                    return ast.refuse(alloc, rep, .KORU161, flow.location, flow.module, "std/store:query({s}): '{s}' is a tor, not a store - query sweeps a plural container's rows. Call '{s}' for its value; if rows were meant, declare `std/store:new({s}, capacity: N)`", .{ store_name, store_name, store_name, store_name });
+                }
+            } else if (pi.* == .inline_code) {
+                // A ruled marker, not a new convention: store.view.kz emits
+                // this prefix and store.kz already string-matches it at three
+                // sites — this file is a third consumer of the same spelling.
+                const code = pi.inline_code.code;
+                const prefix = "// store-view ";
+                if (std.mem.startsWith(u8, code, prefix)) {
+                    if (std.mem.indexOfScalar(u8, code, ':')) |colon| {
+                        const nm = std.mem.trim(u8, code[prefix.len..colon], " \t");
+                        if (std.mem.eql(u8, nm, store_name)) {
+                            return ast.refuse(alloc, rep, .KORU161, flow.location, flow.module, "std/store:query({s}): '{s}' is a store view - a fixed projection, not a sweepable container; query the store it projects, or read '{s}' fields directly", .{ store_name, store_name, store_name });
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    // The undeclared-name fallback — teaches the tiers rather than only naming
+    // the missing one, because flow-local bindings are invisible here and were
+    // the corpus's wrong-model factory ("is it a reserved word?").
+    fn refuseUnknown(alloc: std.mem.Allocator, rep: anytype, flow: *const ast_find.Flow, store_name: []const u8) ast.SiteResult {
+        return ast.refuse(alloc, rep, .KORU161, flow.location, flow.module, "std/store:query({s}): unknown plural store - no std/store:new({s}, capacity: N) found (query reads a plural container's live rows; a value store reads '{s}.<field>' or std/store:watch({s}), a flow binding reads bare)", .{ store_name, store_name, store_name, store_name });
+    }
+};

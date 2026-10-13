@@ -1,0 +1,140 @@
+// Koru Standard Library: the `units` part of channel — consumer-unit
+// emission. Joined via `~part units` in channel.kz; merged into the
+// channel module.
+//
+// Each `!`-arm of a consumer compiles to a callable void unit — an
+// event_decl + impl pair on pump.kz's drained-unit convention. A custodial
+// kind's unit takes a plain `__payload` and obligates it onto the arm's
+// own binding as the first step, so `! <kind> v |> body` runs with `v`
+// live — whole-value `<state!>` or per-leaf proto debts alike.
+
+const CU = struct {
+
+    // The `!` arms as generated units — kind arms carry the message, closed
+    // arms carry nothing. A custodial kind's unit accepts a plain
+    // `__payload` and obligates it back to the arm's binding as its first
+    // step — `! <kind> v |> body` runs with `v` live.
+    fn emitConsumerUnits(alloc: std.mem.Allocator, appended: *std.ArrayList(ast.Item), prog: *const ast.Program, flow: *const ast.Flow, chan_name: []const u8, kind_arms: []const CH.Arm, closed_arms: []const CH.Arm, kinds: []const CH.KindEntry, custody: []const ?[]const u8, kind_leaves: []const []const CL.OwnedLeaf) void {
+        for (kind_arms, 0..) |arm, ai| {
+            var proto: []const u8 = "";
+            var custodial = false;
+            for (kinds, 0..) |k, ki| {
+                if (std.mem.eql(u8, k.name, arm.kind)) {
+                    proto = k.proto;
+                    custodial = custody[ki] != null or kind_leaves[ki].len > 0;
+                }
+            }
+            if (custodial) {
+                const uf = alloc.alloc(ast.Field, 1) catch unreachable;
+                uf[0] = ast.Field{
+                    .name = alloc.dupe(u8, "__payload") catch unreachable,
+                    .type = alloc.dupe(u8, proto) catch unreachable,
+                    .phantom = null,
+                };
+                const obl_args = alloc.alloc(ast.Arg, 1) catch unreachable;
+                obl_args[0] = ast.Arg{
+                    .name = alloc.dupe(u8, "p") catch unreachable,
+                    .value = alloc.dupe(u8, "__payload") catch unreachable,
+                    .had_explicit_label = true,
+                };
+                const obl_segs = alloc.alloc([]const u8, 1) catch unreachable;
+                obl_segs[0] = std.fmt.allocPrint(alloc, "__channel_obligate_{s}_{s}", .{ chan_name, arm.kind }) catch unreachable;
+                const obl_inv = ast.Invocation{
+                    .path = ast.DottedPath{
+                        .module_qualifier = alloc.dupe(u8, ast_functional.moduleHome(prog, flow) orelse flow.module) catch unreachable,
+                        .segments = obl_segs,
+                    },
+                    .args = obl_args,
+                    .return_binding = arm.cont.binding,
+                };
+                const inner = alloc.alloc(ast.Continuation, 1) catch unreachable;
+                inner[0] = ast.Continuation{
+                    .branch = "",
+                    .binding = null,
+                    .condition = null,
+                    .node = arm.cont.node,
+                    .indent = arm.cont.indent,
+                    .continuations = arm.cont.continuations,
+                };
+                const synth_arm = ast.Continuation{
+                    .branch = arm.cont.branch,
+                    .binding = arm.cont.binding,
+                    .condition = arm.cont.condition,
+                    .kind = arm.cont.kind,
+                    .node = ast.Node{ .invocation = obl_inv },
+                    .indent = arm.cont.indent,
+                    .continuations = inner,
+                };
+                emitVoidUnit(alloc, appended, prog, flow, std.fmt.allocPrint(alloc, "__channel_{s}_{s}_{d}", .{ chan_name, arm.kind, ai }) catch unreachable, &synth_arm, uf);
+            } else {
+                const uf = alloc.alloc(ast.Field, 1) catch unreachable;
+                uf[0] = ast.Field{
+                    .name = alloc.dupe(u8, arm.cont.binding.?) catch unreachable,
+                    .type = alloc.dupe(u8, proto) catch unreachable,
+                    .phantom = null,
+                };
+                emitVoidUnit(alloc, appended, prog, flow, std.fmt.allocPrint(alloc, "__channel_{s}_{s}_{d}", .{ chan_name, arm.kind, ai }) catch unreachable, arm.cont, uf);
+            }
+        }
+        for (closed_arms, 0..) |arm, ci| {
+            emitVoidUnit(alloc, appended, prog, flow, std.fmt.allocPrint(alloc, "__channel_{s}_closed_{d}", .{ chan_name, ci }) catch unreachable, arm.cont, &.{});
+        }
+    }
+
+    // A `!`-arm compiled into a callable void unit: event_decl + impl.
+    // pump.kz's drained-unit convention — no return contract, the arm's
+    // `|>` chain IS the body. An inline_code body lands as a proc_decl.
+    fn emitVoidUnit(
+        allocator: std.mem.Allocator,
+        appended: *std.ArrayList(ast.Item),
+        program: *const ast.Program,
+        flow: *const ast.Flow,
+        unit_name: []const u8,
+        arm: *const ast.Continuation,
+        input_fields: []const ast.Field,
+    ) void {
+        const host_is_js = std.mem.eql(u8, CompilerEnv.lang, "js");
+        const retain_ann = blk_ra: {
+            const anns = allocator.alloc([]const u8, 1) catch unreachable;
+            anns[0] = allocator.dupe(u8, "retain") catch unreachable;
+            break :blk_ra anns;
+        };
+        appended.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+            .path = CH.mkPath(allocator, ast_functional.moduleHome(program, flow) orelse flow.module, unit_name),
+            .input = ast.Shape{ .fields = input_fields },
+            .branches = &[_]ast.Branch{},
+            .return_type = null,
+            .is_public = false,
+            .is_implicit_flow = false,
+            .annotations = retain_ann,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+        var aclone = ast_functional.cloneContinuation(allocator, arm) catch unreachable;
+        CH.rewriteCont(allocator, &aclone, CH.storeHomes(allocator, program));
+        const anode = aclone.node.?;
+        if (anode == .inline_code) {
+            appended.append(allocator, ast.Item{ .proc_decl = ast.ProcDecl{
+                .path = CH.mkPath(allocator, ast_functional.moduleHome(program, flow) orelse flow.module, unit_name),
+                .body = ast.Source{ .text = anode.inline_code, .location = flow.location, .scope = .{ .bindings = &[_]ast.ScopeBinding{} }, .phantom_type = null },
+                .annotations = &[_][]const u8{},
+                .target = allocator.dupe(u8, if (host_is_js) "js" else "zig") catch unreachable,
+                .location = flow.location,
+                .module = allocator.dupe(u8, flow.module) catch unreachable,
+            } }) catch unreachable;
+            return;
+        }
+        appended.append(allocator, ast.Item{ .flow = ast.Flow{
+            .body = ast.rootSite(anode.invocation, aclone.continuations, flow.location),
+            .pre_label = null,
+            .impl_of = CH.mkPath(allocator, ast_functional.moduleHome(program, flow) orelse flow.module, unit_name),
+            .super_shape = null,
+            .inline_body = anode.invocation.inline_body,
+            .preamble_code = anode.invocation.preamble_code,
+            .is_pure = false,
+            .is_transitively_pure = false,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+    }
+};

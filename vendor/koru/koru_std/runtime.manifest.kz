@@ -1,0 +1,222 @@
+// Koru Standard Library: the `manifest` part of runtime — serializing a
+// scope manifest to JSON and to text (the scope-manifest / explain-runtime
+// verb bodies). Joined via `~part manifest` in runtime.kz; merged into
+// the runtime module at load.
+
+fn jsonAppendString(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) void {
+    // Identifiers, module paths and obligation names cannot carry quotes or
+    // control bytes in Koru; the escape keeps caller-supplied scope names
+    // honest anyway (the only string in the manifest not shaped by the
+    // language).
+    out.append(alloc, '"') catch return;
+    for (s) |c| {
+        switch (c) {
+            '"' => out.appendSlice(alloc, "\\\"") catch return,
+            '\\' => out.appendSlice(alloc, "\\\\") catch return,
+            // All control bytes escape as \u — including \t/\n/\r, which the
+            // (valid, but longer) named forms would overlap in switch terms.
+            0...0x1f => |cc| {
+                var buf: [7]u8 = undefined;
+                const code = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{cc}) catch continue;
+                out.appendSlice(alloc, code) catch return;
+            },
+            else => out.append(alloc, c) catch return,
+        }
+    }
+    out.append(alloc, '"') catch return;
+}
+
+fn jsonAppendNumber(out: *std.ArrayList(u8), alloc: std.mem.Allocator, n: anytype) void {
+    var buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{n}) catch return;
+    out.appendSlice(alloc, s) catch return;
+}
+
+/// Serialize a scope manifest to JSON. The record is the contract; this is
+/// one projection of it (the `explain` host and the Orisha endpoint consume
+/// the same record — or this same function — never a hand-written copy).
+fn scopeManifestToJson(alloc: std.mem.Allocator, m: *const ScopeManifest) ![]const u8 {
+    var out = std.ArrayList(u8).initCapacity(alloc, 512) catch return error.OutOfMemory;
+
+    try out.appendSlice(alloc, "{");
+    try out.appendSlice(alloc, "\"kind\":"); jsonAppendString(&out, alloc, m.kind);
+    try out.appendSlice(alloc, ",\"version\":"); jsonAppendNumber(&out, alloc, m.version);
+    try out.appendSlice(alloc, ",\"scope\":"); jsonAppendString(&out, alloc, m.scope);
+
+    try out.appendSlice(alloc, ",\"events\":[");
+    for (m.events, 0..) |ev, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try out.appendSlice(alloc, "\"name\":"); jsonAppendString(&out, alloc, ev.name);
+        try out.appendSlice(alloc, ",\"cost\":"); jsonAppendNumber(&out, alloc, ev.cost);
+        try out.appendSlice(alloc, ",\"home\":");
+        if (ev.home) |h| jsonAppendString(&out, alloc, h) else try out.appendSlice(alloc, "null");
+        try out.appendSlice(alloc, ",\"args\":[");
+        for (ev.args, 0..) |arg, ai| {
+            if (ai > 0) try out.append(alloc, ',');
+            try out.append(alloc, '{');
+            try out.appendSlice(alloc, "\"name\":"); jsonAppendString(&out, alloc, arg.name);
+            try out.appendSlice(alloc, ",\"type\":"); jsonAppendString(&out, alloc, arg.type_name);
+            try out.appendSlice(alloc, ",\"optional\":"); if (arg.is_optional) try out.appendSlice(alloc, "true") else try out.appendSlice(alloc, "false");
+            try out.appendSlice(alloc, ",\"phantom\":");
+            if (arg.phantom) |p| jsonAppendString(&out, alloc, p) else try out.appendSlice(alloc, "null");
+            try out.append(alloc, '}');
+        }
+        try out.append(alloc, ']');
+        try out.appendSlice(alloc, ",\"creates\":[");
+        for (ev.creates, 0..) |create, ci| {
+            if (ci > 0) try out.append(alloc, ',');
+            try out.append(alloc, '{');
+            try out.appendSlice(alloc, "\"obligation\":"); jsonAppendString(&out, alloc, create.obligation);
+            try out.appendSlice(alloc, ",\"module\":"); jsonAppendString(&out, alloc, create.module);
+            try out.appendSlice(alloc, ",\"field\":"); jsonAppendString(&out, alloc, create.field);
+            try out.appendSlice(alloc, ",\"resource_type\":"); jsonAppendString(&out, alloc, create.resource_type);
+            try out.append(alloc, '}');
+        }
+        try out.append(alloc, ']');
+        try out.appendSlice(alloc, ",\"discharges\":[");
+        for (ev.discharges, 0..) |discharge, di| {
+            if (di > 0) try out.append(alloc, ',');
+            try out.append(alloc, '{');
+            try out.appendSlice(alloc, "\"obligation\":"); jsonAppendString(&out, alloc, discharge.obligation);
+            try out.appendSlice(alloc, ",\"module\":"); jsonAppendString(&out, alloc, discharge.module);
+            try out.appendSlice(alloc, ",\"arg\":"); jsonAppendString(&out, alloc, discharge.arg);
+            try out.append(alloc, '}');
+        }
+        try out.append(alloc, ']');
+        try out.appendSlice(alloc, ",\"branches\":[");
+        for (ev.branches, 0..) |branch, bi| {
+            if (bi > 0) try out.append(alloc, ',');
+            try out.append(alloc, '{');
+            try out.appendSlice(alloc, "\"name\":"); jsonAppendString(&out, alloc, branch.name);
+            try out.appendSlice(alloc, ",\"optional\":"); if (branch.is_optional) try out.appendSlice(alloc, "true") else try out.appendSlice(alloc, "false");
+            try out.appendSlice(alloc, ",\"fields\":[");
+            for (branch.fields, 0..) |bf, fi| {
+                if (fi > 0) try out.append(alloc, ',');
+                try out.append(alloc, '{');
+                try out.appendSlice(alloc, "\"name\":"); jsonAppendString(&out, alloc, bf.name);
+                try out.appendSlice(alloc, ",\"type\":"); jsonAppendString(&out, alloc, bf.type_name);
+                try out.appendSlice(alloc, ",\"optional\":"); if (bf.is_optional) try out.appendSlice(alloc, "true") else try out.appendSlice(alloc, "false");
+                try out.append(alloc, '}');
+            }
+            try out.append(alloc, ']');
+            try out.append(alloc, '}');
+        }
+        try out.append(alloc, ']');
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "],\"includes\":[");
+    for (m.includes, 0..) |inc, ii| {
+        if (ii > 0) try out.append(alloc, ',');
+        jsonAppendString(&out, alloc, inc);
+    }
+    try out.appendSlice(alloc, "]}");
+    return out.toOwnedSlice(alloc);
+}
+
+/// Build ONE scope's manifest record from the program AST — the shared
+/// producer. `register` walks the returned record to emit its embedded const;
+/// the `[explainer]` renders it. Both derive from the same lifted RegistryHelper
+/// + extraction machinery as the dispatch tables, so the record can never drift
+/// from what is actually enforced.
+pub fn scopeManifestForScope(
+    alloc: std.mem.Allocator,
+    program: *const ast.Program,
+    scope_name: []const u8,
+    debug_enabled: bool,
+) ScopeManifest {
+    const event_infos = RegistryHelper.collectEventInfos(alloc, program);
+    const scope_defs = RegistryHelper.collectScopeDefs(alloc, program);
+
+    var resolved_events = std.ArrayList(ResolvedEvent){ .items = &.{}, .capacity = 0 };
+    var visited = std.StringHashMap(void).init(alloc);
+    RegistryHelper.resolveScope(alloc, scope_defs, event_infos, scope_name, debug_enabled, &visited, &resolved_events);
+
+    var events = std.ArrayList(ManifestEvent){ .items = &.{}, .capacity = 0 };
+    for (resolved_events.items) |resolved| {
+        const lookup_name = resolved.internal_name orelse resolved.name;
+        const info = RegistryHelper.findEventInfoHomed(alloc, event_infos, lookup_name, resolved.home) orelse continue;
+        const obligations = extractObligations(alloc, info.event_decl, info.module_name);
+        const branches = extractBranches(alloc, info.event_decl);
+        const input_fields = extractInputFields(alloc, info.event_decl);
+
+        var args = std.ArrayList(ManifestArg){ .items = &.{}, .capacity = 0 };
+        for (input_fields) |f| args.append(alloc, .{
+            .name = f.name, .type_name = f.type_name, .is_optional = f.is_optional, .phantom = f.phantom,
+        }) catch continue;
+        var creates = std.ArrayList(ManifestCreate){ .items = &.{}, .capacity = 0 };
+        for (obligations.creates_specs) |spec| creates.append(alloc, .{
+            .obligation = spec.obligation_name, .module = spec.obligation_module, .field = spec.field_name, .resource_type = spec.resource_type, .branch = spec.branch,
+        }) catch continue;
+        var discharges = std.ArrayList(ManifestDischarge){ .items = &.{}, .capacity = 0 };
+        for (obligations.discharges_specs) |spec| discharges.append(alloc, .{
+            .obligation = spec.obligation_name, .module = spec.obligation_module, .arg = spec.arg_name,
+        }) catch continue;
+        var branch_records = std.ArrayList(ManifestBranch){ .items = &.{}, .capacity = 0 };
+        for (branches) |spec| {
+            var fields = std.ArrayList(ManifestBranchField){ .items = &.{}, .capacity = 0 };
+            for (spec.fields) |f| fields.append(alloc, .{
+                .name = f.name, .type_name = f.type_name, .is_optional = f.is_optional,
+            }) catch continue;
+            branch_records.append(alloc, .{
+                .name = spec.name, .fields = fields.toOwnedSlice(alloc) catch &.{}, .is_optional = spec.is_optional,
+            }) catch continue;
+        }
+
+        events.append(alloc, .{
+            .name = resolved.name,
+            .cost = resolved.cost,
+            .home = info.module_name,
+            .args = args.toOwnedSlice(alloc) catch &.{},
+            .creates = creates.toOwnedSlice(alloc) catch &.{},
+            .discharges = discharges.toOwnedSlice(alloc) catch &.{},
+            .branches = branch_records.toOwnedSlice(alloc) catch &.{},
+        }) catch continue;
+    }
+
+    // Direct `scope(other)` includes named in THIS register block, in order, deduped.
+    var includes = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
+    if (RegistryHelper.findScopeDef(scope_defs, scope_name)) |def| {
+        for (RegistryHelper.parseEntries(alloc, def.source_text, debug_enabled)) |entry| {
+            if (entry.kind == .scope_ref) {
+                var dup = false;
+                for (includes.items) |inc| if (std.mem.eql(u8, inc, entry.name)) {
+                    dup = true;
+                    break;
+                };
+                if (!dup) includes.append(alloc, entry.name) catch {};
+            }
+        }
+    }
+
+    return .{
+        .scope = scope_name,
+        .events = events.toOwnedSlice(alloc) catch &.{},
+        .includes = includes.toOwnedSlice(alloc) catch &.{},
+    };
+}
+
+/// Human text projection of a scope manifest — the same `open(path: string)`
+/// shape the model prompt uses, so a person reading `explain` sees exactly the
+/// vocabulary the runtime serves.
+pub fn scopeManifestToText(alloc: std.mem.Allocator, m: *const ScopeManifest) []const u8 {
+    var out = std.ArrayList(u8).initCapacity(alloc, 256) catch return "";
+    for (m.events, 0..) |ev, i| {
+        if (i > 0) out.append(alloc, '\n') catch continue;
+        out.appendSlice(alloc, ev.name) catch continue;
+        out.append(alloc, '(') catch continue;
+        for (ev.args, 0..) |arg, ai| {
+            if (ai > 0) out.appendSlice(alloc, ", ") catch continue;
+            out.appendSlice(alloc, arg.name) catch continue;
+            out.appendSlice(alloc, ": ") catch continue;
+            out.appendSlice(alloc, arg.type_name) catch continue;
+            if (arg.phantom) |p| {
+                out.append(alloc, '<') catch continue;
+                out.appendSlice(alloc, p) catch continue;
+                out.append(alloc, '>') catch continue;
+            }
+        }
+        out.append(alloc, ')') catch continue;
+    }
+    return out.toOwnedSlice(alloc) catch "";
+}

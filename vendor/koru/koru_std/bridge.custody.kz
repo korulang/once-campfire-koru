@@ -1,0 +1,65 @@
+// Koru Standard Library: the `custody` part of bridge.kz — the resource
+// record. Joined via `~part custody` in bridge.kz; merged into the bridge
+// module at load.
+//
+// The world persists vocabulary (`world`); this part persists CUSTODY —
+// the sibling organ SCENE.md names. A world-mounted bridge appends one
+// line per custody event to `<world>/holds.log`, written at the event so
+// the record survives the process. Reading the log back:
+//
+//   session-open / session-closed   the span a session's holds live in
+//   mint      verb + subject + the handle it bound
+//   release   the discharge that retired it
+//
+// A mint inside a closed session's span with no release was released at
+// hang-up; a mint with NO session-closed after it is a hold that died with
+// the process — still-legible to a successor, never silently owned.
+// Consume-and-reissue verbs (append mints a fresh `<open!>` each call)
+// record one mint/release pair per obligation churn — the log is faithful
+// to custody, not to logical fds.
+// A worldless bridge installs nothing and writes no log.
+
+fn holdsLogAppend(br: *Bridge, line: []const u8) void {
+    const w = br.world orelse return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/holds.log", .{w}) catch return;
+    const f = std.fs.cwd().createFile(path, .{ .truncate = false }) catch return;
+    defer f.close();
+    f.seekFromEnd(0) catch return;
+    f.writeAll(line) catch return;
+    f.writeAll("\n") catch return;
+}
+
+fn custodyNote(ctx: *anyopaque, kind: Interp.CustodyKind, h: *const Interp.Handle, subject: []const u8) void {
+    const br: *Bridge = @ptrCast(@alignCast(ctx));
+    var buf: [768]u8 = undefined;
+    const line = switch (kind) {
+        .mint => std.fmt.bufPrint(&buf, "mint\tt={d}\tsession={s}\thandle={s}\tverb={s}\ttype={s}\tsubject={s}", .{
+            std.time.milliTimestamp(), br.session_id, h.handle_id, h.created_by_event, h.resource_type, subject,
+        }),
+        .release => std.fmt.bufPrint(&buf, "release\tt={d}\tsession={s}\thandle={s}\tby={s}", .{
+            std.time.milliTimestamp(), br.session_id, h.handle_id, h.discharge_event,
+        }),
+    } catch return;
+    holdsLogAppend(br, line);
+}
+
+/// Session boundary records — `session-open`/`session-closed` bracket the
+/// span a session's mints live in, so a died-holding hold is a mint with no
+/// release and no closed marker after it.
+pub fn custodyMark(br: *Bridge, mark: []const u8) void {
+    if (br.world == null) return;
+    var buf: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "{s}\tt={d}\tsession={s}", .{ mark, std.time.milliTimestamp(), br.session_id }) catch return;
+    holdsLogAppend(br, line);
+}
+
+/// Arm the custody record on a world-mounted bridge: the pool witness +
+/// the opening marker. Called from `create` after `loadWorld` — the dir is
+/// already made, and every mint after this line is recorded.
+pub fn armCustodyLog(br: *Bridge) void {
+    if (br.world == null) return;
+    br.pool.custody_ctx = br;
+    br.pool.on_custody = custodyNote;
+    custodyMark(br, "session-open");
+}

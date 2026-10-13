@@ -1,0 +1,137 @@
+// Koru Standard Library: the `enum` part of types — closed tag-set mints.
+// Joined via `~part enum` in types.kz; merged into the types module.
+//
+// `std/types:enum(ThreatLevel) { low, medium, high }` mints a NOMINAL closed
+// tag set — the first materialization rung under the post-dissolution
+// registry: the entry IS its tag list, so nothing is projected from a proto
+// (there are no fields to inherit); the mint stands alone. What it emits is
+// a host enum the tag names survive into — `{{ level:t }}` prints `high`,
+// the C# `$"{s.ThreatLevel}"` parity the LINQ-shaped examples need (`:s`
+// refuses at the Zig layer — a slice spec on an enum — so tag-name printing
+// spells `:t`; a Koru-layer diagnostic for `:s`-on-enum is a later rung) —
+// plus a `// proto-terminal` marker so field-type resolution
+// (`level: ThreatLevel` in a compound) answers like any other terminal: the
+// terminal's host material is its own name, and consumers re-emitting it
+// land on the minted const. Rung 1 is bare tags only — implicit ordinals,
+// `i64` backing; explicit values and width args are later rungs and refuse
+// loudly here rather than half-parse.
+
+~[comptime|transform]pub tor enum {
+    expr: Expression,
+    source: Source,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator,
+    reporter: *std/compiler:ErrorReporter
+} -> SiteResult
+
+~proc enum|zig {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    var type_name = expr;
+    if (type_name.len >= 2 and type_name[0] == '"' and type_name[type_name.len - 1] == '"') {
+        type_name = type_name[1 .. type_name.len - 1];
+    }
+    const name = std.mem.trim(u8, type_name, " \t");
+
+    // The entry name must be an identifier consumers can be shown with;
+    // refuse anything else loudly (never crash).
+    var name_ok = name.len > 0;
+    for (name, 0..) |c, i| {
+        const legal = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c == '_') or (i > 0 and c >= '0' and c <= '9') or (c == '-');
+        if (!legal) {
+            name_ok = false;
+            break;
+        }
+    }
+    if (!name_ok or name.len == 0) {
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/types:enum: the entry name '{s}' is not usable — an enum name must be an identifier (a-z, A-Z, 0-9, '_', '-'; no leading digit)", .{name}) };
+    }
+
+    var is_pub = false;
+    for (flow.annotations) |ann| {
+        if (std.mem.eql(u8, ann, "pub")) {
+            is_pub = true;
+            break;
+        }
+    }
+    const pub_prefix = if (is_pub) "pub " else "";
+
+    // Tag grammar: bare names, one per line — a comma refuses like every
+    // wart. A tag carrying a value (`low: 5`) refuses loudly: explicit
+    // ordinals are a later rung, not a silent parse.
+    var tags = std.ArrayList([]const u8).initCapacity(allocator, 8) catch unreachable;
+    var lines = std.mem.splitScalar(u8, source.text, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, line, ',') != null) return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/types:enum({s}): tag line '{s}' carries a ',' — tags separate on lines, not commas", .{ name, line }) };
+        if (std.mem.indexOfScalar(u8, line, ':') != null) {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/types:enum({s}): tag '{s}' carries an explicit value — rung 1 mints implicit ordinals only (i64, 0-based)", .{ name, line }) };
+        }
+        var tag_ok = line.len > 0;
+        for (line, 0..) |c, i| {
+            const legal = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+                (c == '_') or (i > 0 and c >= '0' and c <= '9') or (c == '-');
+            if (!legal) {
+                tag_ok = false;
+                break;
+            }
+        }
+        if (!tag_ok) {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/types:enum({s}): tag '{s}' is not usable — a tag must be an identifier", .{ name, line }) };
+        }
+        for (tags.items) |prev| {
+            if (std.mem.eql(u8, prev, line)) {
+                return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/types:enum({s}): tag '{s}' is declared twice — a closed tag set cannot repeat a member", .{ name, line }) };
+            }
+        }
+        tags.append(allocator, allocator.dupe(u8, line) catch unreachable) catch unreachable;
+    }
+    if (tags.items.len == 0) {
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/types:enum({s}): an entry with no tags mints nothing — declare at least one tag name", .{name}) };
+    }
+
+    // The markers carry what consumers ask: `// proto-terminal` so the name
+    // resolves as a terminal in field types (its host material is the minted
+    // const's own name), `// types-enum` so tag-set consumers — a future
+    // exhaustiveness check, a `:d` ordinal lowering — can read the members
+    // back. A kebab tag emits `@"low-fire"` so the host field name stays
+    // legal; @tagName returns the unquoted spelling either way.
+    var flat = std.ArrayList(u8).initCapacity(allocator, 32) catch unreachable;
+    var body = std.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+    for (tags.items, 0..) |tag, ti| {
+        if (ti > 0) {
+            flat.appendSlice(allocator, ", ") catch unreachable;
+            body.appendSlice(allocator, ", ") catch unreachable;
+        }
+        flat.appendSlice(allocator, tag) catch unreachable;
+        if (std.mem.indexOfScalar(u8, tag, '-') != null) {
+            body.appendSlice(allocator, "@\"") catch unreachable;
+            body.appendSlice(allocator, tag) catch unreachable;
+            body.append(allocator, '"') catch unreachable;
+        } else {
+            body.appendSlice(allocator, tag) catch unreachable;
+        }
+    }
+    const code = if (std.mem.eql(u8, CompilerEnv.lang, "js"))
+        std.fmt.allocPrint(allocator, "// proto-terminal {s}: {s}\n// types-enum {s}: {s}", .{ name, name, name, flat.items }) catch unreachable
+    else
+        std.fmt.allocPrint(allocator, "// proto-terminal {s}: {s}\n// types-enum {s}: {s}\n{s}const {s} = enum(i64) {{ {s} }};", .{ name, name, name, flat.items, pub_prefix, name, body.items }) catch unreachable;
+
+    const inline_code_item = ast.Item{
+        .inline_code = ast.InlineCode{
+            .code = code,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        },
+    };
+
+    return .{ .replacement = inline_code_item };
+}

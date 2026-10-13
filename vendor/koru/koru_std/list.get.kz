@@ -1,0 +1,29 @@
+// Koru Standard Library: the `get` part of list.kz.
+// Joined via `~part get` in list.kz; merged into the list module at load.
+
+// Random access by index. <list> borrow — read, list untouched. `out-of-bounds`
+// when i is past the end.
+~[comptime|transform]pub tor get {
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc get|zig {
+    if (item.* != .flow) @panic("std/list:get transform: containing item is not a flow");
+    return routeOpCall(allocator, program, &item.flow, "get", invocation);
+}
+
+~pub tor get-i64 { xs: *List_i64<list>, i: usize }
+| item i64
+| out-of-bounds
+
+~proc get-i64|zig {
+    if (i < xs.items.items.len) {
+        return .{ .item = xs.items.items[i] };
+    }
+    return .out_of_bounds;
+}
+
+// Remove and return the last element. <list> borrow: the list stays alive (the

@@ -1,0 +1,311 @@
+// std/string - String library with view/instance ownership model
+//
+// Ownership states:
+//   <view!>     - read-only access, can be promoted to instance
+//   <instance!> - full control, can read/write/free
+//
+// The String struct carries its allocator, so it can be freed anywhere.
+
+const std = @import("std");
+
+pub const String = struct {
+    data: []u8,
+    allocator: std.mem.Allocator,
+
+    // For Zig interop - get the slice
+    pub fn slice(self: String) []const u8 {
+        return self.data;
+    }
+
+    // Package-private - only auto-discharge calls this
+    fn deinit(self: String) void {
+        self.allocator.free(self.data);
+    }
+};
+
+// ============================================
+// Creation tors - different allocator sources
+// ============================================
+
+// Create with explicit allocator
+~pub tor new { allocator: std.mem.Allocator, text: string }
+| ok *String<view!>
+| err string
+
+~proc new|zig {
+    const data = allocator.alloc(u8, text.len) catch {
+        return .{ .err = "allocation failed" };
+    };
+    @memcpy(data, text);
+
+    const s = allocator.create(String) catch {
+        allocator.free(data);
+        return .{ .err = "allocation failed" };
+    };
+    s.* = .{ .data = data, .allocator = allocator };
+    return .{ .ok = s };
+}
+
+// Create with page allocator (simple, for demos)
+~pub tor from-page { text: string }
+| ok *String<view!>
+| err string
+
+~proc from-page|zig {
+    const allocator = koru_allocator();
+    const data = allocator.alloc(u8, text.len) catch {
+        return .{ .err = "allocation failed" };
+    };
+    @memcpy(data, text);
+
+    const s = allocator.create(String) catch {
+        allocator.free(data);
+        return .{ .err = "allocation failed" };
+    };
+    s.* = .{ .data = data, .allocator = allocator };
+    return .{ .ok = s };
+}
+
+// ============================================
+// Ownership transitions
+// ============================================
+
+// Take ownership - view becomes instance
+~pub tor take { s: *String<!view> } -> *String<instance!>
+~take -> s
+
+// Release ownership - instance becomes view
+~pub tor release { s: *String<!instance> } -> *String<view!>
+~release -> s
+
+// ============================================
+// Cleanup
+// ============================================
+
+// Free - works on either view or instance (consume-marker on BOTH members, so
+// the union discharges either state; `<!view|instance>` marked only `view`,
+// hiding `free` from `instance!` obligations — the discharge-finder's
+// .state_union branch keys off each member's own consume marker).
+~pub tor free { s: *String<!view|!instance> }
+
+~proc free|zig {
+    s.allocator.free(s.data);
+    s.allocator.destroy(s);
+}
+
+// ============================================
+// Snapshot - the escape path (610_007, ruled 2026-09-05)
+// ============================================
+//
+// `read` (`{ s } -> string` via `-> s.data`) retired here: a returned borrow
+// is unpoliceable — the owner can invalidate it by discharge OR mutation —
+// so borrows flow down, never up (KORU095 refuses the projection). Consumers
+// that used `read` to feed a call take the handle instead (borrow-for-the-
+// call, `{{ h:S }}`); genuine escapes copy out through this tor. The copy
+// carries `<view!>` so it cannot leak the way a bare allocating `string`
+// return would. One memcpy, at a boundary, priced as noise.
+~pub tor snapshot { s: *String<view|instance> }
+| ok *String<view!>
+| err string
+~snapshot = std/string:from-page(text: s.data)
+| ok s2 => ok s2
+| err e => err e
+
+~pub tor len { s: *String<view|instance> } -> usize
+~len -> s.data.len
+
+// ============================================
+// Query / transform operations (FRONTIERS gap 4)
+//
+// Safe-by-construction: each op returns a scalar or a NEW owned String, never
+// a borrowed sub-view of `s`. So the ratified borrow model holds trivially —
+// `|` terminal payloads OWN what they carry (a scalar owns itself; substring
+// allocates a fresh copy) with zero borrow machinery. Cheap views wait on the
+// borrow-obligation surface; `split` (many parts) waits on the store.
+// ============================================
+
+// Parse the string's text as a base-10 integer.
+~pub tor parse-int { s: *String<view|instance> }
+| ok i64
+| err string
+
+~proc parse-int|zig {
+    const n = std.fmt.parseInt(i64, s.data, 10) catch {
+        return .{ .err = "not an integer" };
+    };
+    return .{ .ok = n };
+}
+
+// Build a NEW owned String from a base-10 integer (the int→string mirror of
+// parse-int). Owned return, so it carries its own ownership obligation.
+~pub tor from-int { n: i64 }
+| ok *String<view!>
+| err string
+
+~proc from-int|zig {
+    const allocator = koru_allocator();
+    const data = std.fmt.allocPrint(allocator, "{d}", .{n}) catch {
+        return .{ .err = "allocation failed" };
+    };
+    const s = allocator.create(String) catch {
+        allocator.free(data);
+        return .{ .err = "allocation failed" };
+    };
+    s.* = .{ .data = data, .allocator = allocator };
+    return .{ .ok = s };
+}
+
+// Does the string contain `needle`?
+~pub tor contains { s: *String<view|instance>, needle: string }
+| yes
+| no
+
+~proc contains|zig {
+    if (std.mem.indexOf(u8, s.data, needle) != null) {
+        return .yes;
+    }
+    return .no;
+}
+
+// First index of `needle`, or not-found.
+~pub tor index-of { s: *String<view|instance>, needle: string }
+| found usize
+| not-found
+
+~proc index-of|zig {
+    if (std.mem.indexOf(u8, s.data, needle)) |idx| {
+        return .{ .found = idx };
+    }
+    return .not_found;
+}
+
+// Extract [start, end) as a NEW owned String<view!> (a fresh copy, not a
+// borrow into `s`). The result carries its own ownership obligation.
+~pub tor substring { s: *String<view|instance>, start: usize, end: usize }
+| ok *String<view!>
+| err string
+
+~proc substring|zig {
+    if (start > end or end > s.data.len) {
+        return .{ .err = "range out of bounds" };
+    }
+    const allocator = s.allocator;
+    const out_data = allocator.alloc(u8, end - start) catch {
+        return .{ .err = "allocation failed" };
+    };
+    @memcpy(out_data, s.data[start..end]);
+    const out = allocator.create(String) catch {
+        allocator.free(out_data);
+        return .{ .err = "allocation failed" };
+    };
+    out.* = .{ .data = out_data, .allocator = allocator };
+    return .{ .ok = out };
+}
+
+// ============================================
+// Split — effect-stream over separated pieces
+// ============================================
+
+// Split a raw byte-slice on a separator, firing `! piece` per piece DURING the
+// call (the read-lines streaming shape, one level down: `! line` is split-on-\n
+// of a file; this is split-on-<sep> of a slice). Operates on []const u8 — the
+// shape read-lines yields and regex named-groups capture — not a *String handle,
+// so it composes directly with line/capture without wrapping. Pieces are
+// BORROWED views into `s` (no allocation, no ownership), valid for the body.
+//
+// This is the naive-phase answer to variable-arity parsing: split into pieces,
+// match each whole piece with the anchored `regex:match`. The principled
+// alternative — a global/streaming regex (`scan`) that finds repeated matches
+// in place — is pinned (640_011) and waits on the engine's unanchored-search
+// "later cut"; split needs no engine work.
+~pub tor split { s: string<*>, sep: string<*> }
+! piece string
+| done usize
+
+~proc split|zig {
+    var __koru_sp_n: usize = 0;
+    // An empty separator would loop forever in splitSequence; treat it as
+    // "the whole slice is one piece" rather than silently hang.
+    if (sep.len == 0) {
+        piece(s);
+        return .{ .done = 1 };
+    }
+    var __koru_sp_it = std.mem.splitSequence(u8, s, sep);
+    while (__koru_sp_it.next()) |__koru_sp_piece| {
+        piece(__koru_sp_piece);
+        __koru_sp_n += 1;
+    }
+    return .{ .done = __koru_sp_n };
+}
+
+// ============================================
+// Write operations - require instance
+// ============================================
+
+~pub tor append { s: *String<instance>, text: string<*> }
+| ok
+| err string
+
+~proc append|zig {
+    const new_len = s.data.len + text.len;
+    const new_data = s.allocator.realloc(s.data, new_len) catch {
+        return .{ .err = "realloc failed" };
+    };
+    @memcpy(new_data[s.data.len..], text);
+    s.data = new_data;
+    return .ok;
+}
+
+// Single-byte append — TUI key input (todo rename): `k.ch` is a u8, not a
+// string literal. Pin 610_022. Without this, every keystroke would need a
+// one-char String allocation just to call `append`.
+~pub tor append-char { s: *String<instance>, ch: u8 }
+| ok
+| err string
+
+~proc append-char|zig {
+    const new_len = s.data.len + 1;
+    const new_data = s.allocator.realloc(s.data, new_len) catch {
+        return .{ .err = "realloc failed" };
+    };
+    new_data[s.data.len] = ch;
+    s.data = new_data;
+    return .ok;
+}
+
+// A String's `data` slice IS its allocation record — there is no capacity
+// field, which is why every mutator above reallocs. The two shrinking tors
+// below must respect that too: editing `len` behind the allocator's back
+// orphans the block, because std.mem.Allocator refuses to act on a
+// zero-length slice in BOTH directions —
+//
+//   free(s.data)        -> `if (bytes_len == 0) return;`   frees nothing
+//   realloc(s.data, n)  -> `if (old_mem.len == 0)` allocates fresh and
+//                          never releases the old pointer
+//
+// so a shrink-to-zero loses the buffer whether it is disposed or appended
+// to next. Pinned as 610_023 (clear) and 610_024 (pop-char). Found by
+// kopium's chat pane leaking one draft line per message sent.
+
+// Drop the last byte (backspace). Empty stays empty — `| ok` either way so
+// a held key doesn't force an err arm.
+~pub tor pop-char { s: *String<instance> }
+
+~proc pop-char|zig {
+    if (s.data.len == 0) return;
+    if (s.data.len == 1) {
+        s.allocator.free(s.data);
+        s.data = &.{};
+        return;
+    }
+    // Shrink the allocation, not just the view. A failed shrink leaves the
+    // string exactly as it was — pop-char declares no err arm.
+    s.data = s.allocator.realloc(s.data, s.data.len - 1) catch return;
+}
+
+~pub tor clear { s: *String<instance> }
+
+~proc clear|zig {
+    s.allocator.free(s.data);
+    s.data = &.{};
+}

@@ -1,0 +1,103 @@
+// Koru Standard Library: Reactive Stores — the `preorder` tor.
+// Joined via `~part preorder` in store.kz; merged into the store module at load.
+
+// ============================================================================
+// STORE.PREORDER — DFS pre-order forest walk over a [tree] store
+// ============================================================================
+//
+//   std/store:preorder(tree)
+//   ! preorder { entity.val } |> …
+//
+// The tree-store traversal surface (695_STORE_TREE, TT5). The coordinator
+// (create) has already transplanted this site's projection/guard/body into
+// qrow/qbody units — identical to query — and emitted a DFS pre-order sweep
+// over the synthesized `parent` column (roots first, insertion order; each
+// node before its children). The site itself becomes that sweep's call.
+// Preorder on a non-[tree] store is rejected by the coordinator with a
+// teaching diagnostic (no parent column to walk).
+
+~[keyword|comptime|transform|claims_descendants]pub tor preorder {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc preorder|zig {
+    const ast = @import("ast");
+
+    if (item.* != .flow) @panic("store:preorder transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    const H = struct {
+        const stripQuotes = @import("emitter_helpers").stripQuotes;
+        const mkPathH = @import("emitter_helpers").mkPathH;
+    };
+
+    var store_name: []const u8 = "";
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "expr")) store_name = H.stripQuotes(arg.value);
+    }
+    if (store_name.len == 0) {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:preorder requires a store name: preorder(name)", .{}) };
+    }
+
+    // The generated units live in the STORE's home namespace, which is the
+    // import-derived `app.lib` — not this flow's file-derived `lib`. They
+    // coincide in the entry file and diverge inside a library (115_018).
+    const home_ns = storeHome(allocator, program, store_name) orelse flow.module;
+    // The coordinator names this site's units by its source line (the same
+    // qsweep scheme as query — only the emitted sweep body differs).
+    const qsweep_name = std.fmt.allocPrint(allocator, "__store_qsweep_{s}_L{d}_{s}", .{ store_name, flow.location.line, storeSiteTag(allocator, flow.location.file) }) catch unreachable;
+    var unit_exists = false;
+    for (flatItems(allocator, program.items)) |pi| {
+        if (pi.* != .event_decl) continue;
+        const ed = &pi.event_decl;
+        if (ed.path.segments.len == 1 and std.mem.eql(u8, ed.path.segments[0], qsweep_name)) {
+            unit_exists = true;
+            break;
+        }
+    }
+    if (!unit_exists) {
+        var create_exists = false;
+        for (flatItems(allocator, program.items)) |pi| {
+            if (pi.* != .flow) continue;
+            const f = &pi.flow;
+            const inv = f.inv();
+            if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "new")) continue;
+            const mq = inv.path.module_qualifier orelse continue;
+            if (!std.mem.eql(u8, mq, "std.store")) continue;
+            for (inv.args) |a| {
+                if (std.mem.eql(u8, a.name, "expr") and std.mem.eql(u8, H.stripQuotes(a.value), store_name)) create_exists = true;
+            }
+        }
+        if (create_exists) {
+            return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:preorder({s}): the preorder precedes its store's create in source - declare the store first", .{store_name}) };
+        }
+        // The store's OWN declaration was already refused; that diagnostic is the
+        // true one and this lookup can only ever fail. Staying silent here is what
+        // keeps one mistake to one error.
+        if (ast.declarationRefused(allocator, program, flow.module, "std/store:new({s}):", .{store_name})) return .{ .transformed = .{} };
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:preorder({s}): unknown store - no std/store:new({s}) found (preorder walks a [tree] container store)", .{ store_name, store_name }) };
+    }
+
+    const sweep_inv = ast.Invocation{
+        .path = H.mkPathH(allocator, home_ns, qsweep_name),
+        .args = &[_]ast.Arg{},
+    };
+    return .{ .transformed = .{ .replacement = ast.Item{ .flow = ast.Flow{
+        .body = ast.rootSite(sweep_inv, &[_]ast.Continuation{}, flow.location),
+        .pre_label = null,
+        .impl_of = flow.impl_of, // preserved: the site may BE an impl flow's head
+        .super_shape = null,
+        .inline_body = null,
+        .preamble_code = null,
+        .is_pure = false,
+        .is_transitively_pure = false,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } } } };
+}
+

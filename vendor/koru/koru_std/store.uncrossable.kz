@@ -1,0 +1,61 @@
+// Koru Standard Library: the `uncrossable` part of store — joined via
+// `~part uncrossable` in store.kz; members land in koru_store.
+//
+// The void-graft boundary, both halves of it. Graft mints the synthesized
+// VOID units store transforms lower arm bodies into — the `asVoidStep`
+// sequential step every interceptor/watch body becomes and the
+// `atEnds` splice that hangs grafted continuations on a chain's leaves.
+// Post-graft such a body sits under `is_transformed_subtree`, which every
+// checker skips by ruling (transformed subtrees are compiler-owned and
+// pre-validated) — so the other half, refuseVoidArm, is the pre-graft
+// wall: a `=>`/`->` inside a void-grafted arm names a branch of nothing
+// and must be refused while the user-authored body is still visible.
+// (kopium wired/holes/10: `=>` in a `! query` arm sailed through checking
+// and died in emitted Zig, undiagnosed.) The walker and the diagnostic
+// live in src/ast.zig (`refuseUncrossable`) — grid's sweep arms and
+// channel's consumer arms share the same boundary and call it directly.
+
+const Graft = struct {
+    fn atEnds(alloc: std.mem.Allocator, cont: *ast_find.Continuation, next: *const ast_find.Continuation) void {
+        const ast_functional = @import("ast_functional");
+        if (cont.continuations.len == 0) {
+            const kids = alloc.alloc(ast_find.Continuation, 1) catch unreachable;
+            kids[0] = ast_functional.cloneContinuation(alloc, next) catch unreachable;
+            cont.continuations = kids;
+            return;
+        }
+        for (cont.continuations) |*c| atEnds(alloc, @constCast(c), next);
+    }
+    // A body continuation re-shaped as a sequential void step.
+    fn asVoidStep(alloc: std.mem.Allocator, body: *const ast_find.Continuation) ast_find.Continuation {
+        const ast_functional = @import("ast_functional");
+        const cloned = ast_functional.cloneContinuation(alloc, body) catch unreachable;
+        return ast_find.Continuation{
+            .branch = alloc.dupe(u8, "") catch unreachable,
+            .binding = null,
+            .kind = .terminal,
+            .condition = null,
+            .node = cloned.node,
+            .indent = cloned.indent,
+            .continuations = cloned.continuations,
+            .is_transformed_subtree = true,
+            .location = cloned.location,
+        };
+    }
+};
+
+// Store's call of the shared wall. `verb` is the bare store verb
+// (`query`/`first`/`rule`/`preorder`/`new`/`watch`); `arm` the arm's own
+// name. `new`'s pump arms are the standing exception: a `step`/`wait`
+// participant's `=>` constructs its own declared verdicts, which is how
+// it answers the pump (690_309) — every other `new` arm is void-grafted.
+fn refuseVoidArm(alloc: std.mem.Allocator, rep: anytype, verb: []const u8, store_name: []const u8, arm: []const u8, c: *const ast_find.Continuation, module: []const u8) ?ast_find.SiteResult {
+    if (std.mem.eql(u8, verb, "new") and !isVoidNewArm(arm)) return null;
+    return ast_find.refuseUncrossable(alloc, rep, std.fmt.allocPrint(alloc, "store:{s}", .{verb}) catch unreachable, store_name, arm, c, module);
+}
+
+fn isVoidNewArm(arm: []const u8) bool {
+    return std.mem.eql(u8, arm, "discharge") or std.mem.eql(u8, arm, "cleared") or
+        std.mem.eql(u8, arm, "inserted") or std.mem.eql(u8, arm, "removed") or
+        std.mem.eql(u8, arm, "updated");
+}

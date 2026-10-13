@@ -1,0 +1,1289 @@
+// Koru Standard Library: the `run` part of interpreter.kz — the main
+// interpreter tors (run / run-cached / eval) and the flow-execution core.
+// Joined via `~part run` in interpreter.kz; merged into the interpreter
+// module at load.
+
+// MAIN INTERPRETER EVENTS
+// ============================================================================
+
+// Parse and execute in one step - the main interpreter entry point
+// Use get-scope to get the dispatcher first, then pass it here
+~[retain]pub tor run {
+    source: string,
+    dispatcher: DispatchFn,
+    cost_fn: ?CostFn,  // Optional cost lookup (null = default cost 1)
+    creates_obligations_fn: ?ObligationsArrayFn,   // tor -> []obligations it creates
+    discharges_obligations_fn: ?ObligationsArrayFn, // tor -> []obligations it discharges
+    discharge_event_fn: ?DischargeEventFn,         // obligation -> tor that discharges it
+    creates_spec_fn: ?CreatesSpecFn = null,        // tor -> []CreateSpec with field names
+    discharges_spec_fn: ?DischargesSpecFn = null,  // tor -> []DischargeSpec with arg names
+    budget: ?u64,  // Optional budget limit (null = unlimited)
+    handle_pool: ?*HandlePool,  // Optional external pool (for bridges)
+    fail_fast: bool = true,
+    scope_name: string = "default",  // Scope name for handle isolation
+    auto_discharge: bool = true,  // Auto-discharge undischarged handles at end
+    defined: ?*DefinedFlows = null, input_fn: ?InputLookupFn = null,  // REPL define; tor -> declared input fields
+    lenient: bool = false,  // 430_056: under-handling hands back `unhandled-branch` instead of refusing
+    host_dispatch: ?HostDispatchFn = null,  // session verbs consulted after the scope denies
+    session_env: ?*Environment = null,
+    session_bind_fn: ?SessionBindFn = null,  // binds every dispatched result into the session (rN)
+    session_bind_env: ?*Environment = null,
+    session_bind_counter: ?*u64 = null
+}
+| result { value: Value, used: u64, handles: u32, bound: string, trace: string }
+| unhandled-branch { branch: string, payload: string, handles: string }
+| exhausted { used: u64, last_event: string, handles: u32 }
+| parse-error { message: string, line: u32, column: u32 }
+| validation-error string
+| dispatch-error { event_name: string, message: string, trace: string }
+
+
+// Execute pre-parsed AST - for benchmarks and advanced use
+// This is the fast path: no parsing overhead, just execution!
+~[retain]pub tor eval {
+    flow: *const ast.Flow,
+    dispatcher: DispatchFn,
+    cost_fn: ?CostFn,  // Optional cost lookup (null = default cost 1)
+    creates_obligations_fn: ?ObligationsArrayFn,
+    discharges_obligations_fn: ?ObligationsArrayFn,
+    discharge_event_fn: ?DischargeEventFn,
+    creates_spec_fn: ?CreatesSpecFn = null,        // tor -> []CreateSpec with field names
+    discharges_spec_fn: ?DischargesSpecFn = null,  // tor -> []DischargeSpec with arg names
+    budget: ?u64,  // Optional budget limit (null = unlimited)
+    handle_pool: ?*HandlePool,  // Optional external pool (for bridges)
+    scope_name: string = "default",  // Scope name for handle isolation
+    auto_discharge: bool = true,  // Auto-discharge undischarged handles at end
+    defined: ?*DefinedFlows = null, input_fn: ?InputLookupFn = null,  // REPL define; tor -> declared input fields
+    lenient: bool = false,  // 430_056: under-handling hands back `unhandled-branch`
+    host_dispatch: ?HostDispatchFn = null,
+    session_env: ?*Environment = null,
+    session_bind_fn: ?SessionBindFn = null,
+    session_bind_env: ?*Environment = null,
+    session_bind_counter: ?*u64 = null
+}
+| result { value: Value, used: u64, handles: u32, bound: string, trace: string }
+| unhandled-branch { branch: string, payload: string, handles: string }
+| exhausted { used: u64, last_event: string, handles: u32 }
+| validation-error string
+| dispatch-error { event_name: string, message: string, trace: string }
+
+~proc run|zig {
+    if (findHostTilde(source)) |t| {
+        return .{ .parse_error = .{
+            .message = "`~` is not legal in interpreter source. It switches a host-embedded file (.kz/.kjs) from the host language into Koru; interpreter source is already pure Koru, so it marks nothing. Drop it: write `open(path: \"x\")`, not `~open(path: \"x\")`.",
+            .line = t.line,
+            .column = t.column,
+        }};
+    }
+
+    const allocator = InterpreterThreadState.prepare();
+
+    // Fast path: lightweight flow parser (no TypeRegistry, no ModuleResolver, no ErrorReporter)
+    // Falls back to full parser on failure for edge cases (multi-statement, error reporting)
+    var flow_result = flow_parser.parseFlow(allocator, source);
+    const flow: *const ast.Flow = switch (flow_result) {
+        .flow => |*f| f,
+        .err => switch (freshFlow(allocator, source, fail_fast)) {
+            .flow => |f| f,
+            .err => |e| return .{ .parse_error = .{
+                .message = e.message, .line = e.line, .column = e.column,
+            } },
+        },
+    };
+
+    // Post-parse wire refusals (part `refuse`) — a prose invocation name
+    // (430_055) and a `|*` residual arm (440_020) — gate after either parse
+    // path and before the scope lookup, so neither surfaces as a misleading
+    // `event-denied` nor an unjudgeable dispatch.
+    if (wireParseRefusal(flow)) |msg| {
+        return .{ .parse_error = .{
+            .message = msg, .line = 0, .column = 0,
+        }};
+    }
+    // Validation pass
+    if (validateFlow(flow, allocator, input_fn, defined, session_env)) |validation_err| {
+        return .{ .validation_error = std.heap.page_allocator.dupe(u8, validation_err.message) catch "validation error" };
+    }
+
+    // Create environment and context
+    const env = &InterpreterThreadState.env;
+    const expr_bindings = &InterpreterThreadState.expr_bindings;
+
+    // Seed the session's durable bindings into this run's env — the wire's
+    // `r3.user_id` on turn 9 names a value a turn 4 call bound. Session
+    // values were copied into session memory at bind time, so a shallow
+    // transplant is safe: the arena reset cannot reach them.
+    if (session_env) |se| {
+        var sit = se.bindings.iterator();
+        while (sit.next()) |e| env.bind(e.key_ptr.*, e.value_ptr.*) catch {};
+    }
+
+    var budget_state = BudgetState.init(budget);
+
+    const using_external_pool = handle_pool != null;
+    var local_pool = if (handle_pool == null) HandlePool.init(allocator) else undefined;
+    defer if (!using_external_pool) local_pool.deinit();
+    const active_pool: *HandlePool = if (handle_pool) |ext| ext else &local_pool;
+
+    var ctx = InterpreterContext{
+        .env = env,
+        .expr_bindings = expr_bindings,
+        .allocator = allocator,
+        .dispatcher = dispatcher,
+        .cost_fn = cost_fn,
+        .creates_obligations_fn = creates_obligations_fn,
+        .discharges_obligations_fn = discharges_obligations_fn,
+        .discharge_event_fn = discharge_event_fn,
+        .creates_spec_fn = creates_spec_fn,
+        .discharges_spec_fn = discharges_spec_fn,
+        .budget = &budget_state,
+        .handle_pool = active_pool,
+        .scope_name = scope_name,
+        .defined = defined,
+        .input_fn = input_fn,
+        .host_dispatch = host_dispatch,
+        .session_env = session_env,
+        .session_bind_fn = session_bind_fn,
+        .session_bind_env = session_bind_env,
+        .session_bind_counter = session_bind_counter,
+        .unhandled_outcome = null,
+    };
+
+    // Execute the flow!
+    const result_value = executeFlow(flow, &ctx) catch |err| {
+        // Check if this was a budget exhaustion
+        if (err == error.BudgetExhausted) {
+            autoDischargeHandles(
+                auto_discharge,
+                using_external_pool,
+                active_pool,
+                discharges_spec_fn,
+                dispatcher,
+                allocator,
+            );
+            const stable_last_event = std.heap.page_allocator.dupe(u8, budget_state.last_event) catch budget_state.last_event;
+            return .{ .exhausted = .{
+                .used = budget_state.used,
+                .last_event = stable_last_event,
+                .handles = @intCast(active_pool.countUndischarged()),
+            }};
+        }
+        // Build tor name for error reporting
+        const stable_event_name = persistentEventName(flow.inv());
+
+        autoDischargeHandles(
+            auto_discharge,
+            using_external_pool,
+            active_pool,
+            discharges_spec_fn,
+            dispatcher,
+            allocator,
+        );
+
+        return .{ .dispatch_error = .{
+            .event_name = ctx.failing_event_name orelse stable_event_name,
+            .message = ctx.error_detail orelse @errorName(err),
+            .trace = renderTrace(&ctx.trace, allocator),
+        }};
+    };
+
+// An under-handled fragment hands its outcome back (430_056): the host
+    // becomes the handler. Termination is different from completion —
+    // `result` is "finished with this value", `unhandled-branch` is
+    // "stopped, nobody handled this" — so it is a separate branch, forced
+    // on every caller by KORU022, exactly as the ruling demands. Skip
+    // auto-discharge here: retention across the hand-back is the point;
+    // the host that receives the named handles decides discharge.
+    if (ctx.unhandled_outcome) |u| {
+        if (!lenient) {
+            // The mode is the caller's policy call (430_056 ruling): strict
+            // callers keep today's refusal, named honestly.
+            return .{ .dispatch_error = .{
+                .event_name = ctx.failing_event_name orelse persistentEventName(flow.inv()),
+                .message = "NoBranchMatch",
+                .trace = renderTrace(&ctx.trace, allocator),
+            } };
+        }
+        return .{ .unhandled_branch = .{
+            .branch = u.branch,
+            .payload = u.toJsonBuf(),
+            .handles = renderHeldHandles(active_pool),
+        } };
+    }
+
+    const stable_value = result_value.clonePersistent();
+
+    autoDischargeHandles(
+        auto_discharge,
+        using_external_pool,
+        active_pool,
+        discharges_spec_fn,
+        dispatcher,
+        allocator,
+    );
+
+    return .{ .result = .{
+        .value = stable_value,
+        .used = budget_state.used,
+        .handles = @intCast(active_pool.countUndischarged()),
+        // The terminal's durable name came from the trace's bind, not a
+        // second mint — the last dispatch and the result are the same value.
+        .bound = lastBound(&ctx.trace),
+        .trace = renderTrace(&ctx.trace, allocator),
+    }};
+}
+
+
+
+// ============================================================================
+// FLOW EXECUTION - The core interpreter loop
+// ============================================================================
+
+/// Dispatcher results are borrowed memory: |zig procs hand back slices into
+/// their own stack frames, and generated dispatchers point `fields` at
+/// per-tor threadlocal buffers. Anything the interpreter keeps — an arm
+/// binding, the value it returns — must outlive that, so branch, field names,
+/// and string bytes are copied into the turn arena the moment the dispatcher
+/// answers. Borrowed-at-dispatch is garbage-at-use.
+fn ownDispatchResult(result: *DispatchResult, allocator: std.mem.Allocator) !void {
+    result.branch = try allocator.dupe(u8, result.branch);
+    const owned = try allocator.alloc(NamedField, result.fields.len);
+    for (result.fields, 0..) |f, i| {
+        owned[i] = .{
+            .name = try allocator.dupe(u8, f.name),
+            .value = switch (f.value) {
+                .string_val => |s| FieldValue{ .string_val = try allocator.dupe(u8, s) },
+                else => f.value,
+            },
+        };
+    }
+    result.fields = owned;
+}
+
+fn fieldValueToString(fv: FieldValue, allocator: std.mem.Allocator) ![]const u8 {
+    return switch (fv) {
+        .string_val => |s| allocator.dupe(u8, s),
+        .bool_val => |b| if (b) allocator.dupe(u8, "true") else allocator.dupe(u8, "false"),
+        .int_val => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float_val => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+    };
+}
+
+fn fieldValueToExprValue(fv: FieldValue) ExprValue {
+    return switch (fv) {
+        .string_val => |s| .{ .string_val = s },
+        .bool_val => |b| .{ .bool_val = b },
+        .int_val => |i| .{ .int_val = i },
+        .float_val => |f| .{ .float_val = f },
+    };
+}
+
+// Execute a single flow node, returning the final value
+fn executeFlow(
+    flow: *const ast.Flow,
+    ctx: *InterpreterContext,
+) !Value {
+    const inv = flow.inv();
+    // This flow's own dispatch trace slot — set when the invocation below
+    // really dispatched; a matched `|` arm then writes its binding name onto
+    // it. Control-flow spellings (if/for/while) never set it, so their arm
+    // bindings can't be misattributed onto a sibling's call.
+    var this_trace_idx: ?usize = null;
+
+    // Build invocation for dispatcher
+    var dispatch_result: DispatchResult = undefined;
+
+    // =========================================================================
+    // SPECIAL HANDLING: Control flow (if, for)
+    // Recognized as both bare (if) and qualified (std/control:if)
+    // =========================================================================
+    const is_if = (inv.path.module_qualifier == null and
+                   inv.path.segments.len == 1 and
+                   std.mem.eql(u8, inv.path.segments[0], "if")) or
+                  (inv.path.module_qualifier != null and
+                   std.mem.eql(u8, inv.path.module_qualifier.?, "std.control") and
+                   inv.path.segments.len == 1 and
+                   std.mem.eql(u8, inv.path.segments[0], "if"));
+
+    const is_for = (inv.path.module_qualifier == null and
+                    inv.path.segments.len == 1 and
+                    std.mem.eql(u8, inv.path.segments[0], "for")) or
+                   (inv.path.module_qualifier != null and
+                    std.mem.eql(u8, inv.path.module_qualifier.?, "std.control") and
+                    inv.path.segments.len == 1 and
+                    std.mem.eql(u8, inv.path.segments[0], "for"));
+
+    const is_while = (inv.path.module_qualifier == null and
+                      inv.path.segments.len == 1 and
+                      std.mem.eql(u8, inv.path.segments[0], "while")) or
+                     (inv.path.module_qualifier != null and
+                      std.mem.eql(u8, inv.path.module_qualifier.?, "std.control") and
+                      inv.path.segments.len == 1 and
+                      std.mem.eql(u8, inv.path.segments[0], "while"));
+
+    if (is_if) {
+        // std.debug.print("[INTERPRETER] Detected if, evaluating condition\n", .{});
+
+        // Get expression from the first arg (should be the condition)
+        var condition_result: bool = false;
+
+        if (inv.args.len > 0) {
+            const first_arg = &inv.args[0];
+
+            // Get expression text - from CapturedExpression if available, else from value
+            const expr_text = if (first_arg.expression_value) |captured|
+                captured.text
+            else
+                first_arg.value;
+
+            {
+                // Runtime parsing: parse the expression string using ExpressionParser
+                // std.debug.print("[INTERPRETER] Parsing expression: '{s}'\n", .{expr_text});
+
+                // Quick check for simple literals first
+                if (std.mem.eql(u8, expr_text, "true")) {
+                    condition_result = true;
+                } else if (std.mem.eql(u8, expr_text, "false")) {
+                    condition_result = false;
+                } else {
+                    // Parse complex expression using ExpressionParser (re-exported from koru_parser)
+                    var expr_parser = koru_parser.ExpressionParser.init(ctx.allocator, expr_text);
+                    defer expr_parser.deinit();
+
+                    if (expr_parser.parse()) |parsed_expr| {
+                        // Evaluate the parsed expression against our bindings
+                        if (evaluateExpression(parsed_expr, ctx.expr_bindings)) |eval_result| {
+                            condition_result = eval_result.isTruthy();
+                            // std.debug.print("[INTERPRETER] Expression evaluated to: {}\n", .{condition_result});
+                        } else |_| {
+                            // std.debug.print("[INTERPRETER] Expression eval error: {s}\n", .{@errorName(err)});
+                            condition_result = false;
+                        }
+                    } else |_| {
+                        // std.debug.print("[INTERPRETER] Expression parse error: {s}\n", .{@errorName(parse_err)});
+                        // Fallback: try as simple identifier binding
+                        if (ctx.expr_bindings.get(expr_text)) |val| {
+                            condition_result = val.isTruthy();
+                        } else {
+                            condition_result = expr_text.len > 0;
+                        }
+                    }
+                }
+                // std.debug.print("[INTERPRETER] Condition (from string '{s}'): {}\n", .{expr_text, condition_result});
+            }
+        }
+
+        // Set the branch based on condition result
+        dispatch_result.branch = if (condition_result) "then" else "else";
+        dispatch_result.fields = &[_]NamedField{};
+        // std.debug.print("[INTERPRETER] if taking branch: | {s} |>\n", .{dispatch_result.branch});
+    } else if (is_for) {
+        // =====================================================================
+        // SPECIAL HANDLING: for - Runtime loop
+        // for(0..N) | each i |> body | done |> after
+        // =====================================================================
+        // std.debug.print("[INTERPRETER] Detected for, executing loop\n", .{});
+
+        // Parse range from first arg (format: "start..end")
+        var start: i64 = 0;
+        var end: i64 = 0;
+
+        if (inv.args.len > 0) {
+            const range_str = inv.args[0].value;
+            if (std.mem.indexOf(u8, range_str, "..")) |dot_pos| {
+                start = std.fmt.parseInt(i64, range_str[0..dot_pos], 10) catch 0;
+                end = std.fmt.parseInt(i64, range_str[dot_pos + 2 ..], 10) catch 0;
+            }
+        }
+
+        // std.debug.print("[INTERPRETER] for range: {d}..{d}\n", .{ start, end });
+
+        // Find | each | and | done | continuations
+        var each_cont: ?*const ast.Continuation = null;
+        var done_cont: ?*const ast.Continuation = null;
+
+        for (flow.body.continuations) |*cont| {
+            if (std.mem.eql(u8, cont.branch, "each")) {
+                each_cont = cont;
+            } else if (std.mem.eql(u8, cont.branch, "done")) {
+                done_cont = cont;
+            }
+        }
+
+        // Execute | each | continuation for each iteration
+        if (each_cont) |cont| {
+            var i = start;
+            while (i < end) : (i += 1) {
+                // std.debug.print("[INTERPRETER] for iteration {d}\n", .{i});
+
+                // Bind loop variable if there's a binding
+                if (cont.binding) |binding_name| {
+                    var iter_buf: [32]u8 = undefined;
+                    const iter_str = std.fmt.bufPrint(&iter_buf, "{d}", .{i}) catch "0";
+                    const iter_value = Value{
+                        .branch = "each",
+                        .fields = &[_]NamedField{.{ .name = "value", .value = .{ .string_val = iter_str } }},
+                    };
+                    try ctx.env.bind(binding_name, iter_value);
+
+                    // Also add to expr_bindings for nested conditions
+                    try ctx.expr_bindings.set(binding_name, .{ .int_val = i });
+                }
+
+                // Execute the body if there's a next node
+                if (cont.node) |node| {
+                    switch (node) {
+                        .invocation => |next_inv| {
+                            const next_flow = ast.Flow{
+                                .body = ast.rootSite(next_inv, cont.continuations, .{ .file = "generated", .line = 0, .column = 0 }),
+                                .module = flow.module,
+                            };
+                            _ = try executeFlow(&next_flow, ctx);
+                        },
+                        .branch_constructor => {
+                            // Branch constructor in for body - nothing to do
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+
+        // After loop, take | done | branch
+        dispatch_result.branch = "done";
+        dispatch_result.fields = &[_]NamedField{};
+        // std.debug.print("[INTERPRETER] for complete, taking | done |>\n", .{});
+
+        // If there's a done continuation with a node, follow it
+        if (done_cont) |cont| {
+            if (cont.node) |node| {
+                switch (node) {
+                    .invocation => |next_inv| {
+                        const next_flow = ast.Flow{
+                            .body = ast.rootSite(next_inv, cont.continuations, .{ .file = "generated", .line = 0, .column = 0 }),
+                            .module = flow.module,
+                        };
+                        return try executeFlow(&next_flow, ctx);
+                    },
+                    .branch_constructor => |bc| {
+                        var fields = try ctx.allocator.alloc(NamedField, bc.fields.len);
+                        for (bc.fields, 0..) |field, idx| {
+                            const value = if (field.expression_str) |expr|
+                                FieldValue{ .string_val = try evaluateExpr(expr, ctx) }
+                            else
+                                FieldValue{ .string_val = try ctx.allocator.dupe(u8, field.name) };
+                            fields[idx] = .{
+                                .name = try ctx.allocator.dupe(u8, field.name),
+                                .value = value,
+                            };
+                        }
+                        return Value{
+                            .branch = try ctx.allocator.dupe(u8, bc.branch_name),
+                            .fields = fields,
+                        };
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        return Value.fromDispatch(dispatch_result.branch, dispatch_result.fields);
+    } else if (is_while) {
+        // =====================================================================
+        // SPECIAL HANDLING: while - Conditional loop with state
+        // while(condition in { state }) | continue c |> ... continued { } | done c |> ...
+        // =====================================================================
+
+        // Parse "condition in { initial_state }" from the first arg
+        var condition_expr: []const u8 = "false";
+        var state_text: []const u8 = "";
+
+        if (inv.args.len > 0) {
+            const first_arg = &inv.args[0];
+            const expr_text = if (first_arg.expression_value) |captured|
+                captured.text
+            else
+                first_arg.value;
+
+            // Look for " in " separator
+            if (std.mem.indexOf(u8, expr_text, " in ")) |in_pos| {
+                condition_expr = std.mem.trim(u8, expr_text[0..in_pos], " \t");
+                // Extract state text after "in "
+                state_text = std.mem.trim(u8, expr_text[in_pos + 4 ..], " \t");
+            } else {
+                // No "in", just a condition (infinite loop potential!)
+                condition_expr = expr_text;
+            }
+        }
+
+        // Find | continue | and | done | continuations
+        var continue_cont: ?*const ast.Continuation = null;
+        var done_cont: ?*const ast.Continuation = null;
+
+        for (flow.body.continuations) |*cont| {
+            if (std.mem.eql(u8, cont.branch, "continue")) {
+                continue_cont = cont;
+            } else if (std.mem.eql(u8, cont.branch, "done")) {
+                done_cont = cont;
+            }
+        }
+
+        // Parse initial state from state_text "{ x: 0, y: 1 }"
+        var state_fields = std.StringHashMap(FieldValue).init(ctx.allocator);
+        defer state_fields.deinit();
+
+        if (state_text.len > 0) {
+            // Strip braces and parse key: value pairs
+            const inner = std.mem.trim(u8, state_text, " \t\n{}");
+            var pairs = std.mem.splitScalar(u8, inner, ',');
+            while (pairs.next()) |pair| {
+                const trimmed = std.mem.trim(u8, pair, " \t\n");
+                if (std.mem.indexOf(u8, trimmed, ":")) |colon_pos| {
+                    const key = std.mem.trim(u8, trimmed[0..colon_pos], " \t");
+                    const val_str = std.mem.trim(u8, trimmed[colon_pos + 1 ..], " \t");
+                    const val = std.fmt.parseInt(i64, val_str, 10) catch 0;
+                    try state_fields.put(key, .{ .int_val = val });
+                }
+            }
+        }
+
+        // Execute while loop
+        var iteration: usize = 0;
+        const max_iterations: usize = 10000; // Safety limit
+
+        while (iteration < max_iterations) : (iteration += 1) {
+            // Bind current state to expr_bindings for condition evaluation
+            var state_iter = state_fields.iterator();
+            while (state_iter.next()) |entry| {
+                // Convert FieldValue to ExprValue
+                const expr_val: ExprValue = switch (entry.value_ptr.*) {
+                    .int_val => |i| .{ .int_val = i },
+                    .float_val => |f| .{ .float_val = f },
+                    .bool_val => |b| .{ .bool_val = b },
+                    .string_val => |s| .{ .string_val = s },
+                };
+                try ctx.expr_bindings.set(entry.key_ptr.*, expr_val);
+            }
+
+            // Evaluate condition
+            var condition_result: bool = false;
+            if (std.mem.eql(u8, condition_expr, "true")) {
+                condition_result = true;
+            } else if (std.mem.eql(u8, condition_expr, "false")) {
+                condition_result = false;
+            } else {
+                var expr_parser = koru_parser.ExpressionParser.init(ctx.allocator, condition_expr);
+                defer expr_parser.deinit();
+
+                if (expr_parser.parse()) |parsed_expr| {
+                    if (evaluateExpression(parsed_expr, ctx.expr_bindings)) |eval_result| {
+                        condition_result = eval_result.isTruthy();
+                    } else |_| {
+                        condition_result = false;
+                    }
+                } else |_| {
+                    condition_result = false;
+                }
+            }
+
+            if (!condition_result) {
+                // Condition false - exit loop, take | done | branch
+                break;
+            }
+
+            // Execute | continue | body
+            if (continue_cont) |cont| {
+                // Bind current state to the continuation binding
+                if (cont.binding) |binding_name| {
+                    var fields_list = std.ArrayList(NamedField){ .items = &.{}, .capacity = 0 };
+                    var iter = state_fields.iterator();
+                    while (iter.next()) |entry| {
+                        try fields_list.append(ctx.allocator, .{
+                            .name = entry.key_ptr.*,
+                            .value = entry.value_ptr.*,
+                        });
+
+                        // IMPORTANT: Also add binding.field to expr_bindings for arithmetic evaluation
+                        var field_key_buf: [256]u8 = undefined;
+                        const field_key = std.fmt.bufPrint(&field_key_buf, "{s}.{s}", .{binding_name, entry.key_ptr.*}) catch continue;
+                        const field_key_owned = try ctx.allocator.dupe(u8, field_key);
+                        const expr_val = fieldValueToExprValue(entry.value_ptr.*);
+                        try ctx.expr_bindings.set(field_key_owned, expr_val);
+                    }
+                    const state_value = Value{
+                        .branch = "continue",
+                        .fields = try fields_list.toOwnedSlice(ctx.allocator),
+                    };
+                    try ctx.env.bind(binding_name, state_value);
+                }
+
+                // Execute the body
+                if (cont.node) |node| {
+                    switch (node) {
+                        .invocation => |next_inv| {
+                            const next_flow = ast.Flow{
+                                .body = ast.rootSite(next_inv, cont.continuations, .{ .file = "generated", .line = 0, .column = 0 }),
+                                .module = flow.module,
+                            };
+                            const body_result = try executeFlow(&next_flow, ctx);
+
+                            // Check if body returned "continued" with new state
+                            if (std.mem.eql(u8, body_result.branch, "continued")) {
+                                // Update state from the returned fields
+                                for (body_result.fields) |field| {
+                                    if (field.value == .int_val) {
+                                        try state_fields.put(field.name, field.value);
+                                    } else if (field.value == .string_val) {
+                                        // Try to parse as int
+                                        const val = std.fmt.parseInt(i64, field.value.string_val, 10) catch 0;
+                                        try state_fields.put(field.name, .{ .int_val = val });
+                                    }
+                                }
+                            }
+                        },
+                        .branch_constructor => |bc| {
+                            // Direct branch constructor - check if it's "continued"
+                            if (std.mem.eql(u8, bc.branch_name, "continued")) {
+                                for (bc.fields) |field| {
+                                    if (field.expression_str) |expr| {
+                                        // Use expression parser to evaluate arithmetic like "c.x + 1"
+                                        var expr_parser = koru_parser.ExpressionParser.init(ctx.allocator, expr);
+                                        defer expr_parser.deinit();
+
+                                        if (expr_parser.parse()) |parsed_expr| {
+                                            if (evaluateExpression(parsed_expr, ctx.expr_bindings)) |eval_result| {
+                                                switch (eval_result) {
+                                                    .int_val => |i| try state_fields.put(field.name, .{ .int_val = i }),
+                                                    .float_val => |f| try state_fields.put(field.name, .{ .float_val = f }),
+                                                    .bool_val => |b| try state_fields.put(field.name, .{ .bool_val = b }),
+                                                    .string_val => |s| try state_fields.put(field.name, .{ .string_val = s }),
+                                                    .null_val => {},
+                                                }
+                                            } else |_| {}
+                                        } else |_| {
+                                            // Fallback to simple evaluation
+                                            const evaluated = try evaluateExpr(expr, ctx);
+                                            const val = std.fmt.parseInt(i64, evaluated, 10) catch 0;
+                                            try state_fields.put(field.name, .{ .int_val = val });
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+
+        // Loop ended - take | done | branch
+        dispatch_result.branch = "done";
+        dispatch_result.fields = &[_]NamedField{};
+
+        if (done_cont) |cont| {
+            // Bind final state
+            if (cont.binding) |binding_name| {
+                var fields_list = std.ArrayList(NamedField){ .items = &.{}, .capacity = 0 };
+                var iter = state_fields.iterator();
+                while (iter.next()) |entry| {
+                    try fields_list.append(ctx.allocator, .{
+                        .name = entry.key_ptr.*,
+                        .value = entry.value_ptr.*,
+                    });
+
+                    // Also add binding.field to expr_bindings for branch constructor evaluation
+                    var field_key_buf: [256]u8 = undefined;
+                    const field_key = std.fmt.bufPrint(&field_key_buf, "{s}.{s}", .{binding_name, entry.key_ptr.*}) catch continue;
+                    const field_key_owned = try ctx.allocator.dupe(u8, field_key);
+                    const expr_val = fieldValueToExprValue(entry.value_ptr.*);
+                    try ctx.expr_bindings.set(field_key_owned, expr_val);
+                }
+                const state_value = Value{
+                    .branch = "done",
+                    .fields = try fields_list.toOwnedSlice(ctx.allocator),
+                };
+                try ctx.env.bind(binding_name, state_value);
+            }
+
+            if (cont.node) |node| {
+                switch (node) {
+                    .invocation => |next_inv| {
+                        const next_flow = ast.Flow{
+                            .body = ast.rootSite(next_inv, cont.continuations, .{ .file = "generated", .line = 0, .column = 0 }),
+                            .module = flow.module,
+                        };
+                        return try executeFlow(&next_flow, ctx);
+                    },
+                    .branch_constructor => |bc| {
+                        // Return the branch constructor as the final result
+                        var fields = try ctx.allocator.alloc(NamedField, bc.fields.len);
+                        for (bc.fields, 0..) |field, i| {
+                            var value: FieldValue = undefined;
+
+                            if (field.expression_str) |expr| {
+                                // Use expression parser for arithmetic
+                                var expr_parser = koru_parser.ExpressionParser.init(ctx.allocator, expr);
+                                defer expr_parser.deinit();
+
+                                if (expr_parser.parse()) |parsed_expr| {
+                                    if (evaluateExpression(parsed_expr, ctx.expr_bindings)) |eval_result| {
+                                        value = switch (eval_result) {
+                                            .int_val => |n| .{ .int_val = n },
+                                            .float_val => |f| .{ .float_val = f },
+                                            .bool_val => |b| .{ .bool_val = b },
+                                            .string_val => |s| .{ .string_val = s },
+                                            .null_val => .{ .string_val = "" },
+                                        };
+                                    } else |_| {
+                                        value = .{ .string_val = try evaluateExpr(expr, ctx) };
+                                    }
+                                } else |_| {
+                                    value = .{ .string_val = try evaluateExpr(expr, ctx) };
+                                }
+                            } else {
+                                value = .{ .string_val = try ctx.allocator.dupe(u8, field.name) };
+                            }
+
+                            fields[i] = .{
+                                .name = try ctx.allocator.dupe(u8, field.name),
+                                .value = value,
+                            };
+                        }
+
+                        return Value{
+                            .branch = try ctx.allocator.dupe(u8, bc.branch_name),
+                            .fields = fields,
+                        };
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        return Value.fromDispatch(dispatch_result.branch, dispatch_result.fields);
+    } else {
+        // Normal dispatch for other tors
+        if (ctx.dispatcher) |dispatcher| {
+            // Get tor name for budget tracking
+            const event_name = if (inv.path.segments.len > 0) inv.path.segments[0] else "unknown";
+
+            // Check budget before dispatch - use cost_fn if available
+            const event_cost: u64 = if (ctx.cost_fn) |cost_fn| cost_fn(event_name) else 1;
+            if (ctx.budget) |budget| {
+                if (!budget.consume(event_cost, event_name)) {
+                    return error.BudgetExhausted;
+                }
+            }
+
+            // Evaluate args against environment before dispatching
+            // This resolves binding references like "v.num" to actual values
+            var evaluated_args = try ctx.allocator.alloc(ast.Arg, inv.args.len);
+            for (inv.args, 0..) |arg, i| {
+                evaluated_args[i] = ast.Arg{
+                    .name = arg.name,
+                    .value = try evaluateExpr(arg.value, ctx),
+                    .source_value = arg.source_value,
+                    .expression_value = arg.expression_value,
+                };
+            }
+
+            // Create invocation with evaluated args
+            var evaluated_inv = inv.*;
+            evaluated_inv.args = evaluated_args;
+
+            // REPL-DEFINED FLOW (the runtime define). An tor the session
+            // defined at runtime dispatches to its body: params bound into the
+            // env, body re-parsed and executed. Every call the body makes runs
+            // through THIS dispatch path — possession and obligations enforced
+            // per call, so a defined flow cannot reach beyond what the session
+            // holds. The outer obligation tracking below is a no-op for the
+            // defined flow itself (scope fns don't know it); the body's calls
+            // tracked theirs.
+            var dispatched_defined = false;
+            if (ctx.defined) |defined| {
+                if (findDefinedFlow(defined, event_name)) |df| {
+                    dispatch_result = try dispatchDefinedFlow(ctx, df, &evaluated_inv);
+                    dispatched_defined = true;
+                }
+            }
+            if (!dispatched_defined) {
+                // POSSESSION IS THE AUTHORITY. A discharge tor may only name a
+                // handle this pool actually holds, and the check runs BEFORE the
+                // proc, because the proc is the irreversible half — close(fd) on an
+                // fd you were never handed cannot be undone by noticing afterwards
+                // that the counter did not move.
+                ctx.failing_event_name = persistentEventName(&evaluated_inv);
+                if (ctx.handle_pool) |pool| {
+                    try assertHandlesHeld(ctx, pool, event_name, evaluated_inv.args);
+                }
+
+                dispatcher(&evaluated_inv, &dispatch_result) catch |derr| {
+                    // A dispatcher that fails on typed args reports through
+                    // the detail slot — fold it into the teaching channel.
+                    if (takeDispatchDetail()) |det| ctx.error_detail = det;
+                    // A name the scope denies falls to the session's host
+                    // verbs (vocabulary, grammar — granted by the host, not
+                    // the register block). No grant, no verb: EventDenied
+                    // propagates unchanged.
+                    if (derr == error.EventDenied) {
+                        if (ctx.host_dispatch) |hd| {
+                            const view = HostView{
+                                .scope_name = ctx.scope_name,
+                                .defined = ctx.defined,
+                                .allocator = ctx.allocator,
+                                .error_detail = &ctx.error_detail,
+                                .session_env = ctx.session_env,
+                            };
+                            try hd(event_name, &evaluated_inv, &view, &dispatch_result);
+                        } else return derr;
+                    } else return derr;
+                };
+            }
+
+            // Own the result before anything reads it: binding (arm
+            // continuations), obligation field extraction below, and the
+            // value handed back all keep it past the dispatcher's frame.
+            try ownDispatchResult(&dispatch_result, ctx.allocator);
+
+            // TRACE: what each call issued is a datum the model reads from
+            // the turn's report — a chain's middle is invisible otherwise
+            // (task18 looped get-user-details ten times on a record it had
+            // fetched and never seen). The host's binder gives it a durable
+            // rN so next turn can name it; the arm name patches on below.
+            {
+                var bound_name: []const u8 = "";
+                if (ctx.session_bind_fn) |sbf| {
+                    if (ctx.session_bind_env) |sbe| {
+                        if (ctx.session_bind_counter) |sbc| {
+                            bound_name = sbf(sbe, sbc, Value.fromDispatch(
+                                dispatch_result.branch, dispatch_result.fields));
+                        }
+                    }
+                }
+                this_trace_idx = ctx.trace.items.len;
+                ctx.trace.append(ctx.allocator, .{
+                    .event = event_name,
+                    .bound = bound_name,
+                    .arm = null,
+                    .json = Value.fromDispatch(dispatch_result.branch, dispatch_result.fields)
+                        .toJsonAlloc(ctx.allocator),
+                }) catch {};
+            }
+
+            // Track obligations for the handle pool — prefer the spec API.
+            if (ctx.handle_pool) |pool| {
+                if (ctx.creates_spec_fn) |spec_fn| {
+                    const specs = spec_fn(event_name);
+                    for (specs) |spec| {
+                        // A branch-scoped spec acquires only on the outcome that carried it.
+                        if (spec.branch) |sb| { if (!namesEql(sb, dispatch_result.branch)) continue; }
+                        // Find the discharge tor — scope-local obligation name.
+                        const discharge_event = if (ctx.discharge_event_fn) |discharge_fn|
+                            discharge_fn(spec.obligation_name) orelse "unknown"
+                        else
+                            "unknown";
+                        // Extract handle_id from dispatch result using spec.field_name
+                        // Handle IDs must be strings - skip if not found or wrong type
+                        var handle_id: ?[]const u8 = null;
+                        for (dispatch_result.fields) |field| {
+                            if (std.mem.eql(u8, field.name, spec.field_name)) {
+                                handle_id = switch (field.value) {
+                                    .string_val => |s| s,
+                                    else => null,  // Only strings are valid handle IDs
+                                };
+                                break;
+                            }
+                        }
+                        // Only acquire if we got a valid string handle ID
+                        if (handle_id) |hid| {
+                            // Guarded withdrawal (derived, never authored):
+                            // any input arg that names a currently-held handle
+                            // in this pool makes the new handle a dependent of
+                            // that provider. The provider must outlive it —
+                            // release order follows (dependents first).
+                            var dep_ids: [4]u32 = .{0} ** 4;
+                            var dep_len: usize = 0;
+                            for (evaluated_inv.args) |arg| {
+                                if (dep_len >= dep_ids.len) break;
+                                if (pool.findByHandleId(arg.value, ctx.scope_name)) |provider| {
+                                    dep_ids[dep_len] = provider.id;
+                                    dep_len += 1;
+                                }
+                            }
+                            // Custody subject: the verb's own args — the
+                            // why of the possess, witnessed at the mint.
+                            var subject_buf: [192]u8 = undefined;
+                            _ = pool.acquire(hid, spec.obligation_module, spec.obligation_name, discharge_event,
+                                event_name, spec.resource_type, ctx.scope_name, dep_ids[0..dep_len],
+                                custodySubject(&subject_buf, evaluated_inv.args)) catch {};
+                        }
+                    }
+                } else if (ctx.creates_obligations_fn) |creates_fn| {
+                    // Fallback to legacy API
+                    const obligations = creates_fn(event_name);
+                    for (obligations, 0..) |obligation, i| {
+                        const discharge_event = if (ctx.discharge_event_fn) |discharge_fn|
+                            discharge_fn(obligation) orelse "unknown"
+                        else
+                            "unknown";
+                        var binding_buf: [64]u8 = undefined;
+                        const binding_name = if (obligations.len > 1)
+                            std.fmt.bufPrint(&binding_buf, "result.{s}.{d}", .{dispatch_result.branch, i}) catch "result"
+                        else
+                            std.fmt.bufPrint(&binding_buf, "result.{s}", .{dispatch_result.branch}) catch "result";
+                        var subject_buf: [192]u8 = undefined;
+                        _ = pool.acquire(binding_name, "unknown", obligation, discharge_event,
+                            event_name, "unknown", ctx.scope_name, &.{},
+                            custodySubject(&subject_buf, evaluated_inv.args)) catch {};
+                    }
+                }
+
+                // Check if this tor discharges obligations - prefer new spec API
+                if (ctx.discharges_spec_fn) |spec_fn| {
+                    const specs = spec_fn(event_name);
+                    for (specs) |spec| {
+                        // Extract handle_id from args using spec.arg_name
+                        for (evaluated_inv.args) |arg| {
+                            if (std.mem.eql(u8, arg.name, spec.arg_name)) {
+                                // Scope-aware lookup prevents cross-scope discharge
+                                if (pool.findByHandleId(arg.value, ctx.scope_name)) |handle| {
+                                    pool.dischargeById(handle.id);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                } else if (ctx.discharges_obligations_fn) |discharges_fn| {
+                    // Fallback to legacy API
+                    const obligations = discharges_fn(event_name);
+                    if (obligations.len > 0) {
+                        if (evaluated_inv.args.len > 0) {
+                            pool.discharge(evaluated_inv.args[0].value);
+                        }
+                    }
+                }
+            }
+        } else {
+            return error.NoDispatcher;
+        }
+    }
+
+    // If no continuations, just return the dispatch result — UNLESS the
+    // tor fired a NAMED branch nobody handles. A branchless void (""),
+    // like `note(text: "x")`, is plain completion; a named fire like
+    // `| bad` from a two-branch pick with no arms at all is as unhandled
+    // as B's under-handling (430_056): the fragment gave the outcome
+    // nowhere to go, so lenient hosts get it handed back.
+    if (flow.body.continuations.len == 0) {
+        if (dispatch_result.branch.len > 0) {
+            ctx.unhandled_outcome = Value.fromDispatch(
+                dispatch_result.branch,
+                dispatch_result.fields,
+            );
+            return ctx.unhandled_outcome.?;
+        }
+        return Value.fromDispatch(
+            dispatch_result.branch,
+            dispatch_result.fields,
+        );
+    }
+
+    // Find matching continuation. A plain value return (`-> string`) arrives
+    // branchless; compiled code matches it as `ok` by declaration knowledge,
+    // so the interpreter meets it there — otherwise armed chains over
+    // plain-return verbs (open's handle included) can never match.
+    // Arm selection lives in the `select` part of interpreter.kz — name
+    // match plus `when`-guard judging.
+    const choice = try selectArm(flow.body.continuations, dispatch_result.branch, dispatch_result.fields, ctx.expr_bindings, ctx.allocator);
+    if (choice.idx) |ci| {
+        const cont = flow.body.continuations[ci];
+        const arm_binding = cont.binding;
+        {
+            // Bind the result if there's a binding name
+            if (arm_binding) |binding_name| {
+                const bound_value = Value.fromDispatch(
+                    dispatch_result.branch,
+                    dispatch_result.fields,
+                );
+                try ctx.env.bind(binding_name, bound_value);
+                // The arm's name belongs on this dispatch's trace line —
+                // `get-user-details -> {...} bound: r4 as u`.
+                if (this_trace_idx) |ti| {
+                    ctx.trace.items[ti].arm = binding_name;
+                }
+
+                // expr_bindings for `if`/`when` conditions — same scope the
+                // guard judged in (interpreter.guards).
+                try populateArmExprBindings(ctx.expr_bindings, binding_name, bound_value, dispatch_result.branch, ctx.allocator);
+            }
+
+            // If there's a next node, execute it
+            if (cont.node) |node| {
+                switch (node) {
+                    .invocation => |next_inv| {
+                        // Create a synthetic flow for the next invocation
+                        const next_flow = ast.Flow{
+                            .body = ast.rootSite(next_inv, cont.continuations, .{ .file = "generated", .line = 0, .column = 0 }),
+                            .module = flow.module,
+                        };
+                        return executeFlow(&next_flow, ctx);
+                    },
+                    .terminal => {
+                        // End of flow - true discard for `_`
+                        return Value.empty("discard");
+                    },
+                    .branch_constructor => |bc| {
+                        // Construct a new value from the branch constructor!
+                        if (bc.plain_value) |expr| {
+                            // Identity branch constructor: result expr
+                            var value: FieldValue = undefined;
+
+                            // Try expression parser first for arithmetic like "c.x + 1"
+                            var expr_parser = koru_parser.ExpressionParser.init(ctx.allocator, expr);
+                            defer expr_parser.deinit();
+
+                            if (expr_parser.parse()) |parsed_expr| {
+                                if (evaluateExpression(parsed_expr, ctx.expr_bindings)) |eval_result| {
+                                    value = switch (eval_result) {
+                                        .int_val => |n| .{ .int_val = n },
+                                        .float_val => |f| .{ .float_val = f },
+                                        .bool_val => |b| .{ .bool_val = b },
+                                        .string_val => |s| .{ .string_val = s },
+                                        .null_val => .{ .string_val = "" },
+                                    };
+                                } else |_| {
+                                    // Eval failed - fall back to simple evaluation
+                                    value = .{ .string_val = try evaluateExpr(expr, ctx) };
+                                }
+                            } else |_| {
+                                // Parse failed - fall back to simple evaluation
+                                value = .{ .string_val = try evaluateExpr(expr, ctx) };
+                            }
+
+                            var fields = try ctx.allocator.alloc(NamedField, 1);
+                            fields[0] = .{
+                                .name = "__type_ref",
+                                .value = value,
+                            };
+
+                            return Value{
+                                .branch = try ctx.allocator.dupe(u8, bc.branch_name),
+                                .fields = fields,
+                            };
+                        }
+
+                        var fields = try ctx.allocator.alloc(NamedField, bc.fields.len);
+                        for (bc.fields, 0..) |field, i| {
+                            var value: FieldValue = undefined;
+
+                            if (field.expression_str) |expr| {
+                                // Try expression parser first for arithmetic like "c.x + 1"
+                                var expr_parser = koru_parser.ExpressionParser.init(ctx.allocator, expr);
+                                defer expr_parser.deinit();
+
+                                if (expr_parser.parse()) |parsed_expr| {
+                                    if (evaluateExpression(parsed_expr, ctx.expr_bindings)) |eval_result| {
+                                        value = switch (eval_result) {
+                                            .int_val => |n| .{ .int_val = n },
+                                            .float_val => |f| .{ .float_val = f },
+                                            .bool_val => |b| .{ .bool_val = b },
+                                            .string_val => |s| .{ .string_val = s },
+                                            .null_val => .{ .string_val = "" },
+                                        };
+                                    } else |_| {
+                                        // Eval failed - fall back to simple evaluation
+                                        value = .{ .string_val = try evaluateExpr(expr, ctx) };
+                                    }
+                                } else |_| {
+                                    // Parse failed - fall back to simple evaluation
+                                    value = .{ .string_val = try evaluateExpr(expr, ctx) };
+                                }
+                            } else {
+                                value = .{ .string_val = try ctx.allocator.dupe(u8, field.name) };
+                            }
+
+                            fields[i] = .{
+                                .name = try ctx.allocator.dupe(u8, field.name),
+                                .value = value,
+                            };
+                        }
+
+                        return Value{
+                            .branch = try ctx.allocator.dupe(u8, bc.branch_name),
+                            .fields = fields,
+                        };
+                    },
+                    else => {
+                        // TODO: Handle labels, derefs
+                        return error.UnsupportedNode;
+                    },
+                }
+            } else {
+                // No next node - return current dispatch result
+                return Value.fromDispatch(
+                    dispatch_result.branch,
+                    dispatch_result.fields,
+                );
+            }
+        }
+    }
+
+    // No matching continuation: the fragment handled only part of the output
+    // tree. Hand the dispatch result back as the flow's value instead of
+    // dying, so a host/bridge can act on the unhandled branch (430_056,
+    // `unhandled-branch`). Distinct from a normal completion via the
+    // context flag, which the run/eval procs surface as the ruled branch.
+    ctx.unhandled_outcome = Value.fromDispatch(
+        dispatch_result.branch,
+        dispatch_result.fields,
+    );
+    return ctx.unhandled_outcome.?;
+}
+
+// ============================================================================
+// EVAL PROC - Execute pre-parsed AST (fast path, no parsing!)
+// ============================================================================
+
+~proc eval|zig {
+    const allocator = InterpreterThreadState.prepare();
+
+
+    // Same refusal as `run` — a pre-parsed AST can carry a residual arm too.
+    if (containsResidualArm(flow.body.continuations)) {
+        return .{ .validation_error = "`|*` residual arm is not spellable on the interpreted surface" };
+    }
+    // Validation pass - check for errors BEFORE execution
+    if (validateFlow(flow, allocator, input_fn, defined, session_env)) |validation_err| {
+        return .{ .validation_error = validation_err.message };
+    }
+
+    // Create environment and context
+    const env = &InterpreterThreadState.env;
+    const expr_bindings = &InterpreterThreadState.expr_bindings;
+
+    // Seed the session's durable bindings into this run's env — the wire's
+    // `r3.user_id` on turn 9 names a value a turn 4 call bound. Session
+    // values were copied into session memory at bind time, so a shallow
+    // transplant is safe: the arena reset cannot reach them.
+    if (session_env) |se| {
+        var sit = se.bindings.iterator();
+        while (sit.next()) |e| env.bind(e.key_ptr.*, e.value_ptr.*) catch {};
+    }
+
+    // Initialize budget tracking
+    var budget_state = BudgetState.init(budget);
+
+    // Use external handle pool if provided, otherwise create local one
+    const using_external_pool = handle_pool != null;
+    var local_pool = if (handle_pool == null) HandlePool.init(allocator) else undefined;
+    defer if (!using_external_pool) local_pool.deinit();
+    const active_pool: *HandlePool = if (handle_pool) |ext| ext else &local_pool;
+
+    var ctx = InterpreterContext{
+        .env = env,
+        .expr_bindings = expr_bindings,
+        .allocator = allocator,
+        .dispatcher = dispatcher,
+        .cost_fn = cost_fn,
+        .creates_obligations_fn = creates_obligations_fn,
+        .discharges_obligations_fn = discharges_obligations_fn,
+        .discharge_event_fn = discharge_event_fn,
+        .creates_spec_fn = creates_spec_fn,
+        .discharges_spec_fn = discharges_spec_fn,
+        .budget = &budget_state,
+        .handle_pool = active_pool,
+        .scope_name = scope_name,
+        .defined = defined,
+        .input_fn = input_fn,
+        .host_dispatch = host_dispatch,
+        .session_env = session_env,
+        .session_bind_fn = session_bind_fn,
+        .session_bind_env = session_bind_env,
+        .session_bind_counter = session_bind_counter,
+        .unhandled_outcome = null,
+    };
+
+    // Execute the flow!
+    const result_value = executeFlow(flow, &ctx) catch |err| {
+        // Check if this was a budget exhaustion
+        if (err == error.BudgetExhausted) {
+            autoDischargeHandles(
+                auto_discharge,
+                using_external_pool,
+                active_pool,
+                discharges_spec_fn,
+                dispatcher,
+                allocator,
+            );
+            const stable_last_event = std.heap.page_allocator.dupe(u8, budget_state.last_event) catch budget_state.last_event;
+            return .{ .exhausted = .{
+                .used = budget_state.used,
+                .last_event = stable_last_event,
+                .handles = @intCast(active_pool.countUndischarged()),
+            }};
+        }
+        // Build tor name for error reporting
+        const stable_event_name = persistentEventName(flow.inv());
+
+        autoDischargeHandles(
+            auto_discharge,
+            using_external_pool,
+            active_pool,
+            discharges_spec_fn,
+            dispatcher,
+            allocator,
+        );
+
+        return .{ .dispatch_error = .{
+            .event_name = ctx.failing_event_name orelse stable_event_name,
+            .message = ctx.error_detail orelse @errorName(err),
+            .trace = renderTrace(&ctx.trace, allocator),
+        }};
+    };
+
+// An under-handled fragment hands its outcome back (430_056): the host
+    // becomes the handler. Termination is different from completion —
+    // `result` is "finished with this value", `unhandled-branch` is
+    // "stopped, nobody handled this" — so it is a separate branch, forced
+    // on every caller by KORU022, exactly as the ruling demands. Skip
+    // auto-discharge here: retention across the hand-back is the point;
+    // the host that receives the named handles decides discharge.
+    if (ctx.unhandled_outcome) |u| {
+        if (!lenient) {
+            // The mode is the caller's policy call (430_056 ruling): strict
+            // callers keep today's refusal, named honestly.
+            return .{ .dispatch_error = .{
+                .event_name = ctx.failing_event_name orelse persistentEventName(flow.inv()),
+                .message = "NoBranchMatch",
+                .trace = renderTrace(&ctx.trace, allocator),
+            } };
+        }
+        return .{ .unhandled_branch = .{
+            .branch = u.branch,
+            .payload = u.toJsonBuf(),
+            .handles = renderHeldHandles(active_pool),
+        } };
+    }
+
+    const stable_value = result_value.clonePersistent();
+
+    autoDischargeHandles(
+        auto_discharge,
+        using_external_pool,
+        active_pool,
+        discharges_spec_fn,
+        dispatcher,
+        allocator,
+    );
+
+    return .{ .result = .{
+        .value = stable_value,
+        .used = budget_state.used,
+        .handles = @intCast(active_pool.countUndischarged()),
+        // The terminal's durable name came from the trace's bind, not a
+        // second mint — the last dispatch and the result are the same value.
+        .bound = lastBound(&ctx.trace),
+        .trace = renderTrace(&ctx.trace, allocator),
+    }};
+}
+

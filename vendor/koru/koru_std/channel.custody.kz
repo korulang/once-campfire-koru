@@ -1,0 +1,210 @@
+// Koru Standard Library: the `custody` part of channel — obligation transit.
+// Joined via `~part custody` in channel.kz; merged into the channel module.
+//
+// Custody detection — the per-edge obligation contract
+// (concepts/frag-custody-transit-is-an-edge-contract). A send of a value
+// whose producer ISSUED it (`-> T<state!>` — the `!` suffix marks an
+// issued obligation; `T<!state>` consumes, `T<state>` borrows) transits
+// custody through the vessel. Resolution this rung is same-flow: the
+// ident's `return_binding` producer. Anything unresolvable stays plain.
+//
+// The machinery is transform composition: `new` scans send sites (this
+// part) and emits the `take`/`obligate` pair plus consumer units (the
+// transit part); `send` injects the take under `| ok` alone; consumer
+// units mint via obligate before the arm body.
+
+const CC = struct {
+
+    const SendSite = struct { flow: *const ast.Flow, inv: *const ast.Invocation };
+
+    // scanCustody's answer — ok carries the per-kind custody states, refuse
+    // is a ready refusal item the caller splices as its replacement.
+    const ScanResult = union(enum) { ok: []?[]const u8, refuse: ast.Item };
+
+    // `live!` → "live"; consume-polarity (`!live`) is never a producer.
+    fn phantomStateName(ph: []const u8) ?[]const u8 {
+        if (ph.len == 0 or ph[ph.len - 1] != '!') return null;
+        const base = ph[0 .. ph.len - 1];
+        if (base.len == 0 or base[0] == '!') return null;
+        return base;
+    }
+
+    // The invocation in `flow`'s tree whose `return_binding` is `ident` —
+    // `producer(...): ident |> ...`. The root node counts too.
+    fn producerInv(flow: *const ast.Flow, ident: []const u8) ?*const ast.Invocation {
+        const W = struct {
+            fn binds(n: *const ast.Node, w: []const u8) ?*const ast.Invocation {
+                if (n.* != .invocation) return null;
+                const iv = &n.invocation;
+                if (iv.return_binding) |rb| {
+                    if (std.mem.eql(u8, rb, w)) return iv;
+                }
+                return null;
+            }
+            fn scan(conts: []const ast.Continuation, w: []const u8) ?*const ast.Invocation {
+                for (conts) |*c| {
+                    if (c.node) |*n| {
+                        if (binds(n, w)) |iv| return iv;
+                    }
+                    if (scan(c.continuations, w)) |iv| return iv;
+                }
+                return null;
+            }
+        };
+        if (flow.body.node) |*n| {
+            if (W.binds(n, ident)) |iv| return iv;
+        }
+        return W.scan(flow.body.continuations, ident);
+    }
+
+    // The obligation state `ident` carries inside `flow`, or null for plain.
+    // `ident` must be bound by a tor returning `T<state!>` — consume params
+    // (`T<!state>`) arrive already settled, so params never resolve.
+    fn custodyOf(prog: *const ast.Program, flow: *const ast.Flow, ident: []const u8) ?[]const u8 {
+        if (!CH.identOk(ident)) return null;
+        const prod = producerInv(flow, ident) orelse return null;
+        if (prod.path.segments.len == 0) return null;
+        const decl = ast_functional.findEventDecl(prog, prod.path.module_qualifier orelse (ast_functional.moduleHome(prog, flow) orelse flow.module), prod.path.segments) orelse return null;
+        const rp = decl.return_phantom orelse return null;
+        return phantomStateName(rp);
+    }
+
+    // The continuation in `flow`'s tree whose node IS `invocation` — the
+    // send site's holding continuation, whose children are the site's arms.
+    fn holdingCont(flow: *const ast.Flow, inv: *const ast.Invocation) ?*const ast.Continuation {
+        const W = struct {
+            fn scan(conts: []const ast.Continuation, want: *const ast.Invocation) ?*const ast.Continuation {
+                for (conts) |*c| {
+                    if (c.node) |*n| {
+                        if (n.* == .invocation and &n.invocation == want) return c;
+                    }
+                    if (scan(c.continuations, want)) |hit| return hit;
+                }
+                return null;
+            }
+        };
+        return W.scan(flow.body.continuations, inv);
+    }
+
+    // Every `std/channel:send(<name>, ...)` site in the program, paired with
+    // the flow holding it so the value's producer resolves in-scope.
+    fn sendSites(alloc: std.mem.Allocator, prog: *const ast.Program, chan_name: []const u8) []const SendSite {
+        const W = struct {
+            fn hit(n: *const ast.Node, f: *const ast.Flow, name: []const u8, out: *std.ArrayList(SendSite), al: std.mem.Allocator) void {
+                if (n.* == .invocation and CHM.isChannelInv(&n.invocation, "send") and CH.declSubject(&n.invocation, name)) {
+                    out.append(al, .{ .flow = f, .inv = &n.invocation }) catch unreachable;
+                }
+            }
+            fn scanConts(conts: []const ast.Continuation, f: *const ast.Flow, name: []const u8, out: *std.ArrayList(SendSite), al: std.mem.Allocator) void {
+                for (conts) |*c| {
+                    if (c.node) |*n| hit(n, f, name, out, al);
+                    scanConts(c.continuations, f, name, out, al);
+                }
+            }
+            fn scanItems(its: []const ast.Item, name: []const u8, out: *std.ArrayList(SendSite), al: std.mem.Allocator) void {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .flow => |*f| {
+                            if (f.body.node) |*n| hit(n, f, name, out, al);
+                            scanConts(f.body.continuations, f, name, out, al);
+                        },
+                        .module_decl => |*md| scanItems(md.items, name, out, al),
+                        else => {},
+                    }
+                }
+            }
+        };
+        var out = std.ArrayList(SendSite).initCapacity(alloc, 4) catch unreachable;
+        W.scanItems(prog.items, chan_name, &out, alloc);
+        return out.toOwnedSlice(alloc) catch unreachable;
+    }
+
+    // `| ok |> take(s)` — prepend the custody take to the site's ok arm; when
+    // the site spells no `| ok`, synthesize one (custody moves on success
+    // whether or not the user handles it). `full`/`closed` ride untouched —
+    // producer custody survives those branches.
+    fn injectTake(alloc: std.mem.Allocator, conts: []const ast.Continuation, take_node: ast.Node) []const ast.Continuation {
+        var out = std.ArrayList(ast.Continuation).initCapacity(alloc, conts.len + 1) catch unreachable;
+        var took = false;
+        for (conts) |*c| {
+            var nc = c.*;
+            if (!took and std.mem.eql(u8, std.mem.trim(u8, c.branch, " "), "ok")) {
+                if (c.node) |orig| {
+                    const inner = alloc.alloc(ast.Continuation, 1) catch unreachable;
+                    inner[0] = ast.Continuation{
+                        .branch = "",
+                        .binding = null,
+                        .condition = null,
+                        .node = orig,
+                        .indent = c.indent,
+                        .continuations = c.continuations,
+                    };
+                    nc.node = take_node;
+                    nc.continuations = inner;
+                } else {
+                    nc.node = take_node;
+                }
+                took = true;
+            }
+            out.append(alloc, nc) catch unreachable;
+        }
+        if (!took) {
+            out.append(alloc, ast.Continuation{
+                .branch = alloc.dupe(u8, "ok") catch unreachable,
+                .binding = null,
+                .condition = null,
+                .node = take_node,
+                .indent = 0,
+                .continuations = &.{},
+            }) catch unreachable;
+        }
+        return out.toOwnedSlice(alloc) catch unreachable;
+    }
+
+    // Which kinds transit obligations: every `std/channel:send(<name>, ...)`
+    // site's value resolves to a producer binding; a producer returning
+    // `-> T<state!>` makes the kind custodial. One custody state per kind —
+    // the consumer arm mints ONE phantom, so a kind that transited two
+    // states couldn't be spelled.
+    fn scanCustody(alloc: std.mem.Allocator, prog: *const ast.Program, reporter: anytype, flow: *const ast.Flow, chan_name: []const u8, kinds: []const CH.KindEntry) ScanResult {
+        const custody = alloc.alloc(?[]const u8, kinds.len) catch unreachable;
+        for (custody) |*cp| cp.* = null;
+        for (sendSites(alloc, prog, chan_name)) |site| {
+            var s_kind: ?[]const u8 = null;
+            var s_value: ?[]const u8 = null;
+            var saw_name = false;
+            for (site.inv.args) |a| {
+                if (a.source_value != null) continue;
+                if (CH.isLabelled(a)) {
+                    if (s_kind == null) {
+                        s_kind = std.mem.trim(u8, a.name, " \t");
+                        s_value = std.mem.trim(u8, a.value, " \t");
+                    }
+                } else if (!saw_name) {
+                    saw_name = true;
+                } else if (s_value == null) {
+                    s_value = std.mem.trim(u8, a.value, " \t");
+                }
+            }
+            const vtext = s_value orelse continue;
+            var kidx: ?usize = null;
+            if (s_kind) |kl| {
+                for (kinds, 0..) |k, i| {
+                    if (std.mem.eql(u8, k.name, kl)) kidx = i;
+                }
+            } else if (kinds.len == 1) {
+                kidx = 0;
+            }
+            const ki = kidx orelse continue;
+            const state = custodyOf(prog, site.flow, vtext) orelse continue;
+            if (custody[ki]) |have| {
+                if (!std.mem.eql(u8, have, state)) {
+                    return .{ .refuse = ast.refusal(alloc, reporter, .KORU161, flow.location, flow.module, "std/channel:new({s}): kind '{s}' transits two obligation states ('{s}' and '{s}') — a consumer arm mints one phantom per kind; split the channel or the states", .{ chan_name, kinds[ki].name, have, state }) };
+                }
+            } else {
+                custody[ki] = state;
+            }
+        }
+        return .{ .ok = custody };
+    }
+};

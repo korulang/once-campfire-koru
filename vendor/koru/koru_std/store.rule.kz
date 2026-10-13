@@ -1,0 +1,141 @@
+// Koru Standard Library: Reactive Stores — the `rule` tor.
+// Joined via `~part rule` in store.kz; merged into the store module at load.
+
+// ============================================================================
+// STORE.QUERY — row-level subscription + imperative sweep (rung two)
+// ============================================================================
+//
+// The coordinator (create) has already transplanted this site's projection,
+// guard, and body into the per-line qrow/qbody units and spliced standing
+// enters into the insert path. The site itself becomes the SWEEP over the
+// rows that exist when its program position executes ((l) lean: the
+// imperative sweep IS the stripe).
+
+~[keyword|comptime|transform|claims_descendants]pub tor rule {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc rule|zig {
+    const ast = @import("ast");
+
+    if (item.* != .flow) @panic("store:rule transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    const H = struct {
+        const stripQuotes = @import("emitter_helpers").stripQuotes;
+        const mkPathH = @import("emitter_helpers").mkPathH;
+    };
+
+    var store_name: []const u8 = "";
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "expr")) store_name = H.stripQuotes(arg.value);
+    }
+    if (store_name.len == 0) {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:rule requires a store name: query(name)", .{}) };
+    }
+
+    // The generated units live in the STORE's home namespace, which is the
+    // import-derived `app.lib` — not this flow's file-derived `lib`. They
+    // coincide in the entry file and diverge inside a library (115_018).
+    const home_ns = storeHome(allocator, program, store_name) orelse flow.module;
+    // The coordinator names this site's units by its source line.
+    const qsweep_name = std.fmt.allocPrint(allocator, "__store_qsweep_{s}_L{d}_{s}", .{ store_name, flow.location.line, storeSiteTag(allocator, flow.location.file) }) catch unreachable;
+    var unit_exists = false;
+    for (flatItems(allocator, program.items)) |pi| {
+        if (pi.* != .event_decl) continue;
+        const ed = &pi.event_decl;
+        if (ed.path.segments.len == 1 and std.mem.eql(u8, ed.path.segments[0], qsweep_name)) {
+            unit_exists = true;
+            break;
+        }
+    }
+    if (!unit_exists) {
+        var create_exists = false;
+        for (flatItems(allocator, program.items)) |pi| {
+            if (pi.* != .flow) continue;
+            const f = &pi.flow;
+            const inv = f.inv();
+            if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "new")) continue;
+            const mq = inv.path.module_qualifier orelse continue;
+            if (!std.mem.eql(u8, mq, "std.store")) continue;
+            for (inv.args) |a| {
+                if (std.mem.eql(u8, a.name, "expr") and std.mem.eql(u8, H.stripQuotes(a.value), store_name)) create_exists = true;
+            }
+        }
+        if (create_exists) {
+            return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:rule({s}): the query precedes its store's create in source - declare the store first", .{store_name}) };
+        }
+
+        // The create coordinator, once run, leaves persistent generated units
+        // (`__store_insert_<s>`) even after the raw `new` flow lowers away. If
+        // that unit exists but this query site got NO sweep unit, the store IS
+        // declared — the query is just in a position the coordinator never
+        // scans: a NESTED (handler / loop) body. `query` is a standing-rule
+        // INSTALLATION (comptime-fused into the store's write paths), top-level-
+        // only BY CONSTRUCTION (concept: frag-store-verb-placement) — a nested
+        // body has nothing to install into. Teach that; don't lie "unknown
+        // store" when the store is right there.
+        const insert_unit = std.fmt.allocPrint(allocator, "__store_insert_{s}", .{store_name}) catch unreachable;
+        var store_declared = false;
+        for (flatItems(allocator, program.items)) |pi| {
+            if (pi.* != .event_decl) continue;
+            const ed = &pi.event_decl;
+            if (ed.path.segments.len == 1 and std.mem.eql(u8, ed.path.segments[0], insert_unit)) {
+                store_declared = true;
+                break;
+            }
+        }
+        if (store_declared) {
+            return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:rule({s}) is top-level-only: it cannot be nested inside a handler or loop body. `query` is a standing-rule installation (comptime-fused into the store's write paths), so a nested body has nothing to install into. The store IS declared - move the query to module (top-level) scope. Momentary verbs (insert/take) DO run in nested bodies.", .{store_name}) };
+        }
+
+        // The store's OWN declaration was already refused; that diagnostic is the
+        // true one and this lookup can only ever fail. Staying silent here is what
+        // keeps one mistake to one error.
+        if (ast.declarationRefused(allocator, program, flow.module, "std/store:new({s}):", .{store_name})) return .{ .transformed = .{} };
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:rule({s}): unknown store - no std/store:new({s}) found (or the store is a capacity-1 value - queries need a container, declare `capacity: N` at create)", .{ store_name, store_name }) };
+    }
+
+    const sweep_inv = ast.Invocation{
+        .path = H.mkPathH(allocator, home_ns, qsweep_name),
+        .args = &[_]ast.Arg{},
+    };
+    return .{ .transformed = .{ .replacement = ast.Item{ .flow = ast.Flow{
+        .body = ast.rootSite(sweep_inv, &[_]ast.Continuation{}, flow.location),
+        .pre_label = null,
+        .impl_of = flow.impl_of, // preserved: the site may BE an impl flow's head (e.g. a query body)
+        .super_shape = null,
+        .inline_body = null,
+        .preamble_code = null,
+        .is_pure = false,
+        .is_transitively_pure = false,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } } } };
+}
+
+// ============================================================================
+// STORE.SWEEP — momentary on-demand read of all live rows
+// ============================================================================
+//
+//   std/store:query(items)
+//   ! sweep e |> body(v: e.v)
+//
+// The MOMENTARY twin of query. query is a STANDING-RULE installation
+// (comptime-fused into write paths, top-level-only BY CONSTRUCTION); sweep is a
+// RUNTIME read of the corpus — "for each live row RIGHT NOW, project, run the
+// body" — a momentary act like insert/take, so it composes in NESTED position
+// (a vaxis `! draw` handler, a loop body). It lowers SITE-LOCAL: the sweep loop
+// is emitted INLINE at the call site (`.replacement` inline_code + `.appended`
+// body decls), NEVER via the top-level coordinator — that top-level scan is
+// exactly what makes query top-level-only. Schema comes from the store's
+// persistent `__store_insert_<s>` event (survives after `new` lowers — the same
+// source insert.fieldOrder reads). This is the render-bridge primitive: a
+// retained-mode renderer (vaxis `! draw`, fires on mount + resize with no store
+// write) sweeps the live rows to repaint. See concept: frag-store-verb-placement.
+

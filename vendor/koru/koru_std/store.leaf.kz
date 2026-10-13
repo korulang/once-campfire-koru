@@ -1,0 +1,207 @@
+// Koru Standard Library: leaf-column machinery — joined via
+// `~part leaf` in store.kz; members land in koru_store.
+//
+// A seed field that names a compound proto dissolves into path-named
+// leaf columns (`left: Limb` -> `left.health`). TermRef resolves
+// terminal scalars, MemberRef finds the compound declaration,
+// ProtoExpander does the recursive flatten and records each leaf's
+// provenance — which proto field it expands — for `insert's facet
+// guards and the explainer's enforcement row.
+
+const SL = struct {
+    const ast = @import("ast");
+    const ast_functional = @import("ast_functional");
+    const struct_literal = @import("struct_literal");
+
+    // Slice A home rules for terminals (690_272): a bare terminal name in
+    // field position resolves against its own scope. The column emits the
+    // alias verbatim (list's 665_002 precedent). Qualified names carry their
+    // own home and need address resolution — a later rung.
+    const TermRef = struct {
+        fn isTerminalVerb(verb: []const u8) bool {
+            // The terminal verbs ARE the scalar vocabulary —
+            // `std/proto:i64(Port)` mints `const Port = i64`; `std/types:enum` mints terminal-shaped too.
+            return ast_functional.isScalar(verb) or std.mem.eql(u8, verb, "enum");
+        }
+        fn bareName(value: []const u8) []const u8 {
+            var text = std.mem.trim(u8, value, " \t");
+            if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') {
+                text = text[1 .. text.len - 1];
+            }
+            return std.mem.trim(u8, text, " \t");
+        }
+        fn liveDeclIsTerminal(inv: *const ast.Invocation, want: []const u8) bool {
+            if (inv.path.segments.len != 1) return false;
+            if (!isTerminalVerb(inv.path.segments[0])) return false;
+            if (inv.path.module_qualifier) |mq| {
+                const known_home = std.mem.eql(u8, mq, "std.types") or
+                    std.mem.eql(u8, mq, "std/types") or
+                    std.mem.eql(u8, mq, "std.proto") or
+                    std.mem.eql(u8, mq, "std/proto");
+                if (!known_home) return false;
+            }
+            if (inv.args.len == 0) return false;
+            return std.mem.eql(u8, bareName(inv.args[0].value), want);
+        }
+        fn markerDeclares(line: []const u8, want: []const u8) bool {
+            const marker = std.mem.trimLeft(u8, line, " \t");
+            const prefix = "// proto-terminal ";
+            if (!std.mem.startsWith(u8, marker, prefix)) return false;
+            const colon = std.mem.indexOfScalar(u8, marker[prefix.len..], ':') orelse return false;
+            const declared = std.mem.trim(u8, marker[prefix.len .. prefix.len + colon], " \t");
+            return std.mem.eql(u8, declared, want);
+        }
+        fn scanItems(items: []const ast.Item, scope_home: []const u8, want: []const u8, want_home: []const u8) bool {
+            for (items) |entry| {
+                switch (entry) {
+                    .flow => |candidate| {
+                        if (candidate.body.node) |*node| {
+                            if (node.* == .invocation and std.mem.eql(u8, scope_home, want_home)) {
+                                if (liveDeclIsTerminal(&node.invocation, want)) return true;
+                            }
+                        }
+                    },
+                    .inline_code => |inline_code| {
+                        if (!std.mem.eql(u8, scope_home, want_home)) continue;
+                        var lines = std.mem.splitScalar(u8, inline_code.code, '\n');
+                        while (lines.next()) |ln| {
+                            if (markerDeclares(ln, want)) return true;
+                        }
+                    },
+                    .module_decl => |module| {
+                        if (scanItems(module.items, module.logical_name, want, want_home)) return true;
+                    },
+                    else => {},
+                }
+            }
+            return false;
+        }
+        fn scopeOfFlow(prog: *const ast.Program, target: *const ast.Flow) []const u8 {
+            const Finder = struct {
+                fn find(items: []const ast.Item, needle: *const ast.Flow, scope: []const u8) ?[]const u8 {
+                    for (items) |*entry| {
+                        switch (entry.*) {
+                            .flow => |*f| {
+                                if (f == needle) return scope;
+                            },
+                            .module_decl => |*m| {
+                                if (find(m.items, needle, m.logical_name)) |s| return s;
+                            },
+                            else => {},
+                        }
+                    }
+                    return null;
+                }
+            };
+            return Finder.find(prog.items, target, prog.main_module_name) orelse prog.main_module_name;
+        }
+        fn isDeclared(prog: *const ast.Program, ftype: []const u8, scope_home: []const u8) bool {
+            if (std.mem.indexOfScalar(u8, ftype, ':') != null) return false;
+            const want = bareName(ftype);
+            if (want.len == 0) return false;
+            return scanItems(prog.items, prog.main_module_name, want, scope_home);
+        }
+    };
+    // K1 (union members): a seed field naming a compound proto expands to
+    // the member's leaves — the store derives its columns from its members.
+    // Sketch 1: members are plain `name: Type` fields, no new glyphs. Leaves
+    // fold by bare name under one-identity-per-name (same type text skips,
+    // different text refuses loudly). Disjoint extra leaves become columns
+    // (kinded insert names only its own; unnarrowed reads of a private leaf
+    // refuse). Same-name different-identity still refuses — presence-bit
+    // columns for type-divergent names are a later rung. Nested compounds
+    // inside members and member defaults refuse. Qualified members are a
+    // later rung.
+    const MemberRef = struct {
+        fn isCompoundDoor(inv: *const ast.Invocation) bool {
+            if (inv.path.segments.len != 1) return false;
+            const verb = inv.path.segments[0];
+            const mq = inv.path.module_qualifier orelse return false;
+            const types_door = (std.mem.eql(u8, verb, "proto") or std.mem.eql(u8, verb, "default")) and
+                (std.mem.eql(u8, mq, "std.types") or std.mem.eql(u8, mq, "std/types"));
+            const default_door = (std.mem.eql(u8, verb, "default") or std.mem.eql(u8, verb, "proto")) and
+                (std.mem.eql(u8, mq, "std.proto") or std.mem.eql(u8, mq, "std/proto"));
+            return types_door or default_door;
+        }
+        /// The entry name a compound door declares — `<:` extension rides
+        /// the labeled-arg split (`proto(Dog <: Animal)` → name "Dog <",
+        /// value "Animal"), so the entry is the label minus '<'.
+        fn entryName(inv: *const ast.Invocation) []const u8 {
+            if (inv.args.len == 0) return "";
+            const a0 = inv.args[0];
+            if (a0.had_explicit_label) {
+                const label = std.mem.trim(u8, a0.name, " \t");
+                if (std.mem.endsWith(u8, label, "<"))
+                    return std.mem.trim(u8, label[0 .. label.len - 1], " \t");
+                return label;
+            }
+            return TermRef.bareName(a0.value);
+        }
+        /// The parent spec of an extending declaration — "Animal + Pet" — or
+        /// null for a plain entry.
+        fn parentSpec(inv: *const ast.Invocation) ?[]const u8 {
+            if (inv.args.len == 0) return null;
+            const a0 = inv.args[0];
+            if (!a0.had_explicit_label) return null;
+            const label = std.mem.trim(u8, a0.name, " \t");
+            if (!std.mem.endsWith(u8, label, "<")) return null;
+            const v = std.mem.trim(u8, a0.value, " \t");
+            return if (v.len > 0) v else null;
+        }
+        const Found = struct { text: []const u8, scope: []const u8, parents: ?[]const u8 };
+        fn fieldsOf(prog: *const ast.Program, ftype: []const u8, scope_home: []const u8) ?Found {
+            if (std.mem.indexOfScalar(u8, ftype, ':') != null) return null;
+            const want = TermRef.bareName(ftype);
+            if (want.len == 0) return null;
+            return scanProg(prog.items, prog.main_module_name, want, scope_home);
+        }
+        fn scanProg(items: []const ast.Item, scope: []const u8, want: []const u8, want_home: []const u8) ?Found {
+            for (items) |entry| {
+                switch (entry) {
+                    .flow => |candidate| {
+                        if (!std.mem.eql(u8, scope, want_home)) continue;
+                        if (candidate.body.node) |*node| {
+                            if (node.* == .invocation and isCompoundDoor(&node.invocation)) {
+                                const inv = &node.invocation;
+                                if (inv.args.len == 0) continue;
+                                if (!std.mem.eql(u8, entryName(inv), want)) continue;
+                                for (inv.args) |a| {
+                                    if (a.source_value) |sv| return .{ .text = sv.text, .scope = scope, .parents = parentSpec(inv) };
+                                }
+                                return .{ .text = "", .scope = scope, .parents = parentSpec(inv) };
+                            }
+                        }
+                    },
+                    .inline_code => |inline_code| {
+                        if (!std.mem.eql(u8, scope, want_home)) continue;
+                        var lines = std.mem.splitScalar(u8, inline_code.code, '\n');
+                        while (lines.next()) |raw| {
+                            const line = std.mem.trimLeft(u8, raw, " \t");
+                            const prefix = "// proto ";
+                            if (!std.mem.startsWith(u8, line, prefix)) continue;
+                            const colon = std.mem.indexOfScalar(u8, line[prefix.len..], ':') orelse continue;
+                            const nm = std.mem.trim(u8, line[prefix.len .. prefix.len + colon], " \t");
+                            if (!std.mem.eql(u8, nm, want)) continue;
+                            return .{ .text = line[prefix.len + colon + 1 ..], .scope = scope, .parents = null };
+                        }
+                    },
+                    .module_decl => |module| {
+                        if (scanProg(module.items, module.logical_name, want, want_home)) |f| return f;
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        }
+    };
+
+    // A leaf column's provenance: which proto field it expands. `insert`'s
+    // facet guards and the explainer's enforcement row both read this —
+    // the column `left.health` IS `Limb.health`, so `std/refine(Limb)`
+    // bounds on `health` are this column's contract. The expander itself
+    // lives in store.expand.kz (the growth wall) — aliased here so the
+    // `SL.` surface new/insert/plan query keeps its shape.
+    const ColProv = StoreExpand.ColProv;
+    const ProtoParent = StoreExpand.ProtoParent;
+    const ProtoExpander = StoreExpand.ProtoExpander;
+};

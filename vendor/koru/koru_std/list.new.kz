@@ -1,0 +1,138 @@
+// Koru Standard Library: the `new` part of list.kz.
+// Joined via `~part new` in list.kz; merged into the list module at load.
+
+~[comptime|transform]pub tor new {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc new|zig {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow) &item.flow else @panic("std/list:new: expected a flow site");
+
+    // Element type as written, e.g. "i64" or "app/car:Engine".
+    const elem = std.mem.trim(u8, expr, " \t");
+
+    // A primitive keeps the old single-segment hand-written route; a proto
+    // entry goes through synthesis.
+    const proto_name = protoEntryName(allocator, elem);
+    const is_proto_elem = if (proto_name) |pn| programHasProto(program, pn) else false;
+
+    var appended_items: []const ast.Item = &.{};
+
+    // The stage loop can re-fire this same site after its own successful
+    // splice (the walker revisits the rewritten tree), and a NESTED
+    // `std/list:new(<proto>)` site reaches this handler through a synthetic
+    // site-view whose wrapper fields are not the real flow's. `hasRewrittenNew`
+    // is the dedupe marker for the re-fired case — the container already
+    // exists, so this pass just rewrites its call site. Refusing there made
+    // the re-fire fatal (KORU173 on an already-synthesized program).
+    const routed_name = if (is_proto_elem) blk: {
+        if (!hasRewrittenNew(program, proto_name.?)) {
+            appended_items = synthesizeContainer(allocator, program, flow, proto_name.?, elem, reporter);
+            if (appended_items.len == 0) {
+                return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/list:new({s}): container synthesis produced no units — the proto entry was not found or has no parseable fields", .{elem}) };
+            }
+        }
+        break :blk proto_name.?;
+    } else elem;
+
+    const seg = std.fmt.allocPrint(allocator, "new-{s}", .{routed_name}) catch unreachable;
+    const new_segments = allocator.alloc([]const u8, 1) catch unreachable;
+    new_segments[0] = seg;
+
+    // The rewrite addresses the module the ROUTED CONSTRUCTOR lives in.
+    // A primitive constructor stays in std.list — its hand-written home;
+    // stamping the caller's module here minted `<entry>:new-i64`, a tor no
+    // module declares (KORU040 on every primitive `new(i64)` site). A proto
+    // container's constructor is SYNTHESIZED into the caller's module, so it
+    // must be addressed there: appended items never get canonicalized, the
+    // path is spelled from the start.
+    const routed_qualifier: ?[]const u8 = if (is_proto_elem)
+        allocator.dupe(u8, flow.module) catch unreachable
+    else if (invocation.path.module_qualifier) |mq|
+        allocator.dupe(u8, mq) catch unreachable
+    else
+        null;
+    const new_inv = ast.Invocation{
+        .path = ast.DottedPath{
+            .module_qualifier = routed_qualifier,
+            .segments = new_segments,
+        },
+        .args = &[_]ast.Arg{},
+    };
+
+    // Ops over THIS site's bindings route to the synthesized suffixed tors
+    // (`std/list:push(xs, …)` → `<caller>:push-<Name>(xs, …)`), resolved from
+    // the names the site's own branches bind. A handle used in a LATER flow
+    // still refuses loudly at the shape check — the sliced-scope boundary the
+    // module header states.
+    const carried = if (is_proto_elem)
+        rewriteProtoOps(allocator, flow.module, flow.body.continuations, routed_name)
+    else
+        flow.body.continuations;
+
+    const new_item = ast.Item{
+        .flow = ast.Flow{
+            .body = ast.rootSite(new_inv, carried, flow.location),
+            .pre_label = if (flow.pre_label) |l| allocator.dupe(u8, l) catch unreachable else null,
+            .impl_of = flow.impl_of,
+            .super_shape = null,
+            .inline_body = null,
+            .preamble_code = null,
+            .is_pure = flow.is_pure,
+            .is_transitively_pure = flow.is_transitively_pure,
+            .location = flow.location,
+
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        },
+    };
+
+    return .{ .replacement = new_item, .appended = appended_items };
+}
+
+
+
+fn protoNameDbg(prog: *const astz.Program, elem: []const u8) bool {
+    if (findProtoDecl(prog, elem) != null) return true;
+    if (programHasProto(prog, elem)) return true;
+    return false;
+}
+
+// Concrete i64 constructor (runtime). `new(i64)` rewrites to this. Carries the
+// <list!> ownership obligation.
+~pub tor new-i64 {}
+| list *List_i64<list!>
+| err string
+
+~proc new-i64|zig {
+    const allocator = koru_allocator();
+    const self = allocator.create(List_i64) catch {
+        return .{ .err = "allocation failed" };
+    };
+    self.* = .{
+        .items = std.ArrayList(i64).initCapacity(allocator, 0) catch {
+            allocator.destroy(self);
+            return .{ .err = "allocation failed" };
+        },
+        .allocator = allocator,
+    };
+    return .{ .list = self };
+}
+
+// ============================================
+// Mutation (borrow — obligation untouched)
+// ============================================
+
+// Append a value. Void, chains with `|>`. OOM panics (the approved split: a
+// growable push is loud-on-failure, not a per-call error branch).
+//
+// PROTO containers route by the DISPATCH-GAP doctrine (660_026): tors lower
+// keyed by NAME only, so every concrete container gets its OWN suffixed
+// tors. `push(xs, v)` over the hand-written i64 trunk stays monomorphic
+// HERE; a proto-derived container's op is the SYNTHESIZED `push-<Name>` the

@@ -1,0 +1,65 @@
+// Koru Standard Library: the `wait` part of pump — joined via
+// `~part wait` in pump.kz; members land in koru_pump.
+//
+// The `! wait` interest contract. A participant's wait callee declares
+// its blocking interest BY RETURN TYPE: `-> i32` is a descriptor to
+// poll, `-> i128` a relative re-poll duration in ns, `-> { fd: i32,
+// wait_ns: i128 }` both at once. Field PRESENCE is the vocabulary — a
+// participant never writes sentinels. The generated wait units
+// normalize to `{ fd, wait_ns }` with internal sentinels (-1 / maxInt)
+// for whichever interest the callee didn't declare, so the union poll
+// loop reads one shape.
+
+const PWait = struct {
+    const Interest = struct { fd: bool = false, ns: bool = false, scalar: bool = false };
+
+    // `fd`/`wait_ns` count only as field NAMES on a `-> { ... }` return
+    // text — an unrelated `fd`-substring can't satisfy the contract the
+    // way an indexOf check could.
+    fn recordHasField(rt: []const u8, name: []const u8) bool {
+        var it = std.mem.splitScalar(u8, rt, ',');
+        while (it.next()) |piece_raw| {
+            const piece = std.mem.trim(u8, piece_raw, " \t\r\n{}");
+            const colon = std.mem.indexOfScalar(u8, piece, ':') orelse continue;
+            if (std.mem.eql(u8, std.mem.trim(u8, piece[0..colon], " \t\r\n"), name)) return true;
+        }
+        return false;
+    }
+
+    // Classify a wait callee's `->` text: a bare `i32`/`i128` is a scalar
+    // interest (fd / re-poll ns), a record declares `fd` and/or `wait_ns`
+    // fields. null = no interest — callers refuse join_wait_no_interest.
+    fn classify(rt: []const u8) ?Interest {
+        const rt_t = std.mem.trim(u8, rt, " \t\r\n");
+        if (std.mem.eql(u8, rt_t, "i32")) return .{ .fd = true, .scalar = true };
+        if (std.mem.eql(u8, rt_t, "i128")) return .{ .ns = true, .scalar = true };
+        const i = Interest{ .fd = recordHasField(rt, "fd"), .ns = recordHasField(rt, "wait_ns") };
+        return if (i.fd or i.ns) i else null;
+    }
+
+    // Emit `__pump_<name>_wait_<idx>` — the participant's interest unit.
+    // Scalar callees forward the value bare; an interest the callee
+    // didn't declare arrives as the internal sentinel.
+    fn emitWait(
+        allocator: std.mem.Allocator,
+        appended: *std.ArrayList(ast.Item),
+        program: *const ast.Program,
+        flow: *const ast.Flow,
+        pump_name: []const u8,
+        join_idx: usize,
+        wa: *const ast.Continuation,
+        wbind: []const u8,
+        i: Interest,
+    ) void {
+        const wf = allocator.alloc(ast.Field, 1) catch unreachable;
+        wf[0] = ast.Field{
+            .name = allocator.dupe(u8, wbind) catch unreachable,
+            .type = allocator.dupe(u8, "i64") catch unreachable,
+        };
+        const fwd = std.fmt.allocPrint(allocator, ".{{ .fd = {s}, .wait_ns = {s} }}", .{
+            if (i.fd) (if (i.scalar) "__koru_w" else "__koru_w.fd") else "-1",
+            if (i.ns) (if (i.scalar) "__koru_w" else "__koru_w.wait_ns") else "@import(\"std\").math.maxInt(i128)",
+        }) catch unreachable;
+        emitVerbUnit(allocator, appended, program, flow, std.fmt.allocPrint(allocator, "__pump_{s}_wait_{d}", .{ pump_name, join_idx }) catch unreachable, wa, wf, "{ fd: i32, wait_ns: i128 }", "__koru_w", fwd);
+    }
+};

@@ -1,0 +1,575 @@
+// Koru Interpreter Standard Library
+// Enables runtime evaluation of Koru source code
+//
+// DESIGN:
+// - Parses Koru source at runtime using the same parser as the compiler
+// - Walks the AST and executes tors via registered dispatchers
+// - Tracks bindings in an environment; validates flows before execution
+//
+// Usage:
+//   import std/interpreter
+//   import std/runtime
+//
+//   // Register tors you want callable at runtime
+//   std/runtime:register(scope: "api") {
+//       greet
+//       process_order
+//   }
+//
+//   // Interpret Koru source
+//   std/interpreter:run(source: user_input, scope: "api")
+//   | result r |> handle_result(value: r.value)
+//   | parse-error e |> respond(status: 400, body: e.message)
+//   | validation-error e |> respond(status: 400, body: e.message)
+//   | dispatch-error e |> respond(status: 500, body: e.tor)
+
+~[runtime]
+
+~import std/build
+
+const std = @import("std");
+const ast = @import("ast");
+const koru_parser = @import("koru_parser");
+const flow_parser = @import("flow_parser");
+
+// ============================================================================
+// BUILD REQUIREMENTS - Parser and checkers for runtime use
+
+~std/build:requires {
+    const REL_TO_ROOT = "${REL_TO_ROOT}";
+
+    // Errors module (needed by parser and ast)
+    const errors_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/errors.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Log module - compiler logging
+    const log_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/log.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // AST module
+    const ast_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/ast.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_module.addImport("errors", errors_module);
+
+    // Lexer module (needed by parser)
+    const lexer_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/lexer.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Type registry (needed by parser)
+    const type_registry_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/type_registry.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    type_registry_module.addImport("ast", ast_module);
+    type_registry_module.addImport("log", log_module);
+
+    // Expression parser (needed by parser)
+    const expression_parser_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/expression_parser.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    expression_parser_module.addImport("lexer", lexer_module);
+    expression_parser_module.addImport("ast", ast_module);
+
+    // Comptime evaluator — the one evaluator; annotation entries ride it
+    const comptime_eval_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/comptime_eval.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    comptime_eval_module.addImport("ast", ast_module);
+    comptime_eval_module.addImport("expression_parser", expression_parser_module);
+
+    // Union collector (needed by parser)
+    const union_collector_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/union_collector.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    union_collector_module.addImport("ast", ast_module);
+
+    // Liquid templating (used by transform_pass_runner if needed)
+    const liquid_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/liquid.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Config module (needed by module_resolver)
+    const config_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/config.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    config_module.addImport("log", log_module);
+
+    // File types module (needed by module_resolver and parser)
+    const file_types_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/file_types.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Module resolver (needed by parser)
+    const module_resolver_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/module_resolver.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    module_resolver_module.addImport("config", config_module);
+    module_resolver_module.addImport("log", log_module);
+    module_resolver_module.addImport("file_types", file_types_module);
+
+    // Parse-time name normalizer (kebab -> snake). Shares ast_module for type identity.
+    const ast_mangle_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/ast_mangle.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_mangle_module.addImport("ast", ast_module);
+
+    // Annotation parser - block-entry delimiting + parametrized annotation queries
+    const annotation_parser_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/annotation_parser.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Struct-literal parser - parser.zig imports it for seed/field literals.
+    // Depends on liquid; keep this beside parser or the graph drifts (the
+    // module list here must stay a superset of src/parser.zig's imports).
+    const struct_literal_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/struct_literal.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    struct_literal_module.addImport("liquid", liquid_module);
+
+    // Parser module - the core!
+    const parser_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/parser.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    parser_module.addImport("struct_literal", struct_literal_module);
+    parser_module.addImport("ast", ast_module);
+    parser_module.addImport("ast_mangle", ast_mangle_module);
+    parser_module.addImport("lexer", lexer_module);
+    parser_module.addImport("errors", errors_module);
+    parser_module.addImport("type_registry", type_registry_module);
+    parser_module.addImport("expression_parser", expression_parser_module);
+    parser_module.addImport("comptime_eval", comptime_eval_module);
+    parser_module.addImport("annotation_parser", annotation_parser_module);
+    parser_module.addImport("union_collector", union_collector_module);
+    parser_module.addImport("module_resolver", module_resolver_module);
+    parser_module.addImport("file_types", file_types_module);
+
+    // Flow parser - lightweight parser for runtime eval (no TypeRegistry, no ModuleResolver)
+    const flow_parser_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = REL_TO_ROOT ++ "/src/flow_parser.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    flow_parser_module.addImport("ast", ast_module);
+    flow_parser_module.addImport("lexer", lexer_module);
+    flow_parser_module.addImport("errors", errors_module);
+    flow_parser_module.addImport("expression_parser", expression_parser_module);
+
+    // Add to executable
+    exe.root_module.addImport("koru_parser", parser_module);
+    exe.root_module.addImport("koru_ast", ast_module);
+    exe.root_module.addImport("koru_errors", errors_module);
+    exe.root_module.addImport("ast", ast_module);  // Also expose as "ast" for interpreter.kz's own use
+    exe.root_module.addImport("flow_parser", flow_parser_module);
+    exe.root_module.addImport("liquid", liquid_module);
+}
+
+// ============================================================================
+// INTERPRETER VALUE - Runtime representation of Koru values
+// ============================================================================
+
+pub const FieldValue = union(enum) {
+    string_val: []const u8,
+    int_val: i64,
+    float_val: f64,
+    bool_val: bool,
+};
+
+pub const NamedField = struct {
+    name: []const u8,
+    value: FieldValue,
+};
+
+pub const Value = struct {
+    branch: []const u8,              // Which branch was taken/constructed
+    fields: []const NamedField,      // Structured fields (typed from dispatcher)
+
+    pub fn empty(branch_name: []const u8) Value {
+        return .{
+            .branch = branch_name,
+            .fields = &[_]NamedField{},
+        };
+    }
+
+    /// Create a Value from dispatcher results - direct field handoff, zero parsing!
+    pub fn fromDispatch(branch_name: []const u8, fields: []const NamedField) Value {
+        return .{
+            .branch = branch_name,
+            .fields = fields,
+        };
+    }
+
+    /// Serialize to JSON into `allocator` memory, sized to the output — there
+    /// is no ceiling. A render that cannot be produced is a panic, never an
+    /// empty string: the 4KB `catch return ""` this replaces silently emptied
+    /// every payload past the scratch buffer.
+    pub fn toJsonAlloc(self: Value, allocator: std.mem.Allocator) []const u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        self.writeJson(out.writer(allocator)) catch @panic("koru: OOM serializing value");
+        return out.toOwnedSlice(allocator) catch @panic("koru: OOM serializing value");
+    }
+
+    /// Serialize into durable page-backed memory for report payloads that
+    /// outlive the call (unhandled-branch / dispatch-error / debug prints).
+    /// Page-backed like the neighboring renderHeldHandles/persistentEventName.
+    pub fn toJsonBuf(self: Value) []const u8 {
+        return self.toJsonAlloc(std.heap.page_allocator);
+    }
+
+    fn writeJson(self: Value, w: anytype) !void {
+        try w.writeAll("{\"branch\":\"");
+        try w.writeAll(self.branch);
+        try w.writeByte('"');
+        if (self.fields.len == 1 and std.mem.eql(u8, self.fields[0].name, "__type_ref")) {
+            // Scalar payload — emit as "value": <val>
+            try w.writeAll(",\"value\":");
+            try writeFieldValue(w, self.fields[0].value);
+        } else if (self.fields.len > 0) {
+            // Named fields — emit as "fields": { ... }
+            try w.writeAll(",\"fields\":{");
+            for (self.fields, 0..) |f, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeByte('"');
+                try w.writeAll(f.name);
+                try w.writeAll("\":");
+                try writeFieldValue(w, f.value);
+            }
+            try w.writeByte('}');
+        }
+        try w.writeByte('}');
+    }
+
+    fn writeFieldValue(w: anytype, fv: FieldValue) !void {
+        switch (fv) {
+            .int_val => |v| try std.fmt.format(w, "{d}", .{v}),
+            .float_val => |v| try std.fmt.format(w, "{d}", .{v}),
+            .bool_val => |v| try w.writeAll(if (v) "true" else "false"),
+            .string_val => |v| {
+                try w.writeByte('"');
+                for (v) |c| {
+                    switch (c) {
+                        '"' => try w.writeAll("\\\""),
+                        '\\' => try w.writeAll("\\\\"),
+                        '\n' => try w.writeAll("\\n"),
+                        '\r' => try w.writeAll("\\r"),
+                        '\t' => try w.writeAll("\\t"),
+                        else => try w.writeByte(c),
+                    }
+                }
+                try w.writeByte('"');
+            },
+        }
+    }
+
+    /// Clone value into a persistent copy that survives arena teardown.
+    /// Uses a thread-local arena that GROWS with the value — no ceiling;
+    /// valid until the next clonePersistent call. Caller must consume (e.g.
+    /// serialize) before the next interpreter call. OOM panics — the old
+    /// fixed-buffer version silently returned un-cloned slices on overflow.
+    pub fn clonePersistent(self: Value) Value {
+        const S = struct {
+            threadlocal var inited: bool = false;
+            threadlocal var arena: std.heap.ArenaAllocator = undefined;
+        };
+        if (!S.inited) {
+            S.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            S.inited = true;
+        }
+        _ = S.arena.reset(.retain_capacity);
+        const allocator = S.arena.allocator();
+        const branch_copy = allocator.dupe(u8, self.branch) catch @panic("koru: OOM cloning value");
+        const field_copy = allocator.alloc(NamedField, self.fields.len) catch @panic("koru: OOM cloning value");
+        for (self.fields, 0..) |f, i| {
+            const name_copy = allocator.dupe(u8, f.name) catch @panic("koru: OOM cloning value");
+            const value_copy = switch (f.value) {
+                .string_val => |s| FieldValue{ .string_val = allocator.dupe(u8, s) catch @panic("koru: OOM cloning value") },
+                .bool_val => |b| FieldValue{ .bool_val = b },
+                .int_val => |n| FieldValue{ .int_val = n },
+                .float_val => |fl| FieldValue{ .float_val = fl },
+            };
+            field_copy[i] = .{ .name = name_copy, .value = value_copy };
+        }
+        return .{ .branch = branch_copy, .fields = field_copy };
+    }
+};
+
+// ============================================================================
+// VALUE SERIALIZATION - Convert interpreter Value to JSON
+// ============================================================================
+
+~[retain]pub tor value.stringify { value: Value } -> string<std/io:allocated!>
+
+~proc value.stringify|zig {
+    return value.toJsonAlloc(koru_allocator());
+}
+
+// ============================================================================
+// BUDGET TRACKING - Metered execution
+// ============================================================================
+
+pub const BudgetState = struct {
+    /// Total budget allocated for this request (null = unlimited)
+    limit: ?u64,
+    /// Budget consumed so far
+    used: u64,
+    /// Last tor that was executed (for exhaustion reporting)
+    last_event: []const u8,
+
+    pub fn init(limit: ?u64) BudgetState {
+        return .{
+            .limit = limit,
+            .used = 0,
+            .last_event = "",
+        };
+    }
+
+    /// Try to consume budget. Returns true if allowed, false if exhausted.
+    pub fn consume(self: *BudgetState, cost: u64, event_name: []const u8) bool {
+        if (self.limit) |max| {
+            if (self.used + cost > max) {
+                return false; // Would exceed budget
+            }
+        }
+        self.used += cost;
+        self.last_event = event_name;
+        return true;
+    }
+
+    pub fn remaining(self: *const BudgetState) ?u64 {
+        if (self.limit) |max| {
+            return max - self.used;
+        }
+        return null; // Unlimited
+    }
+};
+
+// ============================================================================
+// ENVIRONMENT - Tracks bindings during interpretation
+// ============================================================================
+
+pub const Environment = struct {
+    bindings: std.StringHashMap(Value),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) Environment {
+        return .{
+            .bindings = std.StringHashMap(Value).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Environment) void {
+        self.bindings.deinit();
+    }
+
+    /// Clear bindings but keep capacity to avoid reallocating in hot paths.
+    pub fn clear(self: *Environment) void {
+        self.bindings.clearRetainingCapacity();
+    }
+
+    pub fn bind(self: *Environment, name: []const u8, value: Value) !void {
+        try self.bindings.put(name, value);
+    }
+
+    pub fn get(self: *Environment, name: []const u8) ?Value {
+        return self.bindings.get(name);
+    }
+
+    pub fn remove(self: *Environment, name: []const u8) void {
+        _ = self.bindings.remove(name);
+    }
+};
+
+// ============================================================================
+// DISPATCH RESULT - What dispatchers return to the interpreter
+// ============================================================================
+
+pub const DispatchResult = struct {
+    branch: []const u8,
+    fields: []const NamedField,  // Direct typed field values
+};
+
+// ============================================================================
+// INTERPRETER CONTEXT - Passed to the execution loop
+// ============================================================================
+
+pub const InterpreterContext = struct {
+    env: *Environment,
+    expr_bindings: *ExprBindings,  // For expression evaluation in ~if
+    allocator: std.mem.Allocator,
+    // Dispatcher function pointer - set by the scope
+    dispatcher: ?*const fn(*const ast.Invocation, *DispatchResult) anyerror!void,
+    // Cost lookup function - returns cost for an tor name
+    cost_fn: ?*const fn([]const u8) u64,
+    // Obligation lookup functions (tors can create/discharge multiple obligations)
+    creates_obligations_fn: ?ObligationsArrayFn,   // tor -> []obligations it creates
+    discharges_obligations_fn: ?ObligationsArrayFn, // tor -> []obligations it discharges
+    discharge_event_fn: ?DischargeEventFn,         // obligation -> tor that discharges it
+    // Full spec lookup functions (with field/arg names for handle registry)
+    creates_spec_fn: ?CreatesSpecFn,               // tor -> []CreateSpec
+    discharges_spec_fn: ?DischargesSpecFn,         // tor -> []DischargeSpec
+    // Budget tracking (optional - null means unlimited)
+    budget: ?*BudgetState,
+    // Handle pool for resource tracking (optional)
+    handle_pool: ?*HandlePool,
+    // Scope name for handle isolation
+    scope_name: []const u8,
+    // Runtime-defined flows (the REPL define) — consulted before the scope
+    defined: ?*DefinedFlows,
+    // Defined-dispatch nesting level — bound: interpreter.defined.kz.
+    defined_depth: u32 = 0,
+    // Tor -> declared input fields (InputFieldSpec, phantom spellings
+    // included). Needed at dispatch, not only at validate: a `T<state>`
+    // borrow param is enforced HERE against the live pool — field
+    // membership is the validate-time half of the same surface.
+    input_fn: ?InputLookupFn = null,
+    // Host verbs consulted AFTER the scope denies (the defined table and the
+    // scope's own verbs both outrank them). null = the session grants none.
+    host_dispatch: ?HostDispatchFn = null,
+    // Durable session bindings (the bridge's env): seeded into the per-run
+    // env at start, and the write target for a host verb that persists a
+    // value across turns. null = no session behind this run; every binding
+    // dies with it.
+    session_env: ?*Environment = null,
+    // Set when the fragment ended because a branch had no handler (430_056):
+    // the outcome that fired, handed back for the host to act on.
+    unhandled_outcome: ?Value = null,
+    // Set by a failing eval before it throws — a sentence naming what the
+    // fragment actually asked for, so dispatch-error can teach instead of
+    // reporting a bare @errorName.
+    error_detail: ?[]const u8 = null,
+    // The invocation about to dispatch, recorded per step — a mid-chain
+    // refusal names ITS step, not the flow's head (`flow.inv()`), which is
+    // what dispatch-error used to report: `confirm(held: h)` failing four
+    // steps into a chain reported itself as `select`.
+    failing_event_name: ?[]const u8 = null,
+    // The run's dispatch trace — one entry per real call, in dispatch
+    // order. Rendered onto run's `result`/`dispatch-error`; empty when the
+    // turn never reached the dispatcher.
+    trace: std.ArrayListUnmanaged(TraceEntry) = .{},
+    // Host binder + its state — when set, every dispatched result binds a
+    // durable session name, so `hold`'s <held> minted mid-chain is
+    // addressable next turn, not only the arm name that dies at turn end.
+    session_bind_fn: ?SessionBindFn = null,
+    session_bind_env: ?*Environment = null,
+    session_bind_counter: ?*u64 = null,
+};
+
+pub const InterpreterThreadState = struct {
+    threadlocal var inited: bool = false;
+    threadlocal var arena: std.heap.ArenaAllocator = undefined;
+    threadlocal var env: Environment = undefined;
+    threadlocal var expr_bindings: ExprBindings = undefined;
+
+    pub fn prepare() std.mem.Allocator {
+        if (!inited) {
+            arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            env = Environment.init(std.heap.page_allocator);
+            expr_bindings = ExprBindings.init(std.heap.page_allocator);
+            inited = true;
+        }
+        _ = arena.reset(.retain_capacity);
+        if (env.bindings.count() != 0) env.clear();
+        if (expr_bindings.values.count() != 0) expr_bindings.clear();
+        __dispatch_detail = null;
+        return arena.allocator();
+    }
+};
+
+// HOST-TILDE WALL - interpreter source is pure Koru
+
+/// Location of a `` found in code position, or null if the source is clean.
+pub const HostTilde = struct {
+    line: u32,
+    column: u32,
+};
+
+/// `` switches a HOST-EMBEDDED file (.kz/.kjs) from the host language into
+/// Koru. Interpreter source is already pure Koru, so the character marks
+/// nothing here and is rejected outright — the same rule `.k` files enforce.
+///
+/// Tildes INSIDE string literals are left alone: `open(path: "/notes.txt")`
+/// is a path, not a parser-mode switch.
+pub fn findHostTilde(source: []const u8) ?HostTilde {
+    var line: u32 = 1;
+    var column: u32 = 1;
+    var in_string = false;
+    var escaped = false;
+
+    for (source) |c| {
+        if (escaped) {
+            escaped = false;
+        } else if (in_string and c == '\\') {
+            escaped = true;
+        } else if (c == '"') {
+            in_string = !in_string;
+        } else if (c == '~' and !in_string) {
+            return .{ .line = line, .column = column };
+        }
+
+        if (c == '\n') {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    return null;
+}
+~part args
+~part argref
+~part arith
+~part arms
+~part checks
+~part contracts
+~part define
+~part expr
+~part guards
+~part names
+~part parse
+~part pool
+~part run
+~part refuse
+~part runcached
+~part select
+~part literal
+~part validate
+~part trace
+~part handles
+~part flowsrc
+~part deftable
+~part defined

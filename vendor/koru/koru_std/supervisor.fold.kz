@@ -1,0 +1,1086 @@
+// Koru Standard Library: the `fold` part of supervisor.kz — the elaboration
+// itself: the `supervised` transform decl+proc and the generated-AST
+// constructors it builds the step tor and `#`/`@` fold from. Joined via
+// `~part fold` in supervisor.kz; merged into the supervisor module at load.
+// `std`/`ast`/`H`/`functional` arrive at module scope from the other parts — local
+// imports here would shadow them.
+
+const F = struct {
+    // ---- generated-AST constructors -----------------------------------------
+    // The fold elaboration builds real AST — `=> b`, `=> b v`, `=> b { f: e }`
+    // produces, `| b x when c => …` arms, and the `__more` record. No |zig
+    // strings: the generated shape checks and emits like hand-written code.
+
+    /// A ctor field `{ name: <expr> }` — `type: "auto"`, value as expression text.
+    fn ctorField(alloc: std.mem.Allocator, name: []const u8, expr: []const u8) ast.Field {
+        return ast.Field{
+            .name = alloc.dupe(u8, name) catch unreachable,
+            .type = alloc.dupe(u8, "auto") catch unreachable,
+            .expression_str = alloc.dupe(u8, expr) catch unreachable,
+        };
+    }
+    /// `=> <name>` bare — no payload, no value.
+    fn ctorBareNode(alloc: std.mem.Allocator, name: []const u8) ast.Node {
+        return ast.Node{ .branch_constructor = ast.BranchConstructor{
+            .branch_name = alloc.dupe(u8, name) catch unreachable,
+            .fields = &[_]ast.Field{},
+            .plain_value = null,
+        } };
+    }
+    /// `=> <name> <plain>` — positional value produce.
+    fn ctorNode(alloc: std.mem.Allocator, name: []const u8, plain: []const u8) ast.Node {
+        return ast.Node{ .branch_constructor = ast.BranchConstructor{
+            .branch_name = alloc.dupe(u8, name) catch unreachable,
+            .fields = &[_]ast.Field{},
+            .plain_value = alloc.dupe(u8, plain) catch unreachable,
+        } };
+    }
+    /// `=> <name> { f: <e>, … }` — record produce from ctor fields.
+    fn ctorFieldsNode(alloc: std.mem.Allocator, name: []const u8, fields: []const ast.Field) ast.Node {
+        return ast.Node{ .branch_constructor = ast.BranchConstructor{
+            .branch_name = alloc.dupe(u8, name) catch unreachable,
+            .fields = fields,
+            .plain_value = null,
+        } };
+    }
+    /// `| <branch> [bind] [when cond] => <node>` — a produce arm.
+    fn produceCont(alloc: std.mem.Allocator, branch: []const u8, binding: ?[]const u8, cond: ?[]const u8, node: ast.Node, loc: errors.SourceLocation) ast.Continuation {
+        return ast.Continuation{
+            .branch = alloc.dupe(u8, branch) catch unreachable,
+            .binding = if (binding) |b| alloc.dupe(u8, b) catch unreachable else null,
+            .condition = if (cond) |c| alloc.dupe(u8, c) catch unreachable else null,
+            .node = node,
+            .continuations = &[_]ast.Continuation{},
+            .is_transformed_subtree = true,
+            .location = loc,
+            .indent = 0,
+        };
+    }
+
+    fn positionalField(alloc: std.mem.Allocator, ty: []const u8) []ast.Field {
+        const fs = alloc.alloc(ast.Field, 1) catch unreachable;
+        fs[0] = ast.Field{
+            .name = alloc.dupe(u8, "__type_ref") catch unreachable,
+            .type = alloc.dupe(u8, ty) catch unreachable,
+        };
+        return fs;
+    }
+    /// The "forward the last outcome" produce on the supervised branch:
+    /// `=> b <bind>` when the child's branch carries a payload, `=> b` bare
+    /// when it is void. The step's branches are the child's declaration —
+    /// a void branch declares nothing, so nothing is produced for it.
+    fn lastOutcomeNode(alloc: std.mem.Allocator, name: []const u8, has_payload: bool, fail_bind: []const u8) ast.Node {
+        if (has_payload) return ctorNode(alloc, name, fail_bind);
+        return ctorBareNode(alloc, name);
+    }
+    /// Map an `| exhausted => X […]` ctor onto the step's vocabulary — the
+    /// target is a STEP branch now, and the step's branches pass through
+    /// verbatim, so the produce is legal exactly when it would be on the
+    /// child itself.
+    fn mappedCtorNode(alloc: std.mem.Allocator, ct: *const ast.BranchConstructor) ast.Node {
+        if (ct.plain_value != null) return ctorNode(alloc, ct.branch_name, ct.plain_value.?);
+        if (ct.fields.len > 0) {
+            const fs = alloc.alloc(ast.Field, ct.fields.len) catch unreachable;
+            for (ct.fields, 0..) |f, i| fs[i] = H.cloneField(alloc, f);
+            return ctorFieldsNode(alloc, ct.branch_name, fs);
+        }
+        return ctorBareNode(alloc, ct.branch_name);
+    }
+
+    /// `=> __more { … }` — the loop arm's produce: the next attempt's step
+    /// inputs. Child inputs take `inv`'s re-entry args where named (or ride
+    /// at the current value — the LAST attempt's, ambient); the counter
+    /// increments; `__last: __n` stamps the failure under `within`.
+    /// Positional collapse when the step input list is a sole counter.
+    fn moreNode(alloc: std.mem.Allocator, inputs: []const ast.Field, counter: []const u8, within: bool, inv: ?*const ast.Invocation) ast.Node {
+        var list = std.ArrayList(ast.Field).initCapacity(alloc, inputs.len + 2) catch unreachable;
+        for (inputs) |fld| {
+            var val = fld.name;
+            if (inv) |iv| {
+                for (iv.args) |a| {
+                    if (std.mem.eql(u8, a.name, fld.name)) val = a.value;
+                }
+            }
+            list.append(alloc, ctorField(alloc, fld.name, val)) catch unreachable;
+        }
+        const bump = std.fmt.allocPrint(alloc, "{s} + 1", .{counter}) catch unreachable;
+        list.append(alloc, ctorField(alloc, counter, bump)) catch unreachable;
+        if (within) list.append(alloc, ctorField(alloc, "__last", "__n")) catch unreachable;
+        const fs = list.toOwnedSlice(alloc) catch unreachable;
+        if (fs.len == 1) return ctorNode(alloc, "__more", fs[0].expression_str.?);
+        return ctorFieldsNode(alloc, "__more", fs);
+    }
+    /// Block-mode `__more` — args map from `args: { field: expr }` entries
+    /// (`arg_exprs` is the parser's `{name, value}` slice — `anytype` so the
+    /// proc-local `struct_literal` import stays out of the signature).
+    fn moreNodeArgsMap(alloc: std.mem.Allocator, inputs: []const ast.Field, arg_exprs: anytype, counter: []const u8, within: bool) ast.Node {
+        var list = std.ArrayList(ast.Field).initCapacity(alloc, inputs.len + 2) catch unreachable;
+        for (inputs) |fld| {
+            var val = fld.name;
+            for (arg_exprs) |ae| {
+                if (std.mem.eql(u8, ae.name, fld.name)) val = ae.value;
+            }
+            list.append(alloc, ctorField(alloc, fld.name, val)) catch unreachable;
+        }
+        const bump = std.fmt.allocPrint(alloc, "{s} + 1", .{counter}) catch unreachable;
+        list.append(alloc, ctorField(alloc, counter, bump)) catch unreachable;
+        if (within) list.append(alloc, ctorField(alloc, "__last", "__n")) catch unreachable;
+        const fs = list.toOwnedSlice(alloc) catch unreachable;
+        if (fs.len == 1) return ctorNode(alloc, "__more", fs[0].expression_str.?);
+        return ctorFieldsNode(alloc, "__more", fs);
+    }
+    /// Policy-mode `__more` — the policy's `| retry` payload adapts the
+    /// child inputs it names (`a.<f>`); a positional `| retry i64` IS the
+    /// sole input's new value (`a` itself). Unmentioned inputs ride at the
+    /// current attempt's values.
+    fn moreNodePolicy(alloc: std.mem.Allocator, inputs: []const ast.Field, counter: []const u8, within: bool, retry: *const ast.Branch) ast.Node {
+        var list = std.ArrayList(ast.Field).initCapacity(alloc, inputs.len + 2) catch unreachable;
+        const retry_positional = H.hasPayload(retry) and retry.payload.fields.len == 1 and
+            std.mem.eql(u8, retry.payload.fields[0].name, "__type_ref");
+        for (inputs) |fld| {
+            var val: []const u8 = fld.name;
+            if (retry_positional) {
+                val = "a";
+            } else if (H.hasPayload(retry)) {
+                for (retry.payload.fields) |rf| {
+                    if (std.mem.eql(u8, rf.name, fld.name)) {
+                        val = std.fmt.allocPrint(alloc, "a.{s}", .{rf.name}) catch unreachable;
+                    }
+                }
+            }
+            list.append(alloc, ctorField(alloc, fld.name, val)) catch unreachable;
+        }
+        const bump = std.fmt.allocPrint(alloc, "{s} + 1", .{counter}) catch unreachable;
+        list.append(alloc, ctorField(alloc, counter, bump)) catch unreachable;
+        if (within) list.append(alloc, ctorField(alloc, "__last", "__n")) catch unreachable;
+        const fs = list.toOwnedSlice(alloc) catch unreachable;
+        if (fs.len == 1) return ctorNode(alloc, "__more", fs[0].expression_str.?);
+        return ctorFieldsNode(alloc, "__more", fs);
+    }
+};
+
+~[keyword|comptime|transform]pub tor supervised {
+    source: Source,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc supervised|zig {
+    // `ast` arrives at module scope from the `decl` part — a local import
+    // here would shadow it.
+    const struct_literal = @import("struct_literal");
+
+    if (item.* != .flow) @panic("supervisor:supervised transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    // `H` and `PolicyInfo` arrive at module scope from the `h` and
+    // `policy` parts.
+
+    // ---- 1. The policy datablock, if written: { restart: N } ---------------
+    // The block is OPTIONAL — the arm-children policy (`| retry …`,
+    // `| exhausted …`) is the other spelling. Which one applies is decided
+    // after the site is located (its continuations carry the arms).
+    var block_text: ?[]const u8 = null;
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "source")) block_text = arg.value;
+    }
+    var restart_text: ?[]const u8 = null;
+    var restart_rt: []const u8 = "";
+    var arg_exprs: []const struct_literal.StructField = &.{};
+    // `within_spacing` — the `{ within: N unit }` DECLARATION, wall-clock
+    // min-spacing between restarts. Declarations are data and live in the
+    // block; decision rules live in the arm children — each content kind in
+    // its own slot. `ticks` is pinned vocabulary waiting on its supplier
+    // (an enclosing signal model's steppable clock).
+    var within_spacing: ?[]const u8 = null;
+    // `policy_name` — `{ policy: Name }` delegates the decision rules to a
+    // named same-module tor (its `retry`/`exhausted` vocabulary IS the arm
+    // vocabulary). Rule-source, same slot as `restart:`/`args:` — so it
+    // conflicts with those fields and with rule arms alike.
+    var policy_name: ?[]const u8 = null;
+    var policy_info: PolicyInfo = undefined;
+    if (block_text) |bt| {
+        const braced = std.fmt.allocPrint(allocator, "{{{s}}}", .{bt}) catch unreachable;
+        const policy_fields = struct_literal.parseFields(allocator, braced) catch |err| {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: {s}", .{struct_literal.describeError(err)}) } };
+        };
+        for (policy_fields) |pf| {
+            if (std.mem.eql(u8, pf.name, "restart")) {
+                restart_text = pf.value;
+            } else if (std.mem.eql(u8, pf.name, "args")) {
+                arg_exprs = struct_literal.parseFields(allocator, pf.value) catch |err| {
+                    return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: args: {s}", .{struct_literal.describeError(err)}) } };
+                };
+            } else if (std.mem.eql(u8, pf.name, "within")) {
+                if (within_spacing != null) {
+                    return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: 'within' declared twice — one spacing bound per policy", .{}) } };
+                }
+                switch (parseWithin(allocator, reporter, flow.location, flow.module, pf.value)) {
+                    .ok => |ws| within_spacing = ws,
+                    .refuse => |r| return .{ .transformed = .{ .replacement = r } },
+                }
+            } else if (std.mem.eql(u8, pf.name, "policy")) {
+                if (policy_name != null) {
+                    return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: 'policy' declared twice — one delegated policy per supervised call", .{}) } };
+                }
+                policy_name = std.mem.trim(u8, pf.value, " ");
+            } else {
+                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: unknown policy field '{s}' — rule fields: restart, args, policy; modifier: within", .{pf.name}) } };
+            }
+        }
+    }
+
+    // ---- 2. Locate the producing call --------------------------------------
+    // A nested site arrives as a SiteView: `item.flow.body` is a COPY of the
+    // holding continuation (the `| boom f` arm), and `.site_of` points at the
+    // REAL continuation inside the program tree. The producing call is the
+    // parent — the real-tree continuation whose `.continuations` holds the
+    // site. Walk the real program to find it.
+    const site: *const ast.Continuation = if (flow.site_of) |s| s else &flow.body;
+    const FindParent = struct {
+        fn inCont(cont: *const ast.Continuation, parent: ?*const ast.Continuation, target: *const ast.Continuation) ?*const ast.Continuation {
+            if (cont == target) return parent;
+            for (cont.continuations) |*c| {
+                if (inCont(c, cont, target)) |p| return p;
+            }
+            return null;
+        }
+        fn inItems(items: []const ast.Item, target: *const ast.Continuation) ?*const ast.Continuation {
+            for (items) |*pi| {
+                switch (pi.*) {
+                    .flow => |*f| {
+                        if (inCont(&f.body, null, target)) |p| return p;
+                    },
+                    .module_decl => |*m| {
+                        if (inItems(m.items, target)) |p| return p;
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        }
+    };
+    const parent = FindParent.inItems(program.items, site) orelse {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised must sit on a branch arm of the call it supervises", .{}) } };
+    };
+    if (parent.node == null or parent.node.? != .invocation) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised must sit on a branch arm of an event call", .{}) } };
+    }
+    const child_inv = parent.node.?.invocation;
+    const child_name = child_inv.path.segments[child_inv.path.segments.len - 1];
+    // Parsed paths qualify through the import-derived logical name
+    // (`app.lib`); `flow.module` is the file-derived name (`lib`). Compare
+    // like spellings — the site's home resolved the same way, through the
+    // real containing flow (a nested site's `flow` is a view the tree scan
+    // cannot find; `site` points at the real continuation).
+    const real_flow = functional.containingFlow(program, site) orelse flow;
+    const site_home = functional.moduleHome(program, real_flow) orelse flow.module;
+    const child_module = child_inv.path.module_qualifier orelse site_home;
+
+    // v1 scope: the child must live in the same module as the site.
+    if (!std.mem.eql(u8, child_module, site_home)) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: '{s}' lives in '{s}' — v1 supervises same-module children only", .{ child_name, child_module }) } };
+    }
+
+    // ---- 3. The child's declared outcome vocabulary ------------------------
+    // Decls inside a module_decl qualify by the module's logical name, so
+    // the scan must descend — `app.lib:attempt` is invisible to a
+    // top-level-only walk (115_052).
+    const child_decl = functional.findEventDecl(program, child_module, &.{child_name});
+    const decl = child_decl orelse {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: no event declaration found for '{s}'", .{child_name}) } };
+    };
+
+    var supervised_branch: ?*const ast.Branch = null;
+    for (decl.branches) |*b| {
+        if (std.mem.eql(u8, b.name, site.branch)) supervised_branch = b;
+    }
+    if (supervised_branch == null) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: '{s}' declares no branch '| {s}'", .{ child_name, site.branch }) } };
+    }
+
+    // Only one arm may claim the supervised branch — a `when`-sibling would
+    // make the retry boundary ambiguous.
+    for (parent.continuations) |*sib| {
+        if (sib == site) continue;
+        if (std.mem.eql(u8, sib.branch, site.branch)) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: '| {s}' is claimed by more than one arm — supervise exactly one", .{site.branch}) } };
+        }
+    }
+
+    // ---- 3.5. The policy: arm children, or the datablock -------------------
+    // Children of the site ARE the policy: `| retry <t> when <cond>` rules
+    // (optionally carrying a `|> <call>` re-entry invocation) and
+    // `| exhausted [when <cond>] => <produce>` terminal rules, evaluated in
+    // order on each supervised failure. First match wins; no match forwards
+    // the last outcome upward in kind — the supervision contract.
+    //
+    // `t` (the retry arm's own binding name) is the count of retries already
+    // spent — `| retry t when t < N` grants exactly N re-entries. The failure
+    // payload rides under the site's binding (`f` above); the call's input
+    // fields ride as the generated proc's own params.
+    const fail_bind = blk: {
+        const sb = site.binding orelse break :blk "f";
+        break :blk if (std.mem.eql(u8, sb, "_")) "f" else sb;
+    };
+    const RuleKind = enum { retry, exhausted };
+    const Rule = struct {
+        kind: RuleKind,
+        cond: ?[]const u8,
+        bind: ?[]const u8, // retry only — names the retries-spent counter
+        inv: ?*const ast.Invocation, // retry only — explicit re-entry call
+        ctor: ?*const ast.BranchConstructor, // exhausted only — terminal produce
+    };
+    var rules = std.ArrayList(Rule).initCapacity(allocator, 4) catch unreachable;
+    for (site.continuations) |*c| {
+        // `[key: value]` arms arrive with the brackets stripped — a `:` in
+        // the name is the marker (plain branch names can't carry one). An
+        // arm-shaped declaration is a do-nothing arm borrowing an outcome
+        // dispatch slot — declarations are DATA and live in the block.
+        if (std.mem.indexOfScalar(u8, c.branch, ':') != null) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: '| [{s}]' declares nothing on an outcome arm — policy declarations ride the block: 'supervised {{ {s} }}'", .{ c.branch, c.branch }) } };
+        }
+        if (std.mem.eql(u8, c.branch, "retry")) {
+            if (c.condition == null) {
+                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: `| retry` needs a `when` — an unconditional retry never terminates. Bound it on the attempt counter: `| retry t when t < N`", .{}) } };
+            }
+            if (c.binding) |rb| {
+                if (std.mem.startsWith(u8, rb, "__")) {
+                    return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: counter binding '{s}' — generated names live under '__', pick another", .{rb}) } };
+                }
+                if (std.mem.eql(u8, rb, fail_bind)) {
+                    return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: counter binding '{s}' collides with the failure payload binding — pick another", .{rb}) } };
+                }
+            }
+            var inv: ?*const ast.Invocation = null;
+            if (c.node) |*n| {
+                switch (n.*) {
+                    .invocation => |*iv| inv = iv,
+                    else => {
+                        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: `| retry` re-enters through a `|>` call — a `=>` produce is terminal and belongs on `| exhausted`", .{}) } };
+                    },
+                }
+            }
+            rules.append(allocator, .{ .kind = .retry, .cond = c.condition, .bind = c.binding, .inv = inv, .ctor = null }) catch unreachable;
+        } else if (std.mem.eql(u8, c.branch, "exhausted")) {
+            if (c.binding != null) {
+                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: `| exhausted` binds nothing — the failure payload rides under the arm's own binding ('{s}')", .{fail_bind}) } };
+            }
+            if (c.node == null or c.node.? != .branch_constructor) {
+                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: `| exhausted` produces the terminal outcome: `=> {s} {s}` — or write no `| exhausted` at all for forward-in-kind", .{ site.branch, fail_bind }) } };
+            }
+            rules.append(allocator, .{ .kind = .exhausted, .cond = c.condition, .bind = null, .inv = null, .ctor = &c.node.?.branch_constructor }) catch unreachable;
+        } else {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: policy arms are `| retry` and `| exhausted` — got '| {s}'", .{c.branch}) } };
+        }
+    }
+
+    var terminal_exh = false;
+    // The block's fields split by KIND: `restart`/`args`/`policy` are
+    // rule-source (they spell decisions — inline, or by delegation) and
+    // conflict with rule arms — two spellings of one policy. `within` is a
+    // modifier — it parameterizes whatever rules exist, and composes with
+    // every rule-source spelling.
+    const rule_source = restart_text != null or arg_exprs.len > 0 or policy_name != null;
+    if (rules.items.len > 0 and rule_source) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: 'restart:'/'args:'/'policy:' fields and `| retry`/`| exhausted` arms spell the same decisions — keep rules in one place (a 'within:' declaration composes with either)", .{}) } };
+    }
+    if (policy_name != null and (restart_text != null or arg_exprs.len > 0)) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: 'policy:' delegates the decisions — 'restart:'/'args:' spell them inline; keep one rule-source per supervised call", .{}) } };
+    }
+    if (rules.items.len == 0 and !rule_source and within_spacing != null) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: 'within' modifies a policy — with no 'restart:'/'policy:' field and no `| retry` arms there is nothing to space", .{}) } };
+    }
+    if (rules.items.len > 0) {
+        // ---- arm policy mode ----
+        var retry_count: usize = 0;
+        var bounded = false;
+        for (rules.items, 0..) |r, i| {
+            switch (r.kind) {
+                .retry => {
+                    retry_count += 1;
+                    if (r.inv) |iv| {
+                        const re_name = iv.path.segments[iv.path.segments.len - 1];
+                        const re_module = iv.path.module_qualifier orelse flow.module;
+                        if (!std.mem.eql(u8, re_name, child_name) or !std.mem.eql(u8, re_module, child_module)) {
+                            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: re-entry calls '{s}' only — '{s}' returns a different outcome vocabulary (cross-event re-entry lands with the union work)", .{ child_name, re_name }) } };
+                        }
+                        for (iv.args) |a| {
+                            var found_field = false;
+                            for (decl.input.fields) |fld| {
+                                if (std.mem.eql(u8, a.name, fld.name)) found_field = true;
+                            }
+                            if (!found_field) {
+                                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: re-entry names '{s}' — '{s}' has no input field '{s}' (label the argument: `{s}: …`)", .{ a.name, child_name, a.name, a.name }) } };
+                            }
+                        }
+                    }
+                    if (r.bind) |rb| {
+                        if (H.mentionsWord(r.cond.?, rb)) bounded = true;
+                    }
+                },
+                .exhausted => {
+                    const ct = r.ctor.?;
+                    var found_branch = false;
+                    for (decl.branches) |*b| {
+                        if (std.mem.eql(u8, b.name, ct.branch_name)) {
+                            found_branch = true;
+                            if (H.hasPayload(b) and ct.plain_value == null) {
+                                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: `=> {s}` carries a payload — `=> {s} <expr>`", .{ ct.branch_name, ct.branch_name }) } };
+                            }
+                            if (!H.hasPayload(b) and ct.plain_value != null) {
+                                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: '| {s}' carries no payload — write `=> {s}`", .{ ct.branch_name, ct.branch_name }) } };
+                            }
+                        }
+                    }
+                    if (!found_branch) {
+                        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: `| exhausted => {s}` — '{s}' declares no branch '{s}'", .{ ct.branch_name, child_name, ct.branch_name }) } };
+                    }
+                    if (r.cond == null and i != rules.items.len - 1) {
+                        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: an unconditional `| exhausted` is terminal — it must be the last policy arm", .{}) } };
+                    }
+                    if (r.cond == null) terminal_exh = true;
+                },
+            }
+        }
+        if (retry_count == 0) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: a policy needs at least one `| retry` arm — `| exhausted` alone is the plain arm spelling", .{}) } };
+        }
+        if (!bounded) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: no `| retry` arm bounds on the attempt counter — keep-alive conditions must carry their own escape: `| retry t when t < N`", .{}) } };
+        }
+        const sup_br = supervised_branch.?;
+        if (H.hasPayload(sup_br)) {
+            for (decl.input.fields) |fld| {
+                if (std.mem.eql(u8, fail_bind, fld.name)) {
+                    return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: failure binding '{s}' collides with a '{s}' input field — pick another", .{ fail_bind, child_name }) } };
+                }
+            }
+        }
+    } else if (policy_name != null) {
+        // ---- delegated policy mode ----
+        // The policy tor consumes the failure stream under the arm
+        // vocabulary (`f`, `t`) — `f` bound inside the step on the child's
+        // own payload, `t` the counter field.
+        const sup_br = supervised_branch.?;
+        if (H.hasPayload(sup_br)) {
+            for (decl.input.fields) |fld| {
+                if (std.mem.eql(u8, fail_bind, fld.name)) {
+                    return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: failure binding '{s}' collides with a '{s}' input field — pick another", .{ fail_bind, child_name }) } };
+                }
+            }
+        }
+        switch (resolvePolicy(allocator, reporter, flow.location, flow.module, program, policy_name.?, child_name, decl, site.branch, sup_br)) {
+            .ok => |pi| policy_info = pi,
+            .refuse => |r| return .{ .transformed = .{ .replacement = r } },
+        }
+    } else {
+        // ---- datablock policy mode ----
+        if (block_text == null) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised requires a policy — arm children (`| retry t when t < N`), a block (`supervised {{ restart: N }}`), or delegation (`supervised {{ policy: name }}`)", .{}) } };
+        }
+        restart_rt = restart_text orelse {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: policy block must declare 'restart: N'", .{}) } };
+        };
+        const restart_n = std.fmt.parseInt(i64, std.mem.trim(u8, restart_rt, " "), 10) catch {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: restart must be a non-negative integer literal, got '{s}'", .{restart_rt}) } };
+        };
+        if (restart_n < 1) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: restart must be at least 1 — 'restart: 0' declares no retries; the plain '| {s} f => {s} f' arm already spells forward-as-is", .{ flow.body.branch, flow.body.branch }) } };
+        }
+        // `args: { field: expr }` — the retry argument map. Each expr runs in
+        // the step's scope: the failing attempt's inputs are ambient (`port`
+        // reads the port that just refused), the counter rides its field,
+        // and the failure payload binds under the arm's own name.
+        for (arg_exprs) |ae| {
+            var found_field = false;
+            for (decl.input.fields) |fld| {
+                if (std.mem.eql(u8, ae.name, fld.name)) found_field = true;
+            }
+            if (!found_field) {
+                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: args names '{s}' — '{s}' has no input field '{s}'", .{ ae.name, child_name, ae.name }) } };
+            }
+        }
+    }
+
+    // ---- 4. The elaboration: a `#`/`@` fold over a generated step tor ------
+    // `supervised` lowers to the language's own labeled re-entry — the shape
+    // 320_151 writes by hand. The step tor `__sup_step_L<line>` takes the
+    // child's inputs plus the retry counter (and `__last` under `within`);
+    // its branches are the child's vocabulary plus `__more`, the loop arm
+    // carrying the next attempt's inputs. The site call is rerouted to
+    // `#L __step(<args>, <counter>: 0)` — `retarget_producer` replaces the
+    // producing invocation, so sibling arms dispatch on the STEP's
+    // vocabulary, not the child's.
+    const line_no = site.location.line;
+    const step_name = std.fmt.allocPrint(allocator, "__sup_step_L{d}", .{line_no}) catch unreachable;
+    const label_name = std.fmt.allocPrint(allocator, "__sup_L{d}", .{line_no}) catch unreachable;
+    const sup_br = supervised_branch.?;
+    const sup_has_payload = H.hasPayload(sup_br);
+
+    // The counter is a step input named after the retry arm's own binding —
+    // `| retry t when t < 5` makes `t` the field, so `when` conditions and
+    // re-entry expressions (`port + 1 + t`) resolve verbatim in the step's
+    // scope. Block/policy modes have no user name: `__t`. All retry arms
+    // share the one counter.
+    var counter_name: []const u8 = "__t";
+    var counter_named = false;
+    for (rules.items) |r| {
+        if (r.kind != .retry) continue;
+        const rb = r.bind orelse continue;
+        if (!counter_named) {
+            counter_name = rb;
+            counter_named = true;
+        } else if (!std.mem.eql(u8, counter_name, rb)) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: retry arms share one counter — got '| retry {s}' and '| retry {s}'", .{ counter_name, rb }) } };
+        }
+    }
+    for (decl.input.fields) |fld| {
+        if (std.mem.eql(u8, fld.name, counter_name)) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: counter '{s}' collides with a '{s}' input field — pick another name", .{ counter_name, child_name }) } };
+        }
+        if (within_spacing != null and std.mem.eql(u8, fld.name, "__last")) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: '{s}' input '__last' collides with the within-spacing field", .{child_name}) } };
+        }
+    }
+    for (decl.branches) |*b| {
+        if (std.mem.eql(u8, b.name, "__more")) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: '{s}' declares a '__more' branch — the fold's loop arm needs the name", .{child_name}) } };
+        }
+    }
+    // A void supervised branch cannot bind a payload — the name has no
+    // referent inside the fold (the inner arm binds the child's payload,
+    // and a void branch has none).
+    if (!sup_has_payload) {
+        if (site.binding) |sb_bind| {
+            if (!std.mem.eql(u8, sb_bind, "_")) {
+                return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: '| {s} {s}' binds nothing — '{s}' declares '| {s}' with no payload", .{ site.branch, sb_bind, child_name, site.branch }) } };
+            }
+        }
+        if (site.destructure.len > 0) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: '| {s} {{…}}' destructures nothing — '{s}' declares '| {s}' with no payload", .{ site.branch, child_name, site.branch }) } };
+        }
+    }
+    // A destructure on the supervised arm is never read even when the branch
+    // HAS a payload: the fold binds the failure through `site.binding`
+    // (`| boom f |>`), so `{ q }`'s fields — and any annotation on them —
+    // drop silently. Refuse the surface this consumer does not implement.
+    if (site.destructure.len > 0) {
+        return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: '| {s} {{…}}' destructures nothing the fold reads — bind the failure payload by name ('| {s} f |>')", .{ site.branch, site.branch }) } };
+    }
+    // Policy expressions referencing the failure binding on a payload-less
+    // branch would compile to an undeclared Zig identifier — refuse here.
+    if (!sup_has_payload) {
+        var f_is_input = false;
+        for (decl.input.fields) |fld| {
+            if (std.mem.eql(u8, fld.name, fail_bind)) f_is_input = true;
+        }
+        if (!f_is_input) {
+            for (rules.items) |r| {
+                if (r.kind != .retry) continue;
+                if (H.mentionsWord(r.cond.?, fail_bind)) {
+                    return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: retry condition references '{s}' — '| {s}' carries no failure payload", .{ fail_bind, site.branch }) } };
+                }
+                if (r.inv) |iv| {
+                    for (iv.args) |a| {
+                        if (H.mentionsWord(a.value, fail_bind)) {
+                            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: re-entry argument references '{s}' — '| {s}' carries no failure payload", .{ fail_bind, site.branch }) } };
+                        }
+                    }
+                }
+            }
+            for (arg_exprs) |ae| {
+                if (H.mentionsWord(ae.value, fail_bind)) {
+                    return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: args references '{s}' — '| {s}' carries no failure payload", .{ fail_bind, site.branch }) } };
+                }
+            }
+        }
+    }
+
+    // The enclosing tor's `| <site.branch>` — the forward arm produces on
+    // ITS vocabulary. A decl-less flow (`run = …`) passes the step's
+    // outcome through verbatim.
+    var home_branch: ?*const ast.Branch = null;
+    var home_has_decl = false;
+    var home_name: []const u8 = child_name;
+    home: for (program.items) |*pi| {
+        switch (pi.*) {
+            .flow => |*hf| {
+                if (!H.contContains(&hf.body, parent)) continue;
+                if (hf.impl_of) |io| {
+                    if (io.segments.len > 0) home_name = io.segments[io.segments.len - 1];
+                    for (program.items) |*di| {
+                        if (di.* != .event_decl) continue;
+                        const ed = &di.event_decl;
+                        if (!H.pathEq(io, ed.path)) continue;
+                        home_has_decl = true;
+                        for (ed.branches) |*b| {
+                            if (std.mem.eql(u8, b.name, site.branch)) home_branch = b;
+                        }
+                    }
+                }
+                break :home;
+            },
+            .module_decl => |*m| {
+                if (findHomeDecl(m.items, parent, site.branch)) |hb| {
+                    home_branch = hb.branch;
+                    home_has_decl = hb.found_decl;
+                    if (hb.name) |n| home_name = n;
+                    break :home;
+                }
+            },
+            else => {},
+        }
+    }
+
+    // The home branch owes a payload the child cannot produce: the child
+    // declares '| <site.branch>' void, so nothing exists to forward.
+    if (home_branch) |hb| {
+        if (H.hasPayload(hb) and !sup_has_payload) {
+            return .{ .transformed = .{ .replacement = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/supervisor:supervised: '{s}' declares '| {s}' with a payload — '{s}'s '| {s}' is void and carries nothing to forward", .{ home_name, site.branch, child_name, site.branch }) } };
+        }
+    }
+
+    // Step inputs: child inputs + counter + (`__last` under within).
+    var step_input_list = std.ArrayList(ast.Field).initCapacity(allocator, decl.input.fields.len + 2) catch unreachable;
+    for (decl.input.fields) |fld| {
+        step_input_list.append(allocator, H.cloneField(allocator, fld)) catch unreachable;
+    }
+    step_input_list.append(allocator, ast.Field{
+        .name = allocator.dupe(u8, counter_name) catch unreachable,
+        .type = allocator.dupe(u8, "i64") catch unreachable,
+    }) catch unreachable;
+    if (within_spacing != null) {
+        step_input_list.append(allocator, ast.Field{
+            .name = allocator.dupe(u8, "__last") catch unreachable,
+            .type = allocator.dupe(u8, "i128") catch unreachable,
+        }) catch unreachable;
+    }
+    const step_inputs = step_input_list.toOwnedSlice(allocator) catch unreachable;
+    const more_positional = step_inputs.len == 1;
+
+    // Step branches: the child's vocabulary verbatim — a void branch stays
+    // void — plus `__more` carrying the step inputs.
+    const step_branches = allocator.alloc(ast.Branch, decl.branches.len + 1) catch unreachable;
+    for (decl.branches, 0..) |*b, i| {
+        step_branches[i] = ast.Branch{
+            .name = allocator.dupe(u8, b.name) catch unreachable,
+            .payload = ast.Shape{
+                .fields = H.cloneFields(allocator, b.payload.fields),
+                .is_wildcard = b.payload.is_wildcard,
+            },
+            .is_optional = b.is_optional,
+            .is_panic = b.is_panic,
+            .kind = b.kind,
+            .resume_type = b.resume_type,
+            .resume_phantom = b.resume_phantom,
+            .resume_arms = b.resume_arms,
+            .annotations = b.annotations,
+        };
+    }
+    step_branches[decl.branches.len] = ast.Branch{
+        .name = allocator.dupe(u8, "__more") catch unreachable,
+        .payload = ast.Shape{
+            .fields = if (more_positional)
+                F.positionalField(allocator, step_inputs[0].type)
+            else
+                H.cloneFields(allocator, step_inputs),
+        },
+        .is_panic = false,
+        .kind = .terminal,
+    };
+
+    // ---- the step body -----------------------------------------------------
+    // `__step = <child>(<field>, …)` — every arg a pun on the step's own
+    // inputs: the reader environment is the current attempt's arguments.
+    // Under `within`, a `now(): __n` prefix supplies the clock.
+    var step_arms = std.ArrayList(ast.Continuation).initCapacity(allocator, decl.branches.len + rules.items.len + 3) catch unreachable;
+    const step_bind: ?[]const u8 = if (sup_has_payload) fail_bind else null;
+
+    for (decl.branches) |*b| {
+        if (std.mem.eql(u8, b.name, site.branch)) continue;
+        if (H.hasPayload(b)) {
+            // `| b __v => b __v` — payload forwards verbatim.
+            step_arms.append(allocator, F.produceCont(allocator, b.name, "__v", null, F.ctorNode(allocator, b.name, "__v"), flow.location)) catch unreachable;
+        } else {
+            // `| b => b` — void forwards bare.
+            step_arms.append(allocator, F.produceCont(allocator, b.name, null, null, F.ctorBareNode(allocator, b.name), flow.location)) catch unreachable;
+        }
+    }
+
+    if (policy_name != null) {
+        // `| <sb> [f] |> <policy>([f: f,] t: <counter>)` — the policy tor
+        // decides; `retry` re-enters via `__more`, `exhausted` produces the
+        // supervised outcome. Under `within` a granted-but-unspaced retry
+        // falls through to a same-branch forward (keep-alive failed).
+        var policy_args = std.ArrayList(ast.Arg).initCapacity(allocator, 2) catch unreachable;
+        if (policy_info.takes_f) {
+            policy_args.append(allocator, ast.Arg{
+                .name = allocator.dupe(u8, "f") catch unreachable,
+                .value = allocator.dupe(u8, fail_bind) catch unreachable,
+                .had_explicit_label = true,
+            }) catch unreachable;
+        }
+        if (policy_info.takes_t) {
+            policy_args.append(allocator, ast.Arg{
+                .name = allocator.dupe(u8, "t") catch unreachable,
+                .value = allocator.dupe(u8, counter_name) catch unreachable,
+                .had_explicit_label = true,
+            }) catch unreachable;
+        }
+        var policy_arms = std.ArrayList(ast.Continuation).initCapacity(allocator, 3) catch unreachable;
+        // `| retry a => __more { … }` — `a` adapts the child inputs it
+        // declares (positional `i64` is the sole input's new value);
+        // undeclared inputs ride at the current attempt's values.
+        const retry_cond: ?[]const u8 = if (within_spacing) |ws|
+            std.fmt.allocPrint(allocator, "(__last == -1 or __n - __last >= {s})", .{ws}) catch unreachable
+        else
+            null;
+        policy_arms.append(allocator, ast.Continuation{
+            .branch = allocator.dupe(u8, "retry") catch unreachable,
+            .binding = if (H.hasPayload(policy_info.retry)) allocator.dupe(u8, "a") catch unreachable else null,
+            .condition = retry_cond,
+            .node = F.moreNodePolicy(allocator, decl.input.fields, counter_name, within_spacing != null, policy_info.retry),
+            .continuations = &[_]ast.Continuation{},
+            .is_transformed_subtree = true,
+            .location = site.location,
+            .indent = 0,
+        }) catch unreachable;
+        if (within_spacing != null) {
+            // Within-veto: a granted retry inside the window forwards the
+            // last failure in kind — pacing is not a policy decision.
+            policy_arms.append(allocator, ast.Continuation{
+                .branch = allocator.dupe(u8, "retry") catch unreachable,
+                .binding = if (H.hasPayload(policy_info.retry)) allocator.dupe(u8, "a") catch unreachable else null,
+                .condition = null,
+                .node = F.lastOutcomeNode(allocator, site.branch, sup_has_payload, fail_bind),
+                .continuations = &[_]ast.Continuation{},
+                .is_transformed_subtree = true,
+                .location = site.location,
+                .indent = 0,
+            }) catch unreachable;
+        }
+        if (policy_info.exhausted) |eb| {
+            const eb_payload = H.hasPayload(eb);
+            policy_arms.append(allocator, ast.Continuation{
+                .branch = allocator.dupe(u8, "exhausted") catch unreachable,
+                .binding = if (eb_payload) allocator.dupe(u8, "e") catch unreachable else null,
+                .condition = null,
+                .node = if (eb_payload)
+                    F.ctorNode(allocator, site.branch, "e")
+                else
+                    F.lastOutcomeNode(allocator, site.branch, sup_has_payload, fail_bind),
+                .continuations = &[_]ast.Continuation{},
+                .is_transformed_subtree = true,
+                .location = site.location,
+                .indent = 0,
+            }) catch unreachable;
+        }
+        step_arms.append(allocator, ast.Continuation{
+            .branch = allocator.dupe(u8, site.branch) catch unreachable,
+            .binding = step_bind,
+            .condition = null,
+            .node = ast.Node{ .invocation = ast.Invocation{
+                .path = H.mkPath(allocator, site_home, policy_name.?),
+                .args = policy_args.toOwnedSlice(allocator) catch unreachable,
+                .source_module = allocator.dupe(u8, flow.module) catch unreachable,
+            } },
+            .continuations = policy_arms.toOwnedSlice(allocator) catch unreachable,
+            .is_transformed_subtree = true,
+            .location = site.location,
+            .indent = 0,
+        }) catch unreachable;
+    } else if (rules.items.len > 0) {
+        // ---- arm mode: each `| retry`/`| exhausted` becomes a when-guarded
+        // arm on the step's supervised branch. `port + 1 + t` in a re-entry
+        // arg reads the FAILED attempt's inputs — ambient, not threaded.
+        for (rules.items) |r| {
+            switch (r.kind) {
+                .retry => {
+                    const cond = if (within_spacing) |ws|
+                        std.fmt.allocPrint(allocator, "({s}) and (__last == -1 or __n - __last >= {s})", .{ r.cond.?, ws }) catch unreachable
+                    else
+                        r.cond;
+                    step_arms.append(allocator, ast.Continuation{
+                        .branch = allocator.dupe(u8, site.branch) catch unreachable,
+                        .binding = step_bind,
+                        .condition = cond,
+                        .node = F.moreNode(allocator, decl.input.fields, counter_name, within_spacing != null, r.inv),
+                        .continuations = &[_]ast.Continuation{},
+                        .is_transformed_subtree = true,
+                        .location = site.location,
+                        .indent = 0,
+                    }) catch unreachable;
+                },
+                .exhausted => {
+                    const ct = r.ctor.?;
+                    step_arms.append(allocator, ast.Continuation{
+                        .branch = allocator.dupe(u8, site.branch) catch unreachable,
+                        .binding = step_bind,
+                        .condition = if (r.cond) |cd| allocator.dupe(u8, cd) catch unreachable else null,
+                        .node = F.mappedCtorNode(allocator, ct),
+                        .continuations = &[_]ast.Continuation{},
+                        .is_transformed_subtree = true,
+                        .location = site.location,
+                        .indent = 0,
+                    }) catch unreachable;
+                },
+            }
+        }
+        if (!terminal_exh) {
+            // No unguarded `| exhausted` — the last failure forwards in kind.
+            step_arms.append(allocator, ast.Continuation{
+                .branch = allocator.dupe(u8, site.branch) catch unreachable,
+                .binding = step_bind,
+                .condition = null,
+                .node = F.lastOutcomeNode(allocator, site.branch, sup_has_payload, fail_bind),
+                .continuations = &[_]ast.Continuation{},
+                .is_transformed_subtree = true,
+                .location = site.location,
+                .indent = 0,
+            }) catch unreachable;
+        }
+    } else {
+        // ---- block mode: `{ restart: N [, args: {…}] [, within: …] }` ------
+        const cond = if (within_spacing) |ws|
+            std.fmt.allocPrint(allocator, "({s} < {s}) and (__last == -1 or __n - __last >= {s})", .{ counter_name, restart_rt, ws }) catch unreachable
+        else
+            std.fmt.allocPrint(allocator, "{s} < {s}", .{ counter_name, restart_rt }) catch unreachable;
+        step_arms.append(allocator, ast.Continuation{
+            .branch = allocator.dupe(u8, site.branch) catch unreachable,
+            .binding = step_bind,
+            .condition = cond,
+            .node = F.moreNodeArgsMap(allocator, decl.input.fields, arg_exprs, counter_name, within_spacing != null),
+            .continuations = &[_]ast.Continuation{},
+            .is_transformed_subtree = true,
+            .location = site.location,
+            .indent = 0,
+        }) catch unreachable;
+        step_arms.append(allocator, ast.Continuation{
+            .branch = allocator.dupe(u8, site.branch) catch unreachable,
+            .binding = step_bind,
+            .condition = null,
+            .node = F.lastOutcomeNode(allocator, site.branch, sup_has_payload, fail_bind),
+            .continuations = &[_]ast.Continuation{},
+            .is_transformed_subtree = true,
+            .location = site.location,
+            .indent = 0,
+        }) catch unreachable;
+    }
+
+    // The step body: `<child>(<punned inputs>)` — optionally under a
+    // `now(): __n` clock prefix when `within` paces the loop.
+    const child_call = ast.Invocation{
+        .path = blk: {
+            const segs = allocator.alloc([]const u8, child_inv.path.segments.len) catch unreachable;
+            for (child_inv.path.segments, 0..) |s, si| segs[si] = allocator.dupe(u8, s) catch unreachable;
+            break :blk ast.DottedPath{
+                .module_qualifier = if (child_inv.path.module_qualifier) |mq| allocator.dupe(u8, mq) catch unreachable else null,
+                .segments = segs,
+            };
+        },
+        .args = blk: {
+            const aa = allocator.alloc(ast.Arg, decl.input.fields.len) catch unreachable;
+            for (decl.input.fields, 0..) |fld, ai| {
+                aa[ai] = ast.Arg{
+                    .name = allocator.dupe(u8, fld.name) catch unreachable,
+                    .value = allocator.dupe(u8, fld.name) catch unreachable,
+                    .had_explicit_label = false,
+                };
+            }
+            break :blk aa;
+        },
+        .source_module = allocator.dupe(u8, flow.module) catch unreachable,
+    };
+    const dial_cont = ast.Continuation{
+        .branch = "",
+        .binding = null,
+        .condition = null,
+        .node = ast.Node{ .invocation = child_call },
+        .continuations = step_arms.toOwnedSlice(allocator) catch unreachable,
+        .is_transformed_subtree = true,
+        .location = flow.location,
+        .indent = 0,
+    };
+    const step_body: ast.Continuation = if (within_spacing != null) ast.Continuation{
+        // `now(): __n |> <child>(…)` — the clock binds at chain top, ambient
+        // to every arm's `when` and produce.
+        .branch = "",
+        .binding = null,
+        .condition = null,
+        .node = ast.Node{ .invocation = ast.Invocation{
+            .path = H.mkPath(allocator, "std.time", "now"),
+            .args = &[_]ast.Arg{},
+            .source_module = allocator.dupe(u8, flow.module) catch unreachable,
+            .return_binding = allocator.dupe(u8, "__n") catch unreachable,
+        } },
+        .continuations = blk: {
+            const cc = allocator.alloc(ast.Continuation, 1) catch unreachable;
+            cc[0] = dial_cont;
+            break :blk cc;
+        },
+        .is_transformed_subtree = true,
+        .location = flow.location,
+        .indent = 0,
+    } else dial_cont;
+
+    var appended = std.ArrayList(ast.Item).initCapacity(allocator, 3) catch unreachable;
+    // `within` paces the loop off `std/time:now` — the generated step calls
+    // it, so the program needs the module whether the user's file imports
+    // it or not.
+    if (within_spacing != null) {
+        var time_imported = false;
+        for (program.items) |*pi| {
+            if (pi.* == .import_decl and std.mem.eql(u8, pi.import_decl.path, "std/time")) time_imported = true;
+        }
+        if (!time_imported) {
+            appended.append(allocator, ast.Item{ .import_decl = ast.ImportDecl{
+                .path = allocator.dupe(u8, "std/time") catch unreachable,
+                .local_name = allocator.dupe(u8, "std.time") catch unreachable,
+                .module = allocator.dupe(u8, flow.module) catch unreachable,
+            } }) catch unreachable;
+        }
+    }
+    appended.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+        .path = H.mkPath(allocator, site_home, step_name),
+        .input = ast.Shape{ .fields = step_inputs, .is_wildcard = decl.input.is_wildcard },
+        .branches = step_branches,
+        .is_public = false,
+        .is_implicit_flow = false,
+        .annotations = &[_][]const u8{},
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } }) catch unreachable;
+    appended.append(allocator, ast.Item{ .flow = ast.Flow{
+        .body = step_body,
+        .impl_of = H.mkPath(allocator, site_home, step_name),
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } }) catch unreachable;
+
+    // ---- 5. The site rewrite ------------------------------------------------
+    // `#L __step(<original args>, <counter>: 0 [, __last: 0])` replaces the
+    // producing call; children = the `__more` jump arm, the site's sibling
+    // arms verbatim, and a forward arm where the supervised arm stood.
+    var site_children = std.ArrayList(ast.Continuation).initCapacity(allocator, parent.continuations.len + 1) catch unreachable;
+
+    // `| __more s |> @L(s.<f>, …)` — jump args read the loop payload's
+    // fields back onto the step's inputs (positional payload: `s` itself).
+    const jump_args = blk: {
+        const ja = allocator.alloc(ast.Arg, step_inputs.len) catch unreachable;
+        for (step_inputs, 0..) |fld, ji| {
+            ja[ji] = ast.Arg{
+                .name = allocator.dupe(u8, fld.name) catch unreachable,
+                .value = if (more_positional)
+                    allocator.dupe(u8, "s") catch unreachable
+                else
+                    std.fmt.allocPrint(allocator, "s.{s}", .{fld.name}) catch unreachable,
+                .had_explicit_label = true,
+            };
+        }
+        break :blk ja;
+    };
+    site_children.append(allocator, ast.Continuation{
+        .branch = allocator.dupe(u8, "__more") catch unreachable,
+        .binding = allocator.dupe(u8, "s") catch unreachable,
+        .condition = null,
+        .node = ast.Node{ .label_jump = .{
+            .label = label_name,
+            .args = jump_args,
+        } },
+        .continuations = &[_]ast.Continuation{},
+        .is_transformed_subtree = true,
+        .location = site.location,
+        .indent = 0,
+    }) catch unreachable;
+
+    const step_sup_payload = sup_has_payload;
+    for (parent.continuations) |*sib| {
+        if (sib == site) {
+            // The forward arm where the supervised arm stood: produce the
+            // site's own branch upward — payload forwarding the step's
+            // outcome, `_`-discarding when the enclosing tor declares void.
+            const fwd: ast.Continuation = if (step_sup_payload) blk: {
+                if (home_has_decl and home_branch != null and !H.hasPayload(home_branch.?)) {
+                    break :blk ast.Continuation{
+                        .branch = allocator.dupe(u8, site.branch) catch unreachable,
+                        .binding = allocator.dupe(u8, "_") catch unreachable,
+                        .condition = null,
+                        .node = F.ctorBareNode(allocator, site.branch),
+                        .continuations = &[_]ast.Continuation{},
+                        .is_transformed_subtree = true,
+                        .location = site.location,
+                        .indent = sib.indent,
+                    };
+                }
+                break :blk ast.Continuation{
+                    .branch = allocator.dupe(u8, site.branch) catch unreachable,
+                    .binding = allocator.dupe(u8, "__r") catch unreachable,
+                    .condition = null,
+                    .node = F.ctorNode(allocator, site.branch, "__r"),
+                    .continuations = &[_]ast.Continuation{},
+                    .is_transformed_subtree = true,
+                    .location = site.location,
+                    .indent = sib.indent,
+                };
+            } else ast.Continuation{
+                .branch = allocator.dupe(u8, site.branch) catch unreachable,
+                .binding = null,
+                .condition = null,
+                .node = F.ctorBareNode(allocator, site.branch),
+                .continuations = &[_]ast.Continuation{},
+                .is_transformed_subtree = true,
+                .location = site.location,
+                .indent = sib.indent,
+            };
+            site_children.append(allocator, fwd) catch unreachable;
+        } else {
+            site_children.append(allocator, sib.*) catch unreachable;
+        }
+    }
+
+    // `#L __step(<original args>, <counter>: 0)` — args verbatim from the
+    // producing call (they evaluate in the enclosing tor's scope, as
+    // written), then the counter seed.
+    var head_args = std.ArrayList(ast.Arg).initCapacity(allocator, child_inv.args.len + 2) catch unreachable;
+    for (child_inv.args) |a| {
+        head_args.append(allocator, ast.Arg{
+            .name = allocator.dupe(u8, a.name) catch unreachable,
+            .value = allocator.dupe(u8, a.value) catch unreachable,
+            .had_explicit_label = a.had_explicit_label,
+        }) catch unreachable;
+    }
+    head_args.append(allocator, ast.Arg{
+        .name = allocator.dupe(u8, counter_name) catch unreachable,
+        .value = allocator.dupe(u8, "0") catch unreachable,
+        .had_explicit_label = true,
+    }) catch unreachable;
+    if (within_spacing != null) {
+        head_args.append(allocator, ast.Arg{
+            .name = allocator.dupe(u8, "__last") catch unreachable,
+            .value = allocator.dupe(u8, "-1") catch unreachable,
+            .had_explicit_label = true,
+        }) catch unreachable;
+    }
+
+    return .{ .transformed = .{
+        .replacement_node = ast.NodeReplacement{
+            .node = ast.Node{ .label_with_invocation = .{
+                .label = label_name,
+                .invocation = ast.Invocation{
+                    .path = H.mkPath(allocator, site_home, step_name),
+                    .args = head_args.toOwnedSlice(allocator) catch unreachable,
+                    .source_module = allocator.dupe(u8, flow.module) catch unreachable,
+                },
+                .is_declaration = true,
+            } },
+            .children = site_children.toOwnedSlice(allocator) catch unreachable,
+            .retarget_producer = true,
+        },
+        .appended = appended.toOwnedSlice(allocator) catch unreachable,
+    } };
+}
+

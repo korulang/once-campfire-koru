@@ -1,0 +1,586 @@
+// Build Requirements Standard Library
+// Allows modules to declare their build dependencies
+//
+// TOP-LEVEL COMPTIME EXECUTION:
+// This module uses top-level comptime calls for automatic collection.
+// When imported, the top-level collect() executes automatically.
+
+~[comptime]
+
+const emit_build_zig = @import("emit_build_zig");
+const std = @import("std");
+const Root = @import("root");
+const ast_functional = @import("ast_functional");
+const emitter_helpers = @import("emitter_helpers");
+const annotation_parser = @import("annotation_parser");
+
+// Re-export variant registry functions from the core
+// This allows userland code to query variants via std.build.getVariant()
+pub const getVariant = emitter_helpers.getVariant;
+pub const registerVariant = emitter_helpers.registerVariant;
+
+// Import shared compiler types (to avoid circular dependency with compiler.kz)
+~import std/compiler_types
+
+// ============================================================================
+// FLAG MATCHING - Annotation-based conditional compilation
+// ============================================================================
+// Use [build("prod")] or [build("dev", "staging")] to conditionally include
+// declarations based on the --build=X compiler flag.
+//
+// Usage in source code:
+//   [build("prod")]koru/docker:image(tag: "myapp:latest") {
+//       FROM alpine:3.18
+//       COPY zig-out/bin/main /usr/local/bin/myapp
+//       CMD ["myapp"]
+//   }
+//
+//   [build("dev")]koru/docker:image(tag: "myapp:latest") {
+//       FROM alpine:3.18
+//       RUN apk add --no-cache gdb strace
+//       COPY zig-out/bin/main /usr/local/bin/myapp
+//       CMD ["myapp", "--debug"]
+//   }
+//
+// Then: koruc main.kz --build=prod docker build
+//
+// Usage in a command proc:
+//   for (program.items) |item| {
+//       if (item == .flow) {
+//           const flow = item.flow;
+//           if (!matchesFlags(flow.inv().annotations)) continue;
+//           // ... process the flow
+//       }
+//   }
+//
+// Semantics:
+//   - No build(...) annotation → always matches
+//   - Has build("x", "y", ...) → matches if --build=x OR --build=y
+//
+pub fn matchesFlags(annotations: []const []const u8) bool {
+    // Look for build(...) parametrized annotation
+    for (annotations) |ann| {
+        // Try to parse as a parametrized call
+        const maybe_call = annotation_parser.parseCall(std.heap.page_allocator, ann) catch continue;
+        if (maybe_call) |call| {
+            defer {
+                var mutable_call = call;
+                mutable_call.deinit(std.heap.page_allocator);
+            }
+
+            // Check if this is a build() annotation
+            if (std.mem.eql(u8, call.name, "build")) {
+                // Check if any of the args match current --build=X flag
+                for (call.args) |arg| {
+                    // Build the flag string: "build=prod", "build=dev", etc.
+                    var flag_buf: [64]u8 = undefined;
+                    const flag = std.fmt.bufPrint(&flag_buf, "build={s}", .{arg}) catch continue;
+
+                    if (Root.CompilerEnv.hasFlagRuntime(flag)) {
+                        return true;  // Found a matching build flag
+                    }
+                }
+                // Has build() annotation but none of the args matched
+                return false;
+            }
+        }
+    }
+
+    // No build() annotation found → always matches
+    return true;
+}
+
+// Declare build dependency using implicit Source block
+// Usage: std/build:requires { exe.linkSystemLibrary("sqlite3"); }
+// [norun] annotation prevents auto-execution - collect() reads from AST instead
+~[comptime|norun]pub tor requires {
+    source: Source
+}
+| ?added
+| ?parse-error string
+
+~proc requires|zig {
+    // Validate Source syntax
+    // Can be called programmatically by collect() to validate each requirement
+    // TODO: Actually validate Zig syntax
+    return .{ .added = .{} };
+}
+
+// ============================================================================
+// VARIANT SELECTION - Conditional proc selection based on build flags
+// ============================================================================
+// Allows selecting different proc variants based on --build flag.
+// Usage:
+//   [build("release")]std/build:variants {
+//       "compute": "fast",
+//       "blur": "gpu"
+//   }
+//   [build("debug")]std/build:variants {
+//       "compute": "naive",
+//       "blur": "cpu"
+//   }
+//
+// When compiled with --build=release, the emitter will use "fast" for compute.
+// When compiled with --build=debug, the emitter will use "naive" for compute.
+//
+// The Source block contains JSON-like mappings: event_name → variant_name
+// The program AST is used to validate that referenced tors exist
+
+~[comptime]pub tor variants { meta: InvocationMeta, source: Source, program: std/compiler:Program }
+| configured usize
+| skipped string
+| invalid-event string
+
+~proc variants|zig {
+    // Check if this config's annotation matches the --build flag
+    if (!matchesFlags(meta.annotations)) {
+        return .{ .skipped = "no matching build flag" };
+    }
+
+    // Parse the source as simple JSON-like key:value pairs
+    // Format: "event_name": "variant_name"
+    var count: usize = 0;
+    var pos: usize = 0;
+    const text = source.text;
+
+    while (pos < text.len) {
+        // Skip whitespace and braces
+        while (pos < text.len and (text[pos] == ' ' or text[pos] == '\n' or text[pos] == '\r' or text[pos] == '\t' or text[pos] == '{' or text[pos] == '}' or text[pos] == ',')) {
+            pos += 1;
+        }
+        if (pos >= text.len) break;
+
+        // Expect opening quote for key
+        if (text[pos] != '"') {
+            pos += 1;
+            continue;
+        }
+        pos += 1;
+
+        // Read key
+        const key_start = pos;
+        while (pos < text.len and text[pos] != '"') {
+            pos += 1;
+        }
+        const key = text[key_start..pos];
+        pos += 1; // skip closing quote
+
+        // Skip colon and whitespace
+        while (pos < text.len and (text[pos] == ':' or text[pos] == ' ')) {
+            pos += 1;
+        }
+
+        // Expect opening quote for value
+        if (pos >= text.len or text[pos] != '"') continue;
+        pos += 1;
+
+        // Read value
+        const value_start = pos;
+        while (pos < text.len and text[pos] != '"') {
+            pos += 1;
+        }
+        const value = text[value_start..pos];
+        pos += 1; // skip closing quote
+
+        // Validate that the tor exists in the AST and grab its decl
+        const event = ast_functional.findEventByCanonicalName(program, key) orelse {
+            return .{ .invalid_event = key };
+        };
+
+        // Register under the tor's canonical name (e.g. "blinky:main"),
+        // not the raw user-supplied key (e.g. "main"). visitor_emitter looks
+        // up the canonical form at emission time, so the registry must match.
+        // page_allocator: this is comptime, the slice lives until process exit.
+        const canonical = emitter_helpers.buildCanonicalEventName(&event.path, std.heap.page_allocator, null) catch continue;
+
+        if (emitter_helpers.registerVariant(canonical, value)) {
+            count += 1;
+        }
+    }
+
+    return .{ .configured = count };
+}
+
+// ============================================================================
+// BUILD CONFIG - Key-value build parameters based on build flags
+// ============================================================================
+// Sets build-time configuration values (e.g., cross-compilation target).
+// Composes with build:variants — variants select WHICH code, config sets
+// HOW to build it. Both use the same [build(X)] guard system.
+//
+// Usage:
+//   [build("linux")]std/build:config {
+//       "target": "x86_64-linux-musl"
+//   }
+//
+// The compiler is agnostic to the keys — it just passes them through.
+// Currently the backend recognizes "target" for zig cross-compilation.
+
+~[comptime]pub tor config { meta: InvocationMeta, source: Source }
+| configured usize
+| skipped string
+
+~proc config|zig {
+    if (!matchesFlags(meta.annotations)) {
+        return .{ .skipped = "no matching build flag" };
+    }
+
+    // Parse the source as simple JSON-like key:value pairs
+    var count: usize = 0;
+    var pos: usize = 0;
+    const text = source.text;
+
+    while (pos < text.len) {
+        // Skip whitespace and braces
+        while (pos < text.len and (text[pos] == ' ' or text[pos] == '\n' or text[pos] == '\r' or text[pos] == '\t' or text[pos] == '{' or text[pos] == '}' or text[pos] == ',')) {
+            pos += 1;
+        }
+        if (pos >= text.len) break;
+
+        // Expect opening quote for key
+        if (text[pos] != '"') {
+            pos += 1;
+            continue;
+        }
+        pos += 1;
+
+        // Read key
+        const key_start = pos;
+        while (pos < text.len and text[pos] != '"') {
+            pos += 1;
+        }
+        const key = text[key_start..pos];
+        pos += 1; // skip closing quote
+
+        // Skip colon and whitespace
+        while (pos < text.len and (text[pos] == ':' or text[pos] == ' ')) {
+            pos += 1;
+        }
+
+        // Expect opening quote for value
+        if (pos >= text.len or text[pos] != '"') continue;
+        pos += 1;
+
+        // Read value
+        const value_start = pos;
+        while (pos < text.len and text[pos] != '"') {
+            pos += 1;
+        }
+        const value = text[value_start..pos];
+        pos += 1; // skip closing quote
+
+        // Register in the build config registry
+        if (emitter_helpers.registerBuildConfig(key, value)) {
+            count += 1;
+        }
+    }
+
+    return .{ .configured = count };
+}
+
+// ============================================================================
+// BUILD COMMANDS - Shell Script Execution (Frontend Optimization)
+// ============================================================================
+// FRONTEND OPTIMIZATION: Unlike most compiler features, build:command.sh
+// is processed in the frontend (koruc) rather than the backend compiler.
+// This allows instant execution without backend compilation overhead.
+//
+// For commands that need Zig/Koru compilation, use build:command.proc or
+// build:command.flow (backend passes, slower but more powerful).
+//
+// Usage:
+//   std/build:command.sh(name: "test", description: "Run all tests") {
+//     ./run_regression.sh
+//   }
+//
+// Invoke: koruc main.kz test --all --verbose
+// Executes: ./run_regression.sh --all --verbose
+//
+// The shell command receives all remaining argv as arguments.
+// Use `koruc main.kz help` to list all available commands.
+
+~[comptime|norun]pub tor command.sh { name: string, description: string, source: Source }
+
+// ============================================================================
+// BUILD COMMANDS - Zig Functions (Frontend Compilation + Execution)
+// ============================================================================
+// FRONTEND EXECUTION: Powerful commands with full compiler access!
+// Unlike command.sh, command.zig functions have access to the AST and allocator,
+// enabling sophisticated build orchestration and metaprogramming.
+//
+// Function Signature:
+//   pub fn execute(
+//       allocator: std.mem.Allocator,
+//       argv: [][]const u8,
+//       ast: *const Program
+//   ) !void
+//
+// Usage:
+//   std/build:command.zig(name: "build") {
+//     const std = @import("std");
+//     const ast = @import("ast");
+//
+//     pub fn execute(allocator: std.mem.Allocator, argv: [][]const u8, program: *const ast.Program) !void {
+//       // Parse argv for command arguments
+//       // Collect build:step invocations from AST
+//       // Orchestrate build step execution with dependency resolution
+//     }
+//   }
+//
+// Invoke: koruc main.kz build test --verbose
+//   - Command name: "build"
+//   - argv: ["test", "--verbose"]
+//   - AST: Full program AST for inspection/manipulation
+//
+// Available in scope:
+//   - std.mem.Allocator for memory management
+//   - Full AST access for metaprogramming
+//   - Can import compiler utilities (build_step_utils, etc.)
+//
+// Examples:
+//   koruc main.kz build           # Run all build steps
+//   koruc main.kz build test      # Run 'test' step + dependencies
+//   koruc main.kz clean           # Custom cleanup command
+//   koruc main.kz deploy prod     # Deployment orchestration
+
+~[comptime|norun]pub tor command.zig { name: string, source: Source }
+
+// ============================================================================
+// BUILD COMMANDS - Native Koru Flows (Zero Context Switch)
+// ============================================================================
+// FRONTEND EXECUTION: Write build commands in pure Koru!
+// The command body IS a flow continuation - no Source block, no Zig, just Koru.
+//
+// Usage:
+//   std/build:command(name: "greet", description: "Say hello")
+//   | execute ctx |>
+//       if(ctx.argv.len > 1)
+//       | then |> std/io:println("Hello, " ++ ctx.argv[1] ++ "!")
+//       | else |> std/io:println("Usage: greet <name>")
+//
+// Invoke: koruc main.kz greet World
+//   Output: Hello, World!
+//
+// The execute branch receives:
+//   - ctx.argv: [][]const u8 - command line arguments after command name
+//   - ctx.program: *const Program - full AST access (optional)
+//
+// Unlike command.sh (shell) or command.zig (raw Zig), command uses normal
+// Koru flow syntax. Same patterns as everything else - tors, branches, if.
+//
+// Examples:
+//   std/build:command(name: "check", description: "Run all checks")
+//   | execute ctx |>
+//       std/build:run_step("lint")
+//       | done |> std/build:run_step("test")
+//           | done |> std/io:println("All checks passed!")
+//           | failed e |> std/io:println("Tests failed: " ++ e)
+//       | failed e |> std/io:println("Lint failed: " ++ e)
+
+~[comptime|norun]pub tor command { name: string, description: string } -> []string
+
+// ============================================================================
+// BUILD STEPS - Declarative Build Pipeline with Dependencies
+// ============================================================================
+// FRONTEND EXECUTION: Build steps are collected and executed in dependency order
+// during the compilation process. Steps declare dependencies using annotations.
+//
+// Usage:
+//   std/build:step(name: "compile") {
+//     zig build-exe main.zig
+//   }
+//
+//   [depends_on(compile)]std/build:step(name: "test") {
+//     ./main --test
+//   }
+//
+//   [depends_on(compile, test)]std/build:step(name: "package") {
+//     tar czf app.tar.gz main
+//   }
+//
+// Execution:
+// - Steps are collected from AST with their annotations
+// - Dependencies are extracted from [depends_on(...)] annotations
+// - Dependency graph is built and topologically sorted
+// - Steps execute in correct order (circular dependencies are detected and error)
+//
+// Annotations:
+// - [depends_on(step1, step2, ...)] - Variadic dependency list
+// - Future: [parallel], [optional], [timeout(30)], etc.
+
+~[comptime|norun]pub tor step { name: string, source: Source }
+
+// ============================================================================
+// DEFAULT BUILD STEPS - Standard 2-Phase Metaprogramming Compilation
+// ============================================================================
+// These steps implement Koru's standard compilation pipeline:
+//   1. Compile backend metaprogram (main.zig → backend executable)
+//   2. Run backend (applies optimizations, generates final code)
+//   3. Run the final program
+//
+// Users can override any step by defining their own with the same name
+// (without the [default] annotation). The override resolution in main.zig
+// will automatically use user-defined steps over these defaults.
+
+// Phase 1: Compile backend metaprogram using build_backend.zig
+~[default] step(name: "compile_backend") {
+    zig build --build-file build_backend.zig
+}
+
+// Phase 2: Run backend to generate & compile final program.
+//
+// TWO defects lived in these six lines, independently, and both were latent
+// because the declarative step pipeline only engages once a program declares a
+// step of its own — and the one test that covers the chain (310_033) overrides
+// compile_backend, build AND run with echoes, so it proves ordering while
+// executing none of these scripts.
+//
+// 1. The separator was `,`. Annotations separate on `|` (`[comptime|transform]`,
+//    `[abstract|retain]`). `[default, depends_on(compile_backend)]` parsed as
+//    something that is not two annotations, and the depends_on was DROPPED
+//    SILENTLY — no diagnostic, just a dependency that never fires. The comma
+//    inside `depends_on(a, b)` is a different thing: that is one annotation's
+//    argument list, and it is correct.
+// 2. The binary is `backend`, not `main` — phase 1 emits `zig-out/bin/backend`.
+//
+// Together they meant anyone attaching `[depends_on(build)]` to the real default
+// got `sh: ./zig-out/bin/main: No such file or directory` / `BuildStepFailed`,
+// and fixing only the name moved it to `./zig-out/bin/backend: No such file`,
+// because compile_backend still never ran.
+~[default|depends_on(compile_backend)] step(name: "build") {
+    ./zig-out/bin/backend backend_tmp
+}
+
+// Phase 3: Run the final program
+~[default|depends_on(build)] step(name: "run") {
+    ./backend_tmp
+}
+
+// ============================================================================
+// BUILD COLLECTION - Generate build.zig from build:requires declarations
+// ============================================================================
+// BACKEND PASS: Collects all build:requires from the user's final program AST
+// and generates build.zig for compiling the final executable.
+//
+// This is distinct from compiler:requires (which configures backend compilation).
+// build:requires configures the FINAL PROGRAM compilation.
+//
+// Usage (invoked by compiler.kz during backend coordination):
+//   std/build:collect(ctx: ctx, output-path: "build.zig")
+//   | collected { ctx: CompilerContext }
+//
+// The pass:
+// - Walks ctx.ast for all build:requires invocations
+// - Collects the Source parameters (Zig build code)
+// - Generates build.zig using emit_build_zig library
+// - Returns updated ctx with passes_completed incremented
+
+~[comptime]pub tor collect {
+    ctx: koru_compiler_types.CompilerContext,
+    output_path: string
+} -> koru_compiler_types.CompilerContext
+
+~proc collect|zig {
+    // Extract nested fields from ctx (auto-destructuring only works for top-level tor params)
+    const allocator = ctx.allocator;
+    const ast_items = ctx.ast.items;
+
+    // Collect all build:requires from AST
+    var requirements = std.ArrayList(emit_build_zig.BuildRequirement){
+        .items = &.{},
+        .capacity = 0,
+    };
+    errdefer requirements.deinit(allocator);
+
+    // Walk AST looking for std.build:requires flows
+    for (ast_items) |item| {
+        switch (item) {
+            .flow => |flow| {
+                // Check if this is std.build:requires
+                if (flow.inv().path.module_qualifier) |mq| {
+                    const is_build_requires = (std.mem.eql(u8, mq, "std.build") and
+                        flow.inv().path.segments.len == 1 and
+                        std.mem.eql(u8, flow.inv().path.segments[0], "requires"));
+
+                    if (is_build_requires) {
+                        // Respect build flags: [build("prod")], [build("dev")], etc.
+                        if (!matchesFlags(flow.inv().annotations)) continue;
+                        // Extract source parameter
+                        for (flow.inv().args) |arg| {
+                            if (std.mem.eql(u8, arg.name, "source")) {
+                                // Deduplicate by checking if this source already exists
+                                var found = false;
+                                for (requirements.items) |req| {
+                                    if (std.mem.eql(u8, req.source_code, arg.value)) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if (!found) {
+                                    const requirement = emit_build_zig.BuildRequirement{
+                                        .module_name = "main", // All user code is in "main" module
+                                        .source_code = arg.value,
+                                    };
+                                    try requirements.append(allocator, requirement);
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            .module_decl => |module| {
+                // Also check imported modules
+                for (module.items) |mod_item| {
+                    if (mod_item == .flow) {
+                        const flow = mod_item.flow;
+                        if (flow.inv().path.module_qualifier) |mq| {
+                            const is_build_requires = (std.mem.eql(u8, mq, "std.build") and
+                                flow.inv().path.segments.len == 1 and
+                                std.mem.eql(u8, flow.inv().path.segments[0], "requires"));
+
+                            if (is_build_requires) {
+                                // Respect build flags: [build("prod")], [build("dev")], etc.
+                                if (!matchesFlags(flow.inv().annotations)) continue;
+                                for (flow.inv().args) |arg| {
+                                    if (std.mem.eql(u8, arg.name, "source")) {
+                                        // Deduplicate by checking if this source already exists
+                                        var found = false;
+                                        for (requirements.items) |req| {
+                                            if (std.mem.eql(u8, req.source_code, arg.value)) {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if (!found) {
+                                            const requirement = emit_build_zig.BuildRequirement{
+                                                .module_name = module.logical_name,
+                                                .source_code = arg.value,
+                                            };
+                                            try requirements.append(allocator, requirement);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    // If we found requirements, generate build.zig
+    if (requirements.items.len > 0) {
+        std.debug.print("📦 Found {d} build requirement(s)\n", .{requirements.items.len});
+        try emit_build_zig.emitBuildZig(allocator, requirements.items, output_path);
+        std.debug.print("✓ Generated {s}\n", .{output_path});
+    }
+
+    requirements.deinit(allocator);
+
+    // Update context
+    var updated_ctx = ctx;
+    updated_ctx.passes_completed += 1;
+
+    return updated_ctx;
+}

@@ -1,0 +1,418 @@
+// Koru Standard Library: Reactive Stores — the `insert` tor.
+// Joined via `~part insert` in store.kz; merged into the store module at load.
+
+// ============================================================================
+// STORE.INSERT — append a row to a plural store (rung two)
+// ============================================================================
+//
+//   std/store:insert(game) { hp: 30, kind: 1 }              — bare append
+//   std/store:insert(game) { hp: 50, kind: 1 } | row r |> … — handle form
+//
+// Rewritten into `__store_insert_<s>(…)` (void) or `__store_inserth_<s>(…)`
+// (`| row i64`) — the site's own continuations ride along. `__site_line`
+// carries the site's source position so standing query enters stay honest
+// about program order (a query only hears inserts BELOW it in source).
+
+~[keyword|comptime|transform]pub tor insert {
+    expr: Expression,
+    source: Source,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc insert|zig {
+    const ast = @import("ast");
+    const ast_functional = @import("ast_functional");
+    const struct_literal = @import("struct_literal");
+
+    if (item.* != .flow) @panic("store:insert transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    const H = struct {
+        const stripQuotes = @import("emitter_helpers").stripQuotes;
+        const mkPathH = @import("emitter_helpers").mkPathH;
+        // The INSERT surface's column order — `storeInsertOrder`, NOT
+        // `storeFieldOrder`. The two differ by the `[tree]`-synthesized
+        // `parent` column, which is not insertable.
+        fn fieldOrder(alloc: std.mem.Allocator, prog: *const ast.Program, store: []const u8) ?[]const []const u8 {
+            return storeInsertOrder(alloc, prog, store);
+        }
+        // Is `col` an OWNED column (the store holds `[CAP]*Type` and teardown
+        // frees the live pointers — 690_053's single-ownership contract)?
+        // Sources, mirroring charCap's transform-order tolerance: the
+        // generated SoA cell host_line when create already ran (`<col>:
+        // [CAP]*Type`), else the untransformed create's seed block (`*mod:
+        // Type<state!>` — the leading `*` is the ownership marker).
+        fn ownedCol(alloc: std.mem.Allocator, prog: *const ast.Program, store: []const u8, col: []const u8) bool {
+            const marker = std.fmt.allocPrint(alloc, "const __KoruStoreT_{s} = struct {{", .{store}) catch unreachable;
+            for (flatItems(alloc, prog.items)) |pi| {
+                if (pi.* != .host_line) continue;
+                const t = pi.host_line.content;
+                if (std.mem.indexOf(u8, t, marker) == null) continue;
+                const fkey = std.fmt.allocPrint(alloc, "\n    {s}: [", .{col}) catch unreachable;
+                const fpos = std.mem.indexOf(u8, t, fkey) orelse return false;
+                const rest = t[fpos + fkey.len ..];
+                // scalar: `8]i64`; fixed-char: `8][16]u8`; owned: `8]*koru_std...`
+                const close = std.mem.indexOfScalar(u8, rest, ']') orelse return false;
+                const after = rest[close + 1 ..];
+                return after.len > 0 and after[0] == '*';
+            }
+            // create not yet transformed: read the raw seed block.
+            for (flatItems(alloc, prog.items)) |pi| {
+                if (pi.* != .flow) continue;
+                const f = &pi.flow;
+                const inv = f.inv();
+                if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "new")) continue;
+                const mq = inv.path.module_qualifier orelse continue;
+                if (!std.mem.eql(u8, mq, "std.store")) continue;
+                var name_matches = false;
+                var seed: ?[]const u8 = null;
+                for (inv.args) |a| {
+                    if (std.mem.eql(u8, a.name, "expr")) {
+                        name_matches = std.mem.eql(u8, stripQuotes(a.value), store);
+                    } else if (std.mem.eql(u8, a.name, "source")) {
+                        seed = a.value;
+                    }
+                }
+                if (!name_matches or seed == null) continue;
+                const braced = std.fmt.allocPrint(alloc, "{{{s}}}", .{seed.?}) catch unreachable;
+                const cf = struct_literal.parseFields(alloc, braced) catch return false;
+                for (cf) |c| {
+                    if (!std.mem.eql(u8, c.name, col)) continue;
+                    return std.mem.startsWith(u8, std.mem.trim(u8, c.value, " "), "*");
+                }
+                return false;
+            }
+            return false;
+        }
+        // Unescaped byte length of a string literal's inner text: `\n` is one
+        // byte, `\x41` is one byte. (`\u{...}` overcounts — acceptable
+        // conservatism for a fixed-buffer limit check this rung.)
+        fn literalByteLen(lit: []const u8) usize {
+            var blen: usize = 0;
+            var k: usize = 0;
+            while (k < lit.len) {
+                if (lit[k] == '\\' and k + 1 < lit.len) {
+                    if (lit[k + 1] == 'x' and k + 3 < lit.len) {
+                        k += 4;
+                    } else {
+                        k += 2;
+                    }
+                } else {
+                    k += 1;
+                }
+                blen += 1;
+            }
+            return blen;
+        }
+        // Cell-path rewrite for seed values (690_192): `cfg.base` in an insert
+        // literal must lower to the SoA cell like it does in if/when exprs
+        // (690_074) and stored rhs. The insert site is a std.store invocation,
+        // so create's whole-program walk SKIPS its args — the seed is the one
+        // write-envelope position the walk never reaches. Mirrors the stored
+        // transform's rewrite (transforms own the rewriting at their own sites).
+        const isIdent = @import("emitter_helpers").isKebabIdentChar;
+        fn storeRefs(alloc: std.mem.Allocator, text: []const u8, name: []const u8, is_identity: bool) []const u8 {
+            const expr_ctx = ast.expressionMask(alloc, text);
+            var out = std.ArrayList(u8).initCapacity(alloc, text.len + 32) catch unreachable;
+            var i: usize = 0;
+            while (i < text.len) {
+                const at_boundary = ast.identBoundaryBefore(text, i);
+                const starts = at_boundary and (i == 0 or text[i - 1] != '.') and std.mem.startsWith(u8, text[i..], name);
+                const after = i + name.len;
+                if (starts and after < text.len and text[after] == '.') {
+                    out.appendSlice(alloc, "__koru_store_") catch unreachable;
+                    out.appendSlice(alloc, name) catch unreachable;
+                    i += name.len;
+                } else if (is_identity and expr_ctx[i] and starts and
+                    (after >= text.len or (!isIdent(text[after]) and text[after] != '[')))
+                {
+                    // A ONE-column store read in a seed (`insert(counter) { counter }`)
+                    // still has to reach a column in the SoA cell, so it resolves to
+                    // the synthesized one. `[` is excluded so a row index
+                    // (`todos[…]`) still takes the indexed path elsewhere.
+                    out.appendSlice(alloc, "__koru_store_") catch unreachable;
+                    out.appendSlice(alloc, name) catch unreachable;
+                    out.append(alloc, '.') catch unreachable;
+                    out.appendSlice(alloc, ast.STORE_IDENTITY_COLUMN) catch unreachable;
+                    i += name.len;
+                } else {
+                    out.append(alloc, text[i]) catch unreachable;
+                    i += 1;
+                }
+            }
+            return out.toOwnedSlice(alloc) catch unreachable;
+        }
+        // Every store name visible in the program — untransformed creates plus
+        // generated apply tors — so a seed value can reference a cell from
+        // any store, under any transform order.
+        fn allStoreNames(alloc: std.mem.Allocator, prog: *const ast.Program) []const []const u8 {
+            return storeAllNames(alloc, prog);
+        }
+        fn isIdentityStore(alloc: std.mem.Allocator, prog: *const ast.Program, store: []const u8) bool {
+            const order = fieldOrder(alloc, prog, store) orelse return false;
+            return order.len == 1 and std.mem.eql(u8, order[0], ast.STORE_IDENTITY_COLUMN);
+        }
+        fn storeRefsAll(alloc: std.mem.Allocator, prog: *const ast.Program, text: []const u8) []const u8 {
+            var t = text;
+            for (allStoreNames(alloc, prog)) |nm| t = storeRefs(alloc, t, nm, isIdentityStore(alloc, prog, nm));
+            return t;
+        }
+    };
+
+    var store_name: []const u8 = "";
+    var block_text: ?[]const u8 = null;
+    var kind_name: ?[]const u8 = null;
+    for (invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "expr")) store_name = H.stripQuotes(arg.value);
+        if (std.mem.eql(u8, arg.name, "source")) block_text = arg.value;
+        if (std.mem.eql(u8, arg.name, "kind")) kind_name = H.stripQuotes(std.mem.trim(u8, arg.value, " "));
+    }
+    if (store_name.len == 0 or block_text == null) {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert requires a store name and a row block: insert(name) {{ field: value }}", .{}) };
+    }
+
+    // Kind channel: `insert(s, kind: member)` writes the demanded tag.
+    // Ordinals are seed order, 1-based (the `// store-kinds` vocabulary).
+    // A missing kind on a kinded store refuses; a kind on a memberless store
+    // refuses — the tag is never silently dropped nor silently zero.
+    var kind_ordinal: ?usize = null;
+    if (kind_name) |kn_raw| {
+        const kn = std.mem.trim(u8, kn_raw, " \t");
+        const members = storeKindMembers(allocator, program, store_name) orelse {
+            return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert({s}): kind: '{s}' names no members — store '{s}' declares no union members (a kind needs members: player: Player, ...)", .{ store_name, kn, store_name }) };
+        };
+        if (members.len == 0) {
+            return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert({s}): kind: '{s}' names no members — store '{s}' declares no union members (a kind needs members: player: Player, ...)", .{ store_name, kn, store_name }) };
+        }
+        var found: ?usize = null;
+        for (members, 0..) |m, mi| {
+            if (std.mem.eql(u8, m, kn)) found = mi + 1;
+        }
+        if (found == null) {
+            var ml = std.ArrayList(u8).initCapacity(allocator, 32) catch unreachable;
+            for (members, 0..) |m, mi| {
+                if (mi > 0) ml.appendSlice(allocator, ", ") catch unreachable;
+                ml.appendSlice(allocator, m) catch unreachable;
+            }
+            return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert({s}): unknown kind '{s}' — members are {s}", .{ store_name, kn, ml.items }) };
+        }
+        kind_ordinal = found;
+    } else {
+        if (storeKindDemanded(allocator, program, store_name)) {
+            const members = storeKindMembers(allocator, program, store_name) orelse &[_][]const u8{};
+            var ml = std.ArrayList(u8).initCapacity(allocator, 32) catch unreachable;
+            for (members, 0..) |m, mi| {
+                if (mi > 0) ml.appendSlice(allocator, ", ") catch unreachable;
+                ml.appendSlice(allocator, m) catch unreachable;
+            }
+            const first: []const u8 = if (members.len > 0) members[0] else "member";
+            return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert({s}): this store holds kinds ({s}) — name one: insert({s}, kind: {s})", .{ store_name, ml.items, store_name, first }) };
+        }
+    }
+
+    // The generated units live in the STORE's home namespace, which is the
+    // import-derived `app.lib` — not this flow's file-derived `lib`. They
+    // coincide in the entry file and diverge inside a library (115_018).
+    const home_ns = storeHome(allocator, program, store_name) orelse flow.module;
+
+    const order = H.fieldOrder(allocator, program, store_name) orelse {
+        // The store's OWN declaration was already refused; that diagnostic is the
+        // true one and this lookup can only ever fail. Staying silent here is what
+        // keeps one mistake to one error.
+        if (ast.declarationRefused(allocator, program, flow.module, "std/store:new({s}):", .{store_name})) return .{ .transformed = .{} };
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert: unknown store '{s}' - no std/store:new({s}) found", .{ store_name, store_name }) };
+    };
+    const braced = std.fmt.allocPrint(allocator, "{{{s}}}", .{block_text.?}) catch unreachable;
+    // A ONE-column store names no column, so its row block IS the value
+    // expression — `insert(nums) { 7 }`, never a field list. That settles
+    // punning: `insert(batch) { p }` puns to `{ p: p }` only because the
+    // column happens to be called `p`; with no column name there is
+    // nothing to pun against, so arity decides — not the author's binding.
+    const insert_identity = order.len == 1 and std.mem.eql(u8, order[0], ast.STORE_IDENTITY_COLUMN);
+    const row_fields: []const struct_literal.StructField = if (insert_identity) blk: {
+        const one = allocator.alloc(struct_literal.StructField, 1) catch unreachable;
+        one[0] = .{ .name = ast.STORE_IDENTITY_COLUMN, .value = std.mem.trim(u8, block_text.?, " \t\n\r") };
+        break :blk one;
+    } else struct_literal.parseFields(allocator, braced) catch |err| {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert({s}): {s}", .{ store_name, struct_literal.describeErrorIn(allocator, err, braced) }) };
+    };
+    if (KeyedAddressing.inFields(allocator, reporter, flow, "std/store:insert", row_fields)) |r| return .{ .transformed = .{ .replacement = r } };
+    // Kinded union: the row names this member's leaves only. Columns the
+    // kind does not own are zero-filled at the call site (the insert tor
+    // still writes every SoA column). Kindless stores keep the exact-arity
+    // contract — without a tag there is no owner to omit for.
+    const kinded_own: ?StoreMemberSchema = blk_own: {
+        if (kind_ordinal) |ko| {
+            if (storeMemberSchemas(allocator, program, store_name)) |schemas| {
+                if (ko >= 1 and ko <= schemas.len) break :blk_own schemas[ko - 1];
+            }
+        }
+        break :blk_own null;
+    };
+    if (kinded_own == null and row_fields.len != order.len) {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert({s}): a row block names every column exactly once ({d} given, {d} declared)", .{ store_name, row_fields.len, order.len }) };
+    }
+    if (kinded_own) |own| {
+        for (row_fields) |rf| {
+            if (!memberOwnsLeaf(own, rf.name)) {
+                var have = std.ArrayList(u8).initCapacity(allocator, 16) catch unreachable;
+                for (own.leaves, 0..) |lf, li| {
+                    if (li > 0) have.appendSlice(allocator, ", ") catch unreachable;
+                    have.appendSlice(allocator, lf.name) catch unreachable;
+                }
+                return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert({s}): column '{s}' is not a leaf of kind '{s}' — {s} holds {s}", .{ store_name, rf.name, own.name, own.name, have.items }) };
+            }
+        }
+    }
+
+    // Args in declared column order; every column required. A named kind
+    // travels as one more param ahead of __site_line (the event carries it —
+    // see ins_* in `new`); the row block never names it.
+    var kind_slots: usize = 0;
+    if (kind_ordinal != null) kind_slots = 1;
+    const call_args = allocator.alloc(ast.Arg, order.len + 1 + kind_slots) catch unreachable;
+    const schemas_for_fill = if (kinded_own != null) storeMemberSchemas(allocator, program, store_name) else null;
+    for (order, 0..) |col, i| {
+        const val: []const u8 = blk: {
+            for (row_fields) |rf| {
+                if (std.mem.eql(u8, rf.name, col)) break :blk rf.value;
+            }
+            if (kinded_own) |own| {
+                if (!memberOwnsLeaf(own, col)) {
+                    const typ = if (schemas_for_fill) |ss| leafTypeInSchemas(ss, col) else null;
+                    if (typ) |t| {
+                        if (zeroFillForType(t)) |z| break :blk z;
+                        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert({s}): column '{s}' is owned by another kind and cannot be zero-filled — name it only on the kind that holds it", .{ store_name, col }) };
+                    }
+                    break :blk "0";
+                }
+            }
+            return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert({s}): row block is missing column '{s}'", .{ store_name, col }) };
+        };
+        // Cell reads in the seed lower to the SoA cell (690_192) — the same
+        // rewrite the stored RHS gets. The insert site is a std.store
+        // invocation, so create's whole-program walk skips its args; this is
+        // the only position the seed's cell paths ever lower.
+        const seed_val: []const u8 = H.storeRefsAll(allocator, program, val);
+        // Fixed-char overflow (690_052): a COMPTIME-KNOWN string literal that
+        // exceeds the column's byte length is a compile error naming column +
+        // limit. Runtime values truncate in the insert proc (the `| toolong`
+        // branch is a deferred refinement).
+        if (charCap(allocator, program, store_name, col)) |ncap| {
+            const v = std.mem.trim(u8, val, " ");
+            if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') {
+                const blen = H.literalByteLen(v[1 .. v.len - 1]);
+                if (blen > ncap) {
+                    return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert({s}): string literal ({d} bytes) overflows char[{d}] column '{s}' - a fixed-char column holds at most its declared byte length", .{ store_name, blen, ncap, col }) };
+                }
+            }
+        }
+        // An OWNED column consumes the caller's <instance!> — ownership moves
+        // INTO the store (690_053), and teardown frees every owned pointer. A
+        // row PROJECTION is a BORROW: the source store keeps its live
+        // <state!> (690_060). Feeding a projection into an owned insert would
+        // put one pointer under two stores' teardowns — both free it — so the
+        // write site refuses (pinned at 690_195). Three faces of the same
+        // borrow, by transform order: `r.name` (the authored projection, not
+        // yet rewritten), `__koru_srf_*` (a sweep arm's projected parameter),
+        // `__koru_store_*` (a query/cell read already lowered to the column).
+        if (H.ownedCol(allocator, program, store_name, col)) {
+            const ov = std.mem.trim(u8, seed_val, " \t\n\r");
+            const is_sweep_proj = std.mem.indexOf(u8, ov, "__koru_srf_") != null;
+            const is_cell_read = std.mem.indexOf(u8, ov, "__koru_store_") != null;
+            const is_dotted_proj = blk: {
+                if (ov.len == 0) break :blk false;
+                const c0 = ov[0];
+                if (!((c0 >= 'a' and c0 <= 'z') or (c0 >= 'A' and c0 <= 'Z') or c0 == '_')) break :blk false;
+                var saw_dot = false;
+                for (ov) |ch| {
+                    const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '.';
+                    if (!ok) break :blk false;
+                    if (ch == '.') saw_dot = true;
+                }
+                break :blk saw_dot;
+            };
+            if (is_sweep_proj or is_cell_read or is_dotted_proj) {
+                return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert({s}): column '{s}' is owned - its value must be an instance the caller gives up (single ownership, 690_053); a row projection is a borrow the source store still owns, and accepting it would put one pointer under two teardowns. Take or build a fresh instance for this row instead.", .{ store_name, col }) };
+            }
+        }
+        call_args[i] = ast.Arg{
+            .name = allocator.dupe(u8, col) catch unreachable,
+            .value = allocator.dupe(u8, seed_val) catch unreachable,
+        };
+    }
+    if (kind_ordinal) |ko| {
+        call_args[order.len] = ast.Arg{
+            .name = allocator.dupe(u8, "kind") catch unreachable,
+            .value = std.fmt.allocPrint(allocator, "{d}", .{ko}) catch unreachable,
+        };
+    }
+    call_args[order.len + kind_slots] = ast.Arg{
+        .name = allocator.dupe(u8, "__site_line") catch unreachable,
+        .value = std.fmt.allocPrint(allocator, "{d}", .{flow.location.line}) catch unreachable,
+    };
+
+    // Handle form iff the site handles `| row …`; `| violated <field>` and
+    // `| ok` are the supervised answers to `?!violated`/`?ok` on the
+    // generated tors; anything else on an insert site is a loud wall.
+    const site_is_head = invocation == flow.inv();
+    var has_row_cont = false;
+    var has_full_cont = false;
+    if (site_is_head) {
+        for (flow.body.continuations) |*c| {
+            const bname = std.mem.trim(u8, c.branch, " ");
+            if (bname.len == 0) continue;
+            if (std.mem.eql(u8, bname, "row")) {
+                has_row_cont = true;
+            } else if (std.mem.eql(u8, bname, "full")) {
+                has_full_cont = true;
+            } else if (std.mem.eql(u8, bname, "violated") or std.mem.eql(u8, bname, "ok")) {
+                // Supervised branches ride the site's continuations into
+                // the generated call unchanged.
+            } else {
+                return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:insert({s}): branch '{s}' - insert answers `| row <binding>`, `| full`, `| ok`, and `| violated <field>` (inserted/removed lifecycle is pinned at 690_016)", .{ store_name, c.branch }) };
+            }
+        }
+    }
+
+    // Owned-store `| full` routes to insertf, which reissues column ownership
+    // on the full arm (690_077). Sites without `| full` still panic via the
+    // void/inserth append path.
+    const target = if (has_full_cont)
+        std.fmt.allocPrint(allocator, "__store_insertf_{s}", .{store_name}) catch unreachable
+    else if (has_row_cont)
+        std.fmt.allocPrint(allocator, "__store_inserth_{s}", .{store_name}) catch unreachable
+    else
+        std.fmt.allocPrint(allocator, "__store_insert_{s}", .{store_name}) catch unreachable;
+
+    const call_inv = ast.Invocation{
+        .path = H.mkPathH(allocator, home_ns, target),
+        .args = call_args,
+    };
+
+    const conts: []ast.Continuation = blk: {
+        const cloned = allocator.alloc(ast.Continuation, flow.body.continuations.len) catch unreachable;
+        for (flow.body.continuations, 0..) |*c, i| {
+            cloned[i] = ast_functional.cloneContinuation(allocator, c) catch unreachable;
+        }
+        break :blk cloned;
+    };
+
+    return .{ .transformed = .{ .replacement = ast.Item{ .flow = ast.Flow{
+        .body = ast.rootSite(call_inv, conts, flow.location),
+        .pre_label = null,
+        .impl_of = flow.impl_of, // preserved: the site may BE an impl flow's head (e.g. a query body)
+        .super_shape = null,
+        .inline_body = null,
+        .preamble_code = null,
+        .is_pure = false,
+        .is_transitively_pure = false,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } } } };
+}
+

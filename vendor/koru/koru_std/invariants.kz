@@ -1,0 +1,179 @@
+// ============================================================
+// INVARIANTS - rules that only inference can check
+// ============================================================
+// Every checker this compiler ships decides a fixed question: does the
+// obligation discharge, does the shape match, is the proc pure. A rule outside
+// that set has no subject to hang on — "comments are written in English",
+// "this diff adds a fallback where the charter wants an assertion", "a record
+// whose subtractions are zero while its subject moved has stopped tracking
+// anything". No algorithm decides those. A reader does, and increasingly that
+// reader is an agent.
+//
+// So they are declared, not enforced. The declaration lives in the source, next
+// to the code it constrains, and is machine-enumerable — which is the entire
+// difference between an invariant and a comment. `koruc <file> invariants`
+// lists them; anything that wants to act on them (a git gate, a review pass, a
+// session brief) reads that list and needs no change here.
+//
+// Weak links are the FEATURE. The rule is natural language on purpose: a
+// consumer that reads prose finds things a formal target vocabulary would have
+// excluded before it ever looked. Demanding a subject destroys the point.
+//
+// TWO DISPOSITIONS, OPPOSITE GRADIENTS. They differ by exactly one undecidable
+// bit — does the author intend this to become code — and the NAME carries it.
+// That is why they are two tors and not one with a field: you cannot tell them
+// apart afterwards by re-reading, so the distinction has to be made at the
+// moment of writing or it is lost.
+//
+//   inferred    — permanent by nature. Nothing will ever make "comments are in
+//                 English" a compiler check. Zero pressure; GROWTH IS GOOD.
+//                 A large `inferred` set is a well-described project.
+//
+//   aspirational — debt by construction. The author means this to become a real
+//                 check and has not built it yet. GROWTH IS A SMELL, and a gate
+//                 is entitled to say so.
+//
+// Usage — a JSON block, exactly as `flag.declare` takes one:
+//
+//   std/invariants:inferred {
+//     "name": "comment-language",
+//     "tags": ["git-gate"],
+//     "rule": "Comments are written in English, not Norwegian."
+//   }
+//
+//   std/invariants:aspirational {
+//     "name": "no-silent-truncation",
+//     "tags": ["git-gate", "review"],
+//     "rule": "No emitter drops elements without a diagnostic. Today three
+//              sites slice and stay quiet; this should become a wall."
+//   }
+//
+// `name` is the identity — nothing else is. `tags` route it to consumers.
+// `rule` is the claim, in prose, addressed to whoever reads it.
+//
+// In pure `.k` there is no tilde — this is a Koru feature, not a
+// host-embedding one. A host-embedding file writes the same block with ``.
+//
+// [norun] for the same reason as flag.declare: the declaration never executes.
+// It is data in the AST, harvested after the parse by whoever asks. That is
+// what makes the surface metacircular — a consumer discovers invariants by
+// parsing the program, never from a hardcoded list.
+
+~[comptime|norun]pub tor inferred { source: Source }
+
+~[comptime|norun]pub tor aspirational { source: Source }
+
+~import std/compiler
+
+~[comptime]
+
+// ============================================================
+// INVARIANTS COMMAND - the module ships its own reader
+// ============================================================
+// `koruc <file> invariants` lists every invariant the program declares,
+// including those declared by imported libraries (`ast.allFlows` descends
+// through module declarations, so a library's own rules are visible rather
+// than silently dropped).
+//
+// This is the whole difference between an invariant and a comment: the set is
+// machine-enumerable. A git gate, a review pass or a session brief consumes
+// this listing and needs no change to this module to do it.
+
+~std/compiler:command.declare {
+    "name": "invariants",
+    "description": "List the invariants a program declares"
+}
+
+~[comptime|command]pub tor invariants {
+    program: *const std/compiler:Program,
+    allocator: __koru_std.mem.Allocator,
+    argv: []string,
+}
+
+~proc invariants|zig {
+    const std = @import("std");
+
+    // `invariants` takes no arguments. Refusing loudly matters more than it
+    // looks: this command's output is what a git gate consumes, so a caller
+    // holding a retired spelling (`invariants gate`) must get a non-zero exit,
+    // not the listing — a hook that greens on the wrong command checks nothing.
+    if (argv.len > 0) {
+        std.debug.print("error: `invariants` takes no arguments (got `{s}`)\n", .{argv[0]});
+        std.debug.print("A gate is a consumer of the listing, not a subcommand: run\n", .{});
+        std.debug.print("    koruc <file> invariants\n", .{});
+        std.debug.print("and act on its output. The surface is specified in koru_std/invariants.kz.\n", .{});
+        std.process.exit(1);
+    }
+
+    const helpers = struct {
+        // Pull one `"field": "value"` out of a declaration block. Returns an
+        // empty slice when absent, so a malformed block degrades to a visibly
+        // incomplete row rather than a crash.
+        fn jsonField(source: []const u8, field: []const u8) []const u8 {
+            var needle_buf: [64]u8 = undefined;
+            const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{field}) catch return "";
+            const at = std.mem.indexOf(u8, source, needle) orelse return "";
+            var i = at + needle.len;
+            while (i < source.len and (source[i] == ' ' or source[i] == ':')) : (i += 1) {}
+            if (i >= source.len) return "";
+            if (source[i] == '"') {
+                i += 1;
+                const start = i;
+                while (i < source.len and source[i] != '"') : (i += 1) {}
+                return source[start..i];
+            }
+            if (source[i] == '[') {
+                const start = i;
+                while (i < source.len and source[i] != ']') : (i += 1) {}
+                if (i < source.len) i += 1;
+                return source[start..i];
+            }
+            return "";
+        }
+    };
+
+    const ast_inv = @import("ast");
+    const all_flows = ast_inv.allFlows(allocator, program);
+    defer allocator.free(all_flows);
+
+    var inferred_n: usize = 0;
+    var aspirational_n: usize = 0;
+
+    // Two passes so each disposition prints as a block. They are opposite
+    // gradients and reading them interleaved hides that.
+    for ([_][]const u8{ "inferred", "aspirational" }) |kind| {
+        var printed_header = false;
+        for (all_flows) |flow| {
+            const mq = flow.inv().path.module_qualifier orelse continue;
+            if (!std.mem.eql(u8, mq, "std.invariants")) continue;
+            if (flow.inv().path.segments.len != 1) continue;
+            if (!std.mem.eql(u8, flow.inv().path.segments[0], kind)) continue;
+
+            for (flow.inv().args) |arg| {
+                if (!std.mem.eql(u8, arg.name, "source")) continue;
+                const name = helpers.jsonField(arg.value, "name");
+                const rule = helpers.jsonField(arg.value, "rule");
+                const tags = helpers.jsonField(arg.value, "tags");
+                const check = helpers.jsonField(arg.value, "check");
+
+                if (!printed_header) {
+                    std.debug.print("\n{s}\n", .{kind});
+                    printed_header = true;
+                }
+                std.debug.print("  {s}", .{name});
+                if (tags.len > 0) std.debug.print("  {s}", .{tags});
+                std.debug.print("\n    {s}:{d}\n", .{ flow.location.file, flow.location.line });
+                if (rule.len > 0) std.debug.print("    {s}\n", .{rule});
+                if (check.len > 0) std.debug.print("    check: {s}\n", .{check});
+
+                if (std.mem.eql(u8, kind, "inferred")) inferred_n += 1 else aspirational_n += 1;
+            }
+        }
+    }
+
+    if (inferred_n == 0 and aspirational_n == 0) {
+        std.debug.print("no invariants declared\n", .{});
+    } else {
+        std.debug.print("\n{d} inferred, {d} aspirational\n", .{ inferred_n, aspirational_n });
+    }
+}

@@ -1,0 +1,46 @@
+// Koru Standard Library: Reactive Stores — query miss classification.
+// Joined via `~part qmiss` in store.kz; merged into the store module at load.
+//
+// "Unknown plural store" was one refusal conflating distinct misses — a name
+// nobody declared, a query that precedes its store's create in source, a
+// capacity-1 value store, and declared-as-another-kind names (a tor, a store
+// view) — the last family lives in the `qmisskind` part. The markers mirror
+// stored.kz/watch.kz: `__store_write_<s>` is the value tier's coordinated
+// write tor, and a still-untransformed `std/store:new` flow is a create
+// sitting BELOW this query — a create that already ran lowered to
+// __store_* markers instead.
+
+const QueryMiss = struct {
+    // Container scope, not module scope: each transform proc re-imports
+    // `ast` locally, and a file-level decl here would collide with all of
+    // them in the merged module — the qnone discipline.
+    const ast = @import("ast");
+    const stripQuotes = @import("emitter_helpers").stripQuotes;
+
+    // null = the store's own `new` declaration was already refused; that
+    // diagnostic is the true one and staying silent keeps one mistake to
+    // one error. Otherwise returns the refusal payload naming the miss.
+    fn refuse(alloc: std.mem.Allocator, rep: anytype, prog: *const ast_find.Program, flow: *const ast_find.Flow, store_name: []const u8) ?ast.SiteResult {
+        if (ast.declarationRefused(alloc, prog, flow.module, "std/store:new({s}):", .{store_name})) return null;
+        const value_write = std.fmt.allocPrint(alloc, "__store_write_{s}", .{store_name}) catch unreachable;
+        var later_create = false;
+        for (flatItems(alloc, prog.items)) |pi| {
+            if (pi.* == .event_decl) {
+                const ed = &pi.event_decl;
+                if (ed.path.segments.len == 1 and std.mem.eql(u8, ed.path.segments[0], value_write)) {
+                    return ast.refuse(alloc, rep, .KORU161, flow.location, flow.module, "std/store:query({s}): '{s}' is a capacity-1 value store - query sweeps a plural container's rows. A value store reads as '{s}.<field>' in a step, or watches via `std/store:watch({s})`; to keep rows, declare `std/store:new({s}, capacity: N)`", .{ store_name, store_name, store_name, store_name, store_name });
+                }
+            } else if (pi.* == .flow) {
+                const inv = pi.flow.inv();
+                if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "new")) continue;
+                const mq = inv.path.module_qualifier orelse continue;
+                if (!std.mem.eql(u8, mq, "std.store")) continue;
+                for (inv.args) |a| {
+                    if (std.mem.eql(u8, a.name, "expr") and std.mem.eql(u8, stripQuotes(a.value), store_name)) later_create = true;
+                }
+            }
+        }
+        if (later_create) return ast.refuse(alloc, rep, .KORU161, flow.location, flow.module, "std/store:query({s}): the query precedes its store's create in source - declare the store first (rung-one ordering)", .{store_name});
+        return QueryMissKind.refuseTail(alloc, rep, prog, flow, store_name);
+    }
+};

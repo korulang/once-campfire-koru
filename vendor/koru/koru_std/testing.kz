@@ -1,0 +1,919 @@
+~[comptime]
+// Koru Testing Framework
+//
+// Compiler-guided test development with automatic mock detection.
+//
+// Usage:
+//   test(User cannot withdraw more than balance) {
+//       account.balance = amount 50
+//       app:withdraw(amount: 100)
+//       | insufficient_funds |> assert.ok()
+//   }
+//
+// The compiler:
+//   1. Traces the flow to find impure tors
+//   2. Errors if impure tor not mocked
+//   3. Errors if mock is unused
+//   4. Generates Zig test block
+
+const std = @import("std");
+
+const validateMocks = struct {
+    fn call(
+        allocator: std.mem.Allocator,
+        program: *const @import("ast").Program,
+        mocks: []const @import("ast").Item,
+        source: *const @import("ast").Source,
+    ) bool {
+        const std_import = @import("std");
+        const ast = @import("ast");
+        const emitter_helpers = @import("emitter_helpers");
+        const errors_mod = @import("errors");
+        const type_registry_module = @import("type_registry");
+
+        if (mocks.len == 0) return true;
+
+        const source_file_name = if (source.location.file.len > 0) source.location.file else "__test__.kz";
+        var reporter = errors_mod.ErrorReporter.init(allocator, source_file_name, source.text) catch {
+            std_import.debug.print("ERROR: Failed to initialize mock shape reporter\n", .{});
+            return false;
+        };
+        defer reporter.deinit();
+
+        const fieldExists = struct {
+            fn check(fields: []const ast.Field, name: []const u8) bool {
+                for (fields) |field| {
+                    if (std_import.mem.eql(u8, field.name, name)) return true;
+                }
+                return false;
+            }
+        }.check;
+
+        var local_registry_ptr: ?*type_registry_module.TypeRegistry = null;
+        const type_registry_ptr: ?*type_registry_module.TypeRegistry = if (program.type_registry) |ptr| blk: {
+            break :blk @ptrCast(@alignCast(ptr));
+        } else blk: {
+            local_registry_ptr = allocator.create(type_registry_module.TypeRegistry) catch unreachable;
+            local_registry_ptr.?.* = type_registry_module.TypeRegistry.init(allocator);
+            local_registry_ptr.?.populateFromAST(program.items) catch unreachable;
+            break :blk local_registry_ptr.?;
+        };
+        defer if (local_registry_ptr) |ptr| {
+            ptr.deinit();
+            allocator.destroy(ptr);
+        };
+
+        for (mocks) |mock_item| {
+            if (mock_item != .immediate_impl) continue;
+            const ii = mock_item.immediate_impl;
+
+            const bc = ii.value;
+            const mock_line = if (source.location.line > 0)
+                source.location.line + ii.location.line - 1
+            else
+                ii.location.line;
+            const mock_column = ii.location.column;
+
+            const event_decl = emitter_helpers.findEventDeclByPath(program.items, &ii.event_path);
+            var event_type: ?type_registry_module.EventType = null;
+            if (event_decl == null) {
+                if (type_registry_ptr) |registry| {
+                    const canonical = emitter_helpers.buildCanonicalEventName(&ii.event_path, allocator, program.main_module_name) catch null;
+                    if (canonical) |name| {
+                        defer allocator.free(name);
+                        if (registry.getEventType(name)) |et| {
+                            event_type = et;
+                        }
+                    }
+                }
+            }
+
+            if (event_decl == null and event_type == null) {
+                reporter.addError(
+                    .KORU040,
+                    mock_line,
+                    mock_column,
+                    "mock references unknown event",
+                    .{},
+                ) catch {
+                    @panic("Mock shape validation failed");
+                };
+                continue;
+            }
+
+            // A bare return (`ev -> value`) is the TWIN of the branch
+            // constructor (`ev => branch value`), not a degenerate case of it:
+            // it pairs with the declaration's `return_type` and carries no
+            // branch tag at all, so `bc.branch_name` is empty by construction.
+            // Looking that empty name up in `branches` is what refused every
+            // correctly-mocked `-> T` tor with "unknown branch ''" — the mock
+            // form the compiler itself recommends (flow_checker.zig:419) was the
+            // one the mock validator could not express (395_006). There is no
+            // branch payload to shape-check here; the value is checked against
+            // `return_type` by the ordinary emission path.
+            if (bc.is_bare_return) {
+                const declares_branches = if (event_decl) |decl|
+                    decl.branches.len > 0
+                else if (event_type) |et|
+                    et.return_type == null
+                else
+                    false;
+                if (declares_branches) {
+                    reporter.addError(
+                        .KORU021,
+                        mock_line,
+                        mock_column,
+                        "mocked tor declares branches, so its mock constructs one — a bare return (`->`) produces no branch tag",
+                        .{},
+                    ) catch {
+                        @panic("Mock shape validation failed");
+                    };
+                }
+                continue;
+            }
+
+            var payload_fields: []const ast.Field = &[_]ast.Field{};
+            var payload_is_wildcard = false;
+
+            if (event_decl) |decl| {
+                var branch_ptr: ?*const ast.Branch = null;
+                for (decl.branches) |*branch| {
+                    if (std_import.mem.eql(u8, branch.name, bc.branch_name)) {
+                        branch_ptr = branch;
+                        break;
+                    }
+                }
+
+                const branch = branch_ptr orelse {
+                    reporter.addError(
+                        .KORU021,
+                        mock_line,
+                        mock_column,
+                        "unknown branch '{s}' in mock",
+                        .{bc.branch_name},
+                    ) catch {
+                        @panic("Mock shape validation failed");
+                    };
+                    continue;
+                };
+
+                payload_fields = branch.payload.fields;
+                payload_is_wildcard = branch.payload.is_wildcard;
+            } else if (event_type) |et| {
+                var branch_type_ptr: ?*const type_registry_module.BranchType = null;
+                for (et.branches) |*branch| {
+                    if (std_import.mem.eql(u8, branch.name, bc.branch_name)) {
+                        branch_type_ptr = branch;
+                        break;
+                    }
+                }
+
+                const branch_type = branch_type_ptr orelse {
+                    reporter.addError(
+                        .KORU021,
+                        mock_line,
+                        mock_column,
+                        "unknown branch '{s}' in mock",
+                        .{bc.branch_name},
+                    ) catch {
+                        @panic("Mock shape validation failed");
+                    };
+                    continue;
+                };
+
+                if (branch_type.payload) |payload| {
+                    payload_fields = payload.fields;
+                    payload_is_wildcard = payload.is_wildcard;
+                } else {
+                    payload_fields = &[_]ast.Field{};
+                    payload_is_wildcard = false;
+                }
+            }
+
+            if (payload_is_wildcard) continue;
+
+            if (bc.plain_value != null and bc.fields.len == 0) {
+                if (payload_fields.len != 1) {
+                    reporter.addError(
+                        .KORU081,
+                        mock_line,
+                        mock_column,
+                        "mock branch '{s}' expects fields, not a bare value",
+                        .{bc.branch_name},
+                    ) catch {
+                        @panic("Mock shape validation failed");
+                    };
+                }
+                continue;
+            }
+
+            for (payload_fields) |expected_field| {
+                if (!fieldExists(bc.fields, expected_field.name)) {
+                    reporter.addError(
+                        .KORU080,
+                        mock_line,
+                        mock_column,
+                        "missing required field '{s}' in mock branch '{s}'",
+                        .{expected_field.name, bc.branch_name},
+                    ) catch {
+                        @panic("Mock shape validation failed");
+                    };
+                }
+            }
+
+            for (bc.fields) |provided_field| {
+                if (!fieldExists(payload_fields, provided_field.name)) {
+                    reporter.addError(
+                        .KORU081,
+                        mock_line,
+                        mock_column,
+                        "unknown field '{s}' in mock branch '{s}'",
+                        .{provided_field.name, bc.branch_name},
+                    ) catch {
+                        @panic("Mock shape validation failed");
+                    };
+                }
+            }
+        }
+
+        if (reporter.hasErrors()) {
+            const stderr_writer = std_import.debug.lockStderrWriter(&.{});
+            defer std_import.debug.unlockStderrWriter();
+            reporter.printErrors(stderr_writer) catch {};
+            return false;
+        }
+
+        return true;
+    }
+}.call;
+
+// =============================================================================
+// Test Declaration
+// =============================================================================
+
+// Main test tor - takes name as Expression, body as Source
+// Transform generates Zig test blocks using real emitter infrastructure
+~[keyword|comptime|transform] pub tor test {
+    expr: Expression,
+    source: Source,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[comptime|retain] pub tor validate-mocks {
+    program: *const std/compiler:Program,
+    mocks: []const std/compiler:Item,
+    source: *const Source,
+    allocator: std.mem.Allocator
+}
+| ok
+| failed string
+
+~proc validate-mocks|zig {
+    if (validateMocks(allocator, program, mocks, source)) {
+        return .{ .ok = .{} };
+    }
+    return .{ .failed = "Mock shape validation failed" };
+}
+
+// Test transform - generates proper Zig test blocks
+// NEW ARCHITECTURE: Run transforms on parsed Source, then use normal emitter
+~proc test|zig {
+    const std_import = @import("std");
+    const ast = @import("ast");
+    const ast_functional = @import("ast_functional");
+    const parser_impl = @import("parser");
+    const emitter_helpers = @import("emitter_helpers");
+
+    // Get the flow from the item
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Position-agnostic: the runner lifts nested sites into a synthetic
+    // top-level flow, so `invocation` IS the flow's own invocation at every depth.
+    _ = invocation;
+
+    // Get test name from expr parameter
+    const test_name = expr;
+
+    // Storage for parsed items
+    var cloned_mocks = std_import.ArrayList(ast.Item).initCapacity(allocator, 8) catch unreachable;
+    var cloned_flows = std_import.ArrayList(ast.Item).initCapacity(allocator, 8) catch unreachable;
+
+    // Parse the source block
+    parse_block: {
+        if (source.text.len == 0) break :parse_block;
+
+        // The test body has no file of its own. It inherits the ENCLOSING file's
+        // DIALECT — and only the dialect. A `.k` is pure Koru with no ``; the
+        // invented "__test__.kz" told the parser this was host-embedded, so every
+        // line of the body parsed as HOST TEXT, nothing was collected, and the
+        // emitted test block came out EMPTY — a pass with zero assertions in it
+        // (395_002, 395_009).
+        //
+        // The synthetic NAME is kept deliberately. A filename answers two
+        // questions in Parser.init — the dialect (parser.zig:707) and the MODULE
+        // NAME (parser.zig:696-705) — and handing it the real path fixes the
+        // first while silently renaming the module, which took 395_005 and
+        // 395_010 red. Same disease as std/runtime:parse.source, seen from the
+        // other side: one parameter, two questions. So: synthetic name for the
+        // module, real extension for the dialect, set after init because is_k is
+        // read during parse and never during init.
+        //
+        // Ruled by Lars 2026-08-07: "use the same extension and semantics as the
+        // original file... Writing `` inside a `.k`-file makes no sense, that is
+        // literally the actual rule."
+        var p = parser_impl.Parser.init(allocator, source.text, "__test__.kz", &[_][]const u8{}, null) catch {
+            break :parse_block;
+        };
+        p.is_k = std_import.mem.endsWith(u8, source.location.file, ".k");
+        defer p.deinit();
+
+        var result = p.parse() catch {
+            break :parse_block;
+        };
+        defer result.deinit();
+
+        // Clone parsed items to owned memory
+        for (result.source_file.items) |*parsed_item| {
+            switch (parsed_item.*) {
+                .immediate_impl => {
+                    const cloned = ast_functional.cloneItem(allocator, parsed_item) catch continue;
+                    cloned_mocks.append(allocator, cloned) catch {};
+                },
+                .flow => {
+                    const cloned = ast_functional.cloneItem(allocator, parsed_item) catch continue;
+                    cloned_flows.append(allocator, cloned) catch {};
+                },
+                else => {},
+            }
+        }
+    }
+
+    // ==========================================================================
+    // NEW ARCHITECTURE: Clone program, substitute mocks, emit test module
+    // ==========================================================================
+
+    // Generate unique test module name from test_name
+    var test_module_name_buf: [128]u8 = undefined;
+    var test_module_name_len: usize = 0;
+    const prefix = "test_";
+    @memcpy(test_module_name_buf[0..prefix.len], prefix);
+    test_module_name_len = prefix.len;
+    // Sanitize test name: replace spaces/special chars with underscores
+    for (test_name) |c| {
+        if (test_module_name_len >= test_module_name_buf.len - 8) break;
+        if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9')) {
+            test_module_name_buf[test_module_name_len] = c;
+            test_module_name_len += 1;
+        } else if (c == ' ' or c == '-' or c == '_') {
+            test_module_name_buf[test_module_name_len] = '_';
+            test_module_name_len += 1;
+        }
+    }
+    const suffix = "_module";
+    @memcpy(test_module_name_buf[test_module_name_len..test_module_name_len + suffix.len], suffix);
+    test_module_name_len += suffix.len;
+    const test_module_name = test_module_name_buf[0..test_module_name_len];
+
+    // Clone program AST
+    const cloned_program = ast_functional.cloneSourceFile(allocator, program) catch {
+        return .{};
+    };
+
+    // Build test module items: program items with mocks substituted
+    var test_module_items = std_import.ArrayList(ast.Item).initCapacity(allocator, cloned_program.items.len + cloned_mocks.items.len) catch unreachable;
+
+    // Helper to check if an impl matches any mock (mocks are now immediate_impl items)
+    const matchesMock = struct {
+        fn check(impl_path: *const ast.DottedPath, mocks: []const ast.Item) bool {
+            for (mocks) |mock_item| {
+                if (mock_item == .immediate_impl) {
+                    const mock_path = &mock_item.immediate_impl.event_path;
+                    if (impl_path.segments.len == mock_path.segments.len) {
+                        var all_match = true;
+                        for (impl_path.segments, mock_path.segments) |a, b| {
+                            if (!std_import.mem.eql(u8, a, b)) {
+                                all_match = false;
+                                break;
+                            }
+                        }
+                        if (all_match) return true;
+                    }
+                }
+            }
+            return false;
+        }
+    };
+
+    // Add cloned program items, filtering out impls that are mocked
+    // Also skip top-level flows, module_decls, and imports that shouldn't be in the flat test module
+    for (cloned_program.items) |p_item| {
+        switch (p_item) {
+            .flow => |f| {
+                // Skip top-level flows (they contain test), but keep impl flows (impl_of set)
+                if (f.impl_of) |*impl_path| {
+                    // Only add if NOT mocked
+                    if (!matchesMock.check(impl_path, cloned_mocks.items)) {
+                        test_module_items.append(allocator, p_item) catch {};
+                    }
+                }
+                // else: top-level flow, skip
+            },
+            .module_decl => {},  // Skip module declarations (test module is flat)
+            .import_decl => {},  // Skip imports (test module uses parent's imports)
+            .immediate_impl => |ii| {
+                // Only add if NOT mocked
+                if (!matchesMock.check(&ii.event_path, cloned_mocks.items)) {
+                    test_module_items.append(allocator, p_item) catch {};
+                }
+            },
+            else => test_module_items.append(allocator, p_item) catch {},
+        }
+    }
+
+    // Add mock immediate_impls (these override any filtered out)
+    for (cloned_mocks.items) |m| {
+        test_module_items.append(allocator, m) catch {};
+    }
+
+    if (!validateMocks(allocator, &cloned_program, cloned_mocks.items, &source)) {
+        @panic("Mock shape validation failed");
+    }
+
+    const type_registry_module = @import("type_registry");
+    var local_registry_ptr: ?*type_registry_module.TypeRegistry = null;
+    const type_registry_ptr: ?*type_registry_module.TypeRegistry = if (program.type_registry) |ptr| blk: {
+        break :blk @ptrCast(@alignCast(ptr));
+    } else blk: {
+        local_registry_ptr = allocator.create(type_registry_module.TypeRegistry) catch unreachable;
+        local_registry_ptr.?.* = type_registry_module.TypeRegistry.init(allocator);
+        local_registry_ptr.?.populateFromAST(program.items) catch unreachable;
+        break :blk local_registry_ptr.?;
+    };
+    defer if (local_registry_ptr) |ptr| {
+        ptr.deinit();
+        allocator.destroy(ptr);
+    };
+
+    // Emit the test module using emitModuleSubset
+    // Pass the original main module name so tor references are redirected to test module
+    const test_module_code = emitter_helpers.emitModuleSubset(
+        allocator,
+        test_module_items.items,
+        test_module_name,
+        type_registry_ptr,
+        program.main_module_name,  // original main module name for tor redirection
+    ) catch |err| {
+        // Loud failure: silently skipping emission would mean the test block
+        // never exists — a test that "passes" by not being generated.
+        std_import.debug.print("FATAL: emitModuleSubset failed in test: {s}\n", .{@errorName(err)});
+        @panic("test transform: emitModuleSubset failed — see error above");
+    };
+
+    // The cloned body is a fresh parse (`__test__.kz`) and never went through
+    // the compiler's keyword-resolution pass. Without this, `assert` still
+    // carries the synthetic home and misses a qualified `std.testing:assert`
+    // handler (395_001). Registry and declaration lookup use the PARENT
+    // program — the clone skipped module_decls. Home is `__test__`, the
+    // parser's module name for that filename. Only the cloned body is
+    // rewritten; test_module_items already came through the outer pass.
+    const keyword_registry = @import("keyword_registry");
+    var kw_registry = keyword_registry.KeywordRegistry.init(allocator);
+    defer kw_registry.deinit();
+    keyword_registry.buildFromItems(program.items, &kw_registry, allocator) catch |err| {
+        std_import.debug.print("FATAL: keyword registry failed in test: {}\n", .{err});
+        @panic("test transform: keyword registry failed — see error above");
+    };
+    if (kw_registry.count() > 0) {
+        keyword_registry.resolveInASTWithLookup(
+            cloned_flows.items,
+            &kw_registry,
+            allocator,
+            "__test__",
+            cloned_flows.items,
+            program.items,
+        ) catch |err| {
+            std_import.debug.print("FATAL: keyword resolve failed in test: {}\n", .{err});
+            @panic("test transform: keyword resolve failed — see error above");
+        };
+    }
+
+    // Run transforms on test flows (for assert -> inline_code, etc.)
+    var flow_items = std_import.ArrayList(ast.Item).initCapacity(allocator, cloned_flows.items.len + test_module_items.items.len) catch unreachable;
+    for (cloned_flows.items) |f| flow_items.append(allocator, f) catch {};
+    // Include test module items for tor resolution during transform
+    for (test_module_items.items) |ti| flow_items.append(allocator, ti) catch {};
+
+    const flow_program = allocator.create(ast.Program) catch unreachable;
+    flow_program.* = ast.Program{
+        .items = flow_items.items,
+        .module_annotations = &[_][]const u8{},
+        .main_module_name = test_module_name,
+        .allocator = allocator,
+        .type_registry = program.type_registry,
+    };
+
+    const backend_output = @import("backend_output_emitted.zig");
+    const transformed_program = backend_output.run_pass("transform", flow_program, allocator, null) catch |err| {
+        // Loud failure: continuing with untransformed test flows would emit
+        // raw transform invocations into the test block.
+        std_import.debug.print("FATAL: transform pass failed in test: {}\n", .{err});
+        @panic("test transform: inner transform pass failed — see error above");
+    };
+
+    // ==========================================================================
+    // NEW: Walk TRANSFORMED flows for purity (after transforms!)
+    // At this point, assert() is already inline_code - won't trigger purity check
+    // ==========================================================================
+
+    std_import.debug.print("[TEST] Building mock lookup map\n", .{});
+
+    // Build mock lookup map for purity checking (still needed to know what's mocked)
+    var mock_paths = std_import.StringHashMap(ast.BranchConstructor).init(allocator);
+    for (cloned_mocks.items) |mock_item| {
+        if (mock_item == .immediate_impl) {
+            const ii = mock_item.immediate_impl;
+            var path_buf = std_import.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+            for (ii.event_path.segments, 0..) |seg, i| {
+                if (i > 0) path_buf.append(allocator, '.') catch {};
+                path_buf.appendSlice(allocator, seg) catch {};
+            }
+            mock_paths.put(path_buf.items, ii.value) catch {};
+        }
+    }
+
+    // Also scan program for constant tors (immediate_impl items)
+    const scanForConstants = struct {
+        fn scan(items: []const ast.Item, paths: *std_import.StringHashMap(ast.BranchConstructor), alloc: std_import.mem.Allocator) void {
+            for (items) |prog_item| {
+                switch (prog_item) {
+                    .immediate_impl => |ii| {
+                        var path_buf = std_import.ArrayList(u8).initCapacity(alloc, 64) catch unreachable;
+                        for (ii.event_path.segments, 0..) |seg, i| {
+                            if (i > 0) path_buf.append(alloc, '.') catch {};
+                            path_buf.appendSlice(alloc, seg) catch {};
+                        }
+                        paths.put(path_buf.items, ii.value) catch {};
+                    },
+                    .module_decl => |mod| {
+                        scan(mod.items, paths, alloc);
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+    scanForConstants.scan(program.items, &mock_paths, allocator);
+
+    // Debug: Show all items in transformed program
+    std_import.debug.print("[TEST] Transformed program has {d} items:\n", .{transformed_program.items.len});
+    for (transformed_program.items, 0..) |t_item, idx| {
+        const item_type = switch (t_item) {
+            .flow => "flow",
+            .immediate_impl => "immediate_impl",
+            .event_decl => "event_decl",
+            .proc_decl => "proc_decl",
+            .module_decl => "module_decl",
+            .inline_code => "inline_code",
+            else => "other",
+        };
+        std_import.debug.print("[TEST]   [{d}] {s}\n", .{idx, item_type});
+        if (t_item == .flow) {
+            std_import.debug.print("[TEST]       invocation: {s}\n", .{t_item.flow.inv().path.segments[0]});
+        }
+        if (t_item == .inline_code) {
+            const preview_len = @min(50, t_item.inline_code.code.len);
+            std_import.debug.print("[TEST]       code: {s}...\n", .{t_item.inline_code.code[0..preview_len]});
+        }
+    }
+
+    // Find ONLY flows that originated from the test source block
+    var transformed_flows = std_import.ArrayList(*const ast.Flow).initCapacity(allocator, 8) catch unreachable;
+    for (transformed_program.items) |*t_item| {
+        if (t_item.* == .flow) {
+            if (std_import.mem.eql(u8, t_item.flow.location.file, "__test__.kz")) {
+                transformed_flows.append(allocator, &t_item.flow) catch {};
+            }
+        }
+    }
+
+    std_import.debug.print("[TEST] Found {d} transformed flows\n", .{transformed_flows.items.len});
+
+    var impure_events = std_import.ArrayList([]const u8).initCapacity(allocator, 8) catch unreachable;
+    for (transformed_flows.items) |t_flow| {
+        walkFlowForPurity(t_flow, &mock_paths, &impure_events, transformed_program.items, allocator);
+    }
+    std_import.debug.print("[TEST] Purity walk complete, {d} impure events\n", .{impure_events.items.len});
+
+    // Error on impure tors without mocks.
+    //
+    // The whole point of this refusal is that it names EVERY impure tor at
+    // once — one recompile, not one per tor. So the names go on the SAME LINE
+    // as the headline: a `@panic` payload is read as a single `panic: <msg>`
+    // line by every tool that quotes it, and a one-per-line list is silently
+    // dropped by anything that quotes only that first line (which is how this
+    // diagnostic got reported as printing nothing at all). One line also makes
+    // the full list a literal substring the regression corpus can PIN, so
+    // "lists them all" is defended by 395_005 rather than by eyeball.
+    if (impure_events.items.len > 0) {
+        var err_msg = std_import.ArrayList(u8).initCapacity(allocator, 256) catch unreachable;
+        err_msg.appendSlice(allocator, "Test '") catch {};
+        err_msg.appendSlice(allocator, test_name) catch {};
+        err_msg.appendSlice(allocator, "' has impure events without mocks: ") catch {};
+        for (impure_events.items, 0..) |event_path, i| {
+            if (i > 0) err_msg.appendSlice(allocator, ", ") catch {};
+            err_msg.appendSlice(allocator, event_path) catch {};
+        }
+        @panic(err_msg.items);
+    }
+
+    // ==========================================================================
+    // Emit test flow using test module prefix
+    // ==========================================================================
+
+    // Growable: generated test code has no natural size ceiling.
+    var code_emitter = emitter_helpers.CodeEmitter.initGrowable(allocator, 16 * 1024) catch unreachable;
+
+    // Dupe the test module name for the context (it needs to outlive the stack buffer)
+    const module_prefix_owned = allocator.dupe(u8, test_module_name) catch unreachable;
+
+    var emit_ctx = emitter_helpers.EmissionContext{
+        .allocator = allocator,
+        .indent_level = 1,
+        .ast_items = test_module_items.items,  // Use test module items for resolution
+        .main_module_name = module_prefix_owned,
+        .module_prefix = module_prefix_owned,  // KEY: Use test module for local references!
+        .is_sync = true,
+        .type_registry = type_registry_ptr,
+    };
+    code_emitter.indent_level = 1;
+
+    // Emit each transformed flow using the test module prefix
+    for (transformed_flows.items) |t_flow| {
+        emitter_helpers.emitFlow(&code_emitter, &emit_ctx, t_flow) catch {};
+    }
+
+    const flow_code = code_emitter.getOutput();
+
+    // Build final test code: test module + test block
+    const test_code = std_import.fmt.allocPrint(
+        allocator,
+        \\{s}
+        \\test "{s}" {{
+        \\{s}}}
+        ,
+        .{ test_module_code, test_name, flow_code }
+    ) catch unreachable;
+
+    // Create inline_code item
+    const new_item = ast.Item{ .inline_code = ast.InlineCode{
+        .code = test_code,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } };
+
+    return .{ .replacement = new_item };
+}
+
+// Helper: Walk flow checking purity
+const walkFlowForPurity = struct {
+    fn call(
+        flow_to_walk: *const @import("ast").Flow,
+        mocks: *const @import("std").StringHashMap(@import("ast").BranchConstructor),
+        impure_list: *@import("std").ArrayList([]const u8),
+        all_items: []const @import("ast").Item,
+        allocator: @import("std").mem.Allocator,
+    ) void {
+        const emitter_helpers = @import("emitter_helpers");
+
+        var path_buf = @import("std").ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+        if (flow_to_walk.inv().path.module_qualifier) |mq| {
+            path_buf.appendSlice(allocator, mq) catch {};
+            path_buf.append(allocator, ':') catch {};
+        }
+        for (flow_to_walk.inv().path.segments, 0..) |seg, i| {
+            if (i > 0) path_buf.append(allocator, '.') catch {};
+            path_buf.appendSlice(allocator, seg) catch {};
+        }
+        const inv_path = path_buf.items;
+
+        if (mocks.get(inv_path)) |_| return;
+
+        // Subflow/composed tors: walk the implementation body instead of
+        // flagging the outer tor. Tests call process_payment etc.; purity
+        // lives in the leaf proc calls inside the impl.
+        if (emitter_helpers.findImplByPath(all_items, &flow_to_walk.inv().path)) |found_impl| {
+            switch (found_impl) {
+                .immediate_impl => return,
+                .flow => |impl_flow| {
+                    call(impl_flow, mocks, impure_list, all_items, allocator);
+                    return;
+                },
+            }
+        }
+
+        if (emitter_helpers.findProcDeclByPath(all_items, &flow_to_walk.inv().path)) |proc| {
+            if (!proc.is_pure) {
+                for (impure_list.items) |existing| {
+                    if (@import("std").mem.eql(u8, existing, inv_path)) return;
+                }
+                impure_list.append(allocator, inv_path) catch {};
+            }
+        } else if (emitter_helpers.findEventDeclByPath(all_items, &flow_to_walk.inv().path)) |event| {
+            if (!event.is_pure) {
+                for (impure_list.items) |existing| {
+                    if (@import("std").mem.eql(u8, existing, inv_path)) return;
+                }
+                impure_list.append(allocator, inv_path) catch {};
+            }
+        }
+
+        for (flow_to_walk.body.continuations) |cont| {
+            walkContinuation(&cont, mocks, impure_list, all_items, allocator);
+        }
+    }
+
+    fn walkContinuation(
+        cont: *const @import("ast").Continuation,
+        mocks: *const @import("std").StringHashMap(@import("ast").BranchConstructor),
+        impure_list: *@import("std").ArrayList([]const u8),
+        all_items: []const @import("ast").Item,
+        allocator: @import("std").mem.Allocator,
+    ) void {
+        if (cont.node) |node| {
+            if (node == .invocation) {
+                const temp_flow = @import("ast").Flow{
+                    .body = cont.*,
+                    .location = cont.location,
+                    .module = "",
+                    .is_pure = true,
+                    .is_transitively_pure = false,
+                };
+                call(&temp_flow, mocks, impure_list, all_items, allocator);
+            } else {
+                for (cont.continuations) |nested| {
+                    walkContinuation(&nested, mocks, impure_list, all_items, allocator);
+                }
+            }
+        } else {
+            for (cont.continuations) |nested| {
+                walkContinuation(&nested, mocks, impure_list, all_items, allocator);
+            }
+        }
+    }
+}.call;
+
+// Helper: Emit flow with mock substitution using real emitter
+const emitFlowWithMocks = struct {
+    fn call(
+        code_emitter: *@import("emitter_helpers").CodeEmitter,
+        ctx: *@import("emitter_helpers").EmissionContext,
+        flow_to_emit: *const @import("ast").Flow,
+        mocks: *const @import("std").StringHashMap(@import("ast").BranchConstructor),
+        counter: *usize,
+    ) !void {
+        const emitter_helpers = @import("emitter_helpers");
+        const std_local = @import("std");
+
+        var path_buf = std_local.ArrayList(u8).initCapacity(ctx.allocator, 64) catch unreachable;
+        for (flow_to_emit.inv().path.segments, 0..) |seg, i| {
+            if (i > 0) try path_buf.append(ctx.allocator, '.');
+            try path_buf.appendSlice(ctx.allocator, seg);
+        }
+        const inv_path = path_buf.items;
+
+        // Handle assert transform inline - emit if(!expr) @panic
+        if (std_local.mem.eql(u8, inv_path, "assert")) {
+            // Get the expression from first arg's value (parser stores it there)
+            if (flow_to_emit.inv().args.len > 0) {
+                const expr_text = flow_to_emit.inv().args[0].value;
+                if (expr_text.len > 0) {
+                    try code_emitter.writeIndent();
+                    try code_emitter.write("try @import(\"std\").testing.expect(");
+                    try code_emitter.write(expr_text);
+                    try code_emitter.write(");\n");
+                    return;
+                }
+            }
+            return; // Skip if no expression found
+        }
+
+        // Handle assert.ok - unconditional pass (noop)
+        if (std_local.mem.eql(u8, inv_path, "assert.ok")) {
+            // assert.ok() is a pass-through checkpoint - just continue
+            // Emit nothing (the test passed this branch)
+            return;
+        }
+
+        // Handle assert.fail - unconditional failure
+        if (std_local.mem.eql(u8, inv_path, "assert.fail")) {
+            try code_emitter.writeIndent();
+            try code_emitter.write("return error.TestUnexpectedResult;\n");
+            return;
+        }
+
+        if (mocks.get(inv_path)) |bc| {
+            const result_var = try @import("std").fmt.allocPrint(ctx.allocator, "__mock_result_{d}", .{counter.*});
+            counter.* += 1;
+
+            try code_emitter.writeIndent();
+            try code_emitter.write("const ");
+            try code_emitter.write(result_var);
+            try code_emitter.write(" = ");
+            try emitter_helpers.emitBranchConstructor(code_emitter, ctx, &bc, true);
+            try code_emitter.write(";\n");
+
+            for (flow_to_emit.body.continuations) |cont| {
+                if (@import("std").mem.eql(u8, cont.branch, bc.branch_name)) {
+                    if (cont.binding) |binding| {
+                        try code_emitter.writeIndent();
+                        try code_emitter.write("const ");
+                        try code_emitter.write(binding);
+                        try code_emitter.write(" = ");
+                        try code_emitter.write(result_var);
+                        try code_emitter.write(".");
+                        try code_emitter.write(bc.branch_name);
+                        try code_emitter.write(";\n");
+                        try code_emitter.writeIndent();
+                        try code_emitter.write("_ = &");
+                        try code_emitter.write(binding);
+                        try code_emitter.write(";\n");
+                    }
+                    if (cont.node) |node| {
+                        if (node == .invocation) {
+                            const nested_flow = @import("ast").Flow{
+                                .body = cont,
+                                .location = cont.location,
+                                .module = "",
+                                .is_pure = true,
+                                .is_transitively_pure = false,
+                            };
+                            try call(code_emitter, ctx, &nested_flow, mocks, counter);
+                        }
+                    }
+                    break;
+                }
+            }
+
+            try code_emitter.writeIndent();
+            try code_emitter.write("_ = &");
+            try code_emitter.write(result_var);
+            try code_emitter.write(";\n");
+        } else {
+            try emitter_helpers.emitFlow(code_emitter, ctx, flow_to_emit);
+        }
+    }
+}.call;
+
+// Test with shared harness (mocks can be unused per-test)
+~[keyword|comptime|transform] pub tor test.with-harness {
+    expr: Expression,
+    harness: string,
+    source: Source
+}
+
+// Define a test harness with shared mocks
+~[keyword|comptime|transform] pub tor test.harness {
+    expr: Expression,
+    source: Source
+}
+
+~part assert
+~part compare
+// =============================================================================
+// Property Testing
+// =============================================================================
+
+// Test that multiple variants produce equivalent results
+// Usage:
+//   test.property.equivalent {
+//       ast:select(blur|*)
+//   }
+~[comptime|transform] pub tor test.property.equivalent {
+    source: Source
+}
+
+// =============================================================================
+// Transform Implementation (Stub)
+// =============================================================================
+
+// The actual transform will:
+// 1. Parse source block as Koru AST
+// 2. Find mock definitions: lines matching `tor = branch { ... }`
+// 3. Extract the flow under test (non-mock lines)
+// 4. Trace flow to find impure tors
+// 5. Error if impure tor not mocked
+// 6. Error if mock unused
+// 7. Create mangled proc implementations for mocks
+// 8. Rewrite flow to call mangled versions
+// 9. Emit Zig test block
+
+// proc test {
+//     // TODO: Implement transform
+//     // For now, just parse and validate structure
+// }

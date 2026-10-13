@@ -1,0 +1,353 @@
+// Koru Standard Library: Proto — compound identity declarations
+// =============================================================
+//
+// The compound front door for proto entries. `std/proto(Name) { fields }`
+// invokes this module's `default` tor through the default-event rule
+// (`std/M(args)` ≡ `std/M:default(args)`; see import_pipeline.zig
+// rewriteDefaultEventCalls). The module name IS the verb — `default` is
+// reachable only through the path, never bare.
+//
+// SURFACE:
+//   std/proto(Player) { health: Health, hp: f32 }
+//     declares a COMPILE-TIME registry entry — layout-silent, with no
+//     emission of its own. The first consumer derives what it needs
+//     (std/list:new synthesizes the element struct plus its `List_<Name>`
+//     container from these fields). The terminal half of the system — named
+//     primitives (`std/proto:f64(Health)`) — is the same act at field
+//     count zero and lands here as the system grows.
+//
+// RULED 2026-08-23 → 09-03 (frag-type-system-design, proto rung; co-derived
+// on the 09-03 walk): a proto names an AFFINITY, never a coupling — the
+// entry is the identity, "same thing" is by NAME ONLY, and the layout system
+// may merge only what a shared name proves identical (never two anonymous
+// fields that merely look alike). Two registrants of the same name are a
+// loud collision; values over two different protos must not interchange
+// (both refused at the KORU layer by the nominal-distinctness gate;
+// see scanDeclaredTypes + the container registration it derives).
+
+const std = @import("std");
+const astz = @import("ast");
+const af = @import("ast_functional");
+
+~[comptime|transform]pub tor default {
+    expr: Expression,
+    source: ?Source,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator,
+    reporter: *std/compiler:ErrorReporter
+} -> SiteResult
+
+~proc default|zig {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    var type_name = expr;
+    if (type_name.len >= 2 and type_name[0] == '"' and type_name[type_name.len - 1] == '"') {
+        type_name = type_name[1 .. type_name.len - 1];
+    }
+    var name = std.mem.trim(u8, type_name, " \t");
+
+    // Extension rides the labeled-arg split: `std/proto(Dog <: Animal + Pet)`
+    // arrives as args[0] = (name: "Dog <", value: "Animal + Pet"). The entry
+    // is the label minus '<'; the value is the parent list — field-set union
+    // spelled in the declaration, the design walk's ruled spelling (698_OOP).
+    // A label WITHOUT the '<' (`Dog : Animal`) reads as a parameter being
+    // passed — refuse and name the real spelling.
+    var parents_spec: ?[]const u8 = null;
+    if (flow.body.node) |*node| {
+        if (node.* == .invocation) {
+            const inv = &node.invocation;
+            if (inv.args.len > 0 and inv.args[0].had_explicit_label) {
+                const label = std.mem.trim(u8, inv.args[0].name, " \t");
+                if (std.mem.endsWith(u8, label, "<")) {
+                    name = std.mem.trim(u8, label[0 .. label.len - 1], " \t");
+                    parents_spec = std.mem.trim(u8, inv.args[0].value, " \t");
+                } else {
+                    return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/proto: '{s}: {s}' reads as a labeled argument — extension is spelled `Name <: Parent` (field-set union), e.g. std/proto(Dog <: Animal)", .{ label, inv.args[0].value }) };
+                }
+            }
+        }
+    }
+
+    // The entry name must be an identifier the derived container can be shown
+    // with; refuse anything else loudly (never crash).
+    var name_ok = name.len > 0;
+    for (name, 0..) |c, i| {
+        const legal = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c == '_') or (i > 0 and c >= '0' and c <= '9') or (c == '-');
+        if (!legal) {
+            name_ok = false;
+            break;
+        }
+    }
+    if (!name_ok or name.len == 0) {
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/proto: the entry name '{s}' is not usable — a proto name must be an identifier (a-z, A-Z, 0-9, '_', '-'; no leading digit)", .{name}) };
+    }
+    // Field grammar: one `name: type` per line (comma optional, trailing commas
+    // fine). A field may name a scalar material, a terminal of its own home, a
+    // qualified name (`app/alpha:Health`) from another home by address, or a
+    // compound of its own home (`pos: Position`) — nesting expands to scalar
+    // leaves, each keeping its identity; the compound graph must be acyclic.
+    // References canonicalize like everything else: a bare name answers to its
+    // own module, a qualified name to the named home — never a program-wide
+    // search, so imports grant spellability without creating ambiguity.
+    // Terminal declarations are looked up in live declaration flows and in the
+    // erased `// proto-terminal Name: kind` markers, so the declaration does
+    // not depend on transform visitation order. The marker keeps the name
+    // intact: the consumer must still see `Health`, not only its host scalar.
+
+    const scope_home = TerminalRef.scopeOfFlow(program, flow);
+    var merged = std.ArrayList(TerminalRef.FieldPair).initCapacity(allocator, 8) catch unreachable;
+
+    // Inherited half first — an extending entry's record carries the
+    // parents' fields ahead of its own (spec order, grandparents deepest).
+    if (parents_spec) |spec| {
+        var ext_stack = std.ArrayList(TerminalRef.CompoundRef).initCapacity(allocator, 4) catch unreachable;
+        ext_stack.append(allocator, .{ .home = scope_home, .name = name }) catch unreachable;
+        if (TerminalRef.expandParents(allocator, program, spec, scope_home, name, &ext_stack, &merged)) |msg| {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "{s}", .{msg}) };
+        }
+    }
+    // Field grammar: one `name: type` per line (comma optional, trailing commas
+    // fine). A field may name a scalar material, a terminal of its own home, a
+    // qualified name (`app/alpha:Health`) from another home by address, a
+    // compound of its own home (`pos: Position`) — nesting expands to scalar
+    // leaves, each keeping its identity — or `ref(X)`, a typed row reference
+    // to a declared compound (lowers to the handle material, exempt from the
+    // containment walk) — or an OWNED leaf `*mod:Type<state!>`, an obligation-
+    // bearing pointer whose debt transits the value (exempt like ref, but the
+    // receiver owes a settle per path). Local fields merge into the inherited
+    // set: same name
+    // + same concept dedups, same name + different concept refuses.
+    // `?Source`: a blockless decl (`Cat <: Animal`) arrives with source null.
+    // The entry grammar is gated once over the whole block before a single
+    // field merges — one `name: type` per line, each name bound once
+    // (proto.fields.kz). The walk below is the consumer, not the checker.
+    const fields = switch (protoFieldBlock(allocator, if (source) |s| s.text else "", false)) {
+        .entries => |es| es,
+        .fault => |msg| return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/proto({s}): {s}", .{ name, msg }) },
+    };
+    for (fields) |e| {
+        if (TerminalRef.appendMerged(allocator, &merged, .{ .name = e.fname, .ftype = e.ftype, .home = scope_home, .origin = name }, name)) |msg| {
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "{s}", .{msg}) };
+        }
+    }
+    if (merged.items.len == 0) {
+        return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/proto({s}): an entry with no fields derives nothing — declare at least one `name: type` field or a `<:` parent", .{name}) };
+    }
+
+    // Vocabulary check over the MERGED set — each pair resolves in the home
+    // that declared it (an inherited field answers to the parent's home, a
+    // local one to this entry's). A parent's own gate guarantees its fields
+    // resolved at its site; re-resolving here keeps the gate total when the
+    // parent's declaration is still live (transform order is not a contract).
+    var has_compound = false;
+    for (merged.items) |p| {
+        if (TerminalRef.isRefType(p.ftype)) {
+            const inner = TerminalRef.refInner(p.ftype);
+            if (!TerminalRef.isDeclaredCompound(program, allocator, inner, p.home)) {
+                return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/proto({s}): field '{s}' names unknown ref target '{s}' — ref() takes a declared compound of its home, or a qualified name from another home", .{ name, p.name, inner }) };
+            }
+            continue;
+        }
+        // Owned leaf — `*mod:Type<state!>`: the field names an obligation-
+        // bearing pointer (store.new.kz's owned-column shape, lifted into the
+        // registry). It is a reference leaf — no expansion, no cycle edge —
+        // and the pinned state declares what the value owes at that path.
+        switch (parseOwnedLeaf(allocator, p.name, name, p.ftype)) {
+            .owned => continue,
+            .malformed => |m| return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "{s}", .{m}) },
+            .none => {},
+        }
+        const known = TerminalRef.isScalarWord(p.ftype);
+        if (!known and !TerminalRef.isDeclared(program, allocator, p.ftype, p.home)) {
+            if (!TerminalRef.isDeclaredCompound(program, allocator, p.ftype, p.home)) {
+                return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/proto({s}): field '{s}' names unknown terminal '{s}' — a field must use a scalar material, a terminal or compound of its own home, or a qualified name from another home", .{ name, p.name, p.ftype }) };
+            }
+            has_compound = true;
+        }
+    }
+
+    // DAG law: compounds must not reach themselves. Walked only when some
+    // field names a compound — flat entries pay nothing, and every entry's
+    // own gate guarantees its outgoing edges resolve, so an unresolvable hop
+    // here is another entry's refusal, never this one's to make. The root's
+    // edges are the MERGED set — `<:` edges live on the extension walk
+    // (expandParents), but a parent's field can still point back at the
+    // child (`Dog <: Cat` where Cat holds `friend: Dog`).
+    if (has_compound) {
+        var mtypes = std.ArrayList([]const u8).initCapacity(allocator, merged.items.len) catch unreachable;
+        for (merged.items) |p| mtypes.append(allocator, p.ftype) catch unreachable;
+        if (TerminalRef.findCycle(allocator, program, name, scope_home, mtypes.items)) |chain| {
+            defer allocator.free(chain);
+            return .{ .replacement = ast.refusal(allocator, reporter, .KORU173, flow.location, flow.module, "std/proto({s}): compound cycle detected: {s} — a compound graph must be acyclic; expansion would never terminate", .{ name, chain }) };
+        }
+    }
+
+    // Layout-silent self-erase: a ONE-LINE comment carries the registry's
+    // content for anyone reading the emitted module; nothing else is emitted
+    // for the entry itself (the consumer's derived struct is what the program
+    // runs on). The collapse is load-bearing: later lines of a multi-line
+    // body land as RAW TEXT in the emitted Zig (only the first carries `//`),
+    // and the backend died on `serial: string` as a bare statement. Fields
+    // join with ", " — the separator std/list's marker parser splits on.
+    // The marker is the MERGED set — consumers never see `<:`; the parents'
+    // fields are already flat here.
+    const flat = blk: {
+        var buf = std.ArrayList(u8).initCapacity(allocator, merged.items.len * 24) catch unreachable;
+        for (merged.items) |p| {
+            if (buf.items.len > 0) buf.appendSlice(allocator, ", ") catch unreachable;
+            buf.appendSlice(allocator, p.name) catch unreachable;
+            buf.appendSlice(allocator, ": ") catch unreachable;
+            buf.appendSlice(allocator, p.ftype) catch unreachable;
+        }
+        break :blk buf.toOwnedSlice(allocator) catch unreachable;
+    };
+    const code = std.fmt.allocPrint(
+        allocator,
+        "// proto {s}: {s}",
+        .{ name, flat },
+    ) catch unreachable;
+
+    const inline_code_item = ast.Item{
+        .inline_code = ast.InlineCode{
+            .code = code,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        },
+    };
+
+    return .{ .replacement = inline_code_item };
+}
+// `mintTerminal` — the scalar-terminal minter — lives in
+// proto.terminal.kz (the `terminal` part).
+
+~[comptime|transform]pub tor i8 {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc i8|zig {
+    return mintTerminal(allocator, item, expr, "i8");
+}
+
+~[comptime|transform]pub tor i16 {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc i16|zig {
+    return mintTerminal(allocator, item, expr, "i16");
+}
+
+~[comptime|transform]pub tor i32 {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc i32|zig {
+    return mintTerminal(allocator, item, expr, "i32");
+}
+
+~[comptime|transform]pub tor i64 {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc i64|zig {
+    return mintTerminal(allocator, item, expr, "i64");
+}
+
+~[comptime|transform]pub tor u8 {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc u8|zig {
+    return mintTerminal(allocator, item, expr, "u8");
+}
+
+~[comptime|transform]pub tor u16 {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc u16|zig {
+    return mintTerminal(allocator, item, expr, "u16");
+}
+
+~[comptime|transform]pub tor u32 {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc u32|zig {
+    return mintTerminal(allocator, item, expr, "u32");
+}
+
+~[comptime|transform]pub tor u64 {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc u64|zig {
+    return mintTerminal(allocator, item, expr, "u64");
+}
+
+~[comptime|transform]pub tor f32 {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc f32|zig {
+    return mintTerminal(allocator, item, expr, "f32");
+}
+
+~[comptime|transform]pub tor f64 {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc f64|zig {
+    return mintTerminal(allocator, item, expr, "f64");
+}
+
+~[comptime|transform]pub tor bool {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc bool|zig {
+    return mintTerminal(allocator, item, expr, "bool");
+}
+
+~[comptime|transform]pub tor string {
+    expr: Expression,
+    item: *const std/compiler:Item,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc string|zig {
+    return mintTerminal(allocator, item, expr, "string");
+}
+~part resolve
+~part fields
+~part ownedleaf
+~part markers
+~part terminal

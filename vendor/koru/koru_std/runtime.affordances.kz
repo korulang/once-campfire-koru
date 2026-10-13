@@ -1,0 +1,73 @@
+// Koru Standard Library: the possession-shaped callable surface.
+// Joined via `~part affordances` in runtime.kz; merged into the runtime
+// module at load.
+
+// ============================================================================
+// SCOPE-AFFORDANCES - the callable surface, possession-shaped (HATEOAS rooms)
+// ============================================================================
+//
+// `scope-vocabulary` is the static surface: everything the scope declares.
+// This is the live half: what may be called GIVEN the resource types the
+// caller holds. An tor is callable now iff every discharge-kind phantom it
+// consumes (`!open`) names a held type; tors with no possession requirement
+// are always callable. `held` is a comma-separated list of resource-type
+// names (the `created_by_event` segments of the caller's live handles). The
+// render uses the same signature spelling as scope-vocabulary, so the
+// callable subset and the static vocabulary are the same bytes filtered.
+//
+// The projection is structural — it reads the scope's declared input fields
+// and phantoms, never a rendered string — so the filter and the enforcement
+// cannot drift (same contract as scope-manifest).
+
+// @retain: scope_affordances_event is referenced from generated Zig code in
+// bridge pipelines (std/bridge:affordances compiles to
+// scope_affordances_event.handler).
+~[retain]pub tor scope-affordances { name: string, held: string }
+| ok string
+| not-found
+
+~proc scope-affordances|zig {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const allocator = arena_state.allocator();
+    var out = std.ArrayList(u8).initCapacity(allocator, 256) catch unreachable;
+
+    inline for (comptime buildScopeTable()) |scope_info| {
+        if (std.mem.eql(u8, name, scope_info.name)) {
+            const events = scope_info.events_fn.?();
+            for (events) |event_name| {
+                const input = if (scope_info.input_fn) |f| f(event_name) orelse &.{} else &.{};
+                // Callable NOW iff every `!type` phantom is among the held
+                // resource types.
+                var callable = true;
+                for (input) |field| {
+                    if (field.phantom) |p| {
+                        if (p.len > 0 and p[0] == '!') {
+                            const required = p[1..];
+                            var found = false;
+                            var it = std.mem.splitScalar(u8, held, ',');
+                            while (it.next()) |piece| {
+                                const t = std.mem.trim(u8, piece, " \t\r\n");
+                                if (t.len > 0 and std.mem.eql(u8, t, required)) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                callable = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!callable) continue;
+                if (out.items.len > 0) out.append(allocator, '\n') catch unreachable;
+                // Same signature spelling as scope-vocabulary — outcomes too,
+                // or a callable line would promise a contract it doesn't show.
+                wireSignatureLine(&out, allocator, event_name, input);
+                if (scope_info.branches_fn) |bf| wireBranchSuffix(&out, allocator, bf(event_name));
+            }
+            return .{ .ok = out.toOwnedSlice(allocator) catch unreachable };
+        }
+    }
+    return .{ .not_found = .{} };
+}

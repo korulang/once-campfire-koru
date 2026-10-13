@@ -1,0 +1,1284 @@
+// Runtime Registry Standard Library
+// Enables scoped runtime evaluation of parsed Koru code
+//
+// DESIGN:
+// - std/runtime:register(scope: "name") { tors } declares a scope (norun)
+// - std/runtime:collect-scopes walks AST and generates dispatch tables
+// - std/runtime:get-scope(name: "...") looks up a scope at runtime
+
+~[comptime|runtime]
+
+~import std/compiler_types
+~import std/interpreter
+
+const std = @import("std");
+const ast = @import("ast");
+
+// ============================================================================
+// SCOPE DECLARATION - [norun] declaration collected by collect-scopes
+
+~[comptime|transform]pub tor register {
+    source: Source,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+// REGISTRY COMMON moved to runtime.registry.kz (~part registry) — shared
+// comptime machinery for register's emission, the scope-manifest builder,
+// and the [explainer].
+const ast_reg = @import("ast");
+
+~proc register|zig {
+    const CompilerEnvRt = @import("root").CompilerEnv;
+    // Get the flow from the item
+    const flow = if (item.* == .flow) &item.flow else return .{};
+
+    // Extract scope name from args or registry annotations
+    const scope_name = Helpers.extractScopeName(invocation, flow.annotations);
+
+    std.debug.print("[REGISTRY] Creating dispatcher for scope '{s}'\n", .{scope_name});
+
+    // Parse tors from source block with optional costs and composition
+    // Syntax:
+    //   event_name              - default cost 1
+    //   event_name(cost)        - custom cost
+    //   scope(other)            - include another scope
+    //   module:*                - include all tors under module prefix
+    //
+    // Obligations are extracted from tor signatures using phantom types:
+    //   <state!> in output = creates obligation (! suffix)
+    //   <!state> in input = discharges obligation (! prefix)
+
+    // Local CreateSpec/DischargeSpec for codegen (mirrors runtime types)
+    const event_infos = RegistryHelper.collectEventInfos(allocator, program);
+    const scope_defs = RegistryHelper.collectScopeDefs(allocator, program);
+    const debug_enabled = CompilerEnvRt.hasFlag("debug");
+
+    var resolved_events = std.ArrayList(ResolvedEvent){ .items = &.{}, .capacity = 0 };
+    var visited = std.StringHashMap(void).init(allocator);
+    defer visited.deinit();
+    RegistryHelper.resolveScope(allocator, scope_defs, event_infos, scope_name, debug_enabled, &visited, &resolved_events);
+
+    // Add @retain annotation to registered tors so dead strip preserves them.
+    // The event_infos point into the original program; replaceFlowRecursive clones
+    // them, carrying the annotations into the new program.
+    for (resolved_events.items) |resolved| {
+        const lookup_name = resolved.internal_name orelse resolved.name;
+        const info = RegistryHelper.findEventInfoHomed(allocator, event_infos, lookup_name, resolved.home) orelse continue;
+        // Retain the event_decl
+        const mutable_decl = @constCast(info.event_decl);
+        const new_anns = allocator.alloc([]const u8, mutable_decl.annotations.len + 1) catch continue;
+        @memcpy(new_anns[0..mutable_decl.annotations.len], mutable_decl.annotations);
+        new_anns[mutable_decl.annotations.len] = "retain";
+        mutable_decl.annotations = new_anns;
+        // Also retain the matching proc_decl (same path)
+        RegistryHelper.retainMatchingProc(allocator, program, info.event_decl);
+    }
+
+    const scope_ident = Helpers.mangleIdentifier(allocator, scope_name);
+    const module_name = Helpers.siteHomeModule(program, item);
+    const emit_helpers = !Helpers.hasRegistryHelpers(program, module_name);
+    var events_list = std.ArrayList(EventEntry){ .items = &.{}, .capacity = 0 };
+    for (resolved_events.items) |resolved| {
+        const lookup_name = resolved.internal_name orelse resolved.name;
+        const info = RegistryHelper.findEventInfoHomed(allocator, event_infos, lookup_name, resolved.home) orelse continue;
+        var obligations = extractObligations(allocator, info.event_decl, info.module_name);
+        const branches = extractBranches(allocator, info.event_decl);
+        const input_fields = extractInputFields(allocator, info.event_decl);
+        const symbol = Helpers.buildEventSymbol(allocator, info.module_name, info.event_decl.path.segments, program.main_module_name);
+        const dispatch_ident = Helpers.mangleIdentifier(allocator, resolved.name);
+        const dispatch_name = std.fmt.allocPrint(allocator, "dispatch_{s}_{s}", .{ scope_ident, dispatch_ident }) catch dispatch_ident;
+
+        // A discharge claim (input phantom `<!state>`) on an tor with NO
+        // implementation is a lie the pool would otherwise trust: the
+        // synthesized no-op handler "releases" the handle without releasing
+        // anything, and close reports success with the resource still held
+        // (440_016 probe). Refuse to emit the discharge claim — the
+        // obligation then strands at hang-up and close panics honestly,
+        // naming the leak instead of papering over it.
+        if ((obligations.discharges.len > 0 or obligations.discharges_specs.len > 0) and
+            !RegistryHelper.eventHasImpl(program, info.event_decl))
+        {
+            std.debug.print("[REGISTRY] WARNING: '{s}' declares a discharge "
+                ++ "phantom but has no implementation — discharge claim refused; "
+                ++ "its obligation strands at hang-up.\n", .{resolved.name});
+            obligations.discharges = &.{};
+            obligations.discharges_specs = &.{};
+        }
+
+        if (obligations.creates.len > 0 or obligations.discharges.len > 0) {
+            std.debug.print("[REGISTRY] Event '{s}': creates={d} specs, discharges={d} specs\n",
+                .{resolved.name, obligations.creates_specs.len, obligations.discharges_specs.len});
+        }
+
+        events_list.append(allocator, .{
+            .name = resolved.name,
+            .cost = resolved.cost,
+            .creates_obligations = obligations.creates,
+            .discharges_obligations = obligations.discharges,
+            .creates_specs = obligations.creates_specs,
+            .discharges_specs = obligations.discharges_specs,
+            .branches = branches,
+            .input_fields = input_fields,
+            .symbol = symbol,
+            .dispatch_name = dispatch_name,
+            .module_name = info.module_name,
+        }) catch continue;
+    }
+
+    std.debug.print("[REGISTRY] Found {d} events\n", .{events_list.items.len});
+
+    // Generate dispatcher code (indented for main_module)
+    var code = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+    const I = "    "; // 4 spaces for main_module indentation
+
+    if (emit_helpers) {
+        code.appendSlice(allocator, I ++ "// " ++ registry_helpers_marker ++ "\n") catch unreachable;
+
+        // Import required modules for generated code
+        code.appendSlice(allocator, I ++ "const __koru_dispatcher_std = @import(\"std\");\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "const __koru_dispatcher_ast = @import(\"ast\");\n\n") catch unreachable;
+
+        // Export type aliases for user code (so they can use bare names like Path, Invocation, etc.)
+        code.appendSlice(allocator, I ++ "pub const Path = __koru_dispatcher_ast.DottedPath;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "pub const Arg = __koru_dispatcher_ast.Arg;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "pub const Invocation = __koru_dispatcher_ast.Invocation;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "pub const DispatchResult = koru_std.koru_runtime.DispatchResult;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "const __koru_ScopeEvent = koru_std.koru_runtime.ScopeEvent;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "const __koru_ScopeDescriptor = koru_std.koru_runtime.ScopeDescriptor;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "const __koru_ScopeManifest = koru_std.koru_runtime.ScopeManifest;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "const __koru_ManifestEvent = koru_std.koru_runtime.ManifestEvent;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "const __koru_ManifestArg = koru_std.koru_runtime.ManifestArg;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "const __koru_ManifestCreate = koru_std.koru_runtime.ManifestCreate;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "const __koru_ManifestDischarge = koru_std.koru_runtime.ManifestDischarge;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "const __koru_ManifestBranch = koru_std.koru_runtime.ManifestBranch;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "const __koru_ManifestBranchField = koru_std.koru_runtime.ManifestBranchField;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "const __koru_FieldValue = koru_std.koru_runtime.FieldValue;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "const __koru_NamedField = koru_std.koru_runtime.NamedField;\n\n") catch unreachable;
+
+        // Helper function - strips quotes from string values
+        code.appendSlice(allocator, I ++ "fn __koru_getArg(__koru_args: []const __koru_dispatcher_ast.Arg, __koru_n: []const u8) ?[]const u8 {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "    for (__koru_args) |__koru_arg| {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "        if (__koru_dispatcher_std.mem.eql(u8, __koru_arg.name, __koru_n)) {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "            var __koru_v = __koru_arg.value;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "            if (__koru_v.len >= 2 and __koru_v[0] == '\"' and __koru_v[__koru_v.len-1] == '\"') __koru_v = __koru_v[1..__koru_v.len-1];\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "            return __koru_v;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "        }\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "    return null;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+
+        // Helper function - builds Input struct from args using comptime reflection
+        code.appendSlice(allocator, I ++ "fn __koru_buildInput(comptime __koru_T: type, __koru_args: []const __koru_dispatcher_ast.Arg) !__koru_T {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "    var __koru_input: __koru_T = undefined;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "    inline for (__koru_dispatcher_std.meta.fields(__koru_T)) |__koru_field| {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "        const __koru_raw = __koru_getArg(__koru_args, __koru_field.name) orelse \"\";\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "        const __koru_F = __koru_field.type;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "        if (__koru_F == bool) {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "            @field(__koru_input, __koru_field.name) = __koru_dispatcher_std.mem.eql(u8, __koru_raw, \"true\") or __koru_dispatcher_std.mem.eql(u8, __koru_raw, \"1\");\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "        } else switch (@typeInfo(__koru_F)) {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "            .int => {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                @field(__koru_input, __koru_field.name) = __koru_dispatcher_std.fmt.parseInt(__koru_F, __koru_raw, 10) catch {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                    koru_std.koru_interpreter.setDispatchDetail(__koru_dispatcher_std.fmt.allocPrint(__koru_dispatcher_std.heap.page_allocator, \"field '{s}' expected \" ++ @typeName(__koru_F) ++ \", got '{s}'\", .{ __koru_field.name, __koru_raw }) catch @panic(\"dispatch: OOM\"));\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                    return error.InvalidArgument;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                };\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "            },\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "            .float => {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                @field(__koru_input, __koru_field.name) = __koru_dispatcher_std.fmt.parseFloat(__koru_F, __koru_raw) catch {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                    koru_std.koru_interpreter.setDispatchDetail(__koru_dispatcher_std.fmt.allocPrint(__koru_dispatcher_std.heap.page_allocator, \"field '{s}' expected \" ++ @typeName(__koru_F) ++ \", got '{s}'\", .{ __koru_field.name, __koru_raw }) catch @panic(\"dispatch: OOM\"));\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                    return error.InvalidArgument;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                };\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "            },\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "            .pointer => |__koru_ptr_info| {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                if (__koru_ptr_info.size == .slice and __koru_ptr_info.child == u8) {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                    @field(__koru_input, __koru_field.name) = __koru_raw;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                } else {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                    @field(__koru_input, __koru_field.name) = __koru_dispatcher_std.mem.zeroes(__koru_F);\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                }\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "            },\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "            else => {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "                @field(__koru_input, __koru_field.name) = if (__koru_F == __koru_dispatcher_ast.Source) .{ .text = __koru_raw, .scope = .{ .bindings = &.{} } } else __koru_dispatcher_std.mem.zeroes(__koru_F);\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "            },\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "        }\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "    return __koru_input;\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+
+        // Helper - owns a result string. A |zig proc that formats into a
+        // local buffer returns a slice into its own dead stack frame; the
+        // interpreter binds these bytes past the dispatcher's return, so
+        // string payloads are copied to page memory at pack time (the same
+        // never-freed tolerance wireReject and parse.wire already carry).
+        code.appendSlice(allocator, I ++ "fn __koru_own(__koru_s: []const u8) []const u8 {\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "    return __koru_dispatcher_std.heap.page_allocator.dupe(u8, __koru_s) catch @panic(\"dispatch: OOM owning result\");\n") catch unreachable;
+        code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+    }
+
+    // Per-event dispatchers and descriptor table
+    for (events_list.items) |event| {
+        const is_control_flow = std.mem.eql(u8, event.name, "if") or
+                                std.mem.eql(u8, event.name, "for") or
+                                std.mem.eql(u8, event.name, "std.control:if") or
+                                std.mem.eql(u8, event.name, "std.control:for");
+
+        code.appendSlice(allocator, I ++ "fn ") catch unreachable;
+        code.appendSlice(allocator, event.dispatch_name) catch unreachable;
+        code.appendSlice(allocator, "(__koru_inv: *const __koru_dispatcher_ast.Invocation, __koru_out: *koru_std.koru_runtime.DispatchResult) !void {\n") catch unreachable;
+
+        if (is_control_flow) {
+            code.appendSlice(allocator, I ++ "    _ = __koru_inv; // Control flow - interpreter handles this\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    __koru_out.* = .{ .branch = \"control\", .fields = &.{} };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    return;\n") catch unreachable;
+        } else {
+            // Generate dispatcher that handles both void and branched tors
+            code.appendSlice(allocator, I ++ "    const __koru_Input = ") catch unreachable;
+            code.appendSlice(allocator, event.symbol) catch unreachable;
+            code.appendSlice(allocator, ".Input;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    const __koru_Handler = ") catch unreachable;
+            code.appendSlice(allocator, event.symbol) catch unreachable;
+            code.appendSlice(allocator, ";\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    const __koru_ReturnType = @typeInfo(@TypeOf(__koru_Handler.handler)).@\"fn\".return_type.?;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    if (__koru_ReturnType == void) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        // Void event - just call and return empty __koru_branch\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        __koru_Handler.handler(try __koru_buildInput(__koru_Input, __koru_inv.args));\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        __koru_out.* = .{ .branch = \"\", .fields = &.{} };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        return;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    if (@typeInfo(__koru_ReturnType) != .@\"union\") {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        // Single-return tor (`-> __koru_T`): the value BINDS, it does not select a\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        // __koru_branch. Reported as the empty __koru_branch with the value on __type_ref,\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        // the same channel identity branches use for bare payloads.\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        const __koru_v = __koru_Handler.handler(try __koru_buildInput(__koru_Input, __koru_inv.args));\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        const __koru_V = @TypeOf(__koru_v);\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        const __koru_SR = struct { threadlocal var buf: [1]__koru_NamedField = undefined; };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        var __koru_n: usize = 0;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        if (__koru_V == bool) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            __koru_SR.buf[0] = .{ .name = \"__type_ref\", .value = __koru_FieldValue{ .bool_val = __koru_v } };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            __koru_n = 1;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        } else if (@typeInfo(__koru_V) == .int) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            __koru_SR.buf[0] = .{ .name = \"__type_ref\", .value = __koru_FieldValue{ .int_val = @as(i64, @intCast(__koru_v)) } };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            __koru_n = 1;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        } else if (@typeInfo(__koru_V) == .float) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            __koru_SR.buf[0] = .{ .name = \"__type_ref\", .value = __koru_FieldValue{ .float_val = @as(f64, @floatCast(__koru_v)) } };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            __koru_n = 1;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        } else if (@typeInfo(__koru_V) == .pointer) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            const __koru_ptr_info = @typeInfo(__koru_V).pointer;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            if (__koru_ptr_info.size == .slice and __koru_ptr_info.child == u8) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                __koru_SR.buf[0] = .{ .name = \"__type_ref\", .value = __koru_FieldValue{ .string_val = __koru_own(__koru_v) } };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                __koru_n = 1;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            }\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        }\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        __koru_out.* = .{ .branch = \"\", .fields = __koru_SR.buf[0..__koru_n] };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        return;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    // Branched event - extract __koru_branch and fields\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    const __koru_r = __koru_Handler.handler(try __koru_buildInput(__koru_Input, __koru_inv.args));\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    const __koru_S = struct { threadlocal var buf: [16]__koru_NamedField = undefined; };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    const __koru_branch = @tagName(__koru_r);\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    const __koru_field_count = switch (__koru_r) { inline else => |__koru_p| blk: {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        const __koru_P = @TypeOf(__koru_p);\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        // Identity branches have bare types, not structs\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        if (@typeInfo(__koru_P) != .@\"struct\") {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            // Identity __koru_branch - create synthetic __type_ref __koru_field\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            if (__koru_P == bool) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                __koru_S.buf[0] = .{ .name = \"__type_ref\", .value = __koru_FieldValue{ .bool_val = __koru_p } };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            } else if (@typeInfo(__koru_P) == .int) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                __koru_S.buf[0] = .{ .name = \"__type_ref\", .value = __koru_FieldValue{ .int_val = @as(i64, @intCast(__koru_p)) } };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            } else if (@typeInfo(__koru_P) == .float) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                __koru_S.buf[0] = .{ .name = \"__type_ref\", .value = __koru_FieldValue{ .float_val = @as(f64, @floatCast(__koru_p)) } };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            } else if (@typeInfo(__koru_P) == .pointer) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                const __koru_ptr_info = @typeInfo(__koru_P).pointer;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                if (__koru_ptr_info.size == .slice and __koru_ptr_info.child == u8) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                    __koru_S.buf[0] = .{ .name = \"__type_ref\", .value = __koru_FieldValue{ .string_val = __koru_own(__koru_p) } };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                } else {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                    break :blk @as(usize, 0);\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                }\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            } else {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                break :blk @as(usize, 0);\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            }\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            break :blk @as(usize, 1);\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        }\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        // Compound __koru_branch - iterate over struct fields\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        const __koru_payload_fields = __koru_dispatcher_std.meta.fields(__koru_P);\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        comptime var __koru_count: usize = 0;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        inline for (__koru_payload_fields) |__koru_field| {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            const __koru_T = __koru_field.type;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            if (__koru_T == bool) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                __koru_S.buf[__koru_count] = .{ .name = __koru_field.name, .value = __koru_FieldValue{ .bool_val = @field(__koru_p, __koru_field.name) } };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                __koru_count += 1;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            } else switch (@typeInfo(__koru_T)) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                .int => {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                    __koru_S.buf[__koru_count] = .{ .name = __koru_field.name, .value = __koru_FieldValue{ .int_val = @as(i64, @intCast(@field(__koru_p, __koru_field.name))) } };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                    __koru_count += 1;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                },\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                .float => {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                    __koru_S.buf[__koru_count] = .{ .name = __koru_field.name, .value = __koru_FieldValue{ .float_val = @as(f64, @floatCast(@field(__koru_p, __koru_field.name))) } };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                    __koru_count += 1;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                },\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                .pointer => |__koru_ptr_info| {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                    if (__koru_ptr_info.size == .slice and __koru_ptr_info.child == u8) {\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                        __koru_S.buf[__koru_count] = .{ .name = __koru_field.name, .value = __koru_FieldValue{ .string_val = __koru_own(@field(__koru_p, __koru_field.name)) } };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                        __koru_count += 1;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                    }\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                },\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "                else => {},\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "            }\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        }\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "        break :blk __koru_count;\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    }};\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    __koru_out.* = .{ .branch = __koru_branch, .fields = __koru_S.buf[0..__koru_field_count] };\n") catch unreachable;
+            code.appendSlice(allocator, I ++ "    return;\n") catch unreachable;
+        }
+
+        code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+    }
+
+    // Scope descriptor and public dispatcher
+    // Obligations are extracted from tor signatures using phantom types
+    code.appendSlice(allocator, I ++ "const scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, " = [_]__koru_ScopeEvent{\n") catch unreachable;
+    for (events_list.items) |event| {
+        code.appendSlice(allocator, I ++ "    .{ .name = \"") catch unreachable;
+        code.appendSlice(allocator, event.name) catch unreachable;
+        code.appendSlice(allocator, "\", .cost = ") catch unreachable;
+        var cost_buf: [32]u8 = undefined;
+        const cost_str = std.fmt.bufPrint(&cost_buf, "{d}", .{event.cost}) catch "1";
+        code.appendSlice(allocator, cost_str) catch unreachable;
+
+        // Emit creates_obligations array (legacy)
+        code.appendSlice(allocator, ", .creates_obligations = &[_][]const u8{") catch unreachable;
+        for (event.creates_obligations, 0..) |obl, i| {
+            if (i > 0) code.appendSlice(allocator, ", ") catch unreachable;
+            code.appendSlice(allocator, "\"") catch unreachable;
+            code.appendSlice(allocator, obl) catch unreachable;
+            code.appendSlice(allocator, "\"") catch unreachable;
+        }
+        code.appendSlice(allocator, "}") catch unreachable;
+
+        // Emit discharges_obligations array (legacy)
+        code.appendSlice(allocator, ", .discharges_obligations = &[_][]const u8{") catch unreachable;
+        for (event.discharges_obligations, 0..) |obl, i| {
+            if (i > 0) code.appendSlice(allocator, ", ") catch unreachable;
+            code.appendSlice(allocator, "\"") catch unreachable;
+            code.appendSlice(allocator, obl) catch unreachable;
+            code.appendSlice(allocator, "\"") catch unreachable;
+        }
+        code.appendSlice(allocator, "}") catch unreachable;
+
+        // Emit creates_specs array (full specs with field names)
+        code.appendSlice(allocator, ", .creates_specs = &[_]koru_std.koru_runtime.CreateSpec{") catch unreachable;
+        for (event.creates_specs, 0..) |spec, i| {
+            if (i > 0) code.appendSlice(allocator, ", ") catch unreachable;
+            code.appendSlice(allocator, ".{ .obligation_module = \"") catch unreachable;
+            code.appendSlice(allocator, spec.obligation_module) catch unreachable;
+            code.appendSlice(allocator, "\", .obligation_name = \"") catch unreachable;
+            code.appendSlice(allocator, spec.obligation_name) catch unreachable;
+            code.appendSlice(allocator, "\", .field_name = \"") catch unreachable;
+            code.appendSlice(allocator, spec.field_name) catch unreachable;
+            code.appendSlice(allocator, "\", .resource_type = \"") catch unreachable;
+            code.appendSlice(allocator, spec.resource_type) catch unreachable;
+            code.appendSlice(allocator, if (spec.branch) |br| std.fmt.allocPrint(allocator, "\", .branch = \"{s}\" }}", .{br}) catch "\" }" else "\" }") catch unreachable;
+        }
+        code.appendSlice(allocator, "}") catch unreachable;
+
+        // Emit discharges_specs array (full specs with arg names)
+        code.appendSlice(allocator, ", .discharges_specs = &[_]koru_std.koru_runtime.DischargeSpec{") catch unreachable;
+        for (event.discharges_specs, 0..) |spec, i| {
+            if (i > 0) code.appendSlice(allocator, ", ") catch unreachable;
+            code.appendSlice(allocator, ".{ .obligation_module = \"") catch unreachable;
+            code.appendSlice(allocator, spec.obligation_module) catch unreachable;
+            code.appendSlice(allocator, "\", .obligation_name = \"") catch unreachable;
+            code.appendSlice(allocator, spec.obligation_name) catch unreachable;
+            code.appendSlice(allocator, "\", .arg_name = \"") catch unreachable;
+            code.appendSlice(allocator, spec.arg_name) catch unreachable;
+            code.appendSlice(allocator, "\" }") catch unreachable;
+        }
+        code.appendSlice(allocator, "}") catch unreachable;
+
+        // Emit branches array (for shape validation)
+        code.appendSlice(allocator, ", .branches = &[_]koru_std.koru_runtime.BranchSpec{") catch unreachable;
+        for (event.branches, 0..) |branch, bi| {
+            if (bi > 0) code.appendSlice(allocator, ", ") catch unreachable;
+            code.appendSlice(allocator, ".{ .name = \"") catch unreachable;
+            code.appendSlice(allocator, branch.name) catch unreachable;
+            code.appendSlice(allocator, "\", .fields = &[_]koru_std.koru_runtime.BranchField{") catch unreachable;
+            for (branch.fields, 0..) |field, fi| {
+                if (fi > 0) code.appendSlice(allocator, ", ") catch unreachable;
+                code.appendSlice(allocator, ".{ .name = \"") catch unreachable;
+                code.appendSlice(allocator, field.name) catch unreachable;
+                code.appendSlice(allocator, "\", .type_name = \"") catch unreachable;
+                code.appendSlice(allocator, field.type_name) catch unreachable;
+                code.appendSlice(allocator, "\", .is_optional = ") catch unreachable;
+                code.appendSlice(allocator, if (field.is_optional) "true" else "false") catch unreachable;
+                code.appendSlice(allocator, " }") catch unreachable;
+            }
+            code.appendSlice(allocator, "}, .is_optional = ") catch unreachable;
+            code.appendSlice(allocator, if (branch.is_optional) "true" else "false") catch unreachable;
+            code.appendSlice(allocator, " }") catch unreachable;
+        }
+        code.appendSlice(allocator, "}") catch unreachable;
+
+        // Emit input_fields array — the tor's argument vocabulary, carrying
+        // the possession phantoms (`!open`) a caller must honor. This is what
+        // lets a running program tell a model what `open(path: ...)` and
+        // `append(handle: ...<!open>)` actually take.
+        code.appendSlice(allocator, ", .input_fields = &[_]koru_std.koru_runtime.InputFieldSpec{") catch unreachable;
+        for (event.input_fields, 0..) |field, fi| {
+            if (fi > 0) code.appendSlice(allocator, ", ") catch unreachable;
+            code.appendSlice(allocator, ".{ .name = \"") catch unreachable;
+            code.appendSlice(allocator, field.name) catch unreachable;
+            code.appendSlice(allocator, "\", .type_name = \"") catch unreachable;
+            code.appendSlice(allocator, field.type_name) catch unreachable;
+            code.appendSlice(allocator, "\", .is_optional = ") catch unreachable;
+            code.appendSlice(allocator, if (field.is_optional) "true" else "false") catch unreachable;
+            code.appendSlice(allocator, ", .phantom = ") catch unreachable;
+            if (field.phantom) |p| {
+                code.appendSlice(allocator, "\"") catch unreachable;
+                code.appendSlice(allocator, p) catch unreachable;
+                code.appendSlice(allocator, "\"") catch unreachable;
+            } else {
+                code.appendSlice(allocator, "null") catch unreachable;
+            }
+            code.appendSlice(allocator, " }") catch unreachable;
+        }
+        code.appendSlice(allocator, "}") catch unreachable;
+
+        code.appendSlice(allocator, ", .dispatcher = ") catch unreachable;
+        code.appendSlice(allocator, event.dispatch_name) catch unreachable;
+        code.appendSlice(allocator, " },\n") catch unreachable;
+    }
+    code.appendSlice(allocator, I ++ "};\n\n") catch unreachable;
+
+    // Generate cost lookup function
+    code.appendSlice(allocator, I ++ "pub fn get_event_cost_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "(__koru_event_name: []const u8) u64 {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    inline for (scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, ") |__koru_ev| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        if (__koru_dispatcher_std.mem.eql(u8, __koru_event_name, __koru_ev.name)) return __koru_ev.cost;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    return 1; // Default cost\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+
+    // Generate obligation lookup functions (return arrays for multiple obligations)
+    code.appendSlice(allocator, I ++ "pub fn get_creates_obligations_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "(__koru_event_name: []const u8) []const []const u8 {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    inline for (scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, ") |__koru_ev| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        if (__koru_dispatcher_std.mem.eql(u8, __koru_event_name, __koru_ev.name)) return __koru_ev.creates_obligations;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    return &[_][]const u8{};\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+
+    code.appendSlice(allocator, I ++ "pub fn get_discharges_obligations_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "(__koru_event_name: []const u8) []const []const u8 {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    inline for (scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, ") |__koru_ev| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        if (__koru_dispatcher_std.mem.eql(u8, __koru_event_name, __koru_ev.name)) return __koru_ev.discharges_obligations;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    return &[_][]const u8{};\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+
+    // Generate discharge tor lookup (for auto-discharge). An tor that
+    // RE-ISSUES the obligation it consumes is NOT a discharger: `append`
+    // (`<!open> -> <open!>`) hands back another obligation exactly like
+    // `tx.exec` does, so calling it releases nothing. The compiled path has
+    // excluded that shape since `eventReIssuesObligation`
+    // (auto_discharge_inserter.zig); this lookup returned the FIRST match and
+    // so handed a bridge a "discharger" that reopened the resource it was asked
+    // to let go of — measured in kopium-headless, where the session's hang-up
+    // invoked `append` and the file descriptor survived it.
+    code.appendSlice(allocator, I ++ "pub fn get_discharge_event_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "(__koru_obligation: []const u8) ?[]const u8 {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    inline for (scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, ") |__koru_ev| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        var __koru_discharges_it = false;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        for (__koru_ev.discharges_obligations) |__koru_dis| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "            if (__koru_dispatcher_std.mem.eql(u8, __koru_obligation, __koru_dis)) { __koru_discharges_it = true; break; }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        if (__koru_discharges_it) {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "            var __koru_reissues = false;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "            for (__koru_ev.creates_obligations) |__koru_cre| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "                if (__koru_dispatcher_std.mem.eql(u8, __koru_obligation, __koru_cre)) { __koru_reissues = true; break; }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "            }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "            if (!__koru_reissues) return __koru_ev.name;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    return null;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+
+    // Generate creates_spec lookup - returns full specs for handle creation
+    code.appendSlice(allocator, I ++ "pub fn get_creates_spec_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "(__koru_event_name: []const u8) []const koru_std.koru_runtime.CreateSpec {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    inline for (scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, ") |__koru_ev| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        if (__koru_dispatcher_std.mem.eql(u8, __koru_event_name, __koru_ev.name)) return __koru_ev.creates_specs;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    return &[_]koru_std.koru_runtime.CreateSpec{};\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+
+    // Generate discharges_spec lookup - returns full specs for discharge
+    code.appendSlice(allocator, I ++ "pub fn get_discharges_spec_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "(__koru_event_name: []const u8) []const koru_std.koru_runtime.DischargeSpec {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    inline for (scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, ") |__koru_ev| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        if (__koru_dispatcher_std.mem.eql(u8, __koru_event_name, __koru_ev.name)) return __koru_ev.discharges_specs;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    return &[_]koru_std.koru_runtime.DischargeSpec{};\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+
+    // Generate branches lookup - returns branch specs for shape validation
+    code.appendSlice(allocator, I ++ "pub fn get_event_branches_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "(__koru_event_name: []const u8) []const koru_std.koru_runtime.BranchSpec {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    inline for (scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, ") |__koru_ev| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        if (__koru_dispatcher_std.mem.eql(u8, __koru_event_name, __koru_ev.name)) return __koru_ev.branches;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    return &[_]koru_std.koru_runtime.BranchSpec{};\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+
+    // Generate event-name enumeration - returns the scope's whole vocabulary.
+    // This is the surface a running program needs to ask a scope what it holds
+    // (and hand that to a model as its prompt), which no event-keyed lookup can
+    // provide by itself.
+    code.appendSlice(allocator, I ++ "const ") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "_event_names = blk: {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    @setEvalBranchQuota(1_000_000);\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    var __koru_arr: [scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, ".len][]const u8 = undefined;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    for (scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, ", 0..) |__koru_ev, __koru_i| __koru_arr[__koru_i] = __koru_ev.name;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    break :blk __koru_arr;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "};\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "pub fn get_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "() []const []const u8 {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    return &") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "_event_names;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+
+    // Generate input-field lookup - an tor's argument vocabulary (null = not this scope's verb).
+    code.appendSlice(allocator, I ++ "pub fn get_event_input_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "(__koru_event_name: []const u8) ?[]const koru_std.koru_runtime.InputFieldSpec {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    inline for (scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, ") |__koru_ev| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        if (__koru_dispatcher_std.mem.eql(u8, __koru_event_name, __koru_ev.name)) return __koru_ev.input_fields;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    return null;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "}\n\n") catch unreachable;
+
+    code.appendSlice(allocator, I ++ "pub const ") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "_descriptor: __koru_ScopeDescriptor = .{ .name = \"") catch unreachable;
+    code.appendSlice(allocator, scope_name) catch unreachable;
+    code.appendSlice(allocator, "\", .events = &scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, " };\n") catch unreachable;
+
+    // The scope manifest: the register block minted as DATA, beside the
+    // descriptor. Built by the SAME shared producer the explainer and the
+    // served JSON use (scopeManifestForScope) — one record, three views, and
+    // the contract can never drift from enforcement.
+    const scope_manifest = scopeManifestForScope(allocator, program, scope_name, debug_enabled);
+
+    code.appendSlice(allocator, I ++ "pub const ") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "_manifest: __koru_ScopeManifest = .{ .scope = \"") catch unreachable;
+    code.appendSlice(allocator, scope_name) catch unreachable;
+    code.appendSlice(allocator, "\", .events = &[_]__koru_ManifestEvent{\n") catch unreachable;
+    for (scope_manifest.events) |event| {
+        code.appendSlice(allocator, I ++ "    .{ .name = \"") catch unreachable;
+        code.appendSlice(allocator, event.name) catch unreachable;
+        code.appendSlice(allocator, "\", .cost = ") catch unreachable;
+        var manifest_cost_buf: [32]u8 = undefined;
+        const manifest_cost_str = std.fmt.bufPrint(&manifest_cost_buf, "{d}", .{event.cost}) catch "1";
+        code.appendSlice(allocator, manifest_cost_str) catch unreachable;
+        code.appendSlice(allocator, ", .home = ") catch unreachable;
+        if (event.home) |event_home| {
+            code.appendSlice(allocator, "\"") catch unreachable;
+            code.appendSlice(allocator, event_home) catch unreachable;
+            code.appendSlice(allocator, "\"") catch unreachable;
+        } else {
+            code.appendSlice(allocator, "null") catch unreachable;
+        }
+
+        // Argument vocabulary — the caller's side of the surface.
+        code.appendSlice(allocator, ", .args = &[_]__koru_ManifestArg{") catch unreachable;
+        for (event.args, 0..) |arg_field, ai| {
+            if (ai > 0) code.appendSlice(allocator, ", ") catch unreachable;
+            code.appendSlice(allocator, ".{ .name = \"") catch unreachable;
+            code.appendSlice(allocator, arg_field.name) catch unreachable;
+            code.appendSlice(allocator, "\", .type_name = \"") catch unreachable;
+            code.appendSlice(allocator, arg_field.type_name) catch unreachable;
+            code.appendSlice(allocator, "\", .is_optional = ") catch unreachable;
+            code.appendSlice(allocator, if (arg_field.is_optional) "true" else "false") catch unreachable;
+            code.appendSlice(allocator, ", .phantom = ") catch unreachable;
+            if (arg_field.phantom) |phantom_str| {
+                code.appendSlice(allocator, "\"") catch unreachable;
+                code.appendSlice(allocator, phantom_str) catch unreachable;
+                code.appendSlice(allocator, "\"") catch unreachable;
+            } else {
+                code.appendSlice(allocator, "null") catch unreachable;
+            }
+            code.appendSlice(allocator, " }") catch unreachable;
+        }
+        code.appendSlice(allocator, "}") catch unreachable;
+
+        // Possession: what the tor mints.
+        code.appendSlice(allocator, ", .creates = &[_]__koru_ManifestCreate{") catch unreachable;
+        for (event.creates, 0..) |create_spec, ci| {
+            if (ci > 0) code.appendSlice(allocator, ", ") catch unreachable;
+            code.appendSlice(allocator, ".{ .obligation = \"") catch unreachable;
+            code.appendSlice(allocator, create_spec.obligation) catch unreachable;
+            code.appendSlice(allocator, "\", .module = \"") catch unreachable;
+            code.appendSlice(allocator, create_spec.module) catch unreachable;
+            code.appendSlice(allocator, "\", .field = \"") catch unreachable;
+            code.appendSlice(allocator, create_spec.field) catch unreachable;
+            code.appendSlice(allocator, "\", .resource_type = \"") catch unreachable;
+            code.appendSlice(allocator, create_spec.resource_type) catch unreachable;
+            code.appendSlice(allocator, if (create_spec.branch) |br| std.fmt.allocPrint(allocator, "\", .branch = \"{s}\" }}", .{br}) catch "\" }" else "\" }") catch unreachable;
+        }
+        code.appendSlice(allocator, "}") catch unreachable;
+
+        // Possession: what the tor consumes.
+        code.appendSlice(allocator, ", .discharges = &[_]__koru_ManifestDischarge{") catch unreachable;
+        for (event.discharges, 0..) |discharge_spec, di| {
+            if (di > 0) code.appendSlice(allocator, ", ") catch unreachable;
+            code.appendSlice(allocator, ".{ .obligation = \"") catch unreachable;
+            code.appendSlice(allocator, discharge_spec.obligation) catch unreachable;
+            code.appendSlice(allocator, "\", .module = \"") catch unreachable;
+            code.appendSlice(allocator, discharge_spec.module) catch unreachable;
+            code.appendSlice(allocator, "\", .arg = \"") catch unreachable;
+            code.appendSlice(allocator, discharge_spec.arg) catch unreachable;
+            code.appendSlice(allocator, "\" }") catch unreachable;
+        }
+        code.appendSlice(allocator, "}") catch unreachable;
+
+        // Output shapes.
+        code.appendSlice(allocator, ", .branches = &[_]__koru_ManifestBranch{") catch unreachable;
+        for (event.branches, 0..) |branch_spec, bi| {
+            if (bi > 0) code.appendSlice(allocator, ", ") catch unreachable;
+            code.appendSlice(allocator, ".{ .name = \"") catch unreachable;
+            code.appendSlice(allocator, branch_spec.name) catch unreachable;
+            code.appendSlice(allocator, "\", .fields = &[_]__koru_ManifestBranchField{") catch unreachable;
+            for (branch_spec.fields, 0..) |branch_field, fi| {
+                if (fi > 0) code.appendSlice(allocator, ", ") catch unreachable;
+                code.appendSlice(allocator, ".{ .name = \"") catch unreachable;
+                code.appendSlice(allocator, branch_field.name) catch unreachable;
+                code.appendSlice(allocator, "\", .type_name = \"") catch unreachable;
+                code.appendSlice(allocator, branch_field.type_name) catch unreachable;
+                code.appendSlice(allocator, "\", .is_optional = ") catch unreachable;
+                code.appendSlice(allocator, if (branch_field.is_optional) "true" else "false") catch unreachable;
+                code.appendSlice(allocator, " }") catch unreachable;
+            }
+            code.appendSlice(allocator, "}, .is_optional = ") catch unreachable;
+            code.appendSlice(allocator, if (branch_spec.is_optional) "true" else "false") catch unreachable;
+            code.appendSlice(allocator, " }") catch unreachable;
+        }
+        code.appendSlice(allocator, "} },\n") catch unreachable;
+    }
+    code.appendSlice(allocator, I ++ "},\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    .includes = &[_][]const u8{") catch unreachable;
+    for (scope_manifest.includes, 0..) |inc, ii| {
+        if (ii > 0) code.appendSlice(allocator, ", ") catch unreachable;
+        code.appendSlice(allocator, "\"") catch unreachable;
+        code.appendSlice(allocator, inc) catch unreachable;
+        code.appendSlice(allocator, "\"") catch unreachable;
+    }
+    code.appendSlice(allocator, "}\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "};\n\n") catch unreachable;
+
+    code.appendSlice(allocator, I ++ "pub fn dispatch_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, "(__koru_inv: *const __koru_dispatcher_ast.Invocation, __koru_out: *koru_std.koru_runtime.DispatchResult) !void {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    var __koru_name_buf: [256]u8 = undefined;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    var __koru_name_len: usize = 0;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    if (__koru_inv.path.module_qualifier) |__koru_mq| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        @memcpy(__koru_name_buf[__koru_name_len..][0..__koru_mq.len], __koru_mq);\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        __koru_name_len += __koru_mq.len;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        __koru_name_buf[__koru_name_len] = ':';\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        __koru_name_len += 1;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    for (__koru_inv.path.segments, 0..) |__koru_seg, __koru_i| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        if (__koru_i > 0) { __koru_name_buf[__koru_name_len] = '.'; __koru_name_len += 1; }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        @memcpy(__koru_name_buf[__koru_name_len..][0..__koru_seg.len], __koru_seg);\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        __koru_name_len += __koru_seg.len;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    const __koru_event_name = __koru_name_buf[0..__koru_name_len];\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    inline for (scope_events_") catch unreachable;
+    code.appendSlice(allocator, scope_ident) catch unreachable;
+    code.appendSlice(allocator, ") |__koru_ev| {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        if (__koru_dispatcher_std.mem.eql(u8, __koru_event_name, __koru_ev.name)) {\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "            return __koru_ev.dispatcher(__koru_inv, __koru_out);\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "        }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    }\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "    return error.EventDenied;\n") catch unreachable;
+    code.appendSlice(allocator, I ++ "}\n") catch unreachable;
+
+    const generated_code = code.toOwnedSlice(allocator) catch unreachable;
+    std.debug.print("[REGISTRY] Generated {d} bytes\n", .{generated_code.len});
+
+    // Replace this flow with generated code
+    const new_item = ast_reg.Item{
+        .host_line = .{
+            .content = generated_code,
+            .location = .{ .file = "runtime:register", .line = 0, .column = 0 },
+            .module = module_name,
+        },
+    };
+
+    // The replacement erases this scope's definition from the AST. Leave a
+    // marker carrying name + base64 source so a `scope(other)` entry at a
+    // LATER site still resolves — collectScopeDefs reads these back.
+    var self_source: []const u8 = "";
+    for (invocation.args) |arg| {
+        if (arg.source_value) |src| {
+            self_source = src.text;
+            break;
+        }
+    }
+    const enc = std.base64.standard.Encoder;
+    const b64 = allocator.alloc(u8, enc.calcSize(self_source.len)) catch return .{ .replacement = new_item };
+    _ = enc.encode(b64, self_source);
+    const marker_content = std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ scope_def_marker, scope_name, b64 }) catch return .{ .replacement = new_item };
+    const appended = allocator.alloc(ast_reg.Item, 1) catch return .{ .replacement = new_item };
+    appended[0] = .{ .host_line = .{
+        .content = marker_content,
+        .location = .{ .file = "runtime:register", .line = 0, .column = 0 },
+        .module = module_name,
+    } };
+    return .{ .replacement = new_item, .appended = appended };
+}
+
+// ============================================================================
+// GET SCOPE - Runtime tor to look up a scope's dispatcher
+
+// Use interpreter's types to ensure compatibility
+// At runtime, koru_std.koru_interpreter is available via root import
+pub const DispatchResult = @import("root").koru_std.koru_interpreter.DispatchResult;
+pub const DispatchFn = @import("root").koru_std.koru_interpreter.DispatchFn;
+pub const CostFn = @import("root").koru_std.koru_interpreter.CostFn;
+pub const ObligationsArrayFn = @import("root").koru_std.koru_interpreter.ObligationsArrayFn;
+pub const DischargeEventFn = @import("root").koru_std.koru_interpreter.DischargeEventFn;
+pub const FieldValue = @import("root").koru_std.koru_interpreter.FieldValue;
+pub const NamedField = @import("root").koru_std.koru_interpreter.NamedField;
+// Import spec types from interpreter
+pub const CreateSpec = @import("root").koru_std.koru_interpreter.CreateSpec;
+pub const DischargeSpec = @import("root").koru_std.koru_interpreter.DischargeSpec;
+pub const CreatesSpecFn = @import("root").koru_std.koru_interpreter.CreatesSpecFn;
+pub const DischargesSpecFn = @import("root").koru_std.koru_interpreter.DischargesSpecFn;
+
+
+pub const ScopeRuntime = struct {
+    name: []const u8,
+    dispatcher: DispatchFn,
+    cost_fn: ?CostFn,
+    creates_obligations_fn: ?ObligationsArrayFn,
+    discharges_obligations_fn: ?ObligationsArrayFn,
+    discharge_event_fn: ?DischargeEventFn,
+    // Full spec lookups with field/arg names
+    creates_spec_fn: ?CreatesSpecFn,
+    discharges_spec_fn: ?DischargesSpecFn,
+    // Branch specs for shape validation
+    branches_fn: ?BranchesLookupFn,
+    // Vocabulary enumeration: tor names + per-event input/arg fields
+    events_fn: ?EventsLookupFn,
+    input_fn: ?InputLookupFn,
+    // The scope's manifest record — minted at scope creation (register) from
+    // the same EventEntry data the dispatch tables are emitted from. null
+    // never occurs for a descriptor register built: the two are emitted side
+    // by side. Defined flows (session growth) are absent by construction.
+    manifest: ?*const ScopeManifest = null,
+};
+
+// ============================================================================
+// SCOPE MANIFEST - the vocabulary minted as a data structure at scope creation
+//
+// `register` reshapes the EventEntry records it emits dispatch tables from
+// into this record and embeds it beside the descriptor. One minting, many
+// served views: the `scope-manifest` tor serializes it to JSON for a running
+// contract endpoint (Orisha), `explain` will consume the same record at
+// compile time, and neither view is ever hand-written. Defined flows (session
+// growth) are absent by construction: the record is minted when the scope is
+// created, before any session exists — it is the compiled base.
+
+/// One tor's argument — the caller's side of the surface.
+pub const ManifestArg = struct {
+    name: []const u8,
+    type_name: []const u8,
+    is_optional: bool = false,
+    /// Raw possession spelling: `"!open"` discharges, `"open!"` creates.
+    phantom: ?[]const u8 = null,
+};
+
+/// An obligation an tor MINTS — carried by an output field (or
+/// `__type_ref` for a bare return). Fields mirror CreateSpec so the contract
+/// and the enforcement are the same bytes.
+pub const ManifestCreate = struct {
+    obligation: []const u8,
+    module: []const u8,
+    field: []const u8,
+    resource_type: []const u8, branch: ?[]const u8 = null, // branch carrying the create; null = bare return
+};
+
+/// An obligation an tor CONSUMES — discharged by a named input arg.
+pub const ManifestDischarge = struct {
+    obligation: []const u8,
+    module: []const u8,
+    arg: []const u8,
+};
+
+/// An output branch's payload field.
+pub const ManifestBranchField = struct {
+    name: []const u8,
+    type_name: []const u8,
+    is_optional: bool = false,
+};
+
+/// An output branch ("shape") an tor can end in.
+pub const ManifestBranch = struct {
+    name: []const u8,
+    fields: []const ManifestBranchField = &.{},
+    is_optional: bool = false,
+};
+
+/// One surface verb: what it takes, what it mints, what it consumes.
+pub const ManifestEvent = struct {
+    name: []const u8,
+    cost: u64 = 1,
+    /// Module that DECLARED the tor (the home that closes the bare-name
+    /// gap), or null for a top-level tor.
+    home: ?[]const u8 = null,
+    args: []const ManifestArg = &.{},
+    creates: []const ManifestCreate = &.{},
+    discharges: []const ManifestDischarge = &.{},
+    branches: []const ManifestBranch = &.{},
+};
+
+/// The served contract for one scope: the register block as data.
+pub const ScopeManifest = struct {
+    kind: []const u8 = "koru/scope-manifest",
+    version: u32 = 1,
+    scope: []const u8,
+    events: []const ManifestEvent = &.{},
+    /// Direct `scope(other)` includes named in THIS register block, in
+    /// declaration order. Transitive closures stay implicit.
+    includes: []const []const u8 = &.{},
+};
+
+fn mangleScopeName(comptime name: []const u8) []const u8 {
+    if (name.len == 0) return "";
+    comptime var buf: [name.len]u8 = undefined;
+    inline for (name, 0..) |c, i| {
+        const is_alnum = (c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or
+            (c == '_');
+        buf[i] = if (is_alnum) c else '_';
+    }
+    return buf[0..];
+}
+
+/// Every namespace a generated scope registry can live in: the root itself,
+/// its struct declarations, and theirs — `main_module`, `koru_app`, and
+/// `koru_app.koru_lib`, two levels being exactly the depth the emitter nests
+/// a dotted module name to.
+///
+/// A `register` written inside a library emits its descriptor and dispatcher
+/// BESIDE the tors they name, which is the only place they can be: Zig gives
+/// a sibling struct no path to the entry struct, so the dispatcher has to sit
+/// where it can reach `koru_app.koru_lib.expensive_event`. A table built from
+/// `main_module` alone therefore found nothing — and found nothing SILENTLY.
+/// The program compiled, ran, and took its `| scope-not-found` arm: a
+/// well-formed answer built on an empty registry, which is the one failure
+/// shape on this boundary with no compile step left to fail in (115_036).
+fn scopeNamespaces() []const type {
+    // The walk is O(declarations in the whole program), and Zig's default
+    // budget is 1000 backwards branches. A program that links enough — vaxis
+    // plus curl plus yyjson plus sse was the case that found this — blows it
+    // and fails with "evaluation exceeded 1000 backwards branches" pointing at
+    // generated code, saying nothing about scopes or `register`. The quota is
+    // a compile-time-only cost and nothing here is recursive without bound:
+    // `collectNamespaces` is depth-limited to 2.
+    @setEvalBranchQuota(1_000_000);
+    return collectNamespaces(@import("root"), 2, &[_]type{});
+}
+
+fn collectNamespaces(comptime C: type, comptime depth: usize, comptime acc: []const type) []const type {
+    comptime var out: []const type = acc ++ &[_]type{C};
+    if (depth == 0) return out;
+    inline for (std.meta.declarations(C)) |d| {
+        const V = @field(C, d.name);
+        if (@TypeOf(V) != type) continue;
+        if (@typeInfo(V) != .@"struct") continue;
+        out = collectNamespaces(V, depth - 1, out);
+    }
+    return out;
+}
+
+fn buildScopeTable() []const ScopeRuntime {
+    @setEvalBranchQuota(1_000_000);
+    comptime var count: usize = 0;
+    inline for (comptime scopeNamespaces()) |NS| {
+        inline for (std.meta.declarations(NS)) |decl| {
+            if (!std.mem.endsWith(u8, decl.name, "_descriptor")) continue;
+            const decl_value = @field(NS, decl.name);
+            if (@TypeOf(decl_value) != ScopeDescriptor) continue;
+            const scope_ident = mangleScopeName(decl_value.name);
+            const dispatch_name = std.fmt.comptimePrint("dispatch_{s}", .{scope_ident});
+            if (!@hasDecl(NS, dispatch_name)) continue;
+            count += 1;
+        }
+    }
+
+    var table: [count]ScopeRuntime = undefined;
+    comptime var i: usize = 0;
+    inline for (comptime scopeNamespaces()) |NS| {
+        inline for (std.meta.declarations(NS)) |decl| {
+            if (!std.mem.endsWith(u8, decl.name, "_descriptor")) continue;
+            const decl_value = @field(NS, decl.name);
+            if (@TypeOf(decl_value) != ScopeDescriptor) continue;
+            const desc = decl_value;
+            const scope_ident = mangleScopeName(desc.name);
+            const dispatch_name = std.fmt.comptimePrint("dispatch_{s}", .{scope_ident});
+            if (!@hasDecl(NS, dispatch_name)) continue;
+
+            const cost_name = std.fmt.comptimePrint("get_event_cost_{s}", .{scope_ident});
+            const creates_name = std.fmt.comptimePrint("get_creates_obligations_{s}", .{scope_ident});
+            const discharges_name = std.fmt.comptimePrint("get_discharges_obligations_{s}", .{scope_ident});
+            const discharge_event_name = std.fmt.comptimePrint("get_discharge_event_{s}", .{scope_ident});
+            const creates_spec_name = std.fmt.comptimePrint("get_creates_spec_{s}", .{scope_ident});
+            const discharges_spec_name = std.fmt.comptimePrint("get_discharges_spec_{s}", .{scope_ident});
+            const branches_name = std.fmt.comptimePrint("get_event_branches_{s}", .{scope_ident});
+            const events_name = std.fmt.comptimePrint("get_events_{s}", .{scope_ident});
+            const input_name = std.fmt.comptimePrint("get_event_input_{s}", .{scope_ident});
+            const manifest_name = std.fmt.comptimePrint("{s}_manifest", .{scope_ident});
+
+            table[i] = .{
+                .name = desc.name,
+                .dispatcher = &@field(NS, dispatch_name),
+                .cost_fn = if (@hasDecl(NS, cost_name)) &@field(NS, cost_name) else null,
+                .creates_obligations_fn = if (@hasDecl(NS, creates_name)) &@field(NS, creates_name) else null,
+                .discharges_obligations_fn = if (@hasDecl(NS, discharges_name)) &@field(NS, discharges_name) else null,
+                .discharge_event_fn = if (@hasDecl(NS, discharge_event_name)) &@field(NS, discharge_event_name) else null,
+                .creates_spec_fn = if (@hasDecl(NS, creates_spec_name)) &@field(NS, creates_spec_name) else null,
+                .discharges_spec_fn = if (@hasDecl(NS, discharges_spec_name)) &@field(NS, discharges_spec_name) else null,
+                .branches_fn = if (@hasDecl(NS, branches_name)) &@field(NS, branches_name) else null,
+                .events_fn = if (@hasDecl(NS, events_name)) &@field(NS, events_name) else null,
+                .input_fn = if (@hasDecl(NS, input_name)) &@field(NS, input_name) else null,
+                .manifest = if (@hasDecl(NS, manifest_name)) &@field(NS, manifest_name) else null,
+            };
+            i += 1;
+        }
+    }
+
+    return table[0..];
+}
+
+~[retain]pub tor get-scope { name: string }
+| scope {
+    dispatcher: DispatchFn,
+    cost_fn: ?CostFn,
+    creates_obligations_fn: ?ObligationsArrayFn,
+    discharges_obligations_fn: ?ObligationsArrayFn,
+    discharge_event_fn: ?DischargeEventFn,
+    creates_spec_fn: ?CreatesSpecFn,
+    discharges_spec_fn: ?DischargesSpecFn,
+    events_fn: ?EventsLookupFn,
+    input_fn: ?InputLookupFn
+}
+| not-found
+
+// Look up scope dispatcher by name — generated beside the register as dispatch_<scope>
+~proc get-scope|zig {
+    inline for (comptime buildScopeTable()) |scope_info| {
+        if (std.mem.eql(u8, name, scope_info.name)) {
+            return .{ .scope = .{
+                .dispatcher = scope_info.dispatcher,
+                .cost_fn = scope_info.cost_fn,
+                .creates_obligations_fn = scope_info.creates_obligations_fn,
+                .discharges_obligations_fn = scope_info.discharges_obligations_fn,
+                .discharge_event_fn = scope_info.discharge_event_fn,
+                .creates_spec_fn = scope_info.creates_spec_fn,
+                .discharges_spec_fn = scope_info.discharges_spec_fn,
+                .events_fn = scope_info.events_fn,
+                .input_fn = scope_info.input_fn,
+            } };
+        }
+    }
+    return .{ .not_found = .{} };
+}
+
+// ============================================================================
+// SCOPE-VOCABULARY - Render a scope's vocabulary for an external reader
+//
+// The whole point of the enumeration surface: a model driving this interpreter
+// must be told, accurately, what it may call — and that description must come
+// from the register declaration, not a hand-typed script that can drift. This
+// renders exactly the surface the register block enforces, as one line per
+// tor with its named arguments and possession phantoms:
+//
+//   open(path: string)
+//   append(handle: string<!open>, text: string)
+//   close(handle: string<!open>)
+//   say(text: string)
+//
+// No JSON schema, no second source of truth: the prompt and the enforcement
+// are the same bytes.
+
+// @retain: scope_vocabulary_event is referenced from generated Zig code in user
+// pipelines (std/bridge:vocabulary compiles to scope_vocabulary_event.handler).
+~[retain]pub tor scope-vocabulary { name: string }
+| ok string
+| not-found
+
+~proc scope-vocabulary|zig {
+    // A local arena over page_allocator — the same substrate the interpreter's
+    // own arena and its message dupes use. ArrayList growth here allocates
+    // fresh chunks (arena realloc resolves to alloc+copy, which works in this
+    // binary; direct realloc-based growth OOMs). The arena is intentionally
+    // never freed: the returned string must outlive this call, and a few pages
+    // per vocabulary render are tolerated exactly like parse-error messages.
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const allocator = arena_state.allocator();
+    var out = std.ArrayList(u8).initCapacity(allocator, 256) catch unreachable;
+
+    inline for (comptime buildScopeTable()) |scope_info| {
+        if (std.mem.eql(u8, name, scope_info.name)) {
+            const events = scope_info.events_fn.?();
+            for (events) |event_name| {
+                if (out.items.len > 0) out.append(allocator, '\n') catch unreachable;
+                const input = if (scope_info.input_fn) |f| f(event_name) orelse &.{} else &.{};
+                wireSignatureLine(&out, allocator, event_name, input);
+                // What the verb mints — the produce edge a `<state>` arg
+                // elsewhere consumes, from the spec table the pool enforces.
+                if (scope_info.creates_spec_fn) |cs| wireMintSuffix(&out, allocator, cs(event_name));
+                // The outcome contract — the branch names an arm must spell.
+                if (scope_info.branches_fn) |bf| wireBranchSuffix(&out, allocator, bf(event_name));
+            }
+            return .{ .ok = out.toOwnedSlice(allocator) catch unreachable };
+        }
+    }
+    return .{ .not_found = .{} };
+}
+
+// ============================================================================
+// SCOPE-MANIFEST - Serve a scope's vocabulary as a data contract (JSON)
+//
+// The manifest record is minted at scope creation (register) from the same
+// EventEntry data the dispatch tables are emitted from; this tor serializes
+// it to JSON so a running program can serve it as a contract endpoint
+// (Orisha) or hand it to a tool. The emitted JSON has no hand-authored bytes:
+// every field derives from the scope declaration, so the served contract and
+// the enforcement cannot drift. Defined flows (session growth) are NOT part
+// of this record — it is the compiled base, minted before any session exists.
+
+// @retain: scope_manifest_event is referenced from generated Zig code in user
+// pipelines (Orisha serves it as the .json endpoint; explain consumes it).
+~[retain]pub tor scope-manifest { name: string }
+| ok string
+| not-found
+
+~proc scope-manifest|zig {
+    inline for (comptime buildScopeTable()) |scope_info| {
+        if (std.mem.eql(u8, name, scope_info.name)) {
+            const m = scope_info.manifest orelse {
+                std.debug.print("[RUNTIME] scope '{s}' has no manifest record\n", .{name});
+                return .{ .not_found = .{} };
+            };
+            var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            const allocator = arena_state.allocator();
+            const json = scopeManifestToJson(allocator, m) catch return .{ .not_found = .{} };
+            return .{ .ok = json };
+        }
+    }
+    return .{ .not_found = .{} };
+}
+
+// ============================================================================
+// SCOPE-GRAMMAR - the wire grammar, rendered from the register block
+//
+// The third render from the scope table, and the one that closes the R2
+// loop: scope-vocabulary tells a model WHAT it may call, scope-manifest
+// serves it as data, and scope-grammar teaches HOW a call is written — the
+// wire's shape rules (the constant half, WIRE_GRAMMAR_TEXT, kept beside the
+// parser that enforces it) above this scope's own verb lines (rendered by
+// scope-vocabulary, so the signatures cannot drift from enforcement either).
+// A prompt built from this render and a turn judged by parse.wire are the
+// same declaration read twice: the lesson and the law.
+
+// @retain: scope_grammar_event is referenced from generated Zig code in user
+// pipelines (kopium's agent prompt is built from it).
+~[retain]pub tor scope-grammar { name: string }
+| ok string
+| not-found
+
+~proc scope-grammar|zig {
+    inline for (comptime buildScopeTable()) |scope_info| {
+        if (std.mem.eql(u8, name, scope_info.name)) {
+            var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            const allocator = arena_state.allocator();
+            var out = std.ArrayList(u8).initCapacity(allocator, 512) catch unreachable;
+            out.appendSlice(allocator, wireGrammarRules(allocator, scope_info.manifest)) catch unreachable;
+            out.appendSlice(allocator, "\n\nYour vocabulary:\n") catch unreachable;
+            switch (scope_vocabulary_event.handler(.{ .name = name })) {
+                .ok => |v| out.appendSlice(allocator, v) catch unreachable,
+                .not_found => unreachable, // the inline-for already matched this scope
+            }
+            return .{ .ok = out.toOwnedSlice(allocator) catch unreachable };
+        }
+    }
+    return .{ .not_found = .{} };
+}
+
+// ============================================================================
+// EXPLAIN-RUNTIME - the `[explainer]` for the scope registry
+//
+// koruc's `koru_explain_gather` calls every discovered `[explainer]` once with
+// the program AST; the `explain` command renders whatever this returns. This
+// explainer builds every registered scope's manifest through the SAME shared
+// producer (`scopeManifestForScope`) the register emission uses, then reports:
+// a note (the human vocabulary lines) plus a `manifest` property carrying the
+// EXACT JSON the `scope-manifest` tor serves — so `explain` shows the served
+// contract bytes, never a hand-written copy.
+
+// @retain: explain_runtime_event is referenced from generated code (koruc's
+// koru_explain_gather invokes every discovered [explainer]).
+~[comptime|explainer]pub tor explain-runtime {
+    program: *const ast.Program,
+    allocator: std.mem.Allocator
+} -> ExplainReport
+
+~proc explain-runtime|zig {
+    const ast_mod = @import("ast");
+    const CompilerEnvRt = @import("root").CompilerEnv;
+    const debug_enabled = CompilerEnvRt.hasFlag("debug");
+
+    const scope_defs = RegistryHelper.collectScopeDefs(allocator, program);
+    var names = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
+    for (scope_defs) |def| {
+        var dup = false;
+        for (names.items) |n| if (std.mem.eql(u8, n, def.name)) {
+            dup = true;
+            break;
+        };
+        if (!dup) names.append(allocator, def.name) catch continue;
+    }
+
+    if (names.items.len == 0) {
+        var entries = std.ArrayList(ast_mod.ExplainReport.Entry){ .items = &.{}, .capacity = 0 };
+        entries.append(allocator, .{ .note = "no scopes registered — declare one with std/runtime:register(scope: \"...\") { open(1) close(1) }" }) catch {};
+        var sections = std.ArrayList(ast_mod.ExplainReport.Section){ .items = &.{}, .capacity = 0 };
+        sections.append(allocator, .{ .heading = "scopes", .entries = entries.toOwnedSlice(allocator) catch &.{} }) catch {};
+        return .{ .title = "std/runtime", .sections = sections.toOwnedSlice(allocator) catch &.{} };
+    }
+
+    var sections = std.ArrayList(ast_mod.ExplainReport.Section){ .items = &.{}, .capacity = 0 };
+    for (names.items) |name| {
+        const manifest = scopeManifestForScope(allocator, program, name, debug_enabled);
+        const text = scopeManifestToText(allocator, &manifest);
+        const json = scopeManifestToJson(allocator, &manifest) catch "";
+
+        var entries = std.ArrayList(ast_mod.ExplainReport.Entry){ .items = &.{}, .capacity = 0 };
+        entries.append(allocator, .{ .note = text }) catch continue;
+        entries.append(allocator, .{ .property = .{ .key = "manifest", .value = .{ .string = json } } }) catch continue;
+
+        sections.append(allocator, .{
+            .heading = name,
+            .entries = entries.toOwnedSlice(allocator) catch &.{},
+        }) catch continue;
+    }
+
+    return .{
+        .title = "std/runtime",
+        .sections = sections.toOwnedSlice(allocator) catch &.{},
+    };
+}
+
+// Internal helper: Look up tor branches for shape validation
+fn lookupEventBranches(scope_name: []const u8, event_name: []const u8) []const BranchSpec {
+    inline for (comptime buildScopeTable()) |scope_info| {
+        if (std.mem.eql(u8, scope_name, scope_info.name)) {
+            if (scope_info.branches_fn) |branches_fn| {
+                return branches_fn(event_name);
+            }
+        }
+    }
+    return &[_]BranchSpec{};
+}
+
+// ============================================================================
+// PARSE - Parse interpreter source without executing it
+//
+// Delegates to `std/interpreter:parse`, which is the interpreter's own parser.
+// It takes no file name on purpose: interpreted source has no file, therefore
+// no host half and no ``. This entry point used to hold a copy of the
+// COMPILER's file parser (`std/koru:parse.source`), which derives its
+// host/pure mode from the filename extension — so a synthetic `"x.kz"`
+// silently put interpreted source in host mode and made `` mandatory, the
+// exact inverse of the rule `run` enforces.
+
+~pub tor parse.source {
+    source: string,
+    allocator: std.mem.Allocator
+}
+| parsed *const ast.Flow
+| parse-error { message: string, line: u32, column: u32 }
+
+~proc parse.source|zig {
+    const interpreter_mod = @import("root").koru_std.koru_interpreter;
+
+    return switch (interpreter_mod.parse_event.handler(.{
+        .source = source,
+        .allocator = allocator,
+    })) {
+        .flow => |f| .{ .parsed = f },
+        .parse_error => |e| .{ .parse_error = .{
+            .message = e.message,
+            .line = e.line,
+            .column = e.column,
+        }},
+    };
+}
+// RUN - Parse and execute Koru source against a named scope
+// shape: Optional tor name to validate response shape against
+// @retain: run_event is referenced from generated Zig code in user pipelines (std/runtime:run invocations in continuations compile to run_event.handler(...))
+~part eval
+~part parsewire
+~part example
+~part run
+~part runcached
+~part outcome
+~part specs
+~part wireval
+~part wirescan
+~part wirecap
+~part wirelex
+~part obtainvia
+~part affordances
+~part manifest
+~part wiretext
+~part contract
+~part registry

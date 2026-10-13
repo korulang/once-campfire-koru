@@ -1,0 +1,691 @@
+// rules.kz — the CLAIMS REGISTRY for Koru
+//
+// A claim is something an author asserts about a declaration, written in the
+// vertical annotation block where the reader already is:
+//
+//   [
+//   - measured no-alloc-in-kernel
+//     This variant compiles the kernel body to a compute shader; the shape is
+//     checked by running it, not by inspection.
+//   ]proc compute|gpu { ... }
+//
+// The entry is the machine's half — a STAMP and an optional RULE NAME. The
+// prose underneath is the reader's half. They live in one block, so they cannot
+// drift apart.
+//
+//   koruc main.k claims          # the census, per stamp
+//   koruc main.k claims json     # the export
+//   koruc main.k assumes build   # what a declaration's flows rest on
+//   koruc main.k assumes build json
+//
+// WHO OWNS WHAT. The compiler carries an opaque entry list and, since the prose
+// change, the prose beside it; it does not know the word "claim". This module
+// defines the vocabulary — which words are stamps, what a key is, what counts
+// as a collision — and it errs loudly AS ITSELF when it evaluates something it
+// cannot (the consumer-relative-rejection rule from
+// frag-annotation-entries-are-expressions). A different module may ship a
+// different vocabulary over the same annotations and get identical support.
+//
+// WHAT THIS DOES NOT DO. It never judges whether a claim is TRUE. `proven` and
+// `measured` are discharged by runners; `inferred` is discharged by whatever
+// external engine the author points at the export. This module only guarantees
+// that every claim has a unique key, so an engine that judges one can say which
+// one it judged.
+//
+// `assumes` walks the CALL GRAPH instead of the annotation list. Literature:
+// Lean's `#print axioms`. Point at a declaration; get the transitive set of
+// declarations its flows can reach, graded by what each callee asserts about
+// itself — and, first-class, which reached declarations assert NOTHING. A
+// `measured` flow that calls five unclaimed things is telling you its
+// measurement did not cover them. The audit never judges truth; it reports
+// reach, and reach is a fact about the program, not a belief about it.
+
+~import std/compiler
+
+~[comptime]
+
+const std = @import("std");
+const ast = @import("ast");
+
+// ============================================================
+// SHARED VOCABULARY — one definition, every command
+// ============================================================
+
+/// The stamps THIS module ships. A stamp says how well the claim is currently
+/// known, never whether it holds. The ladder runs proven (the type system
+/// discharged it) → measured (something ran) → inferred (something declared
+/// it) → aspirational (nothing yet — the honest undischarged claim).
+const STAMPS = [_][]const u8{ "proven", "measured", "inferred", "aspirational" };
+
+const Claim = struct {
+    kind: []const u8, // "tor" (the contract) or "proc" (one implementation)
+    module: []const u8,
+    subject: []const u8,
+    variant: []const u8, // proc target, e.g. "zig(optimized)"; "" for a tor
+    stamp: []const u8,
+    rule: []const u8, // "" when the stamp names no rule
+    prose: []const u8,
+    file: []const u8,
+    line: usize,
+};
+
+/// An entry is a claim when its first word is one of our stamps. Every other
+/// entry belongs to some other consumer and is passed over in silence — the
+/// layering forbids this module having an opinion about `pure`, `comptime`,
+/// or anything else it did not define.
+const ClaimSplit = struct {
+    stamp: []const u8,
+    rule: []const u8,
+};
+
+fn claimSplit(entry: []const u8) ?ClaimSplit {
+    const trimmed = std.mem.trim(u8, entry, " \t");
+    const space = std.mem.indexOfAny(u8, trimmed, " \t");
+    const head = if (space) |si| trimmed[0..si] else trimmed;
+    for (STAMPS) |stamp| {
+        if (std.mem.eql(u8, head, stamp)) {
+            const rule = if (space) |si| std.mem.trim(u8, trimmed[si..], " \t") else "";
+            return .{ .stamp = stamp, .rule = rule };
+        }
+    }
+    return null;
+}
+
+fn dottedPath(alloc: std.mem.Allocator, p: *const ast.DottedPath) []const u8 {
+    var buf = std.ArrayList(u8){};
+    for (p.segments, 0..) |seg, i| {
+        if (i > 0) buf.append(alloc, '.') catch unreachable;
+        buf.appendSlice(alloc, seg) catch unreachable;
+    }
+    return buf.items;
+}
+
+/// "module:subject" for a dotted path — the canonical key every consumer
+/// compares on.
+fn pathKey(alloc: std.mem.Allocator, module: ?[]const u8, p: *const ast.DottedPath) []const u8 {
+    const subj = dottedPath(alloc, p);
+    var buf = std.ArrayList(u8){};
+    if (module) |mq| {
+        buf.appendSlice(alloc, mq) catch unreachable;
+        buf.append(alloc, ':') catch unreachable;
+    }
+    buf.appendSlice(alloc, subj) catch unreachable;
+    return buf.items;
+}
+
+fn claimFull(alloc: std.mem.Allocator, c: Claim) []const u8 {
+    var buf = std.ArrayList(u8){};
+    buf.appendSlice(alloc, c.module) catch unreachable;
+    buf.append(alloc, ':') catch unreachable;
+    buf.appendSlice(alloc, c.subject) catch unreachable;
+    return buf.items;
+}
+
+/// Collect every claim on every declaration, descending through module_decl
+/// (an imported library's claims are visible, never silently dropped).
+fn collectClaims(alloc: std.mem.Allocator, list: []const ast.Item, out: *std.ArrayList(Claim)) void {
+    for (list) |*it| switch (it.*) {
+        .module_decl => |m| collectClaims(alloc, m.items, out),
+        .event_decl => |e| {
+            for (e.annotations) |entry| {
+                const parts = claimSplit(entry) orelse continue;
+                out.append(alloc, .{
+                    .kind = "tor",
+                    .module = e.module,
+                    .subject = dottedPath(alloc, &e.path),
+                    .variant = "",
+                    .stamp = parts.stamp,
+                    .rule = parts.rule,
+                    .prose = e.prose,
+                    .file = e.location.file,
+                    .line = e.location.line,
+                }) catch unreachable;
+            }
+        },
+        .proc_decl => |p| {
+            for (p.annotations) |entry| {
+                const parts = claimSplit(entry) orelse continue;
+                out.append(alloc, .{
+                    .kind = "proc",
+                    .module = p.module,
+                    .subject = dottedPath(alloc, &p.path),
+                    .variant = p.target orelse "",
+                    .stamp = parts.stamp,
+                    .rule = parts.rule,
+                    .prose = p.prose,
+                    .file = p.location.file,
+                    .line = p.location.line,
+                }) catch unreachable;
+            }
+        },
+        else => {},
+    };
+}
+
+fn printJson(v: []const u8) void {
+    std.debug.print("\"", .{});
+    for (v) |c| switch (c) {
+        '"' => std.debug.print("\\\"", .{}),
+        '\\' => std.debug.print("\\\\", .{}),
+        '\n' => std.debug.print("\\n", .{}),
+        '\t' => std.debug.print("\\t", .{}),
+        else => std.debug.print("{c}", .{c}),
+    };
+    std.debug.print("\"", .{});
+}
+
+// ============================================================
+// THE CLAIMS COMMAND — the census
+// ============================================================
+
+~std/compiler:command.declare {
+    "name": "claims",
+    "description": "List every claim in the program and detect duplicate claim keys"
+}
+
+~[comptime|command]pub tor claims {
+    program: *const std/compiler:Program,
+    allocator: __koru_std.mem.Allocator,
+    argv: []string,
+}
+
+~proc claims|zig {
+    var format: []const u8 = "text";
+    if (argv.len > 0) {
+        const fmt = argv[0];
+        if (std.mem.eql(u8, fmt, "text") or std.mem.eql(u8, fmt, "json")) {
+            format = fmt;
+        } else {
+            std.debug.print("claims: unknown format '{s}' — expected text | json\n", .{fmt});
+            std.process.exit(2);
+        }
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var claims_found = std.ArrayList(Claim){};
+    collectClaims(arena_alloc, program.items, &claims_found);
+    const found = claims_found.items;
+
+    // ── the key, and the crash ────────────────────────────────────────────
+    //
+    // The key is kind + module + subject + VARIANT + rule. The variant is not
+    // decoration: `proc compute|zig` and `proc compute|gpu` are two different
+    // implementations of one contract (370_VARIANTS/8201_variants_basic
+    // declares three), and each deserves its own claim. Drop the variant from
+    // the key and they collide — which is exactly what this check exists to
+    // catch, including in the design of the key itself.
+    const sameKey = struct {
+        fn call(a: Claim, b: Claim) bool {
+            return std.mem.eql(u8, a.kind, b.kind) and
+                std.mem.eql(u8, a.module, b.module) and
+                std.mem.eql(u8, a.subject, b.subject) and
+                std.mem.eql(u8, a.variant, b.variant) and
+                std.mem.eql(u8, a.rule, b.rule);
+        }
+    }.call;
+
+    var crashes: usize = 0;
+    for (found, 0..) |claim, i| {
+        for (found[0..i]) |earlier| {
+            if (!sameKey(claim, earlier)) continue;
+            crashes += 1;
+            const rule_label = if (claim.rule.len == 0) "<unnamed>" else claim.rule;
+            std.debug.print(
+                "error: duplicate claim key — {s} {s}:{s}{s}{s} already claims rule '{s}'\n" ++
+                    "  first  --> {s}:{d}  [{s}]\n" ++
+                    "  second --> {s}:{d}  [{s}]\n" ++
+                    "  a claim key is kind + module + subject + variant + rule; two claims on one\n" ++
+                    "  key cannot both be answered, and an external judgment could not say which it\n" ++
+                    "  judged. Make them distinct.\n",
+                .{ claim.kind, claim.module, claim.subject, if (claim.variant.len > 0) "|" else "", claim.variant, rule_label, earlier.file, earlier.line, earlier.stamp, claim.file, claim.line, claim.stamp },
+            );
+        }
+    }
+
+    if (std.mem.eql(u8, format, "json")) {
+        std.debug.print("{{\"claims\":[", .{});
+        for (found, 0..) |c, i| {
+            if (i > 0) std.debug.print(",", .{});
+            std.debug.print(
+                "{{\"kind\":\"{s}\",\"module\":\"{s}\",\"subject\":\"{s}\",\"variant\":\"{s}\"," ++
+                    "\"stamp\":\"{s}\",\"rule\":\"{s}\",\"file\":\"{s}\",\"line\":{d},\"prose\":",
+                .{ c.kind, c.module, c.subject, c.variant, c.stamp, c.rule, c.file, c.line },
+            );
+            printJson(c.prose);
+            std.debug.print("}}", .{});
+        }
+        std.debug.print("],\"key_collisions\":{d}}}\n", .{crashes});
+        if (crashes > 0) std.process.exit(1);
+        return;
+    }
+
+    if (found.len == 0) {
+        std.debug.print("📋 claims — none. Authors make one with a stamp in a vertical annotation block:\n", .{});
+        std.debug.print("   ~[\\n   - aspirational\\n     why this is not discharged yet\\n   ]tor thing {{}}\n", .{});
+        return;
+    }
+
+    std.debug.print("📋 claims — {d} in this program\n\n", .{found.len});
+    for (STAMPS) |stamp| {
+        var count: usize = 0;
+        for (found) |c| {
+            if (std.mem.eql(u8, c.stamp, stamp)) count += 1;
+        }
+        if (count == 0) continue;
+        std.debug.print("{s} ({d})\n", .{ stamp, count });
+        for (found) |c| {
+            if (!std.mem.eql(u8, c.stamp, stamp)) continue;
+            const sep = if (c.variant.len > 0) "|" else "";
+            const rule_label = if (c.rule.len == 0) "" else c.rule;
+            std.debug.print("  {s} {s}:{s}{s}{s}", .{ c.kind, c.module, c.subject, sep, c.variant });
+            if (rule_label.len > 0) std.debug.print("  → {s}", .{rule_label});
+            std.debug.print("\n      {s}:{d}\n", .{ c.file, c.line });
+            if (c.prose.len > 0) {
+                var lines = std.mem.splitScalar(u8, c.prose, '\n');
+                while (lines.next()) |line| std.debug.print("      │ {s}\n", .{line});
+            }
+        }
+        std.debug.print("\n", .{});
+    }
+
+    if (crashes > 0) {
+        std.debug.print("{d} duplicate claim key(s) — the export cannot be trusted until they\n", .{crashes});
+        std.debug.print("are distinct. Fix the claims, then re-run.\n", .{});
+        std.process.exit(1);
+    }
+}
+
+// ============================================================
+// THE ASSUMES COMMAND — the transitive closure
+// ============================================================
+
+~std/compiler:command.declare {
+    "name": "assumes",
+    "description": "List the transitive call closure of a declaration, graded by claims"
+}
+
+~[comptime|command]pub tor assumes {
+    program: *const std/compiler:Program,
+    allocator: __koru_std.mem.Allocator,
+    argv: []string,
+}
+
+~proc assumes|zig {
+    // `assumes <subject> [text|json]`
+    //
+    // SUBJECT. A dotted path, or a bare name when unambiguous across modules:
+    //
+    //   koruc main.k assumes build              # any module's build, else error
+    //   koruc main.k assumes main:build         # qualified
+    //
+    // WALK. The scope of "rests on" is the program's flows: resolve the
+    // subject to a declaration key; expand that key to the flows that
+    // implement it (a flow item's `impl_of` names the tor it implements —
+    // the subflow `build = ...` carries impl_of = build; for flows without an
+    // impl_of, the head invocation names the contract); walk every flow body
+    // for invocations; every reached declaration is reported with its stamp —
+    // or conspicuously without one. visited guards the cycles a transitive
+    // closure always contains.
+    //
+    // It does not judge. It does not gate. It reports reach; what to do
+    // about an unclaimed callee belongs to a consumer.
+
+    if (argv.len == 0) {
+        std.debug.print("assumes: a subject is required — e.g. `koruc main.k assumes build`\n", .{});
+        std.process.exit(2);
+    }
+    var format: []const u8 = "text";
+    const subject_arg = argv[0];
+    if (argv.len > 1) {
+        const fmt = argv[1];
+        if (std.mem.eql(u8, fmt, "text") or std.mem.eql(u8, fmt, "json")) {
+            format = fmt;
+        } else {
+            std.debug.print("assumes: unknown format '{s}' — expected text | json\n", .{fmt});
+            std.process.exit(2);
+        }
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Index: every tor and proc key (the reachable declarations).
+    var event_keys = std.ArrayList([]const u8){};
+    var proc_keys = std.ArrayList([]const u8){};
+    var claims_all = std.ArrayList(Claim){};
+    collectClaims(aa, program.items, &claims_all);
+    const claims = claims_all.items;
+
+    const keyAdd = struct {
+        fn call(list: *std.ArrayList([]const u8), alloc: std.mem.Allocator, key: []const u8) void {
+            for (list.items) |k| if (std.mem.eql(u8, k, key)) return;
+            list.append(alloc, key) catch unreachable;
+        }
+    }.call;
+    {
+        var stack = std.ArrayList([]const ast.Item){};
+        stack.append(aa, program.items) catch unreachable;
+        while (stack.items.len > 0) {
+            const items = stack.pop().?;
+            for (items) |*it| switch (it.*) {
+                .module_decl => |m| stack.append(aa, m.items) catch unreachable,
+                .event_decl => |e| keyAdd(&event_keys, aa, pathKey(aa, e.module, &e.path)),
+                .proc_decl => |p| keyAdd(&proc_keys, aa, pathKey(aa, p.module, &p.path)),
+                else => {},
+            };
+        }
+    }
+
+    // Subject: bare name (last path segment) or full key, unambiguous.
+    var subject_full: []const u8 = "";
+    {
+        const isCandidate = struct {
+            fn call(k: []const u8, subj: []const u8) bool {
+                const colon = std.mem.lastIndexOfScalar(u8, k, ':');
+                const tail = if (colon) |ci| k[ci + 1 ..] else k;
+                return std.mem.eql(u8, tail, subj) or std.mem.eql(u8, k, subj);
+            }
+        }.call;
+        var matches: usize = 0;
+        for (event_keys.items) |k| {
+            if (isCandidate(k, subject_arg)) {
+                matches += 1;
+                subject_full = k;
+            }
+        }
+        for (proc_keys.items) |k| {
+            if (isCandidate(k, subject_arg)) {
+                matches += 1;
+                subject_full = k;
+            }
+        }
+        if (matches == 0) {
+            std.debug.print("assumes: no declaration '{s}' in this program\n", .{subject_arg});
+            std.process.exit(2);
+        }
+        if (matches > 1) {
+            std.debug.print("assumes: '{s}' is ambiguous ({d} candidates) — qualify it (module:name)\n", .{ subject_arg, matches });
+            std.process.exit(2);
+        }
+    }
+
+    // ── reachability over flows ────────────────────────────────────────────
+    const flows = ast.allFlows(aa, program);
+    defer _ = aa.free(flows);
+
+    // One owner->callee edge of the reach graph, recorded while a flow body
+    // is walked. `Edge` must be declared BEFORE walkBody (its signature names
+    // it), which is why it lives beside headKey rather than at the grade step.
+    const Edge = struct {
+        from: []const u8,
+        to: []const u8,
+    };
+
+    const headKey = struct {
+        fn call(f: *const ast.Flow, aa_param: std.mem.Allocator) []const u8 {
+            // A flow item's contract is its `impl_of` (the tor it
+            // implements); for flows without one, the head invocation names
+            // it. The head itself is the FIRST CALL in the body (the `~for`
+            // in `build = ~for(...)`), so it is the contract only for
+            // head-less flows.
+            if (f.impl_of) |io| {
+                return pathKey(aa_param, io.module_qualifier, &io);
+            }
+            const head = f.inv();
+            return pathKey(aa_param, head.path.module_qualifier, &head.path);
+        }
+    }.call;
+
+    var visited = std.StringHashMapUnmanaged(void){};
+    var order = std.ArrayList([]const u8){};
+    var frontier = std.ArrayList([]const u8){};
+
+    // visit — mark a key reached in discovery order; declared keys that may
+    // have bodies of their own go to the frontier for expansion. Everything
+    // comes in as parameters: nested structs cannot capture the proc's locals.
+    const visitKey = struct {
+        fn call(
+            key: []const u8,
+            aa_param: std.mem.Allocator,
+            visited_param: *std.StringHashMapUnmanaged(void),
+            order_param: *std.ArrayList([]const u8),
+            frontier_param: *std.ArrayList([]const u8),
+            event_keys_param: []const []const u8,
+            proc_keys_param: []const []const u8,
+        ) void {
+            if (key.len == 0) return;
+            if (visited_param.contains(key)) return;
+            visited_param.put(aa_param, key, {}) catch unreachable;
+            order_param.append(aa_param, key) catch unreachable;
+            var declared = false;
+            for (event_keys_param) |k| {
+                if (std.mem.eql(u8, k, key)) declared = true;
+            }
+            for (proc_keys_param) |k| {
+                if (std.mem.eql(u8, k, key)) declared = true;
+            }
+            if (declared) frontier_param.append(aa_param, key) catch unreachable;
+        }
+    }.call;
+
+    // walkBody — walk one flow's body as a continuation worklist; every
+    // invocation inside becomes a callee key (via visitKey). Branch bodies
+    // join the worklist; labelled invocations and legacy conditional blocks
+    // pass their inner invocation through.
+    const walkBody = struct {
+        fn call(
+            f: *const ast.Flow,
+            owner: []const u8,
+            aa_param: std.mem.Allocator,
+            visited_param: *std.StringHashMapUnmanaged(void),
+            order_param: *std.ArrayList([]const u8),
+            frontier_param: *std.ArrayList([]const u8),
+            event_keys_param: []const []const u8,
+            proc_keys_param: []const []const u8,
+            edges_param: *std.ArrayList(Edge),
+        ) void {
+            var cont_stack = std.ArrayList(ast.Continuation){};
+            cont_stack.append(aa_param, f.body) catch unreachable;
+            while (cont_stack.items.len > 0) {
+                const c = cont_stack.pop().?;
+                if (c.node) |n| switch (n) {
+                    .invocation => |inv| {
+                        const k = pathKey(aa_param, inv.path.module_qualifier, &inv.path);
+                        visitKey(k, aa_param, visited_param, order_param, frontier_param, event_keys_param, proc_keys_param);
+                        edges_param.append(aa_param, .{ .from = owner, .to = k }) catch unreachable;
+                    },
+                    .label_with_invocation => |lwi| {
+                        const k = pathKey(aa_param, lwi.invocation.path.module_qualifier, &lwi.invocation.path);
+                        visitKey(k, aa_param, visited_param, order_param, frontier_param, event_keys_param, proc_keys_param);
+                        edges_param.append(aa_param, .{ .from = owner, .to = k }) catch unreachable;
+                    },
+                    .foreach => |fe| for (fe.branches) |br| for (br.body) |cc| cont_stack.append(aa_param, cc) catch unreachable,
+                    .conditional => |cd| for (cd.branches) |br| for (br.body) |cc| cont_stack.append(aa_param, cc) catch unreachable,
+                    .switch_result => |sr| for (sr.branches) |br| for (br.body) |cc| cont_stack.append(aa_param, cc) catch unreachable,
+                    .conditional_block => |cb| for (cb.nodes) |nd| switch (nd) {
+                        .invocation => |inv| {
+                            const k = pathKey(aa_param, inv.path.module_qualifier, &inv.path);
+                            visitKey(k, aa_param, visited_param, order_param, frontier_param, event_keys_param, proc_keys_param);
+                            edges_param.append(aa_param, .{ .from = owner, .to = k }) catch unreachable;
+                        },
+                        else => {},
+                    },
+                    else => {},
+                };
+                for (c.continuations) |cc| cont_stack.append(aa_param, cc) catch unreachable;
+            }
+        }
+    }.call;
+
+    // ── the effective grade: what the closure RESTS ON ────────────────────
+    // The authored stamp is a fact about one declaration in isolation. The
+    // effective grade is a fact about the closure: the weakest claim anywhere
+    // beneath a key, computed over the reach edges just walked. Lean's
+    // `#print axioms` shows `[sorryAx]` under a theorem that uses `sorry`;
+    // this is the Koru analogue — a `proven` claim whose closure contains an
+    // `aspirational` or `unclaimed` callee presents an effective grade below
+    // `proven`. The authored stamp is never overridden.
+    var edges = std.ArrayList(Edge){};
+
+    // seed the subject, then expand the frontier: every flow whose head key
+    // matches a frontier key gets its body walked (enqueuing real callees
+    // and recording the owner->callee edge for the grade computation).
+    visitKey(subject_full, aa, &visited, &order, &frontier, event_keys.items, proc_keys.items);
+    while (frontier.items.len > 0) {
+        const key = frontier.pop().?;
+        for (flows) |*f| {
+            if (!std.mem.eql(u8, headKey(f, aa), key)) continue;
+            walkBody(f, key, aa, &visited, &order, &frontier, event_keys.items, proc_keys.items, &edges);
+        }
+    }
+
+    // ── the effective grade: what the closure RESTS ON ─────────────────
+    // The authored stamp is a fact about ONE declaration in isolation. The
+    // effective grade is a fact about the CLOSURE: the weakest claim anywhere
+    // beneath a key, per Lean's `#print axioms` showing [sorryAx]. A
+    // `proven` claim whose closure contains an aspirational/unclaimed callee
+    // presents an effective grade below `proven` — the authored stamp is
+    // never overridden.
+    //
+    // Ladder, weakest first: unclaimed(0) < aspirational(1) < inferred(2) <
+    // measured(3) < proven(4). effective(key) = min(own rank, effective of
+    // every callee in the reach edges). The walk visited each key ONCE, so
+    // the edge graph is a DAG and the memo needs no cycle guard.
+
+    const LADDER = [_][]const u8{ "unclaimed", "aspirational", "inferred", "measured", "proven" };
+    const rankOf = struct {
+        fn call(stamp: []const u8) usize {
+            for (LADDER, 0..) |label, r| {
+                if (std.mem.eql(u8, stamp, label)) return r;
+            }
+            return 0;
+        }
+    }.call;
+    const labelOf = struct {
+        fn call(r: usize) []const u8 {
+            if (r < LADDER.len) return LADDER[r];
+            return "unclaimed";
+        }
+    }.call;
+
+    const Grade = struct {
+        aa_param: std.mem.Allocator,
+        keys_param: []const []const u8,
+        edges_param: []const Edge,
+        claims_param: []const Claim,
+    };
+    // The grade is the weak link of a key's SUBTREE. The walk visited each
+    // key exactly once in `order`, so the edges form a DAG; a post-order
+    // fold over that DAG computes every grade without recursion (Zig nested
+    // consts cannot self-reference, and an iterative fold needs no cycle
+    // guard for the same DAG reason). DFS with an explicit exit stack.
+    const gradeOfAll = struct {
+        fn call(
+            g: *const Grade,
+            memo: *std.StringHashMapUnmanaged(usize),
+        ) void {
+            // enter/exit phases; only leaf keys (no outgoing edges) finalise
+            // first, so every callee's grade is final before its caller's.
+            var stack = std.ArrayList(struct { key: []const u8, done: bool }){};
+            var visit = std.StringHashMapUnmanaged(void){};
+            for (g.keys_param) |root| {
+                if (memo.contains(root)) continue;
+                visit.put(g.aa_param, root, {}) catch unreachable;
+                stack.append(g.aa_param, .{ .key = root, .done = false }) catch unreachable;
+                while (stack.items.len > 0) {
+                    const top = stack.pop().?;
+                    if (top.done) {
+                        // finalise: min over own rank + final callee grades
+                        var best: usize = 0;
+                        for (g.claims_param) |c| {
+                            if (!std.mem.eql(u8, claimFull(g.aa_param, c), top.key)) continue;
+                            const r = rankOf(c.stamp);
+                            if (r > best) best = r;
+                        }
+                        var through: usize = best;
+                        for (g.edges_param) |e| {
+                            if (!std.mem.eql(u8, e.from, top.key)) continue;
+                            const cr = memo.get(e.to) orelse continue;
+                            if (cr < through) through = cr;
+                        }
+                        memo.put(g.aa_param, top.key, through) catch unreachable;
+                    } else {
+                        stack.append(g.aa_param, .{ .key = top.key, .done = true }) catch unreachable;
+                        for (g.edges_param) |e| {
+                            if (!std.mem.eql(u8, e.from, top.key)) continue;
+                            if (memo.contains(e.to)) continue;
+                            if (visit.contains(e.to)) continue;
+                            visit.put(g.aa_param, e.to, {}) catch unreachable;
+                            stack.append(g.aa_param, .{ .key = e.to, .done = false }) catch unreachable;
+                        }
+                    }
+                }
+            }
+        }
+    }.call;
+
+    var eff_memo = std.StringHashMapUnmanaged(usize){};
+    gradeOfAll(&.{ .aa_param = aa, .keys_param = order.items, .edges_param = edges.items, .claims_param = claims }, &eff_memo);
+
+    // ── render ─────────────────────────────
+    if (std.mem.eql(u8, format, "json")) {
+        std.debug.print("{{\"subject\":", .{});
+        printJson(subject_full);
+        std.debug.print(",\"reaches\":[", .{});
+        var first = true;
+        for (order.items) |key| {
+            const eff = eff_memo.get(key) orelse 0;
+            const eff_label = labelOf(eff);
+            var any_claim = false;
+            for (claims) |c| {
+                if (!std.mem.eql(u8, claimFull(aa, c), key)) continue;
+                if (!first) std.debug.print(",", .{});
+                first = false;
+                any_claim = true;
+                std.debug.print("{{\"key\":", .{});
+                printJson(key);
+                std.debug.print(",\"stamp\":", .{});
+                printJson(c.stamp);
+                std.debug.print(",\"effective\":", .{});
+                printJson(eff_label);
+                std.debug.print("}}", .{});
+            }
+            if (!any_claim) {
+                if (!first) std.debug.print(",", .{});
+                first = false;
+                std.debug.print("{{\"key\":", .{});
+                printJson(key);
+                std.debug.print(",\"stamp\":", .{});
+                printJson("unclaimed");
+                std.debug.print(",\"effective\":", .{});
+                printJson(eff_label);
+                std.debug.print("}}", .{});
+            }
+        }
+        std.debug.print("]}}\n", .{});
+        return;
+    }
+
+    std.debug.print("📋 assumes — {s}\n", .{subject_full});
+    if (order.items.len == 0) {
+        std.debug.print("  (nothing reachable)\n", .{});
+        return;
+    }
+    for (order.items) |key| {
+        var stamped = false;
+        const eff = eff_memo.get(key) orelse 0;
+        const eff_label = labelOf(eff);
+        for (claims) |c| {
+            if (std.mem.eql(u8, claimFull(aa, c), key)) {
+                std.debug.print("  {s}:{s}  [{s}] {s}\n", .{ c.module, c.subject, c.stamp, c.rule });
+                stamped = true;
+            }
+        }
+        if (!stamped) std.debug.print("  {s}  [unclaimed]\n", .{key});
+        std.debug.print("  ↓ effective: {s}\n", .{eff_label});
+    }
+}

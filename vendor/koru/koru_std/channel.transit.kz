@@ -1,0 +1,107 @@
+// Koru Standard Library: the `transit` part of channel — emission of the
+// custody pair and the consumer units. Joined via `~part transit` in
+// channel.kz; merged into the channel module.
+//
+// Detection lives in the custody part (which sends transit, under what
+// state); this half emits the machinery that carries it: `take`/`obligate`
+// per custodial kind, the `!`-arm units that mint via obligate, and the
+// take node injected under a custodial send's `| ok`.
+
+const CT = struct {
+
+    // Custody transit ops, per custodial kind: `take` consumes the
+    // producer's `<!state>` under `| ok` (injected by the send transform);
+    // `obligate` mints `<state!>` fresh at the consumer arm's head. The ring
+    // carries bytes; these carry custody.
+    //
+    // COMPOSITE rung (699_031): a kind whose proto declares owned leaves
+    // (`r1: *mod:Type<state!>`) transits one debt PER LEAF — `take` takes a
+    // `<!state>` param per leaf (`take(r1: e.r1, r2: e.r2)` settles each
+    // path), and `obligate` returns the bare proto so the checker's
+    // record-return seeding mints `v.r1`/`v.r2` at the arm. The runtime
+    // bodies stay no-ops; the signatures are the contract.
+    fn emitCustodyOps(alloc: std.mem.Allocator, prog: *const ast.Program, flow: *const ast.Flow, chan_name: []const u8, kinds: []const CH.KindEntry, custody: []const ?[]const u8, kind_leaves: []const []const CL.OwnedLeaf, appended: *std.ArrayList(ast.Item)) void {
+        for (kinds, 0..) |k, ki| {
+            const state = custody[ki];
+            const leaves = kind_leaves[ki];
+            if (state == null and leaves.len == 0) continue;
+            {
+                // take: whole-value param when a `<state!>` producer sent,
+                // plus one consuming param per owned leaf (channel.leaves).
+                const spec = CL.takeFields(alloc, k.proto, state, leaves);
+                CH.synthOp(alloc, prog, flow, std.fmt.allocPrint(alloc, "__channel_take_{s}_{s}", .{ chan_name, k.name }) catch unreachable, spec.fields, &.{}, null, null, spec.body, appended);
+            }
+            {
+                const of = alloc.alloc(ast.Field, 1) catch unreachable;
+                of[0] = ast.Field{
+                    .name = alloc.dupe(u8, "p") catch unreachable,
+                    .type = alloc.dupe(u8, k.proto) catch unreachable,
+                    .phantom = null,
+                };
+                // Composite mints per-path — the bare proto return resolves
+                // to its leaf list at the consumer (seedRecordFieldObligations
+                // reads `*mod:Type<state!>` leaves); a whole-value `<state!>`
+                // rides return_phantom as before.
+                const ret_ph: ?[]const u8 = if (state) |st|
+                    std.fmt.allocPrint(alloc, "{s}!", .{st}) catch unreachable
+                else
+                    null;
+                CH.synthOp(alloc, prog, flow, std.fmt.allocPrint(alloc, "__channel_obligate_{s}_{s}", .{ chan_name, k.name }) catch unreachable, of, &.{}, k.proto, ret_ph, "return p;", appended);
+                // The obligate mint is the transit boundary's receiving
+                // edge: its `<state!>` return is custody, not a plain
+                // obligation — a consumer arm that drops it must refuse
+                // (KORU030), never auto-settle at the leaf (699_027). The
+                // `custody` annotation is how the inserter knows. synthOp
+                // appends decl-then-proc, so the decl is items[len-2].
+                {
+                    const anns = alloc.alloc([]const u8, 2) catch unreachable;
+                    anns[0] = alloc.dupe(u8, "retain") catch unreachable;
+                    anns[1] = alloc.dupe(u8, "custody") catch unreachable;
+                    appended.items[appended.items.len - 2].event_decl.annotations = anns;
+                }
+            }
+        }
+    }
+
+    // The `!` arms as generated units live in channel.units.kz (CU) —
+    // a custodial kind's unit accepts a plain `__payload` and obligates it
+    // back to the arm's binding as its first step.
+
+    // A custodial kind dequeues into `__payload` (the unit obligates it onto
+    // the arm's own binding); plain kinds dequeue straight onto the binding.
+    fn stepFieldName(kinds: []const CH.KindEntry, custody: []const ?[]const u8, kind_leaves: []const []const CL.OwnedLeaf, kind: []const u8, binding: []const u8) []const u8 {
+        for (kinds, 0..) |k, ki| {
+            if (std.mem.eql(u8, k.name, kind) and (custody[ki] != null or kind_leaves[ki].len > 0)) return "__payload";
+        }
+        return binding;
+    }
+
+    // The `take` call node for a custodial send, or null when the sent value
+    // carries no issued obligation. Under a nested site the runner hands
+    // over a site VIEW: `flow` is synthetic, its body IS the send's holding
+    // continuation, and `site_of` points back into the real tree — the
+    // sent binding's producer lives upstream in the containing flow.
+    fn takeNode(alloc: std.mem.Allocator, prog: *const ast.Program, flow: *const ast.Flow, chan_name: []const u8, kind: CH.KindEntry, sent_value: []const u8) ?ast.Node {
+        const home: *const ast.Flow = if (flow.site_of) |h|
+            (ast_functional.containingFlow(prog, h) orelse flow)
+        else
+            flow;
+        const whole = CC.custodyOf(prog, home, sent_value) orelse null;
+        const leaves = CL.ownedLeavesOf(alloc, prog, kind.proto);
+        if (whole == null and leaves.len == 0) return null;
+        const take_name = std.fmt.allocPrint(alloc, "__channel_take_{s}_{s}", .{ chan_name, kind.name }) catch unreachable;
+        const take_segs = alloc.alloc([]const u8, 1) catch unreachable;
+        take_segs[0] = take_name;
+        const take_home = CHM.chanHome(alloc, prog, chan_name) orelse flow.module;
+        if (ast_functional.findEventDecl(prog, take_home, take_segs) == null) return null;
+        return ast.Node{ .invocation = ast.Invocation{
+            .path = ast.DottedPath{
+                .module_qualifier = alloc.dupe(u8, take_home) catch unreachable,
+                .segments = take_segs,
+            },
+            .args = CL.takeArgs(alloc, sent_value, whole, leaves),
+        } };
+    }
+
+
+};

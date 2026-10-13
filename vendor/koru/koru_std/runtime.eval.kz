@@ -1,0 +1,74 @@
+// Koru Standard Library: the eval part. Joined via `~part eval` in runtime.kz.
+
+// ============================================================================
+// EVAL - Run a parsed AST against a named scope
+// ============================================================================
+
+~pub tor eval {
+    flow: *const ast.Flow,
+    scope: string,
+    budget: ?u64,
+    handle_pool: ?*@import("root").koru_std.koru_interpreter.HandlePool,
+    auto_discharge: bool = true,
+    defined: ?*@import("root").koru_std.koru_interpreter.DefinedFlows = null
+}
+| result { value: @import("root").koru_std.koru_interpreter.Value, used: u64, handles: u32 }
+| unhandled-branch { branch: string, payload: string, handles: string }
+| exhausted { used: u64, last_event: string, handles: u32 }
+| validation-error string
+| event-denied string
+| dispatch-error { event_name: string, message: string }
+| scope-not-found string
+
+~proc eval|zig {
+    const interpreter_mod = @import("root").koru_std.koru_interpreter;
+
+    const scope_result = get_scope_event.handler(.{ .name = scope });
+    switch (scope_result) {
+        .scope => |s| {
+            const result = interpreter_mod.eval_event.handler(.{
+                .flow = flow,
+                .dispatcher = s.dispatcher,
+                .cost_fn = s.cost_fn,
+                .creates_obligations_fn = s.creates_obligations_fn,
+                .discharges_obligations_fn = s.discharges_obligations_fn,
+                .discharge_event_fn = s.discharge_event_fn,
+                .creates_spec_fn = s.creates_spec_fn,
+                .discharges_spec_fn = s.discharges_spec_fn,
+                .budget = budget,
+                .handle_pool = handle_pool,
+                .scope_name = scope,  // Pass actual scope name for handle isolation
+                .auto_discharge = auto_discharge,
+                .defined = defined,
+            });
+            switch (result) {
+                .result => |r| return .{ .result = .{
+                    .value = r.value,
+                    .used = r.used,
+                    .handles = r.handles,
+                } },
+                .unhandled_branch => |u| return .{ .unhandled_branch = .{
+                    .branch = u.branch,
+                    .payload = u.payload,
+                    .handles = u.handles,
+                } },
+                .exhausted => |e| return .{ .exhausted = .{
+                    .used = e.used,
+                    .last_event = e.last_event,
+                    .handles = e.handles,
+                } },
+                .validation_error => |e| return .{ .validation_error = e },
+                .dispatch_error => |e| {
+                    if (std.mem.eql(u8, e.message, "EventDenied")) {
+                        return .{ .event_denied = e.event_name };
+                    }
+                    return .{ .dispatch_error = .{
+                        .event_name = e.event_name,
+                        .message = e.message,
+                    } };
+                },
+            }
+        },
+        .not_found => return .{ .scope_not_found = scope },
+    }
+}

@@ -1,0 +1,25 @@
+// Koru Standard Library: the `wit` part of pump — joined via
+// `~part wit` in pump.kz; members land in koru_pump.
+//
+// Witness emission for join verb rows: each row's `at` carries the arm's
+// call-site hash, plus the `std/store:new` generator site when the callee is
+// synthesized — so a pump row resolves back through the door that minted it.
+
+const PW = struct {
+    const site_hash = @import("site_hash");
+
+    // One verb's report rows: the callee property, or refusal note +
+    // `<join>.<verb>.status` when the contract check failed.
+    fn emitVerb(alloc: std.mem.Allocator, entries: *std.ArrayList(ast.ExplainReport.Entry), sites: []const site_hash.Site, k: []const u8, ji: usize, vname: []const u8, v: PX.Verb) void {
+        var ptrs = std.ArrayList(usize).initCapacity(alloc, 2) catch unreachable;
+        if (v.site) |s| ptrs.append(alloc, @intFromPtr(s)) catch unreachable;
+        if (v.gen) |g| ptrs.append(alloc, @intFromPtr(g)) catch unreachable;
+        const at = site_hash.hashesFor(alloc, sites, ptrs.items) catch &.{};
+        if (v.status) |s| {
+            entries.append(alloc, .{ .note = std.fmt.allocPrint(alloc, "join #{d} {s} → {s} — {s}", .{ ji, vname, v.callee, s }) catch unreachable }) catch unreachable;
+            entries.append(alloc, .{ .property = .{ .key = std.fmt.allocPrint(alloc, "{s}.{s}.status", .{ k, vname }) catch unreachable, .value = .{ .string = s }, .at = at } }) catch unreachable;
+        } else {
+            entries.append(alloc, .{ .property = .{ .key = std.fmt.allocPrint(alloc, "{s}.{s}", .{ k, vname }) catch unreachable, .value = .{ .string = v.callee }, .at = at } }) catch unreachable;
+        }
+    }
+};

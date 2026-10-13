@@ -1,0 +1,104 @@
+// Koru Standard Library: Reactive Stores — the `idecls` part.
+// Joined via `~part idecls` in store.kz; merged into the store module at load.
+
+// ============================================================================
+// STORE.IDECLS — `std/indexes:store` declaration discovery + the new-site spec
+// ============================================================================
+//
+// The declaration is pure AST-data (store.index.kz): a `~[norun]` tor claims
+// the site and the node stays in program.items — the AST is the registry.
+// This part reads that registry: every `std/indexes:store(<s>, <col>)` naming
+// a store, and the whole decision `new`'s SoA-cell emit makes from them —
+// the backing-map field text and which seed column it keys on, or the
+// refusal.
+//
+// One declaration per store is the ruling today: a second claim is refused
+// at ITS OWN location — the later declaration is the offender, not the
+// store (pin 690_328). The first-match walk it replaced let a second claim
+// sit dead — no field, no machinery, no diagnostic.
+
+const StoreIndexDecls = struct {
+    /// A `std/indexes:store(<s>, <col>)` declaration: the column it claims
+    /// and its flow — the refusal points at the claim's own location.
+    const Decl = struct {
+        column: ?[]const u8,
+        flow: *const ast_find.Flow,
+    };
+
+    // Shared KORU161 texts — fieldSpec refuses with these, and the
+    // explainer's `status` row formats the same consts (one string, two
+    // sinks, no drift between the error and its explanation).
+    const MSG_second_decl = "std/indexes:store({s}, {s}): '{s}' already carries an index on '{s}' - a second index on one store is a later rung";
+    const MSG_no_column = "std/indexes:store({s}): the declaration names no column - an index keys on one column of the store: std/indexes:store({s}, <col>)";
+
+    /// Every `std/indexes:store(<s>, _)` declaration naming `store_name`.
+    /// Positional args: arg[0] is the store name (lands in the implicit
+    /// `expr` slot, like `new`'s own), the first non-`expr`/`source` arg is
+    /// the column.
+    fn declsOf(alloc: std.mem.Allocator, program: *const ast_find.Program, store_name: []const u8) []const Decl {
+        var out = std.ArrayList(Decl){};
+        for (flatItems(alloc, program.items)) |pi| {
+            if (pi.* != .flow) continue;
+            const inv = pi.flow.inv();
+            const mq = inv.path.module_qualifier orelse continue;
+            if (!std.mem.eql(u8, mq, "std.indexes")) continue;
+            if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "store")) continue;
+            var named_store: ?[]const u8 = null; var column: ?[]const u8 = null;
+            for (inv.args) |a| {
+                if (std.mem.eql(u8, a.name, "expr")) {
+                    named_store = a.value;
+                } else if (!std.mem.eql(u8, a.name, "source")) {
+                    column = a.value;
+                }
+            }
+            const s = named_store orelse continue;
+            if (!std.mem.eql(u8, s, store_name)) continue;
+            out.append(alloc, .{ .column = column, .flow = &pi.flow }) catch unreachable;
+        }
+        return out.items;
+    }
+
+    /// What `new`'s SoA-cell emit needs from the declarations: the backing
+    /// key→handle map field and which seed column it keys on — or the
+    /// refusal. `.none` when nothing declares the store; a declaration
+    /// naming no column refuses at its own location (pin 690_329).
+    const FieldSpec = union(enum) {
+        none,
+        indexed: Indexed,
+        refuse: ast_find.Item,
+
+        const Indexed = struct { col: []const u8, idx: usize, field: []const u8 };
+    };
+
+    fn fieldSpec(
+        alloc: std.mem.Allocator,
+        reporter: anytype,
+        program: *const ast_find.Program,
+        store_name: []const u8,
+        field_names: anytype,
+        field_types: anytype,
+        field_char_caps: anytype,
+        field_owned_info: anytype,
+    ) FieldSpec {
+        const ds = declsOf(alloc, program, store_name);
+        if (ds.len > 1) {
+            return .{ .refuse = ast_find.refusal(alloc, reporter, .KORU161, ds[1].flow.location, ds[1].flow.module, MSG_second_decl, .{ store_name, ds[1].column orelse "?", store_name, ds[0].column orelse "?" }) };
+        }
+        if (ds.len == 0) return .none;
+        const icol = ds[0].column orelse return .{ .refuse = ast_find.refusal(alloc, reporter, .KORU161, ds[0].flow.location, ds[0].flow.module, MSG_no_column, .{ store_name, store_name }) };
+        var icol_type: ?[]const u8 = null;
+        var index_idx: usize = 0;
+        for (field_names, field_types, field_char_caps, field_owned_info, 0..) |fname, ftype, fcc, foi, fi| {
+            if (!std.mem.eql(u8, fname, icol)) continue;
+            if (fcc != null or foi != null) {
+                return .{ .refuse = ast_find.refusal(alloc, reporter, .KORU161, ds[0].flow.location, ds[0].flow.module, "std/indexes:store({s}, {s}): the indexed column must be a scalar column - fixed-char and owned columns are a later rung", .{ store_name, icol }) };
+            }
+            icol_type = ftype;
+            index_idx = fi;
+        }
+        const it = icol_type orelse {
+            return .{ .refuse = ast_find.refusal(alloc, reporter, .KORU161, ds[0].flow.location, ds[0].flow.module, "std/indexes:store({s}, {s}): no column named '{s}' - the index names a declared column of the store", .{ store_name, icol, icol }) };
+        };
+        return .{ .indexed = .{ .col = icol, .idx = index_idx, .field = std.fmt.allocPrint(alloc, "    __index_{s}: @import(\"std\").AutoHashMapUnmanaged({s}, @import(\"std\").ArrayListUnmanaged(i64)) = .{{}},\n", .{ icol, it }) catch unreachable } };
+    }
+};

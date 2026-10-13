@@ -1,0 +1,30 @@
+// IO Runtime Registry
+// Imports std.io and makes its tors available for runtime dispatch.
+//
+// Usage:
+//   import std/io_registry
+//
+// This creates a scope called "std.io" with the following tors:
+//   - std/io:print
+//   - std/io:println
+//   - std/io:readln
+//   - std/io:print.ln
+//
+// The scope can be composed into custom scopes:
+//   [registry:scope(repl)]std/runtime:register {
+//       scope(std.io)
+//       my_custom_event
+//   }
+
+import std/io
+import std/runtime
+
+// Register io tors for runtime dispatch
+std/runtime:register(scope: "std.io") {
+    std/io:print
+    std/io:readln
+    std/io:print.ln
+    std/io:eprintln
+    std/io:success
+    std/io:warn
+}

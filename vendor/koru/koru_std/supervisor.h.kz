@@ -1,0 +1,63 @@
+// Koru Standard Library: the `h` part of supervisor.kz — the shared
+// emission helpers. Joined via `~part h` in supervisor.kz; merged into
+// the supervisor module at load. `std`/`ast` arrive at module scope from
+// the other parts — a local import here would shadow them.
+
+const H = struct {
+    fn mkPath(alloc: std.mem.Allocator, module: []const u8, name: []const u8) ast.DottedPath {
+        const segs = alloc.alloc([]const u8, 1) catch unreachable;
+        segs[0] = alloc.dupe(u8, name) catch unreachable;
+        return ast.DottedPath{ .module_qualifier = alloc.dupe(u8, module) catch unreachable, .segments = segs };
+    }
+    fn cloneField(alloc: std.mem.Allocator, f: ast.Field) ast.Field {
+        var out = f;
+        out.name = alloc.dupe(u8, f.name) catch unreachable;
+        out.type = alloc.dupe(u8, f.type) catch unreachable;
+        if (f.module_path) |mp| out.module_path = alloc.dupe(u8, mp) catch unreachable;
+        if (f.phantom) |p| out.phantom = alloc.dupe(u8, p) catch unreachable;
+        if (f.expression_str) |es| out.expression_str = alloc.dupe(u8, es) catch unreachable;
+        if (f.default) |d| out.default = alloc.dupe(u8, d) catch unreachable;
+        return out;
+    }
+    fn cloneFields(alloc: std.mem.Allocator, fs: []const ast.Field) []ast.Field {
+        const out = alloc.alloc(ast.Field, fs.len) catch unreachable;
+        for (fs, 0..) |f, i| out[i] = cloneField(alloc, f);
+        return out;
+    }
+    fn hasPayload(b: *const ast.Branch) bool {
+        return b.payload.fields.len > 0 or b.payload.is_wildcard;
+    }
+    fn isIdentChar(c: u8) bool {
+        return std.ascii.isAlphanumeric(c) or c == '_';
+    }
+    // Whole-word identifier scan — is `word` referenced as a name inside
+    // `haystack` (a condition or argument expression text)?
+    fn mentionsWord(haystack: []const u8, word: []const u8) bool {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, haystack, i, word)) |pos| {
+            const before = pos == 0 or !isIdentChar(haystack[pos - 1]);
+            const after = pos + word.len >= haystack.len or !isIdentChar(haystack[pos + word.len]);
+            if (before and after) return true;
+            i = pos + 1;
+        }
+        return false;
+    }
+    /// Pointer-identity containment: is `target` `cont` itself or nested in
+    /// its continuations? Used to find the flow that owns a producer site.
+    fn contContains(cont: *const ast.Continuation, target: *const ast.Continuation) bool {
+        if (cont == target) return true;
+        for (cont.continuations) |*c| {
+            if (contContains(c, target)) return true;
+        }
+        return false;
+    }
+    /// Structural equality on dotted paths — qualifier + segments.
+    fn pathEq(a: ast.DottedPath, b: ast.DottedPath) bool {
+        if (!std.mem.eql(u8, a.module_qualifier orelse "", b.module_qualifier orelse "")) return false;
+        if (a.segments.len != b.segments.len) return false;
+        for (a.segments, 0..) |s, i| {
+            if (!std.mem.eql(u8, s, b.segments[i])) return false;
+        }
+        return true;
+    }
+};

@@ -1,0 +1,12 @@
+// Koru Standard Library: the `run-msgs` part of pump — joined via
+// `~part run-msgs` in pump.kz; members land in koru_pump.
+//
+// The `run` transform's refusal texts — split off `pump.messages.kz`
+// when the retire contract outgrew that file's pin. Same rule applies:
+// the explainer formats these verbatim, so wording lives here once.
+const PMRun = struct {
+    const run_needs_name = "std/pump:run needs the pump's name - `std/pump:run(main)`";
+    const run_no_pump = "std/pump:run({s}): no pump named '{s}' - `std/pump:create({s})` declares it, joins attach via `std/pump({s})`, and the drive follows both";
+    const run_already_ran = "std/pump:run({s}): '{s}' already ran - a pump drives once";
+    const run_retire_needs_live = "std/pump:run({s}): join {d} declares `__pump_{s}_retired_{d}` but answers no `! live` - an immortal participant never retires";
+};

@@ -1,0 +1,200 @@
+// Resource Bridge Standard Library — persistent handle storage for long-running interactive sessions (Hollywood OS mode)
+//
+// A Bridge owns a HandlePool that outlives any single interpreter run, so a
+// resource opened on one turn is still held on the next — the human or the agent
+// can act on it three turns later and the obligation is still outstanding.
+//
+// The session is itself an obligation: `create` mints `<session!>` and only
+// `close` discharges it, so a bridge cannot be brought into being and forgotten.
+// You cannot forget to hang up.
+//
+// A bridge is bound to a SCOPE at birth. The scope is the vocabulary: the set of
+// tors that may act on what the bridge holds, and — through each obligation's
+// recorded discharge tor — the knowledge of how to release it. That is what
+// makes hanging up able to actually release rather than merely forget.
+
+~[comptime|runtime]
+
+~import std/interpreter
+~import std/runtime
+const std = @import("std");
+
+// Re-export interpreter types
+pub const HandlePool = @import("root").koru_std.koru_interpreter.HandlePool;
+pub const Handle = @import("root").koru_std.koru_interpreter.Handle;
+pub const DefinedFlows = @import("root").koru_std.koru_interpreter.DefinedFlows;
+pub const Environment = @import("root").koru_std.koru_interpreter.Environment;
+
+// Bridge: persistent session state
+pub const Bridge = struct {
+    pool: HandlePool,
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+    /// The registered scope this session's resources belong to. Discharge is
+    /// dispatched through it, so a bridge with no reachable scope can hold
+    /// handles but cannot release them — and `close` reports exactly that.
+    scope: []const u8,
+    created_at: i64,
+    last_active: i64,
+    /// Runtime-defined flows (the REPL define) — durable per session, so a
+    /// verb defined on one turn is callable on the next, and its calls run
+    /// through the same possession machinery as any other dispatch.
+    defined: *DefinedFlows,
+    /// Session grant for the introspection verbs `vocabulary()` and
+    /// `grammar()`: when set they dispatch as host verbs through the normal
+    /// wire path; when not, they are event-denied like any unvocabularied
+    /// word. There is no other way to ask the session what it knows.
+    introspection: bool,
+    /// The world dir this session's defined flows persist into, or null —
+    /// set by `create(world: ...)`, owned here, freed by deinit.
+    world: ?[]const u8,
+    /// Durable session bindings — values a turn named that stay named on
+    /// the next turn. `run` auto-binds every result as `r{N}` and the
+    /// `bind` host verb writes here directly; both are seeded into each
+    /// run's env, so `r3.user_id` three turns later resolves for real.
+    /// Owned by `session_arena` — never the run arena, which resets per run.
+    session_env: *Environment,
+    /// Everything a bound name points at lives here; `deinit` frees it all
+    /// in one shot — tracking individual dupes across a growing env is the
+    /// leak the leak check just caught. Heap-allocated because the env's
+    /// allocator captures the arena's ADDRESS — a struct field's address
+    /// changes when `init` returns the Bridge by value.
+    session_arena: *std.heap.ArenaAllocator,
+    /// Next auto-bind ordinal — names are `r1`, `r2`, … in run order.
+    bound_count: u64,
+
+    pub fn init(allocator: std.mem.Allocator, session_id: []const u8, scope: []const u8, introspection: bool, world: []const u8) Bridge {
+        const defined = allocator.create(DefinedFlows) catch @panic("std/bridge:create: OOM minting defined-flows table");
+        defined.* = DefinedFlows.init(allocator);
+        const session_arena = allocator.create(std.heap.ArenaAllocator) catch @panic("std/bridge:create: OOM minting session arena");
+        session_arena.* = std.heap.ArenaAllocator.init(allocator);
+        const session_env = allocator.create(Environment) catch @panic("std/bridge:create: OOM minting session env");
+        session_env.* = Environment.init(session_arena.allocator());
+        const world_owned: ?[]const u8 = if (world.len > 0) allocator.dupe(u8, world) catch world else null;
+        return .{
+            .pool = HandlePool.init(allocator),
+            .allocator = allocator,
+            .session_id = allocator.dupe(u8, session_id) catch session_id,
+            .scope = allocator.dupe(u8, scope) catch scope,
+            .created_at = std.time.milliTimestamp(),
+            .last_active = std.time.milliTimestamp(),
+            .defined = defined,
+            .introspection = introspection,
+            .world = world_owned,
+            .session_env = session_env,
+            .session_arena = session_arena,
+            .bound_count = 0,
+        };
+    }
+
+    pub fn touch(self: *Bridge) void {
+        self.last_active = std.time.milliTimestamp();
+    }
+
+    pub fn getHandleCount(self: *Bridge) u32 {
+        var count: u32 = 0;
+        for (self.pool.handles.items) |h| {
+            if (!h.discharged) count += 1;
+        }
+        return count;
+    }
+
+    /// Invoke the real discharge tor for every handle still held, through the
+    /// session's scope.
+    ///
+    /// This used to print a line, set `discharged = true`, and call nothing: the
+    /// counter went to zero while every file stayed open. It now runs the same
+    /// loop the interpreter's end-of-run auto-discharge runs, because releasing a
+    /// resource is one act, not two implementations.
+    ///
+    /// A session that CANNOT release what it holds panics rather than returning
+    /// a number. It briefly returned the still-held count, which read as honest
+    /// and was not: nothing obliges a caller to look at a return value, so the
+    /// unread count is the same shape as the boolean it replaced — satisfied
+    /// bookkeeping over a live resource. It also cost more than it looked:
+    /// auto-discharge can only insert a disposer with NOTHING TO BIND
+    /// (`auto_discharge_inserter.zig:2742`), so a `-> u32` close disqualified
+    /// itself and every failure arm of every conversation had to hang up by hand.
+    pub fn dischargeAll(self: *Bridge) void {
+        const rt = @import("root").koru_std.koru_runtime;
+        const interp = @import("root").koru_std.koru_interpreter;
+
+        switch (rt.get_scope_event.handler(.{ .name = self.scope })) {
+            .scope => |s| interp.dischargeAllHandles(
+                "BRIDGE",
+                &self.pool,
+                s.discharges_spec_fn,
+                s.dispatcher,
+                self.allocator,
+            ),
+            .not_found => std.debug.panic(
+                "std/bridge:close: session '{s}' holds {d} handle(s) and its scope '{s}' is not registered, so nothing can release them",
+                .{ self.session_id, self.getHandleCount(), self.scope },
+            ),
+        }
+
+        const stranded = self.getHandleCount();
+        if (stranded != 0) std.debug.panic(
+            "std/bridge:close: session '{s}' still holds {d} handle(s) after hang-up — a discharge event failed (see the [BRIDGE] lines above)",
+            .{ self.session_id, stranded },
+        );
+    }
+
+    pub fn deinit(self: *Bridge) void {
+        self.allocator.free(self.session_id);
+        self.allocator.free(self.scope);
+        if (self.world) |w| self.allocator.free(w);
+        self.pool.deinit();
+        self.defined.deinit();
+        self.allocator.destroy(self.defined);
+        self.session_env.deinit();
+        self.allocator.destroy(self.session_env);
+        self.session_arena.deinit();
+        self.allocator.destroy(self.session_arena);
+    }
+};
+
+// ============================================================================
+// GET_HANDLES - Query handles currently on the bridge
+// ============================================================================
+
+~pub tor get-handles { br: *Bridge<session> } -> u32
+
+~proc get-handles|zig {
+    return br.getHandleCount();
+}
+// ============================================================================
+// CLOSE - Hang up: release everything the session still holds
+// ============================================================================
+//
+// VOID, and that is load-bearing rather than minimal. Auto-discharge can only
+// insert a disposer with nothing to bind — `auto_discharge_inserter.zig:2742`
+// refuses any tor carrying a branch or a bare return, because the inserter
+// appends a bare call and cannot invent a binding for its output. A `close`
+// that returned the still-held count disqualified itself, which meant every
+// failure arm of every conversation had to spell the hang-up by hand.
+// Failing to release is not a value a caller may drop; it panics. `get-handles`
+// is there for anyone who wants the count on either side of the call.
+
+~pub tor close { br: *Bridge<!session> }
+
+~proc close|zig {
+    br.dischargeAll(); custodyMark(br, "session-closed"); br.deinit(); koru_allocator().destroy(br);
+}
+~part world
+~part custody
+~part run
+~part run-exec
+~part steps
+~part hostverbs
+~part grants
+~part session
+~part bind
+~part residue
+~part affordances
+~part turn
+~part turnscan
+~part wiregate
+~part items
+~part define
+~part deflines

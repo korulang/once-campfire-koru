@@ -1,0 +1,53 @@
+// Koru Standard Library: the `specs` part of runtime — the branch/input/
+// scope metadata types the generated dispatchers and the shape checker
+// speak. Joined via `~part specs` in runtime.kz; merged into the
+// runtime module at load.
+
+// Branch field metadata for shape validation
+pub const BranchField = struct {
+    name: []const u8,
+    type_name: []const u8,
+    is_optional: bool = false,
+};
+
+// Branch metadata for shape validation
+pub const BranchSpec = struct {
+    name: []const u8,
+    fields: []const BranchField,
+    is_optional: bool = false,
+};
+
+// Input-field metadata — the argument vocabulary of an tor, what a caller
+// must NAME when invoking it. Carries the raw possession phantom (`!open`
+// discharges, `open!` creates) so the vocabulary is renderable as
+// `handle: string<!open>` — the exact spelling the scope enforces.
+pub const InputFieldSpec = struct {
+    name: []const u8,
+    type_name: []const u8,
+    is_optional: bool = false,
+    phantom: ?[]const u8 = null,
+};
+
+pub const ScopeEvent = struct {
+    name: []const u8,
+    cost: u64,  // Budget cost for this tor
+    creates_obligations: []const []const u8,    // Legacy: just obligation names
+    discharges_obligations: []const []const u8, // Legacy: just obligation names
+    creates_specs: []const CreateSpec,          // Full specs with field names
+    discharges_specs: []const DischargeSpec,    // Full specs with arg names
+    branches: []const BranchSpec = &.{},        // Branch specs for shape validation
+    input_fields: []const InputFieldSpec = &.{}, // Input/argument vocabulary
+    dispatcher: DispatchFn,
+};
+pub const ScopeDescriptor = struct {
+    name: []const u8,
+    events: []const ScopeEvent,
+};
+
+// Branches lookup function type for shape validation
+pub const BranchesLookupFn = *const fn([]const u8) []const BranchSpec;
+// Event-name enumeration type — the scope's whole vocabulary, order-preserving
+pub const EventsLookupFn = *const fn() []const []const u8;
+// Input-field lookup type — an tor's argument vocabulary; null = the name
+// is not this scope's verb (vocabulary membership answers first).
+pub const InputLookupFn = *const fn([]const u8) ?[]const InputFieldSpec;

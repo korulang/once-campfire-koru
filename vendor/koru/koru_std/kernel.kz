@@ -1,0 +1,2621 @@
+// Koru Standard Library: Computation Kernels
+// ============================================
+//
+// High-performance computation primitives inspired by shader languages.
+// Describe RELATIONSHIPS between data elements, not iteration patterns.
+// The compiler decides optimal data layout and iteration strategy.
+//
+// USAGE:
+//   import std/kernel
+//
+//   // 1. Declare the shape (structure with explicit types)
+//   std/kernel:shape(Body) { x: f64, y: f64, z: f64, vx: f64, vy: f64, vz: f64, mass: f64 }
+//
+//   // 2. Initialize kernel data (creates instance of shape)
+//   // Uses Koru syntax (x: value) which transforms to Zig (.x = value)
+//   std/kernel:init(Body) { x: 0, y: 0, z: 0, vx: 1.0, vy: 0, vz: 0, mass: 1.0 }
+//   | kernel bodies |> ...
+//
+//   // 3. Perform kernel operations
+//   std/kernel:pairwise {
+//       bodies.vel -= d * mag * bodies.other.mass
+//       bodies.other.vel += d * mag * bodies.mass
+//   }
+//
+// DESIGN:
+//   - kernel.shape is [norun] - just a declaration, sits in AST as metadata
+//   - kernel.init is [transform] - looks up shape, emits struct + instance
+//   - kernel.pairwise is [transform] - emits iteration code
+//
+// KERNEL OPERATIONS:
+//   - kernel.pairwise: All unique pairs (i,j where i < j)
+//   - kernel.self: Per-element operations (future)
+//   - kernel.reduce: Reduction to single value (future)
+//   - kernel.cross: Cross-product of two kernels (future)
+//
+// MAGIC BINDINGS:
+//   Inside kernel.pairwise:
+//   - `bodies` refers to the current element (self, bodies[i])
+//   - `bodies.other` refers to the paired element (bodies[j])
+
+const std = @import("std");
+
+/// The ONE Koru expression lowering — see `codegen_utils.lowerKoruExpr`.
+const codegen_utils_kernel = @import("codegen_utils");
+
+
+// ============================================================================
+// KERNEL.SHAPE - Declare kernel data structure (just metadata, no execution)
+// ============================================================================
+//
+// Declares the STRUCTURE of kernel data with explicit types.
+// This is NOT a transform - it just sits in the AST for kernel.init to look up.
+//
+// Example:
+//   std/kernel:shape(Body) { x: f64, y: f64, z: f64, mass: f64 }
+
+~[norun]pub tor shape {
+    expr: Expression,
+    source: Source
+}
+
+// ============================================================================
+// Internal no-op tor for refactored flows
+// (This is here for reference; the transform injects a local one into the user program)
+~[norun]pub tor nop {}
+
+// ============================================================================
+//
+// Creates kernel data from a shape. Looks up the shape by name, emits
+// the struct definition and initialization code, replaces the flow.
+//
+// Example:
+//   std/kernel:init(Body) { x: 0, y: 0, mass: 1.0 }
+//   | kernel bodies |> ...
+//
+// Koru syntax "x: 0" transforms to Zig syntax ".x = 0"
+//
+// This transform:
+//   1. Looks up kernel.shape(Body) in AST
+//   2. Emits a module-scope type declaration for Body
+//   3. Generates a local init tor+proc that allocates kernel data and returns a view
+//   4. Rewrites the flow to call that init tor
+
+~[comptime|transform|claims_descendants]pub tor init {
+    expr: Expression,
+    source: Source,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc init|zig {
+    const ast = @import("ast");
+    const ast_functional = @import("ast_functional");
+
+    // Get the flow from the item
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        @panic("kernel.init: expected flow item");
+
+    // ========================================================================
+    // STEP 1: Locate invocation + kernel binding
+    // ========================================================================
+    // Position-agnostic: the runner lifts nested sites into a synthetic
+    // top-level flow, so `invocation` IS the flow's own invocation at every depth.
+    _ = invocation;
+
+    var has_kernel_continuation = false;
+    var has_computed_continuation = false;
+    var has_reduce_continuation = false;
+    for (flow.body.continuations) |cont| {
+        const branch = std.mem.trim(u8, cont.branch, " ");
+        if (std.mem.eql(u8, branch, "kernel")) {
+            has_kernel_continuation = true;
+        }
+        if (std.mem.eql(u8, branch, "computed")) {
+            has_computed_continuation = true;
+        }
+        if (std.mem.eql(u8, branch, "reduce")) {
+            has_reduce_continuation = true;
+        }
+    }
+
+    // STORE MODE (early — the KORU170 exit check below needs it): the init
+    // arg may name a `std/store:new` store whose SoA columns are the kernel
+    // shape, instead of a `std/kernel:shape` + literal dataset. The store is
+    // the observable, so `| computed |>` is not required in this form
+    // (per-init-form ruling, ratified 2026-06-10).
+    var type_name = expr;
+    if (type_name.len >= 2 and type_name[0] == '"' and type_name[type_name.len - 1] == '"') {
+        type_name = type_name[1 .. type_name.len - 1];
+    }
+    const store_src = kernelFindStoreDecl(allocator, program, type_name);
+    const is_store_mode = store_src != null;
+    const validateKernelSubtree = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            flow_internal: *const ast.Flow,
+        ) ?[]const u8 {
+            const owner_continuations = flow_internal.body.continuations;
+
+            const kernel_cont = ast_functional.findContinuationByBranchInSlice(owner_continuations, "kernel") orelse return null;
+
+            const isNamedInvocation = struct {
+                fn call(inv: *const ast.Invocation, module_name: ?[]const u8, event_name: []const u8) bool {
+                    if (inv.path.segments.len != 1) return false;
+                    if (!std.mem.eql(u8, inv.path.segments[0], event_name)) return false;
+
+                    if (module_name) |expected_module| {
+                        return inv.path.module_qualifier != null and
+                            std.mem.eql(u8, inv.path.module_qualifier.?, expected_module);
+                    }
+
+                    return inv.path.module_qualifier == null;
+                }
+            }.call;
+
+            const ValidationContext = struct {
+                allocator: std.mem.Allocator,
+                // The flow's own module. An invocation resolved to it was written
+                // bare in the file, so the refusal must not grow a qualifier the
+                // author never typed.
+                current_module: []const u8,
+                violation: ?[]const u8 = null,
+
+                // Renders an invocation the way the author spelled it, so the
+                // refusal names a construct they can find in their own file.
+                fn qualifiedName(self: *@This(), inv: *const ast.Invocation) []const u8 {
+                    if (inv.path.segments.len == 0) return "invocation";
+                    var rendered = std.ArrayList(u8).initCapacity(self.allocator, 32) catch
+                        return inv.path.segments[0];
+                    if (inv.path.module_qualifier) |module| {
+                        if (!std.mem.eql(u8, module, self.current_module)) {
+                            rendered.appendSlice(self.allocator, module) catch return inv.path.segments[0];
+                            rendered.append(self.allocator, ':') catch return inv.path.segments[0];
+                        }
+                    }
+                    for (inv.path.segments, 0..) |segment, idx| {
+                        if (idx > 0) rendered.append(self.allocator, '.') catch return inv.path.segments[0];
+                        rendered.appendSlice(self.allocator, segment) catch return inv.path.segments[0];
+                    }
+                    return rendered.items;
+                }
+
+                // A second kernel view is the one refusal that carries a reason
+                // rather than just a name: the author is reaching for cross-set
+                // iteration, which the kernel family does not spell yet.
+                fn isNestedInit(inv: *const ast.Invocation) bool {
+                    return isNamedInvocation(inv, "std.kernel", "init");
+                }
+
+                fn fail(
+                    self: *@This(),
+                    continuation: ?*const ast.Continuation,
+                    construct_name: []const u8,
+                ) ast_functional.LexicalSubtreeWalkControl {
+                    const allowed = "kernel scope currently allows only std.kernel:pairwise, std.kernel:self, std.kernel:step and std.kernel:reduce";
+                    self.violation = if (continuation) |cont|
+                        std.fmt.allocPrint(
+                            self.allocator,
+                            "unsupported construct '{s}' inside kernel scope at {s}:{d}:{d}; {s}",
+                            .{ construct_name, cont.location.file, cont.location.line, cont.location.column, allowed },
+                        ) catch "unsupported construct inside kernel scope"
+                    else
+                        std.fmt.allocPrint(
+                            self.allocator,
+                            "unsupported construct '{s}' inside kernel scope; {s}",
+                            .{ construct_name, allowed },
+                        ) catch "unsupported construct inside kernel scope";
+                    return .stop;
+                }
+
+                fn failNestedInit(
+                    self: *@This(),
+                    continuation: ?*const ast.Continuation,
+                ) ast_functional.LexicalSubtreeWalkControl {
+                    const msg = "std.kernel:init inside a kernel scope declares a second kernel view — one kernel scope owns exactly one view, so the inner init would be claimed by the outer one and its dataset never emitted; give each init its own flow, and note that iteration across two views has no kernel op yet";
+                    self.violation = if (continuation) |cont|
+                        std.fmt.allocPrint(
+                            self.allocator,
+                            "{s} (at {s}:{d}:{d})",
+                            .{ msg, cont.location.file, cont.location.line, cont.location.column },
+                        ) catch msg
+                    else
+                        msg;
+                    return .stop;
+                }
+
+                fn visit(
+                    self: *@This(),
+                    visit_info: ast_functional.LexicalSubtreeVisit,
+                ) !ast_functional.LexicalSubtreeWalkControl {
+                    switch (visit_info) {
+                        .continuation => return .continue_walk,
+                        .invocation => |info| {
+                            const inv = info.invocation;
+                            // ALLOWLIST, closed. The kernel subtree admits exactly these
+                            // kernel ops; every other invocation is refused by name. A
+                            // fallthrough here is what let a nested `std/kernel:init`
+                            // reach `claims_descendants` and be swallowed whole — its
+                            // dataset never emitted, its binding never substituted, the
+                            // failure surfacing as an undeclared host identifier. Pinned:
+                            // 390_052, 390_053, 390_055.
+                            if (
+                                isNamedInvocation(inv, "std.kernel", "pairwise") or
+                                isNamedInvocation(inv, "std.kernel", "self") or
+                                isNamedInvocation(inv, "std.kernel", "step") or
+                                isNamedInvocation(inv, "std.kernel", "reduce")
+                            ) {
+                                return .continue_walk;
+                            }
+
+                            if (isNestedInit(inv)) {
+                                return self.failNestedInit(info.continuation);
+                            }
+
+                            // The ambient keyword constructs are written bare by
+                            // construction — `for`, not `std.control:for`. Name them
+                            // from the leaf so the refusal quotes the file.
+                            if (
+                                isNamedInvocation(inv, null, "for") or
+                                isNamedInvocation(inv, null, "if") or
+                                isNamedInvocation(inv, null, "capture") or
+                                isNamedInvocation(inv, null, "const") or
+                                isNamedInvocation(inv, "std.control", "for") or
+                                isNamedInvocation(inv, "std.control", "if") or
+                                isNamedInvocation(inv, "std.control", "capture") or
+                                isNamedInvocation(inv, "std.declarations", "const")
+                            ) {
+                                return self.fail(info.continuation, inv.path.segments[0]);
+                            }
+
+                            return self.fail(info.continuation, self.qualifiedName(inv));
+                        },
+                        .node => |info| switch (info.node.*) {
+                            .branch_constructor => return self.fail(info.continuation, "branch constructor"),
+                            .foreach => return self.fail(info.continuation, "for"),
+                            .conditional => return self.fail(info.continuation, "if"),
+                            .switch_result => return self.fail(info.continuation, "switch_result"),
+                            .label_apply => return self.fail(info.continuation, "label_apply"),
+                            .label_with_invocation => return self.fail(info.continuation, "label_with_invocation"),
+                            .label_jump => return self.fail(info.continuation, "label_jump"),
+                            .conditional_block => return self.fail(info.continuation, "conditional_block"),
+                            .metatype_binding => return self.fail(info.continuation, "metatype_binding"),
+                            .assignment => return self.fail(info.continuation, "assignment"),
+                            .inline_code => return .continue_walk,
+                            .expression => return .continue_walk,
+                            .terminal => return .continue_walk,
+                            .invocation => unreachable,
+                        },
+                    }
+                }
+            };
+
+            var validation = ValidationContext{ .allocator = alloc, .current_module = flow_internal.module };
+            ast_functional.walkLexicalContinuationSubtree(
+                ValidationContext,
+                kernel_cont,
+                &validation,
+                ValidationContext.visit,
+            ) catch @panic("kernel.init: subtree validation failed");
+
+            return validation.violation;
+        }
+    }.call;
+
+    // Collect kernel ops (pairwise, self) from the kernel subtree for fusion
+    const KernelOp = struct {
+        op_type: []const u8,
+        body_text: []const u8,
+        // Call-site variant tag (`std/kernel:self|mlir { ... }`): selects the
+        // backend the fused emission generates for this op. null = Zig loop.
+        variant: ?[]const u8 = null,
+        // For a `reduce` op: the body STATEMENTS only (the declared `name[type]`
+        // accumulator header has been split off). The loop emitter rewrites and
+        // emits THIS, never the raw body_text (which still carries the header).
+        reduce_statements: ?[]const u8 = null,
+    };
+
+    // A named scalar produced by `std/kernel:reduce` (e.g. `total_mass += k.mass`
+    // yields accumulator `total_mass` of the shape field's type). The init
+    // synthesizes one of these per `| reduce <name> |>` exit so the accumulated
+    // value can reach the caller — the raw result never escapes the kernel scope
+    // otherwise (the `computed` exit binds the kernel ARRAY as a single-field
+    // identity; a scalar is a second output, so it gets its own branch).
+    const ReduceAccumulator = struct {
+        name: []const u8,
+        type: []const u8,
+    };
+
+    const KernelPlan = struct {
+        step_range: ?[]const u8,
+        step_invocation: ?*const ast.Invocation,
+        ops: []KernelOp,
+    };
+
+    const collectKernelOps = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            flow_internal: *const ast.Flow,
+        ) KernelPlan {
+            const empty = KernelPlan{ .step_range = null, .step_invocation = null, .ops = &[_]KernelOp{} };
+            const owner_continuations = flow_internal.body.continuations;
+
+            const kernel_cont = ast_functional.findContinuationByBranchInSlice(owner_continuations, "kernel") orelse return empty;
+
+            var ops = std.ArrayList(KernelOp).initCapacity(alloc, 4) catch unreachable;
+            var step_range: ?[]const u8 = null;
+            var step_inv: ?*const ast.Invocation = null;
+
+            const detectStep = struct {
+                fn call(inv: *const ast.Invocation, out_range: *?[]const u8, out_inv: *?*const ast.Invocation) void {
+                    if (inv.path.segments.len == 1 and std.mem.eql(u8, inv.path.segments[0], "step") and inv.path.module_qualifier != null and std.mem.eql(u8, inv.path.module_qualifier.?, "std.kernel")) {
+                        // Extract range from the invocation's args (value field contains the raw expression)
+                        for (inv.args) |arg| {
+                            if (arg.value.len > 0) {
+                                out_range.* = arg.value;
+                            }
+                        }
+                        out_inv.* = inv;
+                    }
+                }
+            }.call;
+
+            const collectFromContinuations = struct {
+                fn callInner(
+                    a: std.mem.Allocator,
+                    continuations: []const ast.Continuation,
+                    ops_list: *std.ArrayList(KernelOp),
+                    sr: *?[]const u8,
+                    si: *?*const ast.Invocation,
+                ) void {
+                    for (continuations) |*cont| {
+                        // Skip | step |> branches here - handle them separately to avoid double-counting
+                        const is_step = std.mem.eql(u8, cont.branch, "step");
+                        
+                        if (!is_step) {
+                            if (cont.node) |*nd| {
+                                if (nd.* == .invocation) {
+                                    const inv = &nd.invocation;
+                                    detectStep(inv, sr, si);
+                                    const is_pairwise = inv.path.segments.len == 1 and
+                                        std.mem.eql(u8, inv.path.segments[0], "pairwise") and
+                                        inv.path.module_qualifier != null and
+                                        std.mem.eql(u8, inv.path.module_qualifier.?, "std.kernel");
+                                    const is_self = inv.path.segments.len == 1 and
+                                        std.mem.eql(u8, inv.path.segments[0], "self") and
+                                        inv.path.module_qualifier != null and
+                                        std.mem.eql(u8, inv.path.module_qualifier.?, "std.kernel");
+                                    const is_reduce = inv.path.segments.len == 1 and
+                                        std.mem.eql(u8, inv.path.segments[0], "reduce") and
+                                        inv.path.module_qualifier != null and
+                                        std.mem.eql(u8, inv.path.module_qualifier.?, "std.kernel");
+
+                                    if (is_pairwise or is_self or is_reduce) {
+                                        var body_text: ?[]const u8 = null;
+                                        for (inv.args) |arg| {
+                                            if (arg.source_value) |src_val| {
+                                                body_text = src_val.text;
+                                            }
+                                        }
+                                        if (body_text) |bt| {
+                                            ops_list.append(a, .{
+                                                .op_type = if (is_pairwise) "pairwise" else if (is_self) "self" else "reduce",
+                                                .body_text = bt,
+                                                .variant = inv.variant,
+                                            }) catch unreachable;
+                                        }
+                                    }
+                                }
+                            }
+                            // Recurse into nested continuations (for |> chaining)
+                            if (cont.continuations.len > 0) {
+                                callInner(a, cont.continuations, ops_list, sr, si);
+                            }
+                        } else {
+                            // | step |> branch: check its node and recurse into its continuations
+                            if (cont.node) |*nd| {
+                                if (nd.* == .invocation) {
+                                    const inv = &nd.invocation;
+                                    const is_pairwise = inv.path.segments.len == 1 and
+                                        std.mem.eql(u8, inv.path.segments[0], "pairwise") and
+                                        inv.path.module_qualifier != null and
+                                        std.mem.eql(u8, inv.path.module_qualifier.?, "std.kernel");
+                                    const is_self = inv.path.segments.len == 1 and
+                                        std.mem.eql(u8, inv.path.segments[0], "self") and
+                                        inv.path.module_qualifier != null and
+                                        std.mem.eql(u8, inv.path.module_qualifier.?, "std.kernel");
+                                    const is_reduce = inv.path.segments.len == 1 and
+                                        std.mem.eql(u8, inv.path.segments[0], "reduce") and
+                                        inv.path.module_qualifier != null and
+                                        std.mem.eql(u8, inv.path.module_qualifier.?, "std.kernel");
+
+                                    if (is_pairwise or is_self or is_reduce) {
+                                        var body_text: ?[]const u8 = null;
+                                        for (inv.args) |arg| {
+                                            if (arg.source_value) |src_val| {
+                                                body_text = src_val.text;
+                                            }
+                                        }
+                                        if (body_text) |bt| {
+                                            ops_list.append(a, .{
+                                                .op_type = if (is_pairwise) "pairwise" else if (is_self) "self" else "reduce",
+                                                .body_text = bt,
+                                                .variant = inv.variant,
+                                            }) catch unreachable;
+                                        }
+                                    }
+                                }
+                            }
+                            if (cont.continuations.len > 0) {
+                                callInner(a, cont.continuations, ops_list, sr, si);
+                            }
+                        }
+                    }
+                }
+            }.callInner;
+
+            // First check the kernel continuation's direct node (handles simple case like | kernel k |> pairwise {...})
+            if (kernel_cont.node) |*step| {
+                if (step.* == .invocation) {
+                    const inv = &step.invocation;
+                    detectStep(inv, &step_range, &step_inv);
+                    const is_pairwise = inv.path.segments.len == 1 and
+                        std.mem.eql(u8, inv.path.segments[0], "pairwise") and
+                        inv.path.module_qualifier != null and
+                        std.mem.eql(u8, inv.path.module_qualifier.?, "std.kernel");
+                    const is_self = inv.path.segments.len == 1 and
+                        std.mem.eql(u8, inv.path.segments[0], "self") and
+                        inv.path.module_qualifier != null and
+                        std.mem.eql(u8, inv.path.module_qualifier.?, "std.kernel");
+                    const is_reduce = inv.path.segments.len == 1 and
+                        std.mem.eql(u8, inv.path.segments[0], "reduce") and
+                        inv.path.module_qualifier != null and
+                        std.mem.eql(u8, inv.path.module_qualifier.?, "std.kernel");
+
+                    if (is_pairwise or is_self or is_reduce) {
+                        var body_text: ?[]const u8 = null;
+                        for (inv.args) |arg| {
+                            if (arg.source_value) |src_val| {
+                                body_text = src_val.text;
+                            }
+                        }
+                        if (body_text) |bt| {
+                            ops.append(alloc, .{
+                                .op_type = if (is_pairwise) "pairwise" else if (is_self) "self" else "reduce",
+                                .body_text = bt,
+                                .variant = inv.variant,
+                            }) catch unreachable;
+                        }
+                    }
+                }
+            }
+
+            // Then recurse into nested continuations (for chained ops)
+            collectFromContinuations(alloc, kernel_cont.continuations, &ops, &step_range, &step_inv);
+            return KernelPlan{ .step_range = step_range, .step_invocation = step_inv, .ops = ops.toOwnedSlice(alloc) catch unreachable };
+        }
+    }.call;
+
+    if (has_kernel_continuation) {
+        if (validateKernelSubtree(allocator, flow)) |msg| {
+            reporter.addErrorAtLocation(.KORU170, flow.location, "{s}", .{msg}) catch {};
+            const compile_error_code = std.fmt.allocPrint(
+                allocator,
+                "comptime {{ @compileError(\"{s}\"); }}",
+                .{msg},
+            ) catch unreachable;
+
+            const compile_error_item = ast.Item{
+                .inline_code = ast.InlineCode{
+                    .code = compile_error_code,
+                    .location = flow.location,
+                    .module = allocator.dupe(u8, flow.module) catch unreachable,
+                },
+            };
+
+            return .{ .replacement = compile_error_item };
+        }
+    }
+
+    // Enforce: if kernel branch is present, computed branch is required
+    // Without computed, kernel results are trapped with no way to exit the scope
+    // Each init checks itself — claims_descendants ensures outer init runs first
+    //
+    // DESIGN (ratified 2026-06-10): today init takes only a literal source-block
+    // dataset, so a computed-less kernel is unobservable by construction — dead
+    // computation, rejected. If a future init FORM binds external host data
+    // (mutate-in-place, observability outside the kernel), the requirement
+    // becomes per-init-form: that form may make | computed optional. The rule
+    // carves by init form, NEVER by position — position stays irrelevant.
+    // Pinned: 390_054 (top level), 390_023 (in pipeline).
+    if (has_kernel_continuation and !has_computed_continuation and !has_reduce_continuation and !is_store_mode) {
+        reporter.addErrorAtLocation(.KORU170, flow.location, "kernel:init requires a | computed |> exit or a | reduce |> exit — without one, kernel results are trapped inside the kernel scope", .{}) catch {};
+        const computed_error = std.fmt.allocPrint(
+            allocator,
+            "comptime {{ @compileError(\"kernel:init requires a | computed |> exit or a | reduce |> exit — without one, kernel results are trapped inside the kernel scope\"); }}",
+            .{},
+        ) catch unreachable;
+
+        const computed_error_item = ast.Item{
+            .inline_code = ast.InlineCode{
+                .code = computed_error,
+                .location = flow.location,
+                .module = allocator.dupe(u8, flow.module) catch unreachable,
+            },
+        };
+
+        return .{ .replacement = computed_error_item };
+    }
+
+    // Collect kernel ops for fusion
+    const kernel_plan = if (has_kernel_continuation)
+        collectKernelOps(allocator, flow)
+    else
+        KernelPlan{ .step_range = null, .step_invocation = null, .ops = &[_]KernelOp{} };
+
+    // Generate a unique local tor/proc name for this init
+    var hash: u32 = 0;
+    for (flow.module) |c| hash = hash *% 31 +% c;
+    hash = hash *% 31 +% @as(u32, @intCast(flow.location.line));
+    hash = hash *% 31 +% @as(u32, @intCast(flow.location.column));
+    for (source.text) |c| hash = hash *% 31 +% c;
+    const unique_name = std.fmt.allocPrint(allocator, "kernel_init_{d}", .{hash}) catch unreachable;
+    const static_name = std.fmt.allocPrint(allocator, "kernel_init_{d}_data", .{hash}) catch unreachable;
+
+    // ========================================================================
+    // STEP 4: Get struct fields (dynamic lookup or fallback)
+    // ========================================================================
+    // STORE MODE was detected early (the KORU170 exit check needs it); here the
+    // shape fields resolve from the store's declared columns or the shape decl.
+    const shape_src = if (is_store_mode) null else kernelFindShapeSource(program, type_name);
+    const struct_fields = if (shape_src) |s| kernelParseShapeFields(allocator, s) else if (store_src) |s_| kernelParseShapeFields(allocator, s_) else "x: f64, y: f64, mass: f64";
+
+    // ========================================================================
+    // STEP 5: Transform source to Zig struct initialization
+    // ========================================================================
+    // Helper: transform "x: 42, y: 0" -> ".x = 42, .y = 0"
+    // THE TARGET LANGUAGE, READ ONCE. `capture` settled this shape
+    // (control.kz:427): a transform whose two renderings differ in a handful of
+    // spellings branches on the build language here rather than growing a `|js`
+    // twin of its whole body. init is 1391 lines and 60 emission sites, of which
+    // eight actually differ — a variant would be 1391 lines of copy waiting to
+    // drift, which is the two-lowerings-of-one-construct shape that comment
+    // rejects. The `|js` VARIANT mechanism is right when the two renderings are
+    // genuinely different programs; here they are one program with eight seams.
+    //
+    // What differs, and nothing else: the array literal, the loop headers, the
+    // pointer binding, the synthesized proc's target, and how the static
+    // declaration reaches the file. The op BODIES are already host-agnostic —
+    // `ptr[i].mass *= 2.0` is the same text in both languages, which is why this
+    // port is cheap at all.
+    const host_is_js = std.mem.eql(u8, CompilerEnv.lang, "js");
+
+    // Detect array mode: source contains nested {} blocks
+    const trimmed = std.mem.trim(u8, source.text, " \t\n\r");
+    const is_array_mode = std.mem.indexOf(u8, trimmed, "{") != null;
+
+    // init's dataset and the shape declaration it consumes are
+    // `{ name: value }` field lists — the consumers here (kernelTransformFields,
+    // parseShapeAstFields, kernelParseShapeFields) are bare comma splits that
+    // let a fused or half-dropped field ride into the emitted static and die
+    // in backend Zig. The source block is Source-typed, so the frontend's
+    // record-value check cannot reach it; the scan part's
+    // kernelInitFieldListRefusal gates the text through the one field parser
+    // before any splitter runs.
+    if (kernelInitFieldListRefusal(allocator, source.text, is_array_mode, shape_src, flow, reporter)) |refusal_item| {
+        return .{ .replacement = refusal_item };
+    }
+
+    const parseShapeAstFields = struct {
+        fn call(alloc: std.mem.Allocator, shape_source: []const u8) []ast.Field {
+            var resArr = std.ArrayList(ast.Field).initCapacity(alloc, 8) catch unreachable;
+            var iter_f = std.mem.splitSequence(u8, shape_source, ",");
+            while (iter_f.next()) |field_raw| {
+                const field = std.mem.trim(u8, field_raw, " \t\n\r{}");
+                if (field.len == 0) continue;
+                if (std.mem.indexOf(u8, field, ":")) |colon_idx| {
+                    const name = std.mem.trim(u8, field[0..colon_idx], " \t\n\r");
+                    const field_type = std.mem.trim(u8, field[colon_idx + 1 ..], " \t\n\r");
+                    resArr.append(alloc, ast.Field{
+                        .name = alloc.dupe(u8, name) catch unreachable,
+                        .type = alloc.dupe(u8, field_type) catch unreachable,
+                    }) catch unreachable;
+                }
+            }
+            return resArr.items;
+        }
+    }.call;
+
+    const HostTypeScan = struct {
+        // Descends: a host type synthesized by an earlier kernel:init in the
+        // same library sits inside that library's `.module_decl`, and a flat
+        // scan would declare it a second time at top level.
+        fn has(items_scan: []const ast.Item, want: []const u8) bool {
+            for (items_scan) |item_scan| {
+                if (item_scan == .host_type_decl and std.mem.eql(u8, item_scan.host_type_decl.name, want)) return true;
+                if (item_scan == .module_decl and has(item_scan.module_decl.items, want)) return true;
+            }
+            return false;
+        }
+    };
+    const has_host_type = if (is_store_mode) true else HostTypeScan.has(program.items, type_name);
+
+    const type_fields = if (!has_host_type)
+        parseShapeAstFields(allocator, shape_src orelse struct_fields)
+    else
+        &[_]ast.Field{};
+
+    // Get kernel binding name for codegen
+    const kernel_binding_name = if (has_kernel_continuation) blk: {
+        const k_cont = ast_functional.findContinuationByBranchInSlice(flow.body.continuations, "kernel");
+        break :blk if (k_cont) |kc| (kc.binding orelse "k") else "k";
+    } else "k";
+
+    // Generate inline Zig for collected kernel ops
+    const generateKernelOpsCode = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            ops: []KernelOp,
+            step_range: ?[]const u8,
+            binding: []const u8,
+            static_name_ref: []const u8,
+            elem_count: usize,
+            shape_fields: []const ast.Field,
+            is_js: bool,
+            reduce_out: *std.ArrayList(ReduceAccumulator),
+            store_name: []const u8,
+            prog: *const ast.Program,
+            home: []const u8,
+            elem_type_name: []const u8,
+            dataset: []const u8,
+        ) []const u8 {
+            if (ops.len == 0) return "";
+
+            var code = std.ArrayList(u8).initCapacity(alloc, 512) catch unreachable;
+            const ptr_name = "__koru_fused_ptr";
+
+            // A JS array already indexes like the Zig many-pointer does, so the
+            // binding is the array itself — there is nothing to decay.
+            //
+            // Each branch spells its own allocPrint: a format string is comptime
+            // in Zig, so it cannot be selected by a runtime flag.
+            const ptr_line = if (is_js)
+                std.fmt.allocPrint(alloc, "const {s} = {s};", .{ ptr_name, static_name_ref }) catch unreachable
+            else
+                std.fmt.allocPrint(alloc, "const {s} = {s}[0..].ptr;", .{ ptr_name, static_name_ref }) catch unreachable;
+            // STORE MODE binds the store's columns directly — no static dataset,
+            // so the `static_name` pointer line would dangle. Skip it.
+            if (store_name.len == 0) {
+                code.appendSlice(alloc, ptr_line) catch unreachable;
+            }
+
+            // PRE-PASS: read the reduce block's declared `name[type]` accumulator
+            // header, then validate the body statements reference only declared
+            // accumulators (plus the kernel binding). The declaration GUIDES the
+            // codegen — the names and types are declared, never guessed — and the
+            // emission itself is unchanged. Declared names are block-scoped and, for
+            // a reduce op, become the `| reduce |>` payload fields.
+            for (ops) |*rop| {
+                if (!std.mem.eql(u8, rop.op_type, "reduce")) continue;
+                var declared = std.ArrayList(ReduceAccumulator).initCapacity(alloc, 2) catch unreachable;
+                var stmts = std.ArrayList(u8).initCapacity(alloc, rop.body_text.len) catch unreachable;
+                // Entries are separated by `;` or a newline: a declared accumulator
+                // is `<name>[<type>]`; everything else is a body statement
+                // `<name> <op>= <expr>`.
+                var it = std.mem.tokenizeAny(u8, rop.body_text, ";\r\n");
+                while (it.next()) |raw| {
+                    const entry = std.mem.trim(u8, raw, " \t");
+                    if (entry.len == 0) continue;
+                    const eq = std.mem.indexOfScalar(u8, entry, '=');
+                    if (eq == null) {
+                        // `<name>[<type>]` — a declared accumulator slot.
+                        const lbr = std.mem.indexOfScalar(u8, entry, '[') orelse {
+                            std.debug.print("error[KORU123]: std/kernel:reduce entry must be `<name>[<type>]` (a declared accumulator) or `<name> <op>= <expr>` (a body statement) — got `{s}`\n", .{entry});
+                            std.process.exit(1);
+                        };
+                        const rbr = std.mem.lastIndexOfScalar(u8, entry, ']') orelse {
+                            std.debug.print("error[KORU123]: std/kernel:reduce accumulator declaration must be `<name>[<type>]` — got `{s}`\n", .{entry});
+                            std.process.exit(1);
+                        };
+                        const decl_name = std.mem.trim(u8, entry[0..lbr], " \t");
+                        const decl_type = std.mem.trim(u8, entry[lbr + 1 .. rbr], " \t");
+                        if (decl_name.len == 0 or decl_type.len == 0) {
+                            std.debug.print("error[KORU123]: std/kernel:reduce accumulator declaration must be `<name>[<type>]` — got `{s}`\n", .{entry});
+                            std.process.exit(1);
+                        }
+                        var seen = false;
+                        for (declared.items) |d| {
+                            if (std.mem.eql(u8, d.name, decl_name)) { seen = true; break; }
+                        }
+                        if (!seen) declared.append(alloc, .{ .name = decl_name, .type = decl_type }) catch unreachable;
+                    } else {
+                        // `<name> <op>= <expr>` — the LHS must be a declared accumulator.
+                        const eqv = eq.?;
+                        const compound = eqv > 0 and (entry[eqv - 1] == '+' or entry[eqv - 1] == '-' or entry[eqv - 1] == '*' or entry[eqv - 1] == '/');
+                        const acc_name = std.mem.trim(u8, if (compound) entry[0 .. eqv - 1] else entry[0..eqv], " \t");
+                        if (acc_name.len == 0) {
+                            std.debug.print("error[KORU123]: std/kernel:reduce body statement must be `<name> <op>= <expr>` — got `{s}`\n", .{entry});
+                            std.process.exit(1);
+                        }
+                        var found = false;
+                        for (declared.items) |d| {
+                            if (std.mem.eql(u8, d.name, acc_name)) { found = true; break; }
+                        }
+                        if (!found) {
+                            std.debug.print("error[KORU123]: std/kernel:reduce body names an accumulator `{s}` that is not declared — add `<name>[<type>]` to the block header (e.g. `{s}[f64]`)\n", .{ acc_name, acc_name });
+                            std.process.exit(1);
+                        }
+                        if (stmts.items.len > 0) stmts.append(alloc, ';') catch unreachable;
+                        stmts.appendSlice(alloc, entry) catch unreachable;
+                    }
+                }
+                if (declared.items.len == 0) {
+                    std.debug.print("error[KORU123]: std/kernel:reduce needs at least one declared accumulator `<name>[<type>]` (e.g. `total[f64]`)\n", .{});
+                    std.process.exit(1);
+                }
+                for (declared.items) |d| {
+                    reduce_out.append(alloc, .{ .name = d.name, .type = d.type }) catch unreachable;
+                    code.appendSlice(alloc, std.fmt.allocPrint(alloc, "\nvar {s}: {s} = 0;", .{ d.name, d.type }) catch unreachable) catch unreachable;
+                }
+                rop.reduce_statements = stmts.toOwnedSlice(alloc) catch unreachable;
+            }
+
+            if (step_range) |range| {
+                // `0..3` is a Zig range expression; JS has no such value, so the
+                // bounds are split and spelled as a counted `for`. A range that
+                // is not the literal `a..b` shape has no JS lowering, and saying
+                // so beats emitting a loop that silently never runs.
+                const step_open = if (is_js) blk: {
+                    const dots = std.mem.indexOf(u8, range, "..") orelse {
+                        std.debug.print("error[KORU122]: std/kernel:step on the JavaScript target needs a literal `a..b` range (got `{s}`)\n", .{range});
+                        std.process.exit(1);
+                    };
+                    const lo = std.mem.trim(u8, range[0..dots], " \t");
+                    const hi = std.mem.trim(u8, range[dots + 2 ..], " \t");
+                    break :blk std.fmt.allocPrint(alloc, "\nfor (let _step_i = {s}; _step_i < {s}; _step_i++) {{", .{ lo, hi }) catch unreachable;
+                } else std.fmt.allocPrint(alloc, "\nfor ({s}) |_step_i| {{\n    _ = &_step_i;", .{range}) catch unreachable;
+                code.appendSlice(alloc, step_open) catch unreachable;
+            }
+
+            for (ops, 0..) |op, op_idx| {
+                if (store_name.len > 0 and !std.mem.eql(u8, op.op_type, "self") and !std.mem.eql(u8, op.op_type, "pairwise")) {
+                    std.debug.print("error[KORU122]: kernel op `{s}` has no store-backed lowering yet — a store kernel runs `self` and `pairwise` only this rung\n", .{op.op_type});
+                    std.process.exit(1);
+                }
+                if (std.mem.eql(u8, op.op_type, "pairwise")) {
+                    // Loud wall (KORU122): pairwise has no backend variants yet.
+                    if (op.variant) |vt| {
+                        std.debug.print("error[KORU122]: kernel op `pairwise` supports no variants yet (got `|{s}`) — |mlir generation lands on `self` first\n", .{vt});
+                        std.process.exit(1);
+                    }
+                    if (store_name.len > 0) {
+                        // STORE MODE PAIRWISE: k.<f> -> __koru_store_<n>.<f>[i],
+                        // k.other.<f> -> __koru_store_<n>.<f>[j]. SERIAL ONLY this
+                        // rung: pairwise writes BOTH endpoints per pair, so the
+                        // rows are not disjoint and the parallel machinery
+                        // (proven for `self`) must stay off until the
+                        // deterministic-reduction contract lands.
+                        const store_ref = std.fmt.allocPrint(alloc, "__koru_store_{s}", .{store_name}) catch unreachable;
+                        const binding_other = std.fmt.allocPrint(alloc, "{s}.other", .{binding}) catch unreachable;
+                        var body = std.ArrayList(u8).initCapacity(alloc, op.body_text.len * 3) catch unreachable;
+                        var pidx: usize = 0;
+                        while (pidx < op.body_text.len) {
+                            if (pidx + binding_other.len <= op.body_text.len and std.mem.eql(u8, op.body_text[pidx .. pidx + binding_other.len], binding_other)) {
+                                const nxt = pidx + binding_other.len;
+                                if (nxt < op.body_text.len and op.body_text[nxt] == '.') {
+                                    var fe = nxt + 1;
+                                    while (fe < op.body_text.len and (std.ascii.isAlphanumeric(op.body_text[fe]) or op.body_text[fe] == '_')) fe += 1;
+                                    const fld = op.body_text[nxt + 1 .. fe];
+                                    const repl = std.fmt.allocPrint(alloc, "{s}.{s}[j]", .{ store_ref, fld }) catch unreachable;
+                                    body.appendSlice(alloc, repl) catch unreachable;
+                                    pidx = fe;
+                                } else {
+                                    body.appendSlice(alloc, op.body_text[pidx .. pidx + binding_other.len]) catch unreachable;
+                                    pidx += binding_other.len;
+                                }
+                            } else if (pidx + binding.len <= op.body_text.len and std.mem.eql(u8, op.body_text[pidx .. pidx + binding.len], binding)) {
+                                const nxt = pidx + binding.len;
+                                if (nxt < op.body_text.len and op.body_text[nxt] == '.') {
+                                    var fe = nxt + 1;
+                                    while (fe < op.body_text.len and (std.ascii.isAlphanumeric(op.body_text[fe]) or op.body_text[fe] == '_')) fe += 1;
+                                    const fld = op.body_text[nxt + 1 .. fe];
+                                    const repl = std.fmt.allocPrint(alloc, "{s}.{s}[i]", .{ store_ref, fld }) catch unreachable;
+                                    body.appendSlice(alloc, repl) catch unreachable;
+                                    pidx = fe;
+                                } else {
+                                    body.appendSlice(alloc, op.body_text[pidx .. pidx + binding.len]) catch unreachable;
+                                    pidx += binding.len;
+                                }
+                            } else {
+                                body.append(alloc, op.body_text[pidx]) catch unreachable;
+                                pidx += 1;
+                            }
+                        }
+                        if (kernelBodyNeedsTerminator(body.items)) {
+                            body.append(alloc, ';') catch unreachable;
+                        }
+                        const op_src = kernelLowerOpBody(alloc, body.items, is_js);
+                        const store_pair_loop = if (is_js)
+                            std.fmt.allocPrint(alloc,
+                                \\
+                                \\for (let i = 0; i < {s}.len; i++) {{
+                                \\    for (let j = i + 1; j < {s}.len; j++) {{
+                                \\        {s}
+                                \\    }}
+                                \\}}
+                                ,
+                                .{ store_ref, store_ref, op_src }
+                            ) catch unreachable
+                        else
+                            std.fmt.allocPrint(alloc,
+                                \\
+                                \\for (0..{s}.len) |i| {{
+                                \\    for (i + 1..{s}.len) |j| {{
+                                \\        {s}
+                                \\    }}
+                                \\}}
+                                ,
+                                .{ store_ref, store_ref, op_src }
+                            ) catch unreachable;
+                        code.appendSlice(alloc, store_pair_loop) catch unreachable;
+                        continue;
+                    }
+                    // Transform body: k.other.X -> ptr[j].X, k.X -> ptr[i].X
+                    const binding_other = std.fmt.allocPrint(alloc, "{s}.other", .{binding}) catch unreachable;
+                    const self_ref = std.fmt.allocPrint(alloc, "{s}[i]", .{ptr_name}) catch unreachable;
+                    const other_ref = std.fmt.allocPrint(alloc, "{s}[j]", .{ptr_name}) catch unreachable;
+
+                    var body = std.ArrayList(u8).initCapacity(alloc, op.body_text.len * 2) catch unreachable;
+                    var idx: usize = 0;
+                    while (idx < op.body_text.len) {
+                        if (idx + binding_other.len <= op.body_text.len and std.mem.eql(u8, op.body_text[idx..idx + binding_other.len], binding_other)) {
+                            body.appendSlice(alloc, other_ref) catch unreachable;
+                            idx += binding_other.len;
+                        } else if (idx + binding.len <= op.body_text.len and std.mem.eql(u8, op.body_text[idx..idx + binding.len], binding)) {
+                            const at_end = (idx + binding.len >= op.body_text.len);
+                            const next_ok = at_end or (!std.ascii.isAlphanumeric(op.body_text[idx + binding.len]) and op.body_text[idx + binding.len] != '_');
+                            const prev_ok = (idx == 0) or (!std.ascii.isAlphanumeric(op.body_text[idx - 1]) and op.body_text[idx - 1] != '_');
+                            if (next_ok and prev_ok) {
+                                body.appendSlice(alloc, self_ref) catch unreachable;
+                                idx += binding.len;
+                            } else {
+                                body.append(alloc, op.body_text[idx]) catch unreachable;
+                                idx += 1;
+                            }
+                        } else {
+                            body.append(alloc, op.body_text[idx]) catch unreachable;
+                            idx += 1;
+                        }
+                    }
+
+                    if (kernelBodyNeedsTerminator(body.items)) {
+                        body.append(alloc, ';') catch unreachable;
+                    }
+
+                    // THE OP BODY IS A KORU EXPRESSION, so it goes through the
+                    // one lowering rather than being spliced as host text. On Zig
+                    // this is the identity; on JS it is what turns `@sqrt(dsq)`
+                    // into `Math.sqrt(dsq)`.
+                    const op_src = kernelLowerOpBody(alloc, body.items, is_js);
+
+                    const pair_loop = if (is_js)
+                        std.fmt.allocPrint(alloc,
+                            \\
+                            \\for (let i = 0; i < {d}; i++) {{
+                            \\    for (let j = i + 1; j < {d}; j++) {{
+                            \\        {s}
+                            \\    }}
+                            \\}}
+                            ,
+                            .{ elem_count, elem_count, op_src }
+                        ) catch unreachable
+                    else
+                        std.fmt.allocPrint(alloc,
+                            \\
+                            \\for (0..{d}) |i| {{
+                            \\    for (i + 1..{d}) |j| {{
+                            \\        {s}
+                            \\    }}
+                            \\}}
+                            ,
+                            .{ elem_count, elem_count, op_src }
+                        ) catch unreachable;
+                    code.appendSlice(alloc, pair_loop) catch unreachable;
+                } else if (std.mem.eql(u8, op.op_type, "self")) {
+                    if (op.variant) |vt| {
+                        // NO `|mlir` ON JAVASCRIPT, and it refuses by name rather
+                        // than falling back to the ordinary loop. The MLIR/GPU
+                        // lowering is deferred (ruled 2026-08-06: dubious on Zig
+                        // too, a WebGPU analogue is an open question) — and a
+                        // silent fallback would run the kernel on the CPU while the
+                        // source says `|mlir[gpu]`, which is a lying green, not a
+                        // degraded one.
+                        if (is_js) {
+                            std.debug.print("error[KORU122]: std/kernel:self|{s} has no JavaScript lowering — the MLIR/GPU path is Zig-only and a WebGPU analogue is deferred\n  the DEFAULT lowering (`std/kernel:self {{ ... }}`, no variant tag) does run on this target\n", .{vt});
+                            std.process.exit(1);
+                        }
+                        // Split `base[param]` — the bracket parameter selects the
+                        // LOWERING TARGET of the same representation (|mlir[gpu]),
+                        // never a different implementation. RESIDUAL: the call-site
+                        // parameter is scaffolding until the per-event selection
+                        // language lands.
+                        var variant_base: []const u8 = vt;
+                        var variant_param: ?[]const u8 = null;
+                        if (std.mem.indexOfScalar(u8, vt, '[')) |bracket_idx| {
+                            if (vt[vt.len - 1] == ']') {
+                                variant_base = vt[0..bracket_idx];
+                                variant_param = vt[bracket_idx + 1 .. vt.len - 1];
+                            }
+                        }
+                        // Loud wall (KORU122): an unknown backend tag never falls
+                        // back to the Zig loop — that green would lie about which
+                        // machinery computed the answer.
+                        if (!std.mem.eql(u8, variant_base, "mlir") and !std.mem.eql(u8, variant_base, "fpga")) {
+                            std.debug.print("error[KORU122]: kernel op `self` has no `|{s}` variant — supported: |mlir (generated MLIR kernel, optional [gpu] lowering), |fpga (SystemVerilog stage + iverilog sim), or no tag (Zig loop)\n", .{vt});
+                            std.process.exit(1);
+                        }
+                        if (std.mem.eql(u8, variant_base, "fpga")) {
+                            if (variant_param) |vp| {
+                                std.debug.print("error[KORU122]: `self|fpga` takes no `[{s}]` lowering parameter — the tag selects the artifact pipeline whole\n", .{vp});
+                                std.process.exit(1);
+                            }
+                            if (step_range != null) {
+                                std.debug.print("error[KORU122]: `self|fpga` under `std/kernel:step` is not fpga-legal — beat semantics (last-beat reads vs sequential-update) is the unruled design question the fpga-legal trellis names\n", .{});
+                                std.process.exit(1);
+                            }
+                            if (store_name.len > 0) {
+                                std.debug.print("error[KORU122]: `self|fpga` has no store-mode lowering — a fabric stage streams a static kernel dataset, not live store rows\n", .{});
+                                std.process.exit(1);
+                            }
+                            // Emit <sym>.fpga.sv + <sym>.fpga_tb.sv beside the
+                            // ordinary lowering — port widths off the |fpga
+                            // facet's scoped meet. NO continue: the Zig loop
+                            // below stays the host executor; the circuit is the
+                            // proven artifact, not the compute path.
+                            const fpga_sym = std.fmt.allocPrint(alloc, "koru_fpga_{s}_self_{d}", .{ static_name_ref, op_idx }) catch unreachable;
+                            emitFpgaSelf(alloc, prog, home, elem_type_name, binding, op.body_text, shape_fields, dataset, fpga_sym);
+                        } else {
+                        const gpu_target = if (variant_param) |vp| blk: {
+                            if (!std.mem.eql(u8, vp, "gpu")) {
+                                std.debug.print("error[KORU122]: `self|mlir` has no `[{s}]` lowering — supported: [gpu] (SPIR-V blob) or no parameter (host CPU)\n", .{vp});
+                                std.process.exit(1);
+                            }
+                            break :blk true;
+                        } else false;
+                        // ---- |mlir: the compiler writes the kernel ----
+                        // The generated func takes the HOST buffer as a memref
+                        // argument (bare-ptr call convention → C `void f(elem*)`)
+                        // and mutates it in place, so chained ops compose (390_101)
+                        // and `step` re-invocation is semantically sound. Remaining
+                        // walking-skeleton scope: `<k>.<field> <op>= <literal>`
+                        // bodies on a single-field f64/f32 shape (f32 only for [gpu]:
+                        // Apple GPUs carry no Float64).
+                        const bt = std.mem.trim(u8, op.body_text, " \t\n\r;");
+                        if (!std.mem.startsWith(u8, bt, binding) or bt.len <= binding.len or bt[binding.len] != '.') {
+                            std.debug.print("error[KORU123]: `self|mlir` currently generates MLIR only for `{s}.<field> <op>= <literal>` (op: * + - /) — got `{s}`\n", .{ binding, bt });
+                            std.process.exit(1);
+                        }
+                        var rest = bt[binding.len + 1 ..];
+                        var fld_end: usize = 0;
+                        while (fld_end < rest.len and (std.ascii.isAlphanumeric(rest[fld_end]) or rest[fld_end] == '_')) fld_end += 1;
+                        const field_name = rest[0..fld_end];
+                        rest = std.mem.trimLeft(u8, rest[fld_end..], " \t");
+                        if (rest.len < 3 or rest[1] != '=') {
+                            std.debug.print("error[KORU123]: `self|mlir` currently generates MLIR only for `{s}.<field> <op>= <literal>` (op: * + - /) — got `{s}`\n", .{ binding, bt });
+                            std.process.exit(1);
+                        }
+                        const mlir_arith_op: []const u8 = switch (rest[0]) {
+                            '*' => "arith.mulf",
+                            '+' => "arith.addf",
+                            '-' => "arith.subf",
+                            '/' => "arith.divf",
+                            else => blk: {
+                                std.debug.print("error[KORU123]: `self|mlir` supports ops * + - / — got `{c}=` in `{s}`\n", .{ rest[0], bt });
+                                std.process.exit(1);
+                                break :blk "";
+                            },
+                        };
+                        const lit_raw = std.mem.trim(u8, rest[2..], " \t");
+                        if (lit_raw.len == 0) {
+                            std.debug.print("error[KORU123]: `self|mlir` needs a literal operand — got `{s}`\n", .{bt});
+                            std.process.exit(1);
+                        }
+                        const lit = if (std.mem.indexOfAny(u8, lit_raw, ".eE") != null)
+                            lit_raw
+                        else
+                            std.fmt.allocPrint(alloc, "{s}.0", .{lit_raw}) catch unreachable;
+
+                        if (shape_fields.len != 1 or !std.mem.eql(u8, shape_fields[0].name, field_name)) {
+                            std.debug.print("error[KORU123]: `self|mlir` currently supports exactly one shape field matching the body's `{s}` — the shape declares {d} field(s)\n", .{ field_name, shape_fields.len });
+                            std.process.exit(1);
+                        }
+                        const elem_type = shape_fields[0].type;
+                        if (!std.mem.eql(u8, elem_type, "f64") and !std.mem.eql(u8, elem_type, "f32")) {
+                            std.debug.print("error[KORU123]: `self|mlir` supports f64/f32 shape fields — `{s}` is {s}\n", .{ field_name, elem_type });
+                            std.process.exit(1);
+                        }
+                        if (gpu_target and std.mem.eql(u8, elem_type, "f64")) {
+                            std.debug.print("error[KORU123]: `self|mlir[gpu]` requires an f32 shape — Apple GPUs (SPIR-V via MoltenVK) carry no Float64; `{s}` is f64\n", .{field_name});
+                            std.process.exit(1);
+                        }
+
+                        // Generate the MLIR kernel: the host buffer arrives as a
+                        // memref argument; the scf.for self loop mutates it in place.
+                        const sym = std.fmt.allocPrint(alloc, "koru_mlir_{s}_self_{d}", .{ static_name_ref, op_idx }) catch unreachable;
+                        const mlir = std.fmt.allocPrint(alloc,
+                            \\func.func @{s}(%buf: memref<{d}x{s}>) {{
+                            \\  %lb = arith.constant 0 : index
+                            \\  %ub = arith.constant {d} : index
+                            \\  %st = arith.constant 1 : index
+                            \\  %k = arith.constant {s} : {s}
+                            \\  scf.for %i = %lb to %ub step %st {{
+                            \\    %x = memref.load %buf[%i] : memref<{d}x{s}>
+                            \\    %y = {s} %x, %k : {s}
+                            \\    memref.store %y, %buf[%i] : memref<{d}x{s}>
+                            \\  }}
+                            \\  return
+                            \\}}
+                            \\
+                        , .{ sym, elem_count, elem_type, elem_count, lit, elem_type, elem_count, elem_type, mlir_arith_op, elem_type, elem_count, elem_type }) catch unreachable;
+
+                        // Write <sym>.mlir into the build root (Stage C runs there;
+                        // Stage D's build_output.zig glob lowers + links it).
+                        {
+                            const fname = std.fmt.allocPrint(alloc, "{s}.mlir", .{sym}) catch unreachable;
+                            const mf = std.fs.cwd().createFile(fname, .{}) catch |e| {
+                                std.debug.print("error: `self|mlir` cannot write {s}: {s}\n", .{ fname, @errorName(e) });
+                                std.process.exit(1);
+                            };
+                            defer mf.close();
+                            mf.writeAll(mlir) catch unreachable;
+                        }
+
+                        // [gpu]: ALSO emit the GPU form of the same kernel —
+                        // gpu.module/gpu.func, block-per-element indexing, SPIR-V
+                        // entry-point ABI. Stage D routes `.gpu.mlir` through the
+                        // SPIR-V pipeline to a spirv-val-gated blob. The CPU kernel
+                        // above stays linked and computes (8205 coexistence); host
+                        // dispatch through Vulkan is the next rung.
+                        if (gpu_target) {
+                            const gpu_mlir = std.fmt.allocPrint(alloc,
+                                \\module attributes {{
+                                \\  gpu.container_module,
+                                \\  spirv.target_env = #spirv.target_env<#spirv.vce<v1.3, [Shader], [SPV_KHR_storage_buffer_storage_class]>, #spirv.resource_limits<>>
+                                \\}} {{
+                                \\  gpu.module @koru_gpu_kernels {{
+                                \\    gpu.func @{s}_gpu(%buf: memref<{d}xf32, #spirv.storage_class<StorageBuffer>>) kernel
+                                \\      attributes {{spirv.entry_point_abi = #spirv.entry_point_abi<workgroup_size = [1, 1, 1]>}} {{
+                                \\      %i = gpu.block_id x
+                                \\      %x = memref.load %buf[%i] : memref<{d}xf32, #spirv.storage_class<StorageBuffer>>
+                                \\      %k = arith.constant {s} : f32
+                                \\      %y = {s} %x, %k : f32
+                                \\      memref.store %y, %buf[%i] : memref<{d}xf32, #spirv.storage_class<StorageBuffer>>
+                                \\      gpu.return
+                                \\    }}
+                                \\  }}
+                                \\}}
+                                \\
+                            , .{ sym, elem_count, elem_count, lit, mlir_arith_op, elem_count }) catch unreachable;
+                            const gpu_fname = std.fmt.allocPrint(alloc, "{s}.gpu.mlir", .{sym}) catch unreachable;
+                            const gf = std.fs.cwd().createFile(gpu_fname, .{}) catch |e| {
+                                std.debug.print("error: `self|mlir[gpu]` cannot write {s}: {s}\n", .{ gpu_fname, @errorName(e) });
+                                std.process.exit(1);
+                            };
+                            defer gf.close();
+                            gf.writeAll(gpu_mlir) catch unreachable;
+
+                            // Runtime dispatch helper (static): output_emitted.zig
+                            // @imports this to upload -> dispatch -> readback on the
+                            // local Vulkan device (M2 Pro / MoltenVK). @cImport(vulkan);
+                            // the build-root glob links libvulkan + libc onto the exe.
+                            const gpu_rt = std.fs.cwd().createFile("koru_gpu_dispatch.zig", .{}) catch |e| {
+                                std.debug.print("error: `self|mlir[gpu]` cannot write koru_gpu_dispatch.zig: {s}\n", .{@errorName(e)});
+                                std.process.exit(1);
+                            };
+                            defer gpu_rt.close();
+                            gpu_rt.writeAll(
+                            \\const std = @import("std");
+                            \\const vk = @cImport({
+                            \\    @cInclude("stdlib.h");
+                            \\    @cInclude("vulkan/vulkan.h");
+                            \\});
+                            \\
+                            \\fn zi(comptime T: type, fields: anytype) T {
+                            \\    return std.mem.zeroInit(T, fields);
+                            \\}
+                            \\
+                            \\/// Dispatch one SPIR-V compute kernel over `buf` (n f32, one thread/element via
+                            \\/// block_id x) on the local Vulkan device (M2 Pro / MoltenVK). Mutates in place.
+                            \\pub fn koruGpuDispatchF32(spv: []const u8, entry: [*:0]const u8, buf: [*]f32, n: u32) void {
+                            \\    const bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, n) * @sizeOf(f32);
+                            \\
+                            \\    // Point the Vulkan loader at MoltenVK (portability ICD). Hardcoded PoC path,
+                            \\    // same family as the hardcoded LLVM toolchain path — resolves through
+                            \\    // deps/requires later. setenv before the first Vulkan call so the loader
+                            \\    // sees it at ICD enumeration.
+                            \\    _ = vk.setenv("VK_ICD_FILENAMES", "/usr/local/share/vulkan/icd.d/MoltenVK_icd.json", 1);
+                            \\
+                            \\    // instance (MoltenVK is a portability driver)
+                            \\    const inst_exts = [_][*:0]const u8{ "VK_KHR_portability_enumeration", "VK_KHR_get_physical_device_properties2" };
+                            \\    const app = zi(vk.VkApplicationInfo, .{ .sType = vk.VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = vk.VK_API_VERSION_1_2 });
+                            \\    var inst: vk.VkInstance = undefined;
+                            \\    check(vk.vkCreateInstance(&zi(vk.VkInstanceCreateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                            \\        .flags = 0x00000001, // ENUMERATE_PORTABILITY_BIT_KHR
+                            \\        .pApplicationInfo = &app,
+                            \\        .enabledExtensionCount = 2,
+                            \\        .ppEnabledExtensionNames = &inst_exts,
+                            \\    }), null, &inst), "vkCreateInstance");
+                            \\
+                            \\    var ndev: u32 = 0;
+                            \\    check(vk.vkEnumeratePhysicalDevices(inst, &ndev, null), "enumPD count");
+                            \\    if (ndev == 0) @panic("koru gpu: no Vulkan device");
+                            \\    var pds: [8]vk.VkPhysicalDevice = undefined;
+                            \\    if (ndev > 8) ndev = 8;
+                            \\    check(vk.vkEnumeratePhysicalDevices(inst, &ndev, &pds), "enumPD");
+                            \\    const pd = pds[0];
+                            \\
+                            \\    var nqf: u32 = 0;
+                            \\    vk.vkGetPhysicalDeviceQueueFamilyProperties(pd, &nqf, null);
+                            \\    var qfs: [16]vk.VkQueueFamilyProperties = undefined;
+                            \\    if (nqf > 16) nqf = 16;
+                            \\    vk.vkGetPhysicalDeviceQueueFamilyProperties(pd, &nqf, &qfs);
+                            \\    var qfi: u32 = 0xFFFF_FFFF;
+                            \\    var i: u32 = 0;
+                            \\    while (i < nqf) : (i += 1) {
+                            \\        if (qfs[i].queueFlags & vk.VK_QUEUE_COMPUTE_BIT != 0) {
+                            \\            qfi = i;
+                            \\            break;
+                            \\        }
+                            \\    }
+                            \\    if (qfi == 0xFFFF_FFFF) @panic("koru gpu: no compute queue");
+                            \\
+                            \\    const prio: f32 = 1.0;
+                            \\    const qci = zi(vk.VkDeviceQueueCreateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                            \\        .queueFamilyIndex = qfi,
+                            \\        .queueCount = 1,
+                            \\        .pQueuePriorities = &prio,
+                            \\    });
+                            \\    const dev_exts = [_][*:0]const u8{"VK_KHR_portability_subset"};
+                            \\    var dev: vk.VkDevice = undefined;
+                            \\    check(vk.vkCreateDevice(pd, &zi(vk.VkDeviceCreateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+                            \\        .queueCreateInfoCount = 1,
+                            \\        .pQueueCreateInfos = &qci,
+                            \\        .enabledExtensionCount = 1,
+                            \\        .ppEnabledExtensionNames = &dev_exts,
+                            \\    }), null, &dev), "vkCreateDevice");
+                            \\    var queue: vk.VkQueue = undefined;
+                            \\    vk.vkGetDeviceQueue(dev, qfi, 0, &queue);
+                            \\
+                            \\    // storage buffer, host-visible
+                            \\    var vbuf: vk.VkBuffer = undefined;
+                            \\    check(vk.vkCreateBuffer(dev, &zi(vk.VkBufferCreateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                            \\        .size = bytes,
+                            \\        .usage = vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            \\        .sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE,
+                            \\    }), null, &vbuf), "vkCreateBuffer");
+                            \\    var mr: vk.VkMemoryRequirements = undefined;
+                            \\    vk.vkGetBufferMemoryRequirements(dev, vbuf, &mr);
+                            \\    var mp: vk.VkPhysicalDeviceMemoryProperties = undefined;
+                            \\    vk.vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+                            \\    const want = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                            \\    var mti: u32 = 0xFFFF_FFFF;
+                            \\    var m: u32 = 0;
+                            \\    while (m < mp.memoryTypeCount) : (m += 1) {
+                            \\        if ((mr.memoryTypeBits & (@as(u32, 1) << @intCast(m))) != 0 and
+                            \\            (mp.memoryTypes[m].propertyFlags & want) == want)
+                            \\        {
+                            \\            mti = m;
+                            \\            break;
+                            \\        }
+                            \\    }
+                            \\    if (mti == 0xFFFF_FFFF) @panic("koru gpu: no host-visible memory");
+                            \\    var mem: vk.VkDeviceMemory = undefined;
+                            \\    check(vk.vkAllocateMemory(dev, &zi(vk.VkMemoryAllocateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                            \\        .allocationSize = mr.size,
+                            \\        .memoryTypeIndex = mti,
+                            \\    }), null, &mem), "vkAllocateMemory");
+                            \\    check(vk.vkBindBufferMemory(dev, vbuf, mem, 0), "vkBindBufferMemory");
+                            \\
+                            \\    // upload host buffer -> device
+                            \\    var mapped: ?*anyopaque = null;
+                            \\    check(vk.vkMapMemory(dev, mem, 0, bytes, 0, &mapped), "vkMapMemory in");
+                            \\    {
+                            \\        const dst: [*]f32 = @ptrCast(@alignCast(mapped.?));
+                            \\        @memcpy(dst[0..n], buf[0..n]);
+                            \\    }
+                            \\    vk.vkUnmapMemory(dev, mem);
+                            \\
+                            \\    // shader module from the compiler's blob
+                            \\    var sm: vk.VkShaderModule = undefined;
+                            \\    check(vk.vkCreateShaderModule(dev, &zi(vk.VkShaderModuleCreateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                            \\        .codeSize = spv.len,
+                            \\        .pCode = @as([*c]const u32, @ptrCast(@alignCast(spv.ptr))),
+                            \\    }), null, &sm), "vkCreateShaderModule");
+                            \\
+                            \\    // descriptor set layout: binding 0 storage buffer, compute
+                            \\    const dslb = zi(vk.VkDescriptorSetLayoutBinding, .{
+                            \\        .binding = 0,
+                            \\        .descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            \\        .descriptorCount = 1,
+                            \\        .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+                            \\    });
+                            \\    var dsl: vk.VkDescriptorSetLayout = undefined;
+                            \\    check(vk.vkCreateDescriptorSetLayout(dev, &zi(vk.VkDescriptorSetLayoutCreateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                            \\        .bindingCount = 1,
+                            \\        .pBindings = &dslb,
+                            \\    }), null, &dsl), "vkCreateDescriptorSetLayout");
+                            \\    var pl: vk.VkPipelineLayout = undefined;
+                            \\    check(vk.vkCreatePipelineLayout(dev, &zi(vk.VkPipelineLayoutCreateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                            \\        .setLayoutCount = 1,
+                            \\        .pSetLayouts = &dsl,
+                            \\    }), null, &pl), "vkCreatePipelineLayout");
+                            \\
+                            \\    // compute pipeline
+                            \\    var pipe: vk.VkPipeline = undefined;
+                            \\    const cpci = zi(vk.VkComputePipelineCreateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                            \\        .stage = zi(vk.VkPipelineShaderStageCreateInfo, .{
+                            \\            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                            \\            .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+                            \\            .module = sm,
+                            \\            .pName = entry,
+                            \\        }),
+                            \\        .layout = pl,
+                            \\    });
+                            \\    check(vk.vkCreateComputePipelines(dev, null, 1, &cpci, null, &pipe), "vkCreateComputePipelines");
+                            \\
+                            \\    // descriptor pool + set
+                            \\    const dps = zi(vk.VkDescriptorPoolSize, .{ .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 });
+                            \\    var dp: vk.VkDescriptorPool = undefined;
+                            \\    check(vk.vkCreateDescriptorPool(dev, &zi(vk.VkDescriptorPoolCreateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                            \\        .maxSets = 1,
+                            \\        .poolSizeCount = 1,
+                            \\        .pPoolSizes = &dps,
+                            \\    }), null, &dp), "vkCreateDescriptorPool");
+                            \\    var ds: vk.VkDescriptorSet = undefined;
+                            \\    check(vk.vkAllocateDescriptorSets(dev, &zi(vk.VkDescriptorSetAllocateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                            \\        .descriptorPool = dp,
+                            \\        .descriptorSetCount = 1,
+                            \\        .pSetLayouts = &dsl,
+                            \\    }), &ds), "vkAllocateDescriptorSets");
+                            \\    const dbi = zi(vk.VkDescriptorBufferInfo, .{ .buffer = vbuf, .offset = 0, .range = bytes });
+                            \\    const wds = zi(vk.VkWriteDescriptorSet, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                            \\        .dstSet = ds,
+                            \\        .dstBinding = 0,
+                            \\        .descriptorCount = 1,
+                            \\        .descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            \\        .pBufferInfo = &dbi,
+                            \\    });
+                            \\    vk.vkUpdateDescriptorSets(dev, 1, &wds, 0, null);
+                            \\
+                            \\    // record + dispatch (n,1,1)
+                            \\    var cp: vk.VkCommandPool = undefined;
+                            \\    check(vk.vkCreateCommandPool(dev, &zi(vk.VkCommandPoolCreateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                            \\        .queueFamilyIndex = qfi,
+                            \\    }), null, &cp), "vkCreateCommandPool");
+                            \\    var cb: vk.VkCommandBuffer = undefined;
+                            \\    check(vk.vkAllocateCommandBuffers(dev, &zi(vk.VkCommandBufferAllocateInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                            \\        .commandPool = cp,
+                            \\        .level = vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                            \\        .commandBufferCount = 1,
+                            \\    }), &cb), "vkAllocateCommandBuffers");
+                            \\    check(vk.vkBeginCommandBuffer(cb, &zi(vk.VkCommandBufferBeginInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                            \\        .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                            \\    })), "vkBeginCommandBuffer");
+                            \\    vk.vkCmdBindPipeline(cb, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+                            \\    vk.vkCmdBindDescriptorSets(cb, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, null);
+                            \\    vk.vkCmdDispatch(cb, n, 1, 1);
+                            \\    check(vk.vkEndCommandBuffer(cb), "vkEndCommandBuffer");
+                            \\    const si = zi(vk.VkSubmitInfo, .{
+                            \\        .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                            \\        .commandBufferCount = 1,
+                            \\        .pCommandBuffers = &cb,
+                            \\    });
+                            \\    check(vk.vkQueueSubmit(queue, 1, &si, null), "vkQueueSubmit");
+                            \\    check(vk.vkQueueWaitIdle(queue), "vkQueueWaitIdle");
+                            \\
+                            \\    // readback device -> host buffer
+                            \\    check(vk.vkMapMemory(dev, mem, 0, bytes, 0, &mapped), "vkMapMemory out");
+                            \\    {
+                            \\        const src: [*]f32 = @ptrCast(@alignCast(mapped.?));
+                            \\        @memcpy(buf[0..n], src[0..n]);
+                            \\    }
+                            \\    vk.vkUnmapMemory(dev, mem);
+                            \\
+                            \\    // teardown (skeleton: destroy the big handles; process exit reclaims the rest)
+                            \\    vk.vkDestroyPipeline(dev, pipe, null);
+                            \\    vk.vkDestroyShaderModule(dev, sm, null);
+                            \\    vk.vkDestroyDevice(dev, null);
+                            \\    vk.vkDestroyInstance(inst, null);
+                            \\}
+                            \\
+                            \\fn check(r: vk.VkResult, comptime what: []const u8) void {
+                            \\    if (r != vk.VK_SUCCESS) {
+                            \\        std.debug.print("koru gpu: {s} failed = {d}\n", .{ what, r });
+                            \\        @panic("koru gpu dispatch failed");
+                            \\    }
+                            \\}
+                            ) catch unreachable;
+                        }
+
+                        if (gpu_target) {
+                            // Host glue routes to the GPU: embed the validated SPIR-V
+                            // blob and dispatch on the local device. The buffer is
+                            // mutated in place — same contract as the CPU path, so the
+                            // computed continuation reads GPU results.
+                            code.appendSlice(alloc, std.fmt.allocPrint(alloc,
+                                \\
+                                \\{{
+                                \\    const __koru_gpu_{d} = @import("koru_gpu_dispatch.zig");
+                                \\    __koru_gpu_{d}.koruGpuDispatchF32(@embedFile("{s}.gpu.spv"), "{s}_gpu", @ptrCast({s}), {d});
+                                \\}}
+                                ,
+                                .{ op_idx, op_idx, sym, sym, ptr_name, elem_count }
+                            ) catch unreachable) catch unreachable;
+                        } else {
+                            // Host glue: ONE call, buffer mutated in place. Single-field
+                            // shape (walled above) makes [*]Body layout-identical to
+                            // [*]elem for the bare-ptr convention.
+                            code.appendSlice(alloc, std.fmt.allocPrint(alloc,
+                                \\
+                                \\{{
+                                \\    const __koru_mlir_self_{d} = @extern(*const fn ([*]{s}) callconv(.c) void, .{{ .name = "{s}" }});
+                                \\    __koru_mlir_self_{d}(@ptrCast({s}));
+                                \\}}
+                                ,
+                                .{ op_idx, elem_type, sym, op_idx, ptr_name }
+                            ) catch unreachable) catch unreachable;
+                        }
+                        continue;
+                        }
+                    }
+                    // Transform body: k.X -> ptr[i].X (literal mode) or
+                    // k.<field> -> __koru_store_<name>.<field>[i] (store mode:
+                    // raw SoA column access, non-reactive by construction).
+                    if (store_name.len > 0) {
+                        // STORE MODE: reject the ops that would need a family view
+                        // beyond the store's columns on this rung.
+                        if (op.variant) |vt| {
+                            std.debug.print("error[KORU122]: kernel op `self|{s}` has no store-mode lowering yet — a store-backed kernel runs plain `self` only this rung\n", .{vt});
+                            std.process.exit(1);
+                        }
+                        const store_ref = std.fmt.allocPrint(alloc, "__koru_store_{s}", .{store_name}) catch unreachable;
+                        var body = std.ArrayList(u8).initCapacity(alloc, op.body_text.len * 2) catch unreachable;
+                        var sidx: usize = 0;
+                        while (sidx < op.body_text.len) {
+                            if (sidx + binding.len <= op.body_text.len and std.mem.eql(u8, op.body_text[sidx .. sidx + binding.len], binding)) {
+                                const nxt = sidx + binding.len;
+                                if (nxt < op.body_text.len and op.body_text[nxt] == '.') {
+                                    var fe = nxt + 1;
+                                    while (fe < op.body_text.len and (std.ascii.isAlphanumeric(op.body_text[fe]) or op.body_text[fe] == '_')) fe += 1;
+                                    const fld = op.body_text[nxt + 1 .. fe];
+                                    const repl = std.fmt.allocPrint(alloc, "{s}.{s}[i]", .{ store_ref, fld }) catch unreachable;
+                                    body.appendSlice(alloc, repl) catch unreachable;
+                                    sidx = fe;
+                                } else {
+                                    // bare binding with no field: no kernel view on a store
+                                    body.appendSlice(alloc, op.body_text[sidx .. sidx + binding.len]) catch unreachable;
+                                    sidx += binding.len;
+                                }
+                            } else {
+                                body.append(alloc, op.body_text[sidx]) catch unreachable;
+                                sidx += 1;
+                            }
+                        }
+                        if (kernelBodyNeedsTerminator(body.items)) {
+                            body.append(alloc, ';') catch unreachable;
+                        }
+                        const op_src = kernelLowerOpBody(alloc, body.items, is_js);
+                        if (is_js) {
+                            // JavaScript is single-threaded by contract this rung
+                            // (Web Workers are a later one): serial is the honest
+                            // lowering, not a degraded one.
+                            const js_loop = std.fmt.allocPrint(alloc,
+                                \\
+                                \\for (let i = 0; i < {s}.len; i++) {{
+                                \\    {s}
+                                \\}}
+                                ,
+                                .{ store_ref, op_src }
+                            ) catch unreachable;
+                            code.appendSlice(alloc, js_loop) catch unreachable;
+                            continue;
+                        }
+                        // PARALLEL (Zig): `self` writes DISJOINT rows — one thread
+                        // owns `[lo, hi)` and no thread touches another's rows, so
+                        // the result is bit-identical to the serial loop at any
+                        // thread split (no FP reassociation, no oracle change).
+                        // Adaptive per call: live length below a floor runs the
+                        // serial loop; above it, up to cpu-count threads, with a
+                        // spawn failure or empty tail falling back INLINE so no row
+                        // is ever silently skipped.
+                        const par_body = std.mem.replaceOwned(u8, alloc, op_src, "[i]", "[__koru_i]") catch unreachable;
+                        // BODY-AWARE FLOOR: the parallel win amortizes the pool
+                        // overhead against per-row work, so the floor scales
+                        // inversely with the body's size (a compile-time proxy
+                        // for flops/row). Calibrated 2026-08-15 against the
+                        // LOWERED op_src length (the light 9-op body lowers to
+                        // ~614 chars): its crossover sits at/beyond the old
+                        // fixed floor, so 614 maps to 65536. The 40-op body
+                        // (~1.4k chars) gets ~29k and the 264-op (~4.4k) gets
+                        // ~9k. floor = 65536 * 614 / len, clamped.
+                        const body_len = op_src.len;
+                        var par_floor: usize = 65536 * 614 / @max(body_len, @as(usize, 614));
+                        if (par_floor < 4096) par_floor = 4096;
+                        if (par_floor > 65536) par_floor = 65536;
+                        const par_fn_name = std.fmt.allocPrint(alloc, "__koru_par_{s}_{d}", .{ static_name_ref, op_idx }) catch unreachable;
+                        const par_fn = std.fmt.allocPrint(alloc,
+                            \\const {s} = struct {{
+                            \\    fn run(lo: usize, hi: usize) void {{
+                            \\        for (lo..hi) |__koru_i| {{
+                            \\            {s}
+                            \\        }}
+                            \\    }}
+                            \\}};
+                            \\
+                            ,
+                            .{ par_fn_name, par_body }
+                        ) catch unreachable;
+                        const adaptive = std.fmt.allocPrint(alloc,
+                            \\{{
+                            \\    const __koru_n = {s}.len;
+                            \\    if (__koru_n >= {d}) {{
+                            \\        const __koru_p = __koru_pool_ensure();
+                            \\        const __koru_nc = @max(@as(usize, 1), @min(@import("std").Thread.getCpuCount() catch 1, (__koru_n + 4095) / 4096));
+                            \\        var __koru_wg: @import("std").Thread.WaitGroup = .{{}};
+                            \\        for (0..__koru_nc) |__koru_t| {{
+                            \\            const __koru_lo = __koru_t * __koru_n / __koru_nc;
+                            \\            const __koru_hi = if (__koru_t + 1 == __koru_nc) __koru_n else (__koru_t + 1) * __koru_n / __koru_nc;
+                            \\            if (__koru_hi <= __koru_lo) break;
+                            \\            __koru_p.spawnWg(&__koru_wg, {s}.run, .{{ __koru_lo, __koru_hi }});
+                            \\        }}
+                            \\        __koru_wg.wait();
+                            \\    }} else {{
+                            \\        for (0..{s}.len) |i| {{
+                            \\            {s}
+                            \\        }}
+                            \\    }}
+                            \\}}
+                            ,
+                            .{ store_ref, par_floor, par_fn_name, store_ref, op_src }
+                        ) catch unreachable;
+                        code.appendSlice(alloc, par_fn) catch unreachable;
+                        code.appendSlice(alloc, adaptive) catch unreachable;
+                        continue;
+                    }
+                    const self_ref = std.fmt.allocPrint(alloc, "{s}[i]", .{ptr_name}) catch unreachable;
+
+                    var body = std.ArrayList(u8).initCapacity(alloc, op.body_text.len * 2) catch unreachable;
+                    var idx: usize = 0;
+                    while (idx < op.body_text.len) {
+                        if (idx + binding.len <= op.body_text.len and std.mem.eql(u8, op.body_text[idx..idx + binding.len], binding)) {
+                            const at_end = (idx + binding.len >= op.body_text.len);
+                            const next_ok = at_end or (!std.ascii.isAlphanumeric(op.body_text[idx + binding.len]) and op.body_text[idx + binding.len] != '_');
+                            const prev_ok = (idx == 0) or (!std.ascii.isAlphanumeric(op.body_text[idx - 1]) and op.body_text[idx - 1] != '_');
+                            if (next_ok and prev_ok) {
+                                body.appendSlice(alloc, self_ref) catch unreachable;
+                                idx += binding.len;
+                            } else {
+                                body.append(alloc, op.body_text[idx]) catch unreachable;
+                                idx += 1;
+                            }
+                        } else {
+                            body.append(alloc, op.body_text[idx]) catch unreachable;
+                            idx += 1;
+                        }
+                    }
+
+                    if (kernelBodyNeedsTerminator(body.items)) {
+                        body.append(alloc, ';') catch unreachable;
+                    }
+
+                    // THE OP BODY IS A KORU EXPRESSION, so it goes through the
+                    // one lowering rather than being spliced as host text. On Zig
+                    // this is the identity; on JS it is what turns `@sqrt(dsq)`
+                    // into `Math.sqrt(dsq)`.
+                    const op_src = kernelLowerOpBody(alloc, body.items, is_js);
+
+                    const self_loop = if (is_js)
+                        std.fmt.allocPrint(alloc,
+                            \\
+                            \\for (let i = 0; i < {d}; i++) {{
+                            \\    {s}
+                            \\}}
+                            ,
+                            .{ elem_count, op_src }
+                        ) catch unreachable
+                    else
+                        std.fmt.allocPrint(alloc,
+                            \\
+                            \\for (0..{d}) |i| {{
+                            \\    {s}
+                            \\}}
+                            ,
+                            .{ elem_count, op_src }
+                        ) catch unreachable;
+                    code.appendSlice(alloc, self_loop) catch unreachable;
+                } else if (std.mem.eql(u8, op.op_type, "reduce")) {
+                    // Accumulate over every element once: the body (`<name> +=
+                    // <k>.field`) has been collected with the binding reference
+                    // intact, so rewrite `<k>.field` → `ptr[i].field` and emit a
+                    // single pass loop. Accumulator names are untouched by the
+                    // rewrite (identifier-boundary guard, same as `self`).
+                    if (op.variant) |vt| {
+                        std.debug.print("error[KORU122]: kernel op `reduce` supports no variants yet (got `|{s}`)\n", .{vt});
+                        std.process.exit(1);
+                    }
+                    const reduce_body = op.reduce_statements orelse op.body_text;
+                    const self_ref = std.fmt.allocPrint(alloc, "{s}[i]", .{ptr_name}) catch unreachable;
+                    var body = std.ArrayList(u8).initCapacity(alloc, reduce_body.len * 2) catch unreachable;
+                    var ridx: usize = 0;
+                    while (ridx < reduce_body.len) {
+                        if (ridx + binding.len <= reduce_body.len and std.mem.eql(u8, reduce_body[ridx .. ridx + binding.len], binding)) {
+                            const at_end = (ridx + binding.len >= reduce_body.len);
+                            const next_ok = at_end or (!std.ascii.isAlphanumeric(reduce_body[ridx + binding.len]) and reduce_body[ridx + binding.len] != '_');
+                            const prev_ok = (ridx == 0) or (!std.ascii.isAlphanumeric(reduce_body[ridx - 1]) and reduce_body[ridx - 1] != '_');
+                            if (next_ok and prev_ok) {
+                                body.appendSlice(alloc, self_ref) catch unreachable;
+                                ridx += binding.len;
+                            } else {
+                                body.append(alloc, reduce_body[ridx]) catch unreachable;
+                                ridx += 1;
+                            }
+                        } else {
+                            body.append(alloc, reduce_body[ridx]) catch unreachable;
+                            ridx += 1;
+                        }
+                    }
+                    if (kernelBodyNeedsTerminator(body.items)) {
+                        body.append(alloc, ';') catch unreachable;
+                    }
+                    const op_src = kernelLowerOpBody(alloc, body.items, is_js);
+                    // REDUCE IS ASSOCIATIVE: `reduce` is a fold, not a state
+                    // mutation. That is its contract, and it is exactly what
+                    // allows reassociation — so the loop runs under an optimized
+                    // float mode and LLVM can vectorize it into partial sums.
+                    // `self`/`pairwise` keep the strict contract (see the
+                    // "no FP reassociation, no oracle change" note above): they
+                    // mutate state that must match an oracle bit-for-bit.
+                    const reduce_loop = if (is_js)
+                        std.fmt.allocPrint(alloc, "\nfor (let i = 0; i < {d}; i++) {{\n    {s}\n}}", .{ elem_count, op_src }) catch unreachable
+                    else
+                        std.fmt.allocPrint(alloc, "\n@setFloatMode(.optimized);\nfor (0..{d}) |i| {{\n    {s}\n}}\n@setFloatMode(.strict);", .{ elem_count, op_src }) catch unreachable;
+                    code.appendSlice(alloc, reduce_loop) catch unreachable;
+                }
+            }
+
+            if (step_range != null) {
+                code.append(alloc, '}') catch unreachable;
+            }
+
+            return code.toOwnedSlice(alloc) catch unreachable;
+        }
+    }.call;
+
+    var proc_body: []const u8 = undefined;
+    var static_decl: []const u8 = "";
+
+    // ========================================================================
+    // REDUCE: the op pass appends an accumulator per `std/kernel:reduce`
+    // accumulator. A non-empty list means the kernel wants a `| reduce |>` exit.
+    // ========================================================================
+    var reduce_acc = std.ArrayList(ReduceAccumulator).initCapacity(allocator, 2) catch unreachable;
+    var fused_code: []const u8 = "";
+
+    if (is_store_mode) {
+        // STORE MODE: the kernel iterates the store's live rows in place — no
+        // dataset static, no `| computed |>` exit, the store IS the observable.
+        static_decl = "";
+        fused_code = generateKernelOpsCode(allocator, kernel_plan.ops, kernel_plan.step_range, kernel_binding_name, static_name, 0, type_fields, host_is_js, &reduce_acc, type_name, program, flow.module, type_name, source.text);
+        if (host_is_js) {
+            proc_body = std.fmt.allocPrint(allocator, "{s}\nreturn {{ tag: \"kernel\", kernel: {{}} }};", .{fused_code}) catch unreachable;
+        } else {
+            proc_body = std.fmt.allocPrint(allocator, "{s}\nreturn .{{ .kernel = .{{}} }};", .{fused_code}) catch unreachable;
+        }
+    } else if (is_array_mode) {
+        // Array mode: parse multiple { ... } blocks
+        var elements = __koru_std.ArrayList(u8).initCapacity(allocator, source.text.len * 2) catch unreachable;
+        var count: usize = 0;
+
+        var block_iter = __koru_std.mem.splitSequence(u8, source.text, "}");
+        while (block_iter.next()) |block_raw| {
+            if (__koru_std.mem.indexOf(u8, block_raw, "{")) |brace_idx| {
+                const block_content = block_raw[brace_idx + 1 ..];
+                const fields = kernelTransformFields(allocator, block_content, host_is_js);
+
+                if (fields.len > 0) {
+                    if (count > 0) elements.appendSlice(allocator, ", ") catch unreachable;
+                    // `Body{ .x = 1 }` names its type; a JS object literal cannot
+                    // and does not need to.
+                    if (!host_is_js) elements.appendSlice(allocator, type_name) catch unreachable;
+                    elements.appendSlice(allocator, "{ ") catch unreachable;
+                    elements.appendSlice(allocator, fields) catch unreachable;
+                    elements.appendSlice(allocator, " }") catch unreachable;
+                    count += 1;
+                }
+            }
+        }
+
+        static_decl = if (host_is_js)
+            std.fmt.allocPrint(allocator, "let {s} = [{s}];", .{ static_name, elements.items }) catch unreachable
+        else
+            std.fmt.allocPrint(allocator, "var {s} = [_]{s}{{ {s} }};", .{ static_name, type_name, elements.items }) catch unreachable;
+
+        // Generate static-backed initialization (proof-of-concept)
+        fused_code = generateKernelOpsCode(allocator, kernel_plan.ops, kernel_plan.step_range, kernel_binding_name, static_name, count, type_fields, host_is_js, &reduce_acc, "", program, flow.module, type_name, source.text);
+    } else {
+        // Single mode: just one struct instance
+        const fields = kernelTransformFields(allocator, source.text, host_is_js);
+        const single_init = std.fmt.allocPrint(allocator, "{s}{{ {s} }}", .{ if (host_is_js) "" else type_name, fields }) catch unreachable;
+        static_decl = if (host_is_js)
+            std.fmt.allocPrint(allocator, "let {s} = [{s}];", .{ static_name, single_init }) catch unreachable
+        else
+            std.fmt.allocPrint(allocator, "var {s} = [_]{s}{{ {s} }};", .{ static_name, type_name, single_init }) catch unreachable;
+        fused_code = generateKernelOpsCode(allocator, kernel_plan.ops, kernel_plan.step_range, kernel_binding_name, static_name, 1, type_fields, host_is_js, &reduce_acc, "", program, flow.module, type_name, source.text);
+    }
+
+    // Guard the reduce exit (v1 semantics): a reduce op needs a `| reduce |>` exit
+    // (otherwise its accumulated value is silently trapped), and it is not yet
+    // combinable with `| computed |>` in one init — refusing beats both a dropped
+    // value and a mistyped two-branch return.
+    if (reduce_acc.items.len > 0 and !has_reduce_continuation) {
+        std.debug.print("error[KORU123]: std/kernel:reduce needs a `| reduce <name> |>` exit continuation — its accumulated value cannot reach the caller otherwise\n  --> {s}:{d}:{d}\n  hint: end the kernel scope with e.g. `| reduce r |> std/io:print.ln(r.<name>)`\n", .{ flow.location.file, flow.location.line, flow.location.column });
+        std.process.exit(1);
+    }
+    if (has_reduce_continuation and has_computed_continuation) {
+        std.debug.print("error[KORU123]: a kernel:init cannot exit through both `| computed |>` and `| reduce |>` yet — use one exit in this init\n  --> {s}:{d}:{d}\n", .{ flow.location.file, flow.location.line, flow.location.column });
+        std.process.exit(1);
+    }
+
+// Build the single return statement. The exit is the kernel array
+    // (`| computed |>`), a bare `kernel` binding, or — when a reduce op
+    // produced accumulators and the flow carries a `| reduce |>` continuation —
+    // a reduce struct carrying each accumulated scalar as a named field.
+    // STORE MODE built its own return above (the store is the observable).
+    const reduce_active = has_reduce_continuation and reduce_acc.items.len > 0;
+    if (!is_store_mode) {
+        var reduce_returns = std.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+    if (reduce_active) {
+        for (reduce_acc.items, 0..) |racc, ri| {
+            if (ri > 0) reduce_returns.appendSlice(allocator, ", ") catch unreachable;
+            const seg = if (host_is_js)
+                std.fmt.allocPrint(allocator, "{s}: {s}", .{ racc.name, racc.name }) catch unreachable
+            else
+                std.fmt.allocPrint(allocator, ".{s} = {s}", .{ racc.name, racc.name }) catch unreachable;
+            reduce_returns.appendSlice(allocator, seg) catch unreachable;
+        }
+    }
+    const return_branch = if (reduce_active) "reduce" else if (has_computed_continuation) "computed" else "kernel";
+    // A branch return is a tagged union on Zig and the emitter's
+    // `{ tag, <branch> }` object on JS; the slice `[0..]` is just the array.
+    if (host_is_js) {
+        proc_body = if (reduce_active)
+            std.fmt.allocPrint(allocator, "{s}\nreturn {{ tag: \"reduce\", reduce: {{ {s} }} }};", .{ fused_code, reduce_returns.items }) catch unreachable
+        else
+            std.fmt.allocPrint(allocator, "{s}\nreturn {{ tag: \"{s}\", {s}: {s} }};", .{ fused_code, return_branch, return_branch, static_name }) catch unreachable;
+    } else {
+        proc_body = if (reduce_active)
+            std.fmt.allocPrint(allocator, "{s}\nreturn .{{ .reduce = .{{ {s} }} }};", .{ fused_code, reduce_returns.items }) catch unreachable
+        else
+            std.fmt.allocPrint(allocator, "{s}\nreturn .{{ .{s} = {s}[0..] }};", .{ fused_code, return_branch, static_name }) catch unreachable;
+    }
+    }
+
+    // ========================================================================
+    // STEP 5: Replace invocation with a local kernel init tor
+    // ========================================================================
+
+    // The synthesized init tor is addressed by the IMPORT-DERIVED logical name
+    // of the module this init was written in (`app.lib`), never by the
+    // file-derived `flow.module` (`lib`). They collapse in the entry file and
+    // diverge the moment the declaration lives in a library, where the
+    // file-domain name resolves against a namespace nobody registered:
+    // `unknown tor 'lib:kernel_init_…'` with the declaration in plain sight
+    // (115_005). Same two domains std/store names `storeHomeFile` vs
+    // `storeHomeModule`.
+    const home_module = ast.homeModule(program, item) orelse flow.module;
+
+    const invocation_segments = allocator.alloc([]const u8, 1) catch unreachable;
+    invocation_segments[0] = allocator.dupe(u8, unique_name) catch unreachable;
+    const invocation_module = allocator.dupe(u8, home_module) catch unreachable;
+
+    const init_inv = ast.Invocation{
+        .path = ast.DottedPath{
+            .module_qualifier = invocation_module,
+            .segments = invocation_segments,
+        },
+        .args = &[_]ast.Arg{},
+    };
+
+    // Position-agnostic: one write-back path at every depth (the runner
+    // lifts nested sites and grafts the result back).
+    var new_item: ast.Item = undefined;
+    {
+        // Clone continuations (shallow clone of the array is fine if we don't mutate elements).
+        // When fusion folded the kernel ops into the init proc (it now returns
+        // `.computed`/`.reduce`), the consumed `| kernel` continuation MUST be dropped —
+        // otherwise it survives as a dead `.kernel =>` switch arm holding a duplicate of
+        // the fused loops.
+        const drop_kernel_cont = has_computed_continuation or has_reduce_continuation or (is_store_mode and has_kernel_continuation);
+        var kept_count: usize = 0;
+        for (flow.body.continuations) |cont| {
+            if (drop_kernel_cont and std.mem.eql(u8, std.mem.trim(u8, cont.branch, " "), "kernel")) continue;
+            kept_count += 1;
+        }
+        var new_continuations = allocator.alloc(ast.Continuation, kept_count) catch unreachable;
+        var write_idx: usize = 0;
+        for (flow.body.continuations) |cont| {
+            if (drop_kernel_cont and std.mem.eql(u8, std.mem.trim(u8, cont.branch, " "), "kernel")) continue;
+            new_continuations[write_idx] = cont;
+            write_idx += 1;
+        }
+
+        new_item = ast.Item{
+            .flow = ast.Flow{
+                .body = ast.rootSite(init_inv, new_continuations, flow.location),
+                .pre_label = if (flow.pre_label) |l| allocator.dupe(u8, l) catch unreachable else null,
+                .impl_of = flow.impl_of,
+                .super_shape = null,
+                .inline_body = null,
+                .preamble_code = null,
+                .is_pure = flow.is_pure,
+                .is_transitively_pure = flow.is_transitively_pure,
+                .location = flow.location,
+                .module = allocator.dupe(u8, flow.module) catch unreachable,
+            },
+        };
+    }
+
+    // kernel.init replaces its site with new_item and appends the generated
+    // host type (if needed), static decl, and local init tor + proc as new
+    // top-level items. The runner owns placement; Zig top-level decl order is
+    // irrelevant, so appending is equivalent to the old insertAt.
+    {
+        const slice_type = std.fmt.allocPrint(allocator, "[]{s}", .{type_name}) catch unreachable;
+        const branch_fields = allocator.alloc(ast.Field, 1) catch unreachable;
+        branch_fields[0] = ast.Field{
+            .name = allocator.dupe(u8, "__type_ref") catch unreachable,
+            .type = slice_type,
+        };
+
+        const computed_fields = allocator.alloc(ast.Field, 1) catch unreachable;
+        computed_fields[0] = ast.Field{
+            .name = allocator.dupe(u8, "__type_ref") catch unreachable,
+            .type = slice_type,
+        };
+
+        // Declare ONLY the branch the init proc actually returns — `.reduce` when
+        // a reduce op synthesized accumulators, `.computed` when fusion folds the
+        // kernel ops, else `.kernel`. (Declaring both computed+reduce left unused
+        // variants that forced the emitter to keep dead switch arms in the calling
+        // flow.) The `kernel`-return case (e.g. init with no continuation at all)
+        // must stay OPTIONAL so branch-coverage (KORU022) doesn't demand a handler
+        // that isn't there; the computed/reduce-return cases always have their
+        // continuation.
+        const reduce_fields = allocator.alloc(ast.Field, reduce_acc.items.len) catch unreachable;
+        for (reduce_acc.items, 0..) |racc, j| {
+            reduce_fields[j] = ast.Field{
+                .name = allocator.dupe(u8, racc.name) catch unreachable,
+                .type = allocator.dupe(u8, racc.type) catch unreachable,
+            };
+        }
+        const branches = allocator.alloc(ast.Branch, 1) catch unreachable;
+        branches[0] = if (reduce_active) ast.Branch{
+            .name = allocator.dupe(u8, "reduce") catch unreachable,
+            .payload = ast.Shape{ .fields = reduce_fields },
+            .is_optional = false,
+            .annotations = &[_][]const u8{},
+        } else if (has_computed_continuation) ast.Branch{
+            .name = allocator.dupe(u8, "computed") catch unreachable,
+            .payload = ast.Shape{ .fields = computed_fields },
+            .is_optional = false,
+            .annotations = &[_][]const u8{},
+        } else ast.Branch{
+            .name = allocator.dupe(u8, "kernel") catch unreachable,
+            // STORE MODE returns `.{ .kernel = .{} }` — no array payload, the
+            // store is the observable; the branch stays optional so the bare
+            // `init(world)` flow compiles without a handler.
+            .payload = ast.Shape{ .fields = if (is_store_mode) &[_]ast.Field{} else branch_fields },
+            .is_optional = true,
+            .annotations = &[_][]const u8{},
+        };
+
+        const event_segments = allocator.alloc([]const u8, 1) catch unreachable;
+        event_segments[0] = allocator.dupe(u8, unique_name) catch unreachable;
+        const event_module = allocator.dupe(u8, home_module) catch unreachable;
+        const proc_segments = allocator.alloc([]const u8, 1) catch unreachable;
+        proc_segments[0] = allocator.dupe(u8, unique_name) catch unreachable;
+        const proc_module = allocator.dupe(u8, home_module) catch unreachable;
+
+        const local_init_item = ast.Item{
+            .event_decl = ast.EventDecl{
+                .path = ast.DottedPath{ .module_qualifier = event_module, .segments = event_segments },
+                .input = ast.Shape{ .fields = &[_]ast.Field{} },
+                .branches = branches,
+                .is_public = false,
+                .is_implicit_flow = false,
+                .annotations = &[_][]const u8{},
+                .location = flow.location,
+                .module = allocator.dupe(u8, flow.module) catch unreachable,
+            }
+        };
+
+        const local_init_proc = ast.Item{
+            .proc_decl = ast.ProcDecl{
+                .path = ast.DottedPath{ .module_qualifier = proc_module, .segments = proc_segments },
+                .body = ast.Source{ .text = proc_body, .location = flow.location, .scope = .{ .bindings = &[_]ast.ScopeBinding{} }, .phantom_type = null },
+                .annotations = &[_][]const u8{},
+                // The SYNTHESIZED proc carries the build language, not a constant.
+                // Hardcoded "zig" here is what made kernel unreachable on JS: the
+                // body was JavaScript-shaped but tagged zig, so the emitter found
+                // no `|js` proc and refused the whole program with NoJsProcBody.
+                .target = allocator.dupe(u8, if (host_is_js) "js" else "zig") catch unreachable,
+                .location = flow.location,
+                .module = allocator.dupe(u8, flow.module) catch unreachable,
+            },
+        };
+        
+        // HOW THE STATIC DECLARATION REACHES THE FILE DIFFERS BY TARGET, and not
+        // by choice. The JS emitter's host-line walk keys on the FILE EXTENSION
+        // that carries the line (`.kjs` → js, file_types.zig:45); a line
+        // synthesized here is located in the user's `.k`, which is "pure contract,
+        // no host bytes" and returns null — so a host_line would be silently
+        // dropped and the generated proc would reference an array that was never
+        // declared. `.inline_code` is emitted at top level on both targets and has
+        // no such gate, which is exactly what a transform-minted declaration needs.
+        const static_item = if (host_is_js) ast.Item{
+            .inline_code = ast.InlineCode{
+                .code = allocator.dupe(u8, static_decl) catch unreachable,
+                .location = flow.location,
+                .module = allocator.dupe(u8, home_module) catch unreachable,
+            },
+        } else ast.Item{
+            .host_line = ast.HostLine{
+                .content = allocator.dupe(u8, static_decl) catch unreachable,
+                .location = flow.location,
+                .module = allocator.dupe(u8, home_module) catch unreachable,
+            },
+        };
+
+        // PERSISTENT WORKER POOL (Zig, store mode): one module-scope pool,
+        // lazily created on first use and REUSED across every store-kernel
+        // call and frame — thread spawn cost is paid once per process, not
+        // once per kernel run. Emitted once per program (dedup scan so N
+        // store kernels share one pool). JavaScript is single-threaded this
+        // rung and needs no pool.
+        const pool_item = if (host_is_js or !is_store_mode) null else blk: {
+            const hasPool = struct {
+                fn scan(items: []const ast.Item) bool {
+                    for (items) |it| {
+                        if (it == .host_line) {
+                            if (std.mem.indexOf(u8, it.host_line.content, "__koru_pool_ensure") != null) return true;
+                        }
+                        if (it == .module_decl) {
+                            if (scan(it.module_decl.items)) return true;
+                        }
+                    }
+                    return false;
+                }
+            }.scan(program.items);
+            if (hasPool) break :blk null;
+            const pool_code =
+                \\var __koru_pool: @import("std").Thread.Pool = undefined;
+                \\var __koru_pool_ready: bool = false;
+                \\fn __koru_pool_ensure() *@import("std").Thread.Pool {
+                \\    if (!__koru_pool_ready) {
+                \\        @import("std").Thread.Pool.init(&__koru_pool, .{ .allocator = @import("std").heap.smp_allocator }) catch @panic("koru: thread pool init failed");
+                \\        __koru_pool_ready = true;
+                \\    }
+                \\    return &__koru_pool;
+                \\}
+                \\
+            ;
+            break :blk ast.Item{
+                .host_line = ast.HostLine{
+                    .content = allocator.dupe(u8, pool_code) catch unreachable,
+                    .location = flow.location,
+                    .module = allocator.dupe(u8, home_module) catch unreachable,
+                },
+            };
+        };
+
+        const appended = allocator.alloc(ast.Item, @as(usize, if (has_host_type) 3 else 4) + @as(usize, if (pool_item != null) 1 else 0)) catch unreachable;
+        var ai: usize = 0;
+        if (!has_host_type) {
+            appended[ai] = ast.Item{
+                .host_type_decl = ast.HostTypeDecl{
+                    .name = allocator.dupe(u8, type_name) catch unreachable,
+                    .shape = ast.Shape{ .fields = type_fields },
+                    .module = allocator.dupe(u8, home_module) catch unreachable,
+                },
+            };
+            ai += 1;
+        }
+        if (pool_item) |pi| {
+            appended[ai] = pi;
+            ai += 1;
+        }
+        appended[ai] = static_item;
+        ai += 1;
+        appended[ai] = local_init_item;
+        ai += 1;
+        appended[ai] = local_init_proc;
+        ai += 1;
+        return .{ .replacement = new_item, .appended = appended };
+    }
+}
+
+// ============================================================================
+// KERNEL.PAIRWISE - Pairwise iteration over kernel data (TRANSFORM)
+// ============================================================================
+//
+// Iterates over all unique pairs (i, j) where i < j.
+// The kernel variable becomes "self" and .other refers to the paired element.
+//
+// Example:
+//   std/kernel:pairwise {
+//       bodies.vel -= d * mag * bodies.other.mass
+//       bodies.other.vel += d * mag * bodies.mass
+//   }
+//
+// Generated code:
+//   const __kernel_pair = struct {
+//       inline fn call(noalias b1: *@TypeOf(bodies.ptr[0]), noalias b2: *@TypeOf(bodies.ptr[0])) void {
+//           b1.vel -= d * mag * b2.mass;
+//           b2.vel += d * mag * b1.mass;
+//       }
+//   };
+//   for (0..bodies.len) |i| {
+//       for (i+1..bodies.len) |j| {
+//           __kernel_pair.call(&bodies.ptr[i], &bodies.ptr[j]);
+//       }
+//   }
+
+~[comptime|transform]pub tor pairwise {
+    expr: ?Expression,
+    source: Source,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc pairwise|zig {
+    const ast = @import("ast");
+
+    // Get the flow from the item
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        @panic("kernel.pairwise: expected flow item");
+
+    const SearchResult = struct {
+        binding_name: []const u8,
+        kernel_init_invocation: ?*const ast.Invocation,
+        sub_continuations: []const ast.Continuation,
+    };
+
+    const findInvocationRecursive = struct {
+        fn searchContinuations(
+            continuations: []const ast.Continuation,
+            target_inv: *const ast.Invocation,
+            owner_invocation: ?*const ast.Invocation,
+            parent_binding: ?[]const u8,
+            kernel_init_invocation: ?*const ast.Invocation,
+        ) ?SearchResult {
+            for (continuations) |*cont| {
+                var effective_binding = parent_binding;
+                var effective_kernel_init = kernel_init_invocation;
+                if (std.mem.eql(u8, cont.branch, "kernel")) {
+                    effective_binding = cont.binding orelse "k";
+                    if (owner_invocation) |inv| {
+                        effective_kernel_init = inv;
+                    }
+                }
+
+                // Check this continuation's node
+                if (cont.node) |*step| {
+                    if (step.* == .invocation) {
+                        // CRITICAL: Compare pointers to find the EXACT invocation
+                        if (&step.invocation == target_inv) {
+                            return SearchResult{
+                                .binding_name = effective_binding orelse "k",
+                                .kernel_init_invocation = effective_kernel_init,
+                                .sub_continuations = cont.continuations,
+                            };
+                        }
+                    }
+                }
+
+                const next_owner_invocation = if (cont.node) |*step| blk: {
+                    if (step.* == .invocation) {
+                        break :blk &step.invocation;
+                    }
+                    break :blk null;
+                } else null;
+
+                // Recurse into nested continuations
+                if (searchContinuations(cont.continuations, target_inv, next_owner_invocation, effective_binding, effective_kernel_init)) |result| {
+                    return result;
+                }
+            }
+            return null;
+        }
+
+        fn searchItems(
+            items: []const ast.Item,
+            target_inv: *const ast.Invocation,
+        ) ?SearchResult {
+            for (items) |*it| {
+                switch (it.*) {
+                    .flow => |*f| {
+                        if (searchContinuations(f.body.continuations, target_inv, f.inv(), null, null)) |result| {
+                            return result;
+                        }
+                    },
+                    .module_decl => |*mod| {
+                        if (searchItems(mod.items, target_inv)) |result| {
+                            return result;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        }
+    }.searchItems;
+
+    // Same contract as the `self` twin below: a standalone `pairwise` only runs
+    // outside a `kernel:init` subtree, so a failed search is the user's mistake
+    // and not an internal one. Reported, not panicked.
+    const search_result = findInvocationRecursive(program.items, invocation) orelse {
+        std.debug.print(
+            "error[KORU170]: `std/kernel:pairwise` outside a `std/kernel:init` subtree — a kernel op needs a kernel view to operate on\n  --> {s}:{d}:{d}\n  hint: wrap it, e.g. `std/kernel:init(bodies) | kernel k |> std/kernel:pairwise {{ ... }}`\n",
+            .{ flow.location.file, flow.location.line, flow.location.column },
+        );
+        std.process.exit(1);
+    };
+
+    const binding_name = search_result.binding_name;
+    const kernel_init_invocation = search_result.kernel_init_invocation;
+
+    // Unique identifier for ptr to avoid collisions in generated Zig
+    var hash: u32 = 0;
+    for (flow.module) |c| hash = hash *% 31 +% c;
+    hash = hash *% 31 +% @as(u32, @intCast(flow.location.line));
+    hash = hash *% 31 +% @as(u32, @intCast(flow.location.column));
+    for (source.text) |c| hash = hash *% 31 +% c;
+    const ptr_name = std.fmt.allocPrint(allocator, "__koru_kernel_ptr_{d}", .{hash}) catch unreachable;
+
+    // ========================================================================
+    // STEP 2: Transform DSL body
+    // ========================================================================
+    // k.other.X -> ptr[j].X  (direct array access)
+    // k.X -> ptr[i].X        (direct array access)
+    //
+    // This produces a tight loop without function call overhead.
+
+    const binding_other = std.fmt.allocPrint(allocator, "{s}.other", .{binding_name}) catch unreachable;
+    const binding_other_len = binding_other.len;
+    const binding_len = binding_name.len;
+
+    // Direct array index references for tight loop
+    const self_ref = std.fmt.allocPrint(allocator, "{s}[i]", .{ptr_name}) catch unreachable;
+    const other_ref = std.fmt.allocPrint(allocator, "{s}[j]", .{ptr_name}) catch unreachable;
+
+    var body_code = std.ArrayList(u8).initCapacity(allocator, source.text.len * 2) catch unreachable;
+
+    var i: usize = 0;
+    while (i < source.text.len) {
+        if (i + binding_other_len <= source.text.len and std.mem.eql(u8, source.text[i..i+binding_other_len], binding_other)) {
+            body_code.appendSlice(allocator, other_ref) catch unreachable;
+            i += binding_other_len;
+        } else if (i + binding_len <= source.text.len and std.mem.eql(u8, source.text[i..i+binding_len], binding_name)) {
+            const at_end = (i + binding_len >= source.text.len);
+            const next_ok = at_end or (!std.ascii.isAlphanumeric(source.text[i + binding_len]) and source.text[i + binding_len] != '_');
+            const prev_ok = (i == 0) or (!std.ascii.isAlphanumeric(source.text[i - 1]) and source.text[i - 1] != '_');
+            if (next_ok and prev_ok) {
+                body_code.appendSlice(allocator, self_ref) catch unreachable;
+                i += binding_len;
+            } else {
+                body_code.append(allocator, source.text[i]) catch unreachable;
+                i += 1;
+            }
+        } else {
+            body_code.append(allocator, source.text[i]) catch unreachable;
+            i += 1;
+        }
+    }
+
+    const extractKernelInitSource = struct {
+        fn call(inv_opt: ?*const ast.Invocation) ?[]const u8 {
+            const inv = inv_opt orelse return null;
+            for (inv.args) |arg| {
+                if (arg.source_value) |src_val| {
+                    return src_val.text;
+                }
+            }
+            return null;
+        }
+    }.call;
+
+    const countInitElements = struct {
+        fn call(text: []const u8) ?usize {
+            var depth: i32 = 0;
+            var count: usize = 0;
+            var in_string: bool = false;
+            var escaped: bool = false;
+
+            for (text) |c| {
+                if (in_string) {
+                    if (escaped) {
+                        escaped = false;
+                        continue;
+                    }
+                    if (c == '\\') {
+                        escaped = true;
+                        continue;
+                    }
+                    if (c == '"') {
+                        in_string = false;
+                    }
+                    continue;
+                } else if (c == '"') {
+                    in_string = true;
+                    continue;
+                }
+
+                if (c == '{') {
+                    depth += 1;
+                } else if (c == '}') {
+                    if (depth == 1) {
+                        count += 1;
+                    }
+                    depth -= 1;
+                }
+            }
+
+            if (count > 0) return count;
+            return null;
+        }
+    }.call;
+
+    const init_source = extractKernelInitSource(kernel_init_invocation);
+    const known_len = if (init_source) |text| countInitElements(text) else null;
+
+    // Ensure body_code ends with semicolon
+    if (kernelBodyNeedsTerminator(body_code.items)) {
+        body_code.append(allocator, ';') catch unreachable;
+    }
+
+    // ========================================================================
+    // STEP 3: Emit tight N²/2 loop (direct array access)
+    //
+    // Body already transformed: k -> ptr[i], k.other -> ptr[j]
+    // No function call wrapper - just direct nested loops.
+    //
+    // The i < j iteration order guarantees ptr[i] != ptr[j], so LLVM
+    // can optimize without aliasing concerns.
+    //
+    // GPU translation: strip k.other writes, emit N² per-element loop.
+    // The symmetric writes become implicit when j is the outer element.
+    // ========================================================================
+
+    const code = if (known_len) |len|
+        std.fmt.allocPrint(allocator,
+            \\const {0s} = {1s}.ptr;
+            \\for (0..{2d}) |i| {{
+            \\    for (i + 1..{2d}) |j| {{
+            \\        {3s}
+            \\    }}
+            \\}}
+            ,
+            .{ ptr_name, binding_name, len, body_code.items }
+        ) catch unreachable
+    else
+        std.fmt.allocPrint(allocator,
+            \\const {0s} = {1s}.ptr;
+            \\for (0..{1s}.len) |i| {{
+            \\    for (i + 1..{1s}.len) |j| {{
+            \\        {2s}
+            \\    }}
+            \\}}
+            ,
+            .{ ptr_name, binding_name, body_code.items }
+        ) catch unreachable;
+
+    // Detect outer range: only true if an explicit (range) expression was provided,
+    // e.g. pairwise(0..N) { ... }.
+    const has_outer_range = expr != null;
+
+    if (!has_outer_range) {
+        // ====================================================================
+        // STANDARD CASE: replace pairwise with inline i/j loops only
+        // ====================================================================
+        const new_node = ast.Node{ .inline_code = code };
+        return .{ .replacement_node = .{ .node = new_node } };
+    }
+
+    // ========================================================================
+    // OUTER-RANGE CASE: pairwise(0..N) { ... } |> per_step(...)
+    //
+    // Build a ForeachNode for the outer loop.
+    // "step" branch body = [ pairwise i/j inline_code → sub_continuations ]
+    // This puts the per-step continuation (advance_positions etc.) INSIDE the
+    // outer loop, hoisting ptr extraction and fusing both operations together.
+    // ========================================================================
+    const pairwise_body_cont = ast.Continuation{
+        .branch = allocator.dupe(u8, "") catch unreachable,
+        .binding = null,
+        .condition = null,
+        .node = ast.Node{ .inline_code = code },
+        .continuations = search_result.sub_continuations,
+        .indent = 0,
+        .location = flow.location,
+    };
+
+    const each_body = allocator.alloc(ast.Continuation, 1) catch unreachable;
+    each_body[0] = pairwise_body_cont;
+
+    const scope_marks = allocator.alloc([]const u8, 1) catch unreachable;
+    scope_marks[0] = allocator.dupe(u8, "@scope") catch unreachable;
+
+    const branches = allocator.alloc(ast.NamedBranch, 1) catch unreachable;
+    branches[0] = ast.NamedBranch{
+        .name = allocator.dupe(u8, "step") catch unreachable,
+        .body = each_body,
+        .binding = allocator.dupe(u8, "_") catch unreachable,
+        .marks = scope_marks,
+    };
+
+    const foreach_node = ast.Node{ .foreach = .{
+        .iterable = allocator.dupe(u8, expr.?) catch unreachable,
+        .element_type = null,
+        .branches = branches,
+    }};
+
+    const empty_conts = allocator.alloc(ast.Continuation, 0) catch unreachable;
+    return .{ .replacement_node = .{ .node = foreach_node, .children = empty_conts } };
+}
+
+// ============================================================================
+// KERNEL.SELF - Per-element operation over kernel data (TRANSFORM)
+// ============================================================================
+//
+// Iterates over every element individually.
+// k.X refers to the current element (no k.other).
+//
+// Example:
+//   std/kernel:self { k.vel += k.force * dt }
+//
+// Generated code:
+//   const ptr = k.ptr;
+//   for (0..N) |i| {
+//       ptr[i].vel += ptr[i].force * dt;
+//   }
+
+~[comptime|transform]pub tor self {
+    expr: Expression,
+    source: Source,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc self|zig {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        @panic("kernel.self: expected flow item");
+
+    const SearchResult = struct {
+        binding_name: []const u8,
+        kernel_init_invocation: ?*const ast.Invocation,
+        sub_continuations: []const ast.Continuation,
+    };
+
+    const findInvocationRecursive = struct {
+        fn searchContinuations(
+            continuations: []const ast.Continuation,
+            target_inv: *const ast.Invocation,
+            owner_invocation: ?*const ast.Invocation,
+            parent_binding: ?[]const u8,
+            kernel_init_invocation: ?*const ast.Invocation,
+        ) ?SearchResult {
+            for (continuations) |*cont| {
+                var effective_binding = parent_binding;
+                var effective_kernel_init = kernel_init_invocation;
+                if (std.mem.eql(u8, cont.branch, "kernel")) {
+                    effective_binding = cont.binding orelse "k";
+                    if (owner_invocation) |inv| {
+                        effective_kernel_init = inv;
+                    }
+                }
+                if (cont.node) |*step| {
+                    if (step.* == .invocation) {
+                        if (&step.invocation == target_inv) {
+                            return SearchResult{
+                                .binding_name = effective_binding orelse "k",
+                                .kernel_init_invocation = effective_kernel_init,
+                                .sub_continuations = cont.continuations,
+                            };
+                        }
+                    }
+                }
+                const next_owner_invocation = if (cont.node) |*step| blk: {
+                    if (step.* == .invocation) break :blk &step.invocation;
+                    break :blk null;
+                } else null;
+                if (searchContinuations(cont.continuations, target_inv, next_owner_invocation, effective_binding, effective_kernel_init)) |result| {
+                    return result;
+                }
+            }
+            return null;
+        }
+
+        fn searchItems(
+            items: []const ast.Item,
+            target_inv: *const ast.Invocation,
+        ) ?SearchResult {
+            for (items) |*it| {
+                switch (it.*) {
+                    .flow => |*f| {
+                        if (searchContinuations(f.body.continuations, target_inv, f.inv(), null, null)) |result| {
+                            return result;
+                        }
+                    },
+                    .module_decl => |*mod| {
+                        if (searchItems(mod.items, target_inv)) |result| {
+                            return result;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        }
+    }.searchItems;
+
+    // The fused path (kernel:init claims the subtree) handles |mlir generation;
+    // this standalone transform only fires for self OUTSIDE a kernel-init
+    // subtree, where |mlir isn't wired yet. Never silently run the Zig loop
+    // for a tagged call — that green would lie about the backend.
+    if (invocation.variant) |vt| {
+        std.debug.print("error[KORU123]: `std/kernel:self|{s}` outside a `std/kernel:init` subtree is not supported yet — backend variants are generated by the fused kernel path\n", .{vt});
+        std.process.exit(1);
+    }
+
+    // A standalone `self` only ever runs OUTSIDE a `kernel:init` subtree — inside
+    // one, `init` is `claims_descendants` and collects the ops itself. So this
+    // search failing is not an internal inconsistency, it is the ordinary user
+    // mistake of writing a kernel op with no kernel view to operate on, and it
+    // must be REPORTED rather than panicked. Until 2026-08-06 it was
+    // `@panic("... could not find invocation in AST")`, which koruc's SIGABRT
+    // handler then rendered as "the machine ran out of memory ... there is no
+    // compiler diagnostic to fix here" — an ordinary mistake reported as a
+    // hardware fault. Pinned by 390_056.
+    const search_result = findInvocationRecursive(program.items, invocation) orelse {
+        std.debug.print(
+            "error[KORU170]: `std/kernel:self` outside a `std/kernel:init` subtree — a kernel op needs a kernel view to operate on\n  --> {s}:{d}:{d}\n  hint: wrap it, e.g. `std/kernel:init(bodies) | kernel k |> std/kernel:self {{ ... }}`\n",
+            .{ flow.location.file, flow.location.line, flow.location.column },
+        );
+        std.process.exit(1);
+    };
+
+    const binding_name = search_result.binding_name;
+    const kernel_init_invocation = search_result.kernel_init_invocation;
+
+    // Unique identifiers to avoid collisions in generated Zig
+    var hash: u32 = 0;
+    for (flow.module) |c| hash = hash *% 31 +% c;
+    hash = hash *% 31 +% @as(u32, @intCast(flow.location.line));
+    hash = hash *% 31 +% @as(u32, @intCast(flow.location.column));
+    for (source.text) |c| hash = hash *% 31 +% c;
+    const elem_name = std.fmt.allocPrint(allocator, "__koru_self_elem_{d}", .{hash}) catch unreachable;
+    const ptr_name = std.fmt.allocPrint(allocator, "__koru_kernel_ptr_{d}", .{hash}) catch unreachable;
+
+    // ========================================================================
+    // STEP 1: Transform body — replace binding with elem_name
+    // k.X → elem_name.X
+    // ========================================================================
+    const binding_len = binding_name.len;
+    var body_code = std.ArrayList(u8).initCapacity(allocator, source.text.len * 2) catch unreachable;
+    var i: usize = 0;
+    while (i < source.text.len) {
+        if (i + binding_len <= source.text.len and std.mem.eql(u8, source.text[i..i+binding_len], binding_name)) {
+            const at_end = (i + binding_len >= source.text.len);
+            const next_ok = at_end or (!std.ascii.isAlphanumeric(source.text[i + binding_len]) and source.text[i + binding_len] != '_');
+            const prev_ok = (i == 0) or (!std.ascii.isAlphanumeric(source.text[i - 1]) and source.text[i - 1] != '_');
+            if (next_ok and prev_ok) {
+                body_code.appendSlice(allocator, elem_name) catch unreachable;
+                i += binding_len;
+            } else {
+                body_code.append(allocator, source.text[i]) catch unreachable;
+                i += 1;
+            }
+        } else {
+            body_code.append(allocator, source.text[i]) catch unreachable;
+            i += 1;
+        }
+    }
+
+    // Ensure body ends with semicolon
+    if (kernelBodyNeedsTerminator(body_code.items)) {
+        body_code.append(allocator, ';') catch unreachable;
+    }
+
+    // ========================================================================
+    // STEP 2: Inline — replace elem_name with ptr_name[i]
+    // ========================================================================
+    var inlined_body = std.ArrayList(u8).initCapacity(allocator, body_code.items.len * 2) catch unreachable;
+    var j: usize = 0;
+    while (j < body_code.items.len) {
+        if (j + elem_name.len <= body_code.items.len and std.mem.eql(u8, body_code.items[j..j+elem_name.len], elem_name)) {
+            inlined_body.appendSlice(allocator, ptr_name) catch unreachable;
+            inlined_body.appendSlice(allocator, "[i]") catch unreachable;
+            j += elem_name.len;
+        } else {
+            inlined_body.append(allocator, body_code.items[j]) catch unreachable;
+            j += 1;
+        }
+    }
+
+    // ========================================================================
+    // STEP 3: Known-len optimization (compile-time constant loop bound)
+    // ========================================================================
+    const extractKernelInitSource = struct {
+        fn call(inv_opt: ?*const ast.Invocation) ?[]const u8 {
+            const inv = inv_opt orelse return null;
+            for (inv.args) |arg| {
+                if (arg.source_value) |src_val| return src_val.text;
+            }
+            return null;
+        }
+    }.call;
+
+    const countInitElements = struct {
+        fn call(text: []const u8) ?usize {
+            var depth: i32 = 0;
+            var count: usize = 0;
+            var in_string: bool = false;
+            var escaped: bool = false;
+            for (text) |c| {
+                if (in_string) {
+                    if (escaped) { escaped = false; continue; }
+                    if (c == '\\') { escaped = true; continue; }
+                    if (c == '"') in_string = false;
+                    continue;
+                } else if (c == '"') { in_string = true; continue; }
+                if (c == '{') {
+                    depth += 1;
+                } else if (c == '}') {
+                    if (depth == 1) count += 1;
+                    depth -= 1;
+                }
+            }
+            if (count > 0) return count;
+            return null;
+        }
+    }.call;
+
+    const init_source = extractKernelInitSource(kernel_init_invocation);
+    const known_len = if (init_source) |text| countInitElements(text) else null;
+
+    // ========================================================================
+    // STEP 4: Emit single for loop
+    // ========================================================================
+    const loop_code = if (known_len) |len|
+        std.fmt.allocPrint(allocator,
+            \\const {0s} = {1s}.ptr;
+            \\for (0..{2d}) |i| {{
+            \\    {3s}
+            \\}}
+            ,
+            .{ ptr_name, binding_name, len, inlined_body.items }
+        ) catch unreachable
+    else
+        std.fmt.allocPrint(allocator,
+            \\const {0s} = {1s}.ptr;
+            \\for (0..{1s}.len) |i| {{
+            \\    {2s}
+            \\}}
+            ,
+            .{ ptr_name, binding_name, inlined_body.items }
+        ) catch unreachable;
+
+    // Replace invocation with inline code
+    const new_node = ast.Node{ .inline_code = loop_code };
+    return .{ .replacement_node = .{ .node = new_node } };
+}
+
+// Kernel:step - wraps kernel ops in an outer iteration loop
+// Kernel:step - wraps kernel ops in an outer iteration loop.
+// The proc removes step from the AST after init's fusion consumes it.
+
+~[comptime|transform]pub tor step {
+    expr: ?Expression,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator,
+} -> SiteResult
+
+~proc step|zig {
+    _ = expr;
+    const ast = @import("ast");
+
+    // Find the continuation containing this step invocation to check for | step |>
+    const flow = if (item.* == .flow) &item.flow else return .{};
+    
+    const findStepCont = struct {
+        fn search(conts: []const ast.Continuation, target: *const ast.Invocation) ?*const ast.Continuation {
+            for (conts) |*c| {
+                if (c.node) |*n| {
+                    if (n.* == .invocation and &n.invocation == target) return c;
+                }
+                if (search(c.continuations, target)) |found| return found;
+            }
+            return null;
+        }
+    }.search;
+    
+    const step_cont = findStepCont(flow.body.continuations, invocation);
+    
+    // Check for | step |> and flatten it to void-chain
+    var new_conts: []const ast.Continuation = &[_]ast.Continuation{};
+    if (step_cont) |cont| {
+        for (cont.continuations) |*nested| {
+            if (std.mem.eql(u8, nested.branch, "step")) {
+                // Flatten | step |> contents to void-chain
+                var void_cont = allocator.alloc(ast.Continuation, 1) catch unreachable;
+                void_cont[0] = .{
+                    .branch = "",
+                    .binding = nested.binding,
+                    .condition = nested.condition,
+                    .node = nested.node,
+                    .indent = nested.indent,
+                    .continuations = nested.continuations,
+                };
+                new_conts = void_cont;
+                break;
+            }
+        }
+    }
+    
+    const empty_node = ast.Node{ .inline_code = "" };
+    return .{ .replacement_node = .{ .node = empty_node, .children = new_conts } };
+}
+// ============================================================================
+// FUTURE: kernel.reduce, kernel.cross
+// ============================================================================
+
+// [comptime|transform]pub tor reduce { ... }
+// [comptime|transform]pub tor cross { ... }
+~part body
+~part scan
+~part fields
+~part fpga
+~part fpgatb
+~part fpgaemit

@@ -1,0 +1,233 @@
+// Koru Standard Library: the `leaves` part of channel — proto leaf
+// reading. Joined via `~part leaves` in channel.kz; merged into the
+// channel module.
+//
+// A channel kind is a proto name; this part is everything the transform
+// needs to read that name's LEAVES: the field list (`FieldPair`,
+// `protoSourceText`/`protoFields`/`expandInto`), the Zig material each
+// leaf lowers to (`zigFieldType`), and the owned-leaf split —
+// `*mod:Type<state!>` spells a debt at a path, so composite kinds get a
+// `take` param / arg per leaf (`takeFields`, `takeArgs`).
+
+const CL = struct {
+
+    const FieldPair = struct { name: []const u8, ftype: []const u8 };
+
+    fn protoSourceText(prog: *const ast.Program, name: []const u8) ?[]const u8 {
+        const W = struct {
+            fn find(its: []const ast.Item, want: []const u8) ?[]const u8 {
+                for (its) |*pi| {
+                    switch (pi.*) {
+                        .flow => |*f| {
+                            if (f.body.node) |*n| {
+                                if (n.* == .invocation and CH.isProtoDoor(&n.invocation)) {
+                                    const inv = &n.invocation;
+                                    if (std.mem.eql(u8, CH.declEntryName(inv), want)) {
+                                        for (inv.args) |a| {
+                                            if (a.source_value) |sv| return sv.text;
+                                        }
+                                        return "";
+                                    }
+                                }
+                            }
+                        },
+                        .inline_code => |*ic| {
+                            var lines = std.mem.splitScalar(u8, ic.code, '\n');
+                            while (lines.next()) |raw| {
+                                const line = std.mem.trimLeft(u8, raw, " \t");
+                                const prefix = "// proto ";
+                                if (!std.mem.startsWith(u8, line, prefix)) continue;
+                                const colon = std.mem.indexOfScalar(u8, line[prefix.len..], ':') orelse continue;
+                                const nm = std.mem.trim(u8, line[prefix.len .. prefix.len + colon], " \t");
+                                if (std.mem.eql(u8, nm, want)) return line[prefix.len + colon + 1 ..];
+                            }
+                        },
+                        .module_decl => |*md| {
+                            if (find(md.items, want)) |hit| return hit;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            }
+        };
+        return W.find(prog.items, name);
+    }
+
+    // The entry's fields, nested compounds flattened to `a_b` leaf pairs —
+    // the marker form is already flat. A ftype that is itself a registered
+    // compound expands; scalars/terminals pass through. Depth-capped: the
+    // declaration gate owns cycle refusal; this walk just never hangs.
+    fn protoFields(alloc: std.mem.Allocator, prog: *const ast.Program, name: []const u8) ?[]const FieldPair {
+        var out = std.ArrayList(FieldPair).initCapacity(alloc, 8) catch unreachable;
+        if (!expandInto(alloc, prog, "", name, &out, 0)) return null;
+        return out.toOwnedSlice(alloc) catch unreachable;
+    }
+
+    fn expandInto(alloc: std.mem.Allocator, prog: *const ast.Program, prefix: []const u8, name: []const u8, out: *std.ArrayList(FieldPair), depth: usize) bool {
+        if (depth > 8) return false;
+        const text = protoSourceText(prog, name) orelse return false;
+        var lines = std.mem.tokenizeAny(u8, text, "\n,");
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r,");
+            if (line.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const fname = std.mem.trim(u8, line[0..colon], " \t");
+            const ftype = std.mem.trim(u8, line[colon + 1 ..], " \t,");
+            if (fname.len == 0 or ftype.len == 0) continue;
+            const full = if (prefix.len == 0)
+                alloc.dupe(u8, fname) catch unreachable
+            else
+                std.fmt.allocPrint(alloc, "{s}_{s}", .{ prefix, fname }) catch unreachable;
+            // A field naming a declared compound expands to its leaves.
+            if (protoSourceText(prog, ftype) != null) {
+                if (!expandInto(alloc, prog, full, ftype, out, depth + 1)) return false;
+            } else {
+                out.append(alloc, .{ .name = full, .ftype = alloc.dupe(u8, ftype) catch unreachable }) catch unreachable;
+            }
+        }
+        return true;
+    }
+
+    // The Zig material for a proto field type — list.protos' elementZigType,
+    // restated: `string` lowers at the emission boundary, `ref(X)` carries
+    // the row handle, an owned leaf `*mod:Type<state!>` lowers to the host
+    // pointer (`*koru_app.koru_lib.koru_res.Resource` — store.new.kz's
+    // HostPath convention, every module segment `koru_`-prefixed).
+    fn zigFieldType(alloc: std.mem.Allocator, ftype: []const u8) []const u8 {
+        const t = std.mem.trim(u8, ftype, " \t");
+        if (std.mem.eql(u8, t, "string")) return alloc.dupe(u8, "[]const u8") catch unreachable;
+        if (t.len > 5 and std.mem.startsWith(u8, t, "ref(") and t[t.len - 1] == ')')
+            return alloc.dupe(u8, "i64") catch unreachable;
+        if (splitOwnedLeaf(t)) |leaf| {
+            var host = std.ArrayList(u8).initCapacity(alloc, 32) catch unreachable;
+            var it = std.mem.splitAny(u8, leaf.module, "./");
+            var first = true;
+            while (it.next()) |seg| {
+                if (seg.len == 0) continue;
+                if (!first) host.append(alloc, '.') catch unreachable;
+                host.appendSlice(alloc, "koru_") catch unreachable;
+                host.appendSlice(alloc, seg) catch unreachable;
+                first = false;
+            }
+            return std.fmt.allocPrint(alloc, "*{s}.{s}", .{ host.items, leaf.type_name }) catch unreachable;
+        }
+        return alloc.dupe(u8, t) catch unreachable;
+    }
+
+    /// One owned leaf of a proto — `fd: *mod:Type<state!>`. The well-formedness
+    /// wall is the proto door's (proto.resolve.kz parseOwnedLeaf); this only
+    /// decomposes a spelling the registry already accepted.
+    const OwnedLeaf = struct {
+        name: []const u8, // flat leaf name ("r1", or "sub_fd" under a compound)
+        module: []const u8, // "app/lib/res"
+        type_name: []const u8, // "Resource"
+        state: []const u8, // "owned" — the '!' is stripped
+        base: []const u8, // "*app/lib/res:Resource" — phantom stripped
+        ftype: []const u8, // the full spelling, verbatim
+    };
+
+    fn splitOwnedLeaf(ftype: []const u8) ?OwnedLeaf {
+        const t = std.mem.trim(u8, ftype, " \t");
+        if (!std.mem.startsWith(u8, t, "*")) return null;
+        const lt = std.mem.indexOfScalar(u8, t, '<') orelse return null;
+        if (t[t.len - 1] != '>') return null;
+        const type_part = std.mem.trim(u8, t[1..lt], " \t");
+        var phantom = std.mem.trim(u8, t[lt + 1 .. t.len - 1], " \t");
+        if (phantom.len == 0 or phantom[phantom.len - 1] != '!') return null;
+        phantom = phantom[0 .. phantom.len - 1];
+        const state = if (std.mem.lastIndexOfScalar(u8, phantom, ':')) |pc| phantom[pc + 1 ..] else phantom;
+        const tcolon = std.mem.lastIndexOfScalar(u8, type_part, ':') orelse return null;
+        return .{
+            .name = "",
+            .module = type_part[0..tcolon],
+            .type_name = type_part[tcolon + 1 ..],
+            .state = state,
+            .base = std.mem.trim(u8, t[0..lt], " \t"),
+            .ftype = t,
+        };
+    }
+
+    /// The proto's owned leaves — `r1: *mod:Type<state!>` pairs in flat leaf
+    /// order, or empty. A kind whose proto carries them is COMPOSITE-custodial:
+    /// each leaf is a debt the send must consume per path and the arm must
+    /// mint per path — the whole value stays obligation-free (699_031).
+    fn ownedLeavesOf(alloc: std.mem.Allocator, prog: *const ast.Program, proto: []const u8) []const OwnedLeaf {
+        var out = std.ArrayList(OwnedLeaf).initCapacity(alloc, 2) catch unreachable;
+        const fields = protoFields(alloc, prog, proto) orelse return out.toOwnedSlice(alloc) catch unreachable;
+        for (fields) |f| {
+            if (splitOwnedLeaf(f.ftype)) |leaf| {
+                var l = leaf;
+                l.name = f.name;
+                out.append(alloc, l) catch unreachable;
+            }
+        }
+        return out.toOwnedSlice(alloc) catch unreachable;
+    }
+
+    /// The `take` op's parameter list for a kind: a whole-value `Proto<!state>`
+    /// param when a `<state!>` producer sent, plus one `<!state>` param per
+    /// owned leaf — and the matching no-op body ("_ = value; _ = r1; ...").
+    /// The leaf param's module_path carries the leaf's home so `!state`
+    /// canonicalizes against `app/lib/res`, not the decl's module — the
+    /// seeded path debt resolves `app.lib.res:owned!` and the param must ask
+    /// for it. `.type` stays the bare `*Name` — the emitter writes
+    /// hostified(module_path) + "." + type itself.
+    const TakeSpec = struct { fields: []ast.Field, body: []const u8 };
+    fn takeFields(alloc: std.mem.Allocator, proto: []const u8, state: ?[]const u8, leaves: []const OwnedLeaf) TakeSpec {
+        var n_params: usize = leaves.len;
+        if (state != null) n_params += 1;
+        const tf = alloc.alloc(ast.Field, n_params) catch unreachable;
+        var pi: usize = 0;
+        var body = std.ArrayList(u8).initCapacity(alloc, 32) catch unreachable;
+        if (state) |st| {
+            tf[pi] = ast.Field{
+                .name = alloc.dupe(u8, "value") catch unreachable,
+                .type = alloc.dupe(u8, proto) catch unreachable,
+                .phantom = std.fmt.allocPrint(alloc, "!{s}", .{st}) catch unreachable,
+            };
+            pi += 1;
+            body.appendSlice(alloc, "_ = value;\n") catch unreachable;
+        }
+        for (leaves) |leaf| {
+            const dotted = alloc.dupe(u8, leaf.module) catch unreachable;
+            std.mem.replaceScalar(u8, dotted, '/', '.');
+            tf[pi] = ast.Field{
+                .name = alloc.dupe(u8, leaf.name) catch unreachable,
+                .type = std.fmt.allocPrint(alloc, "*{s}", .{leaf.type_name}) catch unreachable,
+                .module_path = dotted,
+                .phantom = std.fmt.allocPrint(alloc, "!{s}", .{leaf.state}) catch unreachable,
+            };
+            pi += 1;
+            body.appendSlice(alloc, std.fmt.allocPrint(alloc, "_ = {s};\n", .{leaf.name}) catch unreachable) catch unreachable;
+        }
+        return .{ .fields = tf, .body = body.items };
+    }
+
+    /// The `take(...)` call's args for a sent binding: `value: e` when the
+    /// binding itself carries custody, plus `leaf: e.leaf` per owned leaf —
+    /// the send consumes each path independently (699_031).
+    fn takeArgs(alloc: std.mem.Allocator, sent_value: []const u8, whole: ?[]const u8, leaves: []const OwnedLeaf) []ast.Arg {
+        var n_args: usize = leaves.len;
+        if (whole != null) n_args += 1;
+        const ta = alloc.alloc(ast.Arg, n_args) catch unreachable;
+        var ai: usize = 0;
+        if (whole != null) {
+            ta[ai] = ast.Arg{
+                .name = alloc.dupe(u8, "value") catch unreachable,
+                .value = alloc.dupe(u8, sent_value) catch unreachable,
+                .had_explicit_label = true,
+            };
+            ai += 1;
+        }
+        for (leaves) |leaf| {
+            ta[ai] = ast.Arg{
+                .name = alloc.dupe(u8, leaf.name) catch unreachable,
+                .value = std.fmt.allocPrint(alloc, "{s}.{s}", .{ sent_value, leaf.name }) catch unreachable,
+                .had_explicit_label = true,
+            };
+            ai += 1;
+        }
+        return ta;
+    }
+};

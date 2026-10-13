@@ -1,0 +1,40 @@
+// Koru Standard Library: the `literal` part of interpreter.kz — literal
+// materialization on the wire path: what the quoted text between the quotes
+// MEANS when it becomes a value. Joined via `~part literal` in
+// interpreter.kz; merged into the interpreter module at load.
+
+// Unescape a string literal's inner text (between the quotes). The wire is
+// line-oriented — an agent cannot put a raw newline inside a quoted arg, so
+// escapes are the ONLY way to carry one; before this, `\n` in a wire string
+// materialized as backslash-n (measured live: a model's multi-line edit()
+// wrote literal "\n" into suite.k, kopium libs-workbench 2026-09-25).
+// Codegen never sees this — its strings are re-emitted into Zig literals,
+// which unescape downstream. Unknown escapes pass through untouched: \q
+// stays backslash-q, not q.
+fn unescapeStringLiteral(inner: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, inner, '\\') == null) return try allocator.dupe(u8, inner);
+    var out = try std.ArrayList(u8).initCapacity(allocator, inner.len);
+    var i: usize = 0;
+    while (i < inner.len) {
+        const c = inner[i];
+        if (c == '\\' and i + 1 < inner.len) {
+            const e = inner[i + 1];
+            switch (e) {
+                'n' => try out.append(allocator, '\n'),
+                't' => try out.append(allocator, '\t'),
+                'r' => try out.append(allocator, '\r'),
+                '0' => try out.append(allocator, 0),
+                '"', '\'', '\\' => try out.append(allocator, e),
+                else => {
+                    try out.append(allocator, '\\');
+                    try out.append(allocator, e);
+                },
+            }
+            i += 2;
+        } else {
+            try out.append(allocator, c);
+            i += 1;
+        }
+    }
+    return out.items;
+}

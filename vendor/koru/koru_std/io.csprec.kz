@@ -1,0 +1,234 @@
+// Koru Standard Library: I/O — CS placeholder operand + interpolation engine.
+// Joined via `~part csprec` in io.kz; merged into the io module at load.
+//
+// The K# vertical's print path. Same surface as __printInterpolateJs —
+// string-literal vs bare expression, `{{ var:fmt }}` placeholders,
+// `{% if v %}…{% endif %}` blocks — and nearly the same emitted text: `"" +
+// x + "lit"` is valid C# (string concat promotes the operand exactly like
+// JS), and `(cond ? "body" : "")` is the same ternary. What differs lives in
+// the two helpers here: exprs lower through the `.cs` arm (and/or, .len,
+// `++`, reserved words) and a `:.N` precision tail honors via
+// `.ToString("F"+N, InvariantCulture)` rather than JS's toFixed — C#'s
+// culture-sensitive formatting would otherwise answer "3,14" for "3.14" in
+// half the world's locales.
+
+
+// ============================================================================
+// CS-target interpolation engine — the __printInterpolateJs twin. SAME expr
+// surface, same reroute-to-print.impl surgery; only the emitted operand text
+// differs, and both helpers producing it live above.
+// ============================================================================
+fn __printInterpolateCs(
+    expr: []const u8,
+    item: anytype,
+    allocator: std.mem.Allocator,
+    comptime with_newline: bool,
+    to_fd: u8,
+) @import("ast").SiteResult {
+    const ast = @import("ast");
+
+    const flow = if (item.* == .flow)
+        &item.flow
+    else
+        return .{};
+
+    // Already transformed — don't re-run.
+    if (flow.inline_body != null) {
+        return .{};
+    }
+
+    var buf = std.ArrayList(u8).initCapacity(allocator, 128) catch unreachable;
+    var first = true;
+    var in_literal = false;
+
+    const openLit = struct {
+        fn call(b: *std.ArrayList(u8), a: std.mem.Allocator, f: *bool, il: *bool) void {
+            if (!il.*) {
+                if (!f.*) b.appendSlice(a, " + ") catch unreachable;
+                b.append(a, '"') catch unreachable;
+                il.* = true;
+                f.* = false;
+            }
+        }
+    }.call;
+
+    const closeLit = struct {
+        fn call(b: *std.ArrayList(u8), a: std.mem.Allocator, il: *bool) void {
+            if (il.*) {
+                b.append(a, '"') catch unreachable;
+                il.* = false;
+            }
+        }
+    }.call;
+
+    const is_string_literal = expr.len > 0 and expr[0] == '"';
+
+    if (is_string_literal) {
+        const end: usize = if (expr[expr.len - 1] == '"') expr.len - 1 else expr.len;
+        const content = expr[1..end];
+        var i: usize = 0;
+        while (i < content.len) {
+            // {% if var %}body{% endif %} → + (var ? "body" : "") +
+            if (i + 1 < content.len and content[i] == '{' and content[i + 1] == '%') {
+                var ws_start = i + 2;
+                while (ws_start < content.len and (content[ws_start] == ' ' or content[ws_start] == '\t')) : (ws_start += 1) {}
+
+                if (ws_start + 3 <= content.len and std.mem.eql(u8, content[ws_start .. ws_start + 3], "if ")) {
+                    var var_pos = ws_start + 3;
+                    while (var_pos < content.len and (content[var_pos] == ' ' or content[var_pos] == '\t')) : (var_pos += 1) {}
+                    var var_end = var_pos;
+                    while (var_end < content.len and content[var_end] != ' ' and content[var_end] != '\t' and content[var_end] != '%') : (var_end += 1) {}
+                    const cond_var = content[var_pos..var_end];
+
+                    var tag_end = var_end;
+                    while (tag_end + 1 < content.len and !(content[tag_end] == '%' and content[tag_end + 1] == '}')) : (tag_end += 1) {}
+
+                    if (tag_end + 1 < content.len) {
+                        const body_start = tag_end + 2;
+                        const endif_marker = "{% endif %}";
+                        if (std.mem.indexOf(u8, content[body_start..], endif_marker)) |endif_offset| {
+                            const body_end = body_start + endif_offset;
+                            const body_content = content[body_start..body_end];
+
+                            closeLit(&buf, allocator, &in_literal);
+                            if (!first) buf.appendSlice(allocator, " + ") catch unreachable;
+                            first = false;
+
+                            buf.append(allocator, '(') catch unreachable;
+                            buf.appendSlice(allocator, cond_var) catch unreachable;
+                            buf.appendSlice(allocator, " ? \"") catch unreachable;
+                            buf.appendSlice(allocator, body_content) catch unreachable; // verbatim — already escaped
+                            buf.appendSlice(allocator, "\" : \"\")") catch unreachable;
+
+                            i = body_end + endif_marker.len;
+                            continue;
+                        }
+                    }
+                }
+                // Unrecognized {% — treat as literal.
+                openLit(&buf, allocator, &first, &in_literal);
+                buf.append(allocator, content[i]) catch unreachable;
+                i += 1;
+            }
+            // {{ var:fmt }} → + (operand) +
+            else if (i + 1 < content.len and content[i] == '{' and content[i + 1] == '{') {
+                var ws_start = i + 2;
+                while (ws_start < content.len and (content[ws_start] == ' ' or content[ws_start] == '\t')) : (ws_start += 1) {}
+
+                var j = ws_start;
+                while (j + 1 < content.len and !(content[j] == '}' and content[j + 1] == '}')) : (j += 1) {}
+
+                if (j + 1 < content.len) {
+                    var ws_end = j;
+                    while (ws_end > ws_start and (content[ws_end - 1] == ' ' or content[ws_end - 1] == '\t')) : (ws_end -= 1) {}
+
+                    closeLit(&buf, allocator, &in_literal);
+                    if (first) {
+                        // Seed string-concat context so a lone/leading numeric
+                        // value promotes to a string, never arithmetic-adds
+                        // (Console.Out.Write(object) would also work — the ""
+                        // keeps the call typed string throughout).
+                        buf.appendSlice(allocator, "\"\" + ") catch unreachable;
+                        first = false;
+                    } else {
+                        buf.appendSlice(allocator, " + ") catch unreachable;
+                    }
+                    ioCsPlaceholderOperand(&buf, allocator, content[ws_start..ws_end]);
+
+                    i = j + 2;
+                } else {
+                    openLit(&buf, allocator, &first, &in_literal);
+                    buf.append(allocator, content[i]) catch unreachable;
+                    i += 1;
+                }
+            } else {
+                openLit(&buf, allocator, &first, &in_literal);
+                buf.append(allocator, content[i]) catch unreachable;
+                i += 1;
+            }
+        }
+        closeLit(&buf, allocator, &in_literal);
+        // Empty template → emit `""` so write() gets a valid string arg.
+        if (first) {
+            buf.appendSlice(allocator, "\"\"") catch unreachable;
+            first = false;
+        }
+    } else {
+        // Bare expression: stringify the whole value; leading `""` forces
+        // string-concat context so a Number is promoted, not arithmetic-added.
+        buf.appendSlice(allocator, "\"\" + (") catch unreachable;
+        buf.appendSlice(allocator, ioLowerCsExpr(allocator, expr)) catch unreachable;
+        buf.append(allocator, ')') catch unreachable;
+        first = false;
+    }
+
+    if (with_newline) {
+        if (!first) buf.appendSlice(allocator, " + ") catch unreachable;
+        buf.appendSlice(allocator, "\"\\n\"") catch unreachable;
+    }
+
+    const write_fn: []const u8 = if (to_fd == 2) "__koru_stderr_write" else "__koru_stdout_write";
+    const inline_code = std.fmt.allocPrint(
+        allocator,
+        "{s}({s});",
+        .{ write_fn, buf.items },
+    ) catch unreachable;
+
+    // Re-route to the [norun] print.impl tor for shape checking — identical
+    // surgery to the zig/js engines; the spliced inline_body does the write.
+    const impl_segments = allocator.alloc([]const u8, 2) catch unreachable;
+    impl_segments[0] = allocator.dupe(u8, "print") catch unreachable;
+    impl_segments[1] = allocator.dupe(u8, "impl") catch unreachable;
+    const impl_path = ast.DottedPath{
+        .module_qualifier = flow.inv().path.module_qualifier,
+        .segments = impl_segments,
+    };
+
+    const new_inv_marks = allocator.alloc([]const u8, flow.inv().marks.len + 1) catch unreachable;
+    for (flow.inv().marks, 0..) |m, idx| {
+        new_inv_marks[idx] = m;
+    }
+    new_inv_marks[flow.inv().marks.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_invocation = ast.Invocation{
+        .path = impl_path,
+        .args = flow.inv().args,
+        .annotations = flow.inv().annotations, .marks = new_inv_marks,
+        .inserted_by_tap = flow.inv().inserted_by_tap,
+        .from_opaque_tap = flow.inv().from_opaque_tap,
+    };
+
+    var transformed_flow = flow.*;
+    transformed_flow.body = ast.rootSite(new_invocation, flow.body.continuations, flow.location);
+    transformed_flow.inline_body = inline_code;
+
+    const new_item = ast.Item{ .flow = transformed_flow };
+    return .{ .replacement = new_item };
+}
+
+// CS variants of the print family — the K# vertical's first transform path.
+// Selected under --lang=cs the way print|js is under --lang=js; same fd +
+// newline semantics, routed through the shared __printInterpolateCs engine.
+~proc print.ln|cs {
+    _ = invocation;
+    _ = program;
+    return __printInterpolateCs(expr, item, allocator, true, 1);
+}
+
+~proc print|cs {
+    _ = invocation;
+    _ = program;
+    return __printInterpolateCs(expr, item, allocator, false, 1);
+}
+
+~proc eprint.ln|cs {
+    _ = invocation;
+    _ = program;
+    return __printInterpolateCs(expr, item, allocator, true, 2);
+}
+
+~proc eprint|cs {
+    _ = invocation;
+    _ = program;
+    return __printInterpolateCs(expr, item, allocator, false, 2);
+}

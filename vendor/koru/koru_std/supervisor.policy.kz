@@ -1,0 +1,149 @@
+// Koru Standard Library: the `policy` part of supervisor.kz — delegated
+// policy resolution and emission. Joined via `~part policy` in
+// supervisor.kz; merged into the supervisor module at load. `std`, `ast`,
+// `errors`, and `H` arrive at module scope from the sibling parts.
+
+// ---- `policy: Name` — delegated policy ------------------------------------
+// The block delegates the decision to a named same-module tor consuming the
+// failure stream under the arm vocabulary — `{ f: <payload>, t: i64 }`, `f`
+// optional, `t` required (the bound channel) — and producing the SAME
+// vocabulary the arms spell:
+// `| retry { <child input fields> }` re-enters with adapted args,
+// `| exhausted` is terminal (payload → same-branch produce, bare → forward
+// the last failure in kind). `within` composes — a declined retry fails the
+// keep-alive contract and the pending failure proceeds upward.
+
+const PolicyInfo = struct {
+    retry: *const ast.Branch,
+    exhausted: ?*const ast.Branch,
+    takes_f: bool,
+    takes_t: bool,
+};
+
+const PolicyResult = union(enum) { ok: PolicyInfo, refuse: ast.Item };
+
+/// Locate `policy_name` in the module and check it against the supervised
+/// call: input vocabulary `{ f, t }`, branch vocabulary `retry|exhausted`,
+// `retry` payload fields name the child inputs they adapt.
+fn resolvePolicy(
+    allocator: std.mem.Allocator,
+    reporter: anytype,
+    loc: errors.SourceLocation,
+    module: []const u8,
+    program: *const ast.Program,
+    policy_name: []const u8,
+    child_name: []const u8,
+    child_decl: *const ast.EventDecl,
+    site_branch: []const u8,
+    sup_br: *const ast.Branch,
+) PolicyResult {
+    const refuse = struct {
+        fn at(alloc: std.mem.Allocator, rep: anytype, l: errors.SourceLocation, m: []const u8, comptime fmt: []const u8, args: anytype) PolicyResult {
+            return .{ .refuse = ast.refusal(alloc, rep, .KORU161, l, m, fmt, args) };
+        }
+    };
+    if (policy_name.len == 0 or std.mem.indexOfAny(u8, policy_name, ":/ ") != null) {
+        return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: 'policy: {s}' — name a tor in this module (cross-module delegation lands with the union work)", .{policy_name});
+    }
+    var policy_decl: ?*const ast.EventDecl = null;
+    for (program.items) |*pi| {
+        if (pi.* != .event_decl) continue;
+        const ed = &pi.event_decl;
+        if (ed.path.segments.len == 1 and std.mem.eql(u8, ed.path.segments[0], policy_name) and
+            std.mem.eql(u8, ed.path.module_qualifier orelse "", module))
+        {
+            policy_decl = ed;
+            break;
+        }
+    }
+    const pd = policy_decl orelse {
+        return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: no event '{s}' in this module — 'policy:' names a tor consuming '{{ f: <failure payload>, t: i64 }}' and producing `| retry {{<child args>}} | exhausted`", .{policy_name});
+    };
+    var takes_f = false;
+    var takes_t = false;
+    for (pd.input.fields) |fld| {
+        if (std.mem.eql(u8, fld.name, "f")) {
+            if (!H.hasPayload(sup_br)) {
+                return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' reads 'f' but '| {s}' carries no failure payload", .{ policy_name, site_branch });
+            }
+            if (sup_br.payload.is_wildcard or !std.mem.eql(u8, fld.type, sup_br.payload.fields[0].type)) {
+                return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' declares 'f: {s}' — '| {s}' carries '{s}'", .{ policy_name, fld.type, site_branch, sup_br.payload.fields[0].type });
+            }
+            takes_f = true;
+        } else if (std.mem.eql(u8, fld.name, "t")) {
+            if (!std.mem.eql(u8, fld.type, "i64")) {
+                return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' — 't' is the retry counter: 't: i64'", .{policy_name});
+            }
+            takes_t = true;
+        } else {
+            return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' input field '{s}' — the vocabulary is '{{ f: <failure payload>, t: i64 }}'", .{ policy_name, fld.name });
+        }
+    }
+    // `t` is required — the bound must be reachable. Arm mode can SEE the
+    // `t < N` escape in the `when`; a delegated tor's logic is opaque, so
+    // the contract is that the counter channel exists. `within` doesn't
+    // count — a throttle isn't a bound (a slow child clears the window).
+    if (!takes_t) {
+        return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' must take 't: i64' — the retry counter is the bound the compiler cannot see inside the tor; keep-alive conditions carry their own escape", .{policy_name});
+    }
+    var retry_b: ?*const ast.Branch = null;
+    var exhausted_b: ?*const ast.Branch = null;
+    for (pd.branches) |*b| {
+        if (std.mem.eql(u8, b.name, "retry")) {
+            retry_b = b;
+        } else if (std.mem.eql(u8, b.name, "exhausted")) {
+            exhausted_b = b;
+        } else {
+            return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' declares '| {s}' — the policy vocabulary is retry|exhausted", .{ policy_name, b.name });
+        }
+    }
+    const rb = retry_b orelse {
+        return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' has no '| retry' branch — a policy that cannot re-enter is a forward, not a supervision", .{policy_name});
+    };
+    if (rb.payload.is_wildcard) {
+        return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' `| retry _` — name the child input fields it adapts: '| retry {{ port: i64, tries: i64 }}'", .{policy_name});
+    }
+    if (rb.payload.fields.len == 1 and std.mem.eql(u8, rb.payload.fields[0].name, "__type_ref")) {
+        // `| retry i64` — identity payload, positional: it IS the new
+        // value of the child's sole input (Koru refuses named single
+        // outcomes, so partial one-field adaptation of a multi-input
+        // child is unspellable — braces take 2+ fields).
+        if (child_decl.input.fields.len != 1) {
+            return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' `| retry {s}` is positional — '{s}' takes {d} inputs; name the fields it adapts: '| retry {{ … }}'", .{ policy_name, rb.payload.fields[0].type, child_name, child_decl.input.fields.len });
+        }
+        const fld = child_decl.input.fields[0];
+        if (!std.mem.eql(u8, rb.payload.fields[0].type, fld.type)) {
+            return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' `| retry {s}` — '{s}' takes '{s}: {s}'", .{ policy_name, rb.payload.fields[0].type, child_name, fld.name, fld.type });
+        }
+    } else {
+        for (rb.payload.fields) |rf| {
+            var found = false;
+            for (child_decl.input.fields) |fld| {
+                if (std.mem.eql(u8, rf.name, fld.name)) {
+                    if (!std.mem.eql(u8, rf.type, fld.type)) {
+                        return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' `| retry` field '{s}: {s}' — '{s}' takes '{s}: {s}'", .{ policy_name, rf.name, rf.type, child_name, fld.name, fld.type });
+                    }
+                    found = true;
+                }
+            }
+            if (!found) {
+                return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' `| retry` field '{s}' — '{s}' has no input field '{s}'", .{ policy_name, rf.name, child_name, rf.name });
+            }
+        }
+    }
+    if (exhausted_b) |eb| {
+        if (H.hasPayload(eb)) {
+            if (!H.hasPayload(sup_br)) {
+                return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' `| exhausted` carries a payload — '| {s}' carries none to produce", .{ policy_name, site_branch });
+            }
+            if (eb.payload.is_wildcard or eb.payload.fields.len != 1) {
+                return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' `| exhausted` produces on '| {s}' — one field, matching the branch payload", .{ policy_name, site_branch });
+            }
+            if (!std.mem.eql(u8, eb.payload.fields[0].type, sup_br.payload.fields[0].type)) {
+                return refuse.at(allocator, reporter, loc, module, "std/supervisor:supervised: policy '{s}' `| exhausted {s}` — '| {s}' carries '{s}'", .{ policy_name, eb.payload.fields[0].type, site_branch, sup_br.payload.fields[0].type });
+            }
+        }
+    }
+    return .{ .ok = .{ .retry = rb, .exhausted = exhausted_b, .takes_f = takes_f, .takes_t = takes_t } };
+}
+

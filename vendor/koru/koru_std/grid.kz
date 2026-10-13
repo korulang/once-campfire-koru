@@ -1,0 +1,471 @@
+// Koru Standard Library: Grid — a fixed, positionally-addressed table
+// =====================================================================
+//
+// A grid is the OTHER kind of table, and the distinction is one question:
+// CAN A ROW MOVE?
+//
+//   std/store — yes. `take` swap-removes, so position is not identity, so a
+//               row is named by a generational HANDLE and every access pays a
+//               brand + bounds + generation check. The store earns that
+//               machinery by supporting removal.
+//
+//   std/grid  — no. Every cell exists from declaration and none is ever
+//               inserted, removed or relocated, so POSITION IS IDENTITY. A
+//               grid pays nothing: no handles, no generation word, no sparse
+//               indirection, no freelist, no `len`.
+//
+// A grid is therefore the degenerate, fastest table in the language, and it
+// gets there by forbidding something rather than by optimising.
+//
+// USAGE:
+//   import std/grid
+//
+//   std/grid:new(cells, size: 4096) { count: 0[i64], sx: 0.0[f32] }
+//   std/grid:stored { cells[h].count: cells[h].count + 1 }
+//
+// SIZE, not capacity. `capacity: N` means "up to N, currently `len`". A grid
+// is EXACTLY N cells, all live from the moment it is declared. Different
+// contract, different word, so the two declarations cannot be misread.
+//
+// OUT OF RANGE TRAPS (ruled 2026-08-03). An index outside `0..size` is a
+// panic naming the grid, matching the store's stale-handle floor: fail loud,
+// never silently address a neighbour. Wrapping is the PROGRAM's decision and
+// belongs in the source as an explicit `% size` where a reader can see it — a
+// spatial hash wants exactly that and should say so.
+//
+// The check is a floor, not a tax to be paid forever: an index the compiler
+// can prove in range needs none, and a `! sweep` arm over a grid is precisely
+// that case — the loop constructs the index from `0..size`, so validating it
+// would be validating a fact established one line above. That is the same
+// floor-then-prove-away arc the store's handle check follows.
+//
+// NOT REACTIVE, deliberately, and the seam is left open. Nothing about a grid
+// forbids watches or interceptors — reactivity in Koru is spliced at comptime
+// and costs nothing when nobody listens. But every reactive surface has to
+// answer what it FIRES, and a whole-grid clear firing four thousand times is a
+// question no workload has asked yet. It gets designed when one does.
+
+const std = @import("std");
+const codegen_utils_grid = @import("codegen_utils");
+
+// ============================================================================
+// THE READ — one lowering, file scope, so there is only ever one to be wrong
+// ============================================================================
+//
+// `<grid>[<index>].<field>` is the grid's ONLY read spelling, and it occurs in
+// three places that used to be three different problems: a write block's value
+// (`stored`), a guard or an argument anywhere in the program (`new`'s
+// whole-program pass), and a nested index inside another read. They share this
+// function. The recurring defect this file is built to avoid is a construct
+// with TWO lowerings that agree only by having been written twice — the store
+// has paid for that four times (690_245 is the last one), and a grid read is
+// small enough that the second copy would have looked harmless.
+const ast_grid = @import("ast");
+
+const grid_read = struct {
+    // A grid, and THE NAMESPACE ITS CELLS LIVE IN.
+    //
+    // The namespace is not decoration. A grid declaration emits its cell type
+    // and its storage into the module that declared it — `main_module` for an
+    // entry file, `koru_app.koru_lib` for `app/lib` — and a read compiled into
+    // any OTHER module must say so. Lowering to a bare `__koru_grid_cells`
+    // works in exactly the place the declaration is, which is why a single-file
+    // test cannot see the difference and why this is the fourth time this file
+    // family has shipped an unqualified generated reference (115_018 for the
+    // store's paths, 115_044 for `[id]`'s cell, 115_045 for the grid's own
+    // units, and now the cells themselves).
+    const GridRef = struct {
+        name: []const u8,
+        ns: []const u8,
+        // ROW LAYOUT (`[layout(row)]`): the cells are one array of a cell
+        // struct rather than one array per column. Carried on the ref because
+        // the ADDRESS FORMATTER is the only place that needs to know, and it
+        // is reached from every read and every write — see `lower`.
+        row: bool = false,
+    };
+    fn find(refs: []const GridRef, n: []const u8) ?GridRef {
+        for (refs) |r| {
+            if (std.mem.eql(u8, r.name, n)) return r;
+        }
+        return null;
+    }
+    // The emitted prefix for a grid declared under `home` — `null` meaning the
+    // entry file's top level. Always qualified, never conditionally: a module
+    // can name itself in the emitted Zig (`main_module.` inside main_module is
+    // how `sweep` already calls its own body tor), so there is no case that
+    // needs the bare spelling and therefore no second rule to get wrong.
+    fn nsFor(alloc: std.mem.Allocator, prog: *const ast_grid.Program, home: ?[]const u8) []const u8 {
+        // JS: the declaration lands at the emitted file's top level and is
+        // reached BARE from every handler via closure — the store's cell
+        // qualifier makes the same call (store.kz:109).
+        if (std.mem.eql(u8, CompilerEnv.lang, "js")) return "";
+        const h = home orelse return "main_module.";
+        if (h.len == 0 or std.mem.eql(u8, h, prog.main_module_name)) return "main_module.";
+        return std.fmt.allocPrint(alloc, "{s}.", .{codegen_utils_grid.buildKoruModulePath(alloc, h) catch unreachable}) catch unreachable;
+    }
+    // Every grid declared anywhere in the program, with the namespace it was
+    // declared in. `new` may or may not have lowered yet depending on site
+    // order, so both spellings count: the raw `std/grid:new` flow and the host
+    // line it becomes.
+    fn collect(alloc: std.mem.Allocator, prog: *const ast_grid.Program, out: *std.ArrayList(GridRef)) void {
+        collectIn(alloc, prog, prog.items, null, out);
+    }
+    // Re-collect a grid from its ALREADY-LOWERED declaration text. The emitted
+    // text says which layout it is: a row grid declares exactly one storage
+    // member, `__koru_row`, so its presence between this header and the next
+    // is the whole test (the JS row instance spells `__koru_row: [...Array(N)]`
+    // to keep the same signature).
+    fn scanLowered(alloc: std.mem.Allocator, prog: *const ast_grid.Program, text: []const u8, home: ?[]const u8, out: *std.ArrayList(GridRef)) void {
+        const needle = "const __KoruGridT_";
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, text, i, needle)) |at| {
+            const s = at + needle.len;
+            var e = s;
+            while (e < text.len and ast_grid.isKebabIdentChar(text[e])) e += 1;
+            const stop = std.mem.indexOfPos(u8, text, e, needle) orelse text.len;
+            const is_row = std.mem.indexOfPos(u8, text[0..stop], e, "__koru_row: [") != null;
+            out.append(alloc, GridRef{ .name = text[s..e], .ns = nsFor(alloc, prog, home), .row = is_row }) catch unreachable;
+            i = e;
+        }
+    }
+    fn collectIn(alloc: std.mem.Allocator, prog: *const ast_grid.Program, its: []const ast_grid.Item, home: ?[]const u8, out: *std.ArrayList(GridRef)) void {
+        for (its) |pi| {
+            switch (pi) {
+                .flow => |f| {
+                    const inv = f.inv();
+                    if (inv.path.module_qualifier) |mq| {
+                        if (std.mem.eql(u8, mq, "std.grid") and inv.path.segments.len == 1 and std.mem.eql(u8, inv.path.segments[0], "new")) {
+                            // The declaration has not lowered yet, so the
+                            // layout is still on the annotation. `new` parses
+                            // this properly and REFUSES a bad facet; here we
+                            // only need the answer, and a malformed one is
+                            // left for `new` to reject with a diagnostic.
+                            var is_row = false;
+                            for (f.annotations) |ann| {
+                                const t = std.mem.trim(u8, ann, " \t");
+                                if (!std.mem.startsWith(u8, t, "layout")) continue;
+                                if (std.mem.indexOf(u8, t, "row") != null) is_row = true;
+                            }
+                            for (inv.args) |a| {
+                                if (std.mem.eql(u8, a.name, "expr")) {
+                                    var n = a.value;
+                                    if (n.len >= 2 and n[0] == '"') n = n[1 .. n.len - 1];
+                                    out.append(alloc, GridRef{ .name = n, .ns = nsFor(alloc, prog, home), .row = is_row }) catch unreachable;
+                                }
+                            }
+                        }
+                    }
+                },
+                .host_line => |hl| scanLowered(alloc, prog, hl.content, home, out),
+                // On JS the declaration rides an `.inline_code` item (a
+                // synthesized host_line pointing at a `.k` is dropped by the
+                // JS emitter's facet filter — same routing as the store cell,
+                // store.new.kz:1374), so the re-collection must read it there too.
+                .inline_code => |ic| scanLowered(alloc, prog, ic.code, home, out),
+                .module_decl => |m| collectIn(alloc, prog, m.items, m.logical_name, out),
+                else => {},
+            }
+        }
+    }
+    // A WRITE TARGET, split into its parts: `lights[x, y].on` is the grid, one
+    // or two index expressions, and a column. Only the write side needs the
+    // parts — a read is lowered whole — and it needs them because the index
+    // and the value are EVALUATED AT THE SITE and threaded in as arguments,
+    // not pasted into a proc body that cannot see the site's bindings.
+    const Target = struct {
+        grid: []const u8,
+        x: []const u8,
+        y: ?[]const u8,
+        field: []const u8,
+    };
+    fn parseTarget(text: []const u8, refs: []const GridRef) ?Target {
+        var e: usize = 0;
+        while (e < text.len and ast_grid.isKebabIdentChar(text[e])) e += 1;
+        if (e == 0 or e >= text.len or text[e] != '[') return null;
+        if (find(refs, text[0..e]) == null) return null;
+        var depth: usize = 0;
+        var j = e;
+        while (j < text.len) {
+            if (text[j] == '[') depth += 1;
+            if (text[j] == ']') {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+            j += 1;
+        }
+        if (j + 1 >= text.len or text[j + 1] != '.') return null;
+        const idx_raw = text[e + 1 .. j];
+        var fe = j + 2;
+        while (fe < text.len and ast_grid.isKebabIdentChar(text[fe])) fe += 1;
+        if (fe == j + 2) return null;
+        // Top-level comma only: a comma inside a nested subscript belongs to
+        // that subscript, not to this address.
+        var comma: ?usize = null;
+        var d2: usize = 0;
+        var k: usize = 0;
+        while (k < idx_raw.len) : (k += 1) {
+            if (idx_raw[k] == '[' or idx_raw[k] == '(') d2 += 1;
+            if (idx_raw[k] == ']' or idx_raw[k] == ')') d2 -= 1;
+            if (idx_raw[k] == ',' and d2 == 0) {
+                comma = k;
+                break;
+            }
+        }
+        if (comma) |cm| {
+            return Target{
+                .grid = text[0..e],
+                .x = std.mem.trim(u8, idx_raw[0..cm], " "),
+                .y = std.mem.trim(u8, idx_raw[cm + 1 ..], " "),
+                .field = text[j + 2 .. fe],
+            };
+        }
+        return Target{ .grid = text[0..e], .x = std.mem.trim(u8, idx_raw, " "), .y = null, .field = text[j + 2 .. fe] };
+    }
+    // A column's declared type. The write threads the value through a typed
+    // tor input, so the type has to be recovered from the declaration — and
+    // as everywhere else in this file, the declaration has two spellings
+    // depending on site order: the raw `std/grid:new` flow (`count: 0[i64]`)
+    // and the host line it becomes (`    count: [8]i64 = ...`).
+    fn columnType(alloc: std.mem.Allocator, its: []const ast_grid.Item, grid: []const u8, field: []const u8) ?[]const u8 {
+        for (its) |pi| {
+            switch (pi) {
+                .flow => |f| {
+                    const inv = f.inv();
+                    const mq = inv.path.module_qualifier orelse continue;
+                    if (!std.mem.eql(u8, mq, "std.grid")) continue;
+                    if (inv.path.segments.len != 1 or !std.mem.eql(u8, inv.path.segments[0], "new")) continue;
+                    var this_name: []const u8 = "";
+                    var block: []const u8 = "";
+                    for (inv.args) |a| {
+                        if (std.mem.eql(u8, a.name, "expr")) {
+                            this_name = a.value;
+                            if (this_name.len >= 2 and this_name[0] == '"') this_name = this_name[1 .. this_name.len - 1];
+                        } else if (std.mem.eql(u8, a.name, "source")) {
+                            block = a.value;
+                        }
+                    }
+                    if (!std.mem.eql(u8, this_name, grid) or block.len == 0) continue;
+                    const struct_literal_g = @import("struct_literal");
+                    const braced = std.fmt.allocPrint(alloc, "{{{s}}}", .{block}) catch unreachable;
+                    const cols = struct_literal_g.parseFields(alloc, braced) catch continue;
+                    for (cols) |c| {
+                        if (!std.mem.eql(u8, std.mem.trim(u8, c.name, " "), field)) continue;
+                        const v = std.mem.trim(u8, c.value, " ");
+                        const lb = std.mem.indexOfScalar(u8, v, '[') orelse continue;
+                        if (v.len == 0 or v[v.len - 1] != ']') continue;
+                        return std.mem.trim(u8, v[lb + 1 .. v.len - 1], " ");
+                    }
+                },
+                .host_line => |hl| {
+                    const head = std.fmt.allocPrint(alloc, "const __KoruGridT_{s} = struct {{", .{grid}) catch unreachable;
+                    const at = std.mem.indexOf(u8, hl.content, head) orelse continue;
+                    // COLUMN layout: `    field: [N]T = ...` — the type sits
+                    // after the extent. ROW layout: the field is a scalar
+                    // member of the nested cell struct, `        field: T = `,
+                    // so there is no extent to skip past. Both are read from
+                    // the emitted text rather than re-derived, because by this
+                    // point the declaration is the only record of the choice.
+                    const needle = std.fmt.allocPrint(alloc, "\n    {s}: [", .{field}) catch unreachable;
+                    if (std.mem.indexOfPos(u8, hl.content, at, needle)) |fat| {
+                        const after = fat + needle.len;
+                        const close = std.mem.indexOfScalarPos(u8, hl.content, after, ']') orelse continue;
+                        var te = close + 1;
+                        while (te < hl.content.len and ast_grid.isKebabIdentChar(hl.content[te])) te += 1;
+                        return hl.content[close + 1 .. te];
+                    }
+                    const rneedle = std.fmt.allocPrint(alloc, "\n        {s}: ", .{field}) catch unreachable;
+                    const rat = std.mem.indexOfPos(u8, hl.content, at, rneedle) orelse continue;
+                    const rs = rat + rneedle.len;
+                    var re = rs;
+                    while (re < hl.content.len and ast_grid.isKebabIdentChar(hl.content[re])) re += 1;
+                    return hl.content[rs..re];
+                },
+                .module_decl => |m| {
+                    if (columnType(alloc, m.items, grid, field)) |hit| return hit;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+    // Rewrite every `<grid>[<expr>].<field>` in `text` to its lowered form.
+    //
+    // The column is named through a POINTER before the index: a by-value base
+    // makes Zig materialise the whole column ahead of a call-valued index,
+    // which cost 1750x on the store's read path
+    // (frag-a-call-valued-index-copies-the-whole-array).
+    //
+    // MASKED, because this now runs over arbitrary program text and not just
+    // write blocks: inside a string only a `{{ … }}` interpolation is an
+    // expression, so prose that happens to read like a subscript is left alone
+    // and an interpolated cell read is not.
+    fn lower(alloc: std.mem.Allocator, text: []const u8, refs: []const GridRef) []const u8 {
+        const expr_ctx = ast_grid.expressionMask(alloc, text);
+        var out = std.ArrayList(u8).initCapacity(alloc, text.len + 64) catch unreachable;
+        var i: usize = 0;
+        while (i < text.len) {
+            var matched = false;
+            if (expr_ctx[i] and ast_grid.identBoundaryBefore(text, i)) {
+                var e = i;
+                while (e < text.len and ast_grid.isKebabIdentChar(text[e])) e += 1;
+                if (e > i and e < text.len and text[e] == '[' and find(refs, text[i..e]) != null) {
+                    // Depth-aware scan so a nested subscript in the index
+                    // survives: `cells[other[k].h].count`.
+                    var depth: usize = 0;
+                    var j = e;
+                    while (j < text.len) {
+                        if (text[j] == '[') depth += 1;
+                        if (text[j] == ']') {
+                            depth -= 1;
+                            if (depth == 0) break;
+                        }
+                        j += 1;
+                    }
+                    if (j < text.len and j + 1 < text.len and text[j + 1] == '.') {
+                        const gname = text[i..e];
+                        const idx_raw = text[e + 1 .. j];
+                        var fe = j + 2;
+                        while (fe < text.len and ast_grid.isKebabIdentChar(text[fe])) fe += 1;
+                        const fname = text[j + 2 .. fe];
+                        // The index may itself contain grid reads.
+                        // A TOP-LEVEL comma in the subscript means the 2-D
+                        // form `g[x, y]`. Depth matters: a comma inside a
+                        // nested subscript belongs to that subscript.
+                        var comma: ?usize = null;
+                        var d2: usize = 0;
+                        var k: usize = 0;
+                        while (k < idx_raw.len) : (k += 1) {
+                            if (idx_raw[k] == '[' or idx_raw[k] == '(') d2 += 1;
+                            if (idx_raw[k] == ']' or idx_raw[k] == ')') d2 -= 1;
+                            if (idx_raw[k] == ',' and d2 == 0) {
+                                comma = k;
+                                break;
+                            }
+                        }
+                        const gref = find(refs, gname) orelse unreachable;
+                        const ns = gref.ns;
+                        // BOTH SPELLINGS TAKE THE POINTER BASE. For a column
+                        // grid `&G.field` is the array; for a row grid
+                        // `&G.__koru_row` is. Naming either by VALUE makes Zig
+                        // materialise the whole array ahead of a call-valued
+                        // index — measured at 1750x on the store's read path
+                        // (frag-a-call-valued-index-copies-the-whole-array),
+                        // and row layout re-opens exactly that hole because the
+                        // element is now bigger, not smaller.
+                        //
+                        // On JS an array IS a reference, and `&` is only valid
+                        // where the expression rewriter runs (writeJsExpr) —
+                        // a proc-body splice (the write unit) never gets that
+                        // pass, so the `&` is dropped at the source instead.
+                        const amp: []const u8 = if (std.mem.eql(u8, CompilerEnv.lang, "js")) "" else "&";
+                        const piece = if (comma) |cm| blk_two: {
+                            const xs = lower(alloc, std.mem.trim(u8, idx_raw[0..cm], " "), refs);
+                            const ys = lower(alloc, std.mem.trim(u8, idx_raw[cm + 1 ..], " "), refs);
+                            break :blk_two if (gref.row)
+                                std.fmt.allocPrint(alloc, "({s}{s}__koru_grid_{s}.__koru_row)[{s}__KoruGridT_{s}.__koru_at2({s}, {s})].{s}", .{ amp, ns, gname, ns, gname, xs, ys, fname }) catch unreachable
+                            else
+                                std.fmt.allocPrint(alloc, "({s}{s}__koru_grid_{s}.{s})[{s}__KoruGridT_{s}.__koru_at2({s}, {s})]", .{ amp, ns, gname, fname, ns, gname, xs, ys }) catch unreachable;
+                        } else blk_one: {
+                            const idx = lower(alloc, idx_raw, refs);
+                            break :blk_one if (gref.row)
+                                std.fmt.allocPrint(alloc, "({s}{s}__koru_grid_{s}.__koru_row)[{s}__KoruGridT_{s}.__koru_at({s})].{s}", .{ amp, ns, gname, ns, gname, idx, fname }) catch unreachable
+                            else
+                                std.fmt.allocPrint(alloc, "({s}{s}__koru_grid_{s}.{s})[{s}__KoruGridT_{s}.__koru_at({s})]", .{ amp, ns, gname, fname, ns, gname, idx }) catch unreachable;
+                        };
+                        out.appendSlice(alloc, piece) catch unreachable;
+                        i = fe;
+                        matched = true;
+                    }
+                }
+            }
+            if (!matched) {
+                out.append(alloc, text[i]) catch unreachable;
+                i += 1;
+            }
+        }
+        return out.toOwnedSlice(alloc) catch unreachable;
+    }
+    // LOWER EVERY READ IN A CONTINUATION TREE.
+    //
+    // Two callers, deliberately: the declaration's whole-program pass, and
+    // `sweep` over the body it has just rewritten. They need identical
+    // coverage — the same skip rule, the same inline_body trap, the same
+    // recursion — and the second caller exists because a sweep body is created
+    // AFTER the declaration's pass has run, so it is a subtree the program walk
+    // can never have seen.
+    //
+    // Sites belonging to std/grid are SKIPPED: `stored` lowers its own block,
+    // and skipping is what leaves a nested write's target in source form long
+    // enough for `stored` to parse it. That is not an optimisation — it is the
+    // mechanism that makes `stored { c.on: … }` addressable at all.
+    fn lowerCont(alloc: std.mem.Allocator, c: *ast_grid.Continuation, refs: []const GridRef) void {
+        if (c.condition) |cd| {
+            @constCast(c).condition = lower(alloc, cd, refs);
+        }
+        if (c.node) |*n| {
+            // Never `|*inv|` on `switch (n.*)` — that captures a TEMPORARY and
+            // the live AST stays raw (store's 690_074).
+            switch (@constCast(n).*) {
+                .invocation => {
+                    const inv = &@constCast(n).invocation;
+                    const ours = blk: {
+                        if (inv.path.module_qualifier) |mq| break :blk std.mem.eql(u8, mq, "std.grid");
+                        break :blk false;
+                    };
+                    if (!ours) {
+                        for (inv.args) |*a| {
+                            @constCast(a).value = lower(alloc, a.value, refs);
+                            if (a.expression_value) |ev| {
+                                const fresh = alloc.create(ast_grid.CapturedExpression) catch unreachable;
+                                fresh.* = ev.*;
+                                fresh.text = lower(alloc, ev.text, refs);
+                                @constCast(a).expression_value = fresh;
+                            }
+                            if (a.source_value) |sv| {
+                                const fresh = alloc.create(ast_grid.Source) catch unreachable;
+                                fresh.* = sv.*;
+                                fresh.text = lower(alloc, sv.text, refs);
+                                @constCast(a).source_value = fresh;
+                            }
+                        }
+                    }
+                    // TEMPLATE EXPANSION FREEZES ARGS EARLY. `if` and `for`
+                    // bake their Expression argument into
+                    // `Invocation.inline_body` before a declaration's pass ever
+                    // runs, so rewriting `inv.args` alone reaches a copy nobody
+                    // emits — the guard under a loop still says `cells[3].on`
+                    // and the host calls it undeclared. store.kz records the
+                    // same trap at 690_074.
+                    if (inv.inline_body) |ib| {
+                        inv.inline_body = lower(alloc, ib, refs);
+                    }
+                },
+                .inline_code => {
+                    @constCast(n).* = .{ .inline_code = lower(alloc, n.inline_code, refs) };
+                },
+                else => {},
+            }
+        }
+        for (c.continuations) |*k| lowerCont(alloc, @constCast(k), refs);
+    }
+    fn lowerItems(alloc: std.mem.Allocator, its: []ast_grid.Item, refs: []const GridRef) void {
+        for (its) |*pi| {
+            switch (pi.*) {
+                // `&pi.flow`, not `|*f|` on a switched copy — the same
+                // temporary-capture rule as above.
+                .flow => {
+                    lowerCont(alloc, &pi.flow.body, refs);
+                    if (pi.flow.inline_body) |ib| pi.flow.inline_body = lower(alloc, ib, refs);
+                },
+                .module_decl => lowerItems(alloc, @constCast(pi.module_decl.items), refs),
+                else => {},
+            }
+        }
+    }
+};
+
+
+~part new
+~part stored
+~part sweep
+

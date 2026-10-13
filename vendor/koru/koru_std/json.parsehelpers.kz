@@ -1,0 +1,282 @@
+// Koru Standard Library: JSON — parse helpers.
+// Joined via `~part helpers` in json.parse.kz; merged into the json.parse
+// module at load. Holds the transform's helper container so the driver
+// stays under the line wall.
+
+const ParseH = struct {
+    const std2 = @import("std");
+    const ast2 = @import("ast");
+
+    const JTy = union(enum) {
+        raw, // bare leaf: the value's raw JSON span (quotes included on strings)
+        str, // string: decoded inner text
+        boolean,
+        int: []const u8,
+        float: []const u8,
+        opt: *const JTy,
+        arr: *const JTy,
+        obj: usize, // index into Ctx.shapes
+    };
+
+    const JField = struct { name: []const u8, ty: *const JTy };
+
+    const Ctx = struct {
+        a: std2.mem.Allocator,
+        sfx: []const u8, // site-unique suffix _L_C
+        shapes: std2.ArrayList([]const JField) = .{},
+        n: usize = 0, // per-site temporary serial (no shadowing)
+        fail: ?[]const u8 = null,
+    };
+
+    fn failf(ctx: *Ctx, comptime fmt: []const u8, args: anytype) void {
+        if (ctx.fail == null)
+            ctx.fail = std2.fmt.allocPrint(ctx.a, fmt, args) catch "std/json:parse refusal detail OOM";
+    }
+
+    fn dupTy(ctx: *Ctx, ty: JTy) *const JTy {
+        const p = ctx.a.create(JTy) catch unreachable;
+        p.* = ty;
+        return p;
+    }
+
+    fn isIntT(t: []const u8) bool {
+        if (std2.mem.eql(u8, t, "isize") or std2.mem.eql(u8, t, "usize")) return true;
+        if (t.len >= 2 and (t[0] == 'i' or t[0] == 'u')) {
+            for (t[1..]) |ch| {
+                if (ch < '0' or ch > '9') return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn isFloatT(t: []const u8) bool {
+        if (t.len >= 2 and t[0] == 'f') {
+            for (t[1..]) |ch| {
+                if (ch < '0' or ch > '9') return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn isPlainIdent(name: []const u8) bool {
+        if (name.len == 0) return false;
+        for (name, 0..) |ch, i| {
+            const ok = if (i == 0)
+                (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or ch == '_'
+            else
+                (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    /// Parse a schema type spelling: `?T`, `[]T` (chains allowed),
+    /// `{...}` (a nested object shape, registered), `string`, `bool`,
+    /// an int or float type. Returns null with ctx.fail set on refusal.
+    fn parseTyText(ctx: *Ctx, text: []const u8) ?*const JTy {
+        const t = std2.mem.trim(u8, text, " \t\r\n");
+        if (t.len == 0) {
+            failf(ctx, "json schema: empty type spelling", .{});
+            return null;
+        }
+        if (t[0] == '?') {
+            const inner = parseTyText(ctx, t[1..]) orelse return null;
+            return dupTy(ctx, .{ .opt = inner });
+        }
+        if (std2.mem.startsWith(u8, t, "[]")) {
+            const inner = parseTyText(ctx, t[2..]) orelse return null;
+            return dupTy(ctx, .{ .arr = inner });
+        }
+        if (std2.mem.startsWith(u8, t, "const "))
+            return parseTyText(ctx, t[6..]);
+        if (t[0] == '{') {
+            if (t.len < 2 or t[t.len - 1] != '}') {
+                failf(ctx, "json schema: malformed object shape '{s}'", .{t});
+                return null;
+            }
+            const fields = parseShapeText(ctx, t[1 .. t.len - 1]) orelse return null;
+            const idx = ctx.shapes.items.len;
+            ctx.shapes.append(ctx.a, fields) catch unreachable;
+            return dupTy(ctx, .{ .obj = idx });
+        }
+        if (std2.mem.eql(u8, t, "string")) return dupTy(ctx, .str);
+        if (std2.mem.eql(u8, t, "bool")) return dupTy(ctx, .boolean);
+        if (isIntT(t)) return dupTy(ctx, .{ .int = ctx.a.dupe(u8, t) catch unreachable });
+        if (isFloatT(t)) return dupTy(ctx, .{ .float = ctx.a.dupe(u8, t) catch unreachable });
+        failf(ctx, "json schema: unsupported field type '{s}' — want string, bool, an int/float type, ?T, []T, or a nested {{...}}", .{t});
+        return null;
+    }
+
+    /// The `{a: t, b: { ... }}` grammar inside type_text — the
+    /// destructure grammar's raw-text twin for shapes nested under `[]`
+    /// or `?` (the real parser only routes a bare `{...}` to `sub`).
+    fn parseShapeText(ctx: *Ctx, inner: []const u8) ?[]const JField {
+        var fields = std2.ArrayList(JField){};
+        var depth: i32 = 0;
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i <= inner.len) : (i += 1) {
+            const at_end = i == inner.len;
+            const split = at_end or (inner[i] == ',' and depth == 0);
+            if (!at_end) {
+                if (inner[i] == '{' or inner[i] == '[' or inner[i] == '(') depth += 1;
+                if (inner[i] == '}' or inner[i] == ']' or inner[i] == ')') depth -= 1;
+            }
+            if (!split) continue;
+            const entry = std2.mem.trim(u8, inner[start..i], " \t\r\n");
+            start = i + 1;
+            if (entry.len == 0) continue;
+            var rest = entry;
+            while (rest.len > 0 and rest[0] == '[' and rest.len > 1 and rest[1] != ']') {
+                const close = std2.mem.indexOfScalar(u8, rest, ']') orelse {
+                    failf(ctx, "json schema: unterminated annotation on field '{s}'", .{entry});
+                    return null;
+                };
+                failf(ctx, "json schema: destructure annotation '[{s}]' has no consumer — a parse implements none", .{rest[1..close]});
+                return null;
+            }
+            // Top-level ':' splits name from type.
+            var colon: ?usize = null;
+            var d2: i32 = 0;
+            for (rest, 0..) |ch, k| {
+                if (ch == '{' or ch == '[' or ch == '(') d2 += 1;
+                if (ch == '}' or ch == ']' or ch == ')') d2 -= 1;
+                if (ch == ':' and d2 == 0) {
+                    colon = k;
+                    break;
+                }
+            }
+            var name: []const u8 = rest;
+            var ty: *const JTy = undefined;
+            if (colon) |c0| {
+                name = std2.mem.trim(u8, rest[0..c0], " \t\r\n");
+                const rt = std2.mem.trim(u8, rest[c0 + 1 ..], " \t\r\n");
+                if (rt.len == 0) {
+                    failf(ctx, "json schema: field '{s}' has ':' but no type", .{name});
+                    return null;
+                }
+                ty = parseTyText(ctx, rt) orelse return null;
+            } else {
+                ty = dupTy(ctx, .raw);
+            }
+            if (std2.mem.eql(u8, name, "_")) {
+                failf(ctx, "json schema: '_' names no JSON key — give the field a name or drop it", .{});
+                return null;
+            }
+            if (!isPlainIdent(name)) {
+                failf(ctx, "json schema: field name '{s}' is not a plain identifier — dotted/kebab/escaped keys can't be spelled in v1", .{name});
+                return null;
+            }
+            fields.append(ctx.a, .{ .name = name, .ty = ty }) catch unreachable;
+        }
+        if (fields.items.len == 0) {
+            failf(ctx, "json schema: empty object shape", .{});
+            return null;
+        }
+        return fields.toOwnedSlice(ctx.a) catch unreachable;
+    }
+
+    /// The ok-branch destructure → []JField. `sub` is a nested object;
+    /// type_text goes through parseTyText; bare leaves are .raw.
+    /// `rw` collects the destructure with each leaf's type_text rewritten
+    /// to its emitted-Zig spelling — the generic destructure emitter
+    /// splices type_text verbatim and `{...}`/`[]{...}` schema text is
+    /// not a Zig type (the shape's `__JP{s}_{i}` name is).
+    fn convFields(ctx: *Ctx, dfs: []const ast2.DestructureField, rw: *std2.ArrayList(ast2.DestructureField)) ?[]const JField {
+        var out = std2.ArrayList(JField){};
+        for (dfs) |f| {
+            if (f.annotations.len > 0) {
+                failf(ctx, "json parse: destructure annotation '[{s}]' on '{s}' has no consumer — a parse implements none", .{ f.annotations[0], f.name });
+                return null;
+            }
+            if (std2.mem.eql(u8, f.name, "_")) {
+                failf(ctx, "json schema: '_' names no JSON key — give the field a name or drop it", .{});
+                return null;
+            }
+            if (!isPlainIdent(f.name)) {
+                failf(ctx, "json schema: field name '{s}' is not a plain identifier — dotted/kebab/escaped keys can't be spelled in v1", .{f.name});
+                return null;
+            }
+            var ty: *const JTy = undefined;
+            var nf = f;
+            if (f.sub.len > 0) {
+                var sub_rw = std2.ArrayList(ast2.DestructureField){};
+                const sub = convFields(ctx, f.sub, &sub_rw) orelse return null;
+                nf.sub = sub_rw.toOwnedSlice(ctx.a) catch unreachable;
+                const idx = ctx.shapes.items.len;
+                ctx.shapes.append(ctx.a, sub) catch unreachable;
+                ty = dupTy(ctx, .{ .obj = idx });
+            } else if (f.type_text) |t| {
+                ty = parseTyText(ctx, t) orelse return null;
+            } else {
+                ty = dupTy(ctx, .raw);
+            }
+            if (f.sub.len == 0) nf.type_text = zigTy(ctx, ty);
+            rw.append(ctx.a, nf) catch unreachable;
+            out.append(ctx.a, .{ .name = f.name, .ty = ty }) catch unreachable;
+        }
+        return out.toOwnedSlice(ctx.a) catch unreachable;
+    }
+
+    /// The Zig type spelling of a JTy in the emitted code.
+    fn zigTy(ctx: *Ctx, ty: *const JTy) []const u8 {
+        return switch (ty.*) {
+            .raw, .str => "[]const u8",
+            .boolean => "bool",
+            .int => |t| t,
+            .float => |t| t,
+            .opt => |inner| std2.fmt.allocPrint(ctx.a, "?{s}", .{zigTy(ctx, inner)}) catch unreachable,
+            .arr => |inner| std2.fmt.allocPrint(ctx.a, "[]const {s}", .{zigTy(ctx, inner)}) catch unreachable,
+            .obj => |i| std2.fmt.allocPrint(ctx.a, "__JP{s}_{d}", .{ ctx.sfx, i }) catch unreachable,
+        };
+    }
+
+    fn w(out: *std2.ArrayList(u8), ctx: *Ctx, comptime fmt: []const u8, args: anytype) void {
+        const s = std2.fmt.allocPrint(ctx.a, fmt, args) catch unreachable;
+        out.appendSlice(ctx.a, s) catch unreachable;
+    }
+
+    /// Emit the read of one JSON value of type `ty` into lvalue `dst`,
+    /// inside a shape-0-style fn (returns ?T, has s/p/e in scope).
+    fn emitRead(ctx: *Ctx, out: *std2.ArrayList(u8), ty: *const JTy, dst: []const u8, what: []const u8) void {
+        switch (ty.*) {
+            .raw => {
+                ctx.n += 1;
+                w(out, ctx, "{{ const __rst{d} = p.*; if (!__jskip{s}(s, p, e)) return null; {s} = s[__rst{d}..p.*]; }} ", .{ ctx.n, ctx.sfx, dst, ctx.n });
+            },
+            .str => {
+                w(out, ctx, "{s} = __jstr{s}(s, p, e, a) orelse return null; ", .{ dst, ctx.sfx });
+            },
+            .boolean => {
+                w(out, ctx, "if (__jlit{s}(s, p, \"true\")) {{ {s} = true; }} else if (__jlit{s}(s, p, \"false\")) {{ {s} = false; }} else {{ e.* = .{{ .message = \"expected true or false for '{s}'\", .offset = p.* }}; return null; }} ", .{ ctx.sfx, dst, ctx.sfx, dst, what });
+            },
+            .int => |t| {
+                ctx.n += 1;
+                w(out, ctx, "{{ const __ns{d} = __jnum{s}(s, p, e) orelse return null; {s} = @import(\"std\").fmt.parseInt({s}, __ns{d}, 10) catch {{ e.* = .{{ .message = \"'{s}' does not fit {s}\", .offset = p.* }}; return null; }}; }} ", .{ ctx.n, ctx.sfx, dst, t, ctx.n, what, t });
+            },
+            .float => |t| {
+                ctx.n += 1;
+                w(out, ctx, "{{ const __ns{d} = __jnum{s}(s, p, e) orelse return null; {s} = @import(\"std\").fmt.parseFloat({s}, __ns{d}) catch {{ e.* = .{{ .message = \"'{s}' does not fit {s}\", .offset = p.* }}; return null; }}; }} ", .{ ctx.n, ctx.sfx, dst, t, ctx.n, what, t });
+            },
+            .opt => |inner| {
+                ctx.n += 1;
+                w(out, ctx, "if (__jlit{s}(s, p, \"null\")) {{ {s} = null; }} else {{ ", .{ ctx.sfx, dst });
+                emitRead(ctx, out, inner, dst, what);
+                w(out, ctx, "}} ", .{});
+            },
+            .arr => |elem| {
+                ctx.n += 1;
+                const n = ctx.n;
+                const elem_zt = zigTy(ctx, elem);
+                w(out, ctx, "if (p.* < s.len and s[p.*] == '[') {{ p.* += 1; var __acc{d} = @import(\"std\").ArrayList({s}){{}}; __jws{s}(s, p); if (p.* < s.len and s[p.*] == ']') {{ p.* += 1; }} else while (true) {{ __jws{s}(s, p); var __el{d}: {s} = undefined; ", .{ n, elem_zt, ctx.sfx, ctx.sfx, n, elem_zt });
+                emitRead(ctx, out, elem, std2.fmt.allocPrint(ctx.a, "__el{d}", .{n}) catch unreachable, what);
+                w(out, ctx, "__acc{d}.append(a, __el{d}) catch {{ e.* = .{{ .message = \"json parse: out of memory\", .offset = p.* }}; return null; }}; __jws{s}(s, p); if (p.* < s.len and s[p.*] == ',') {{ p.* += 1; continue; }} if (p.* < s.len and s[p.*] == ']') {{ p.* += 1; break; }} e.* = .{{ .message = \"expected ',' or ']' in '{s}'\", .offset = p.* }}; return null; }} {s} = __acc{d}.toOwnedSlice(a) catch {{ e.* = .{{ .message = \"json parse: out of memory\", .offset = p.* }}; return null; }}; }} else {{ e.* = .{{ .message = \"expected an array for '{s}'\", .offset = p.* }}; return null; }} ", .{ n, n, ctx.sfx, what, dst, n, what });
+            },
+            .obj => |i| {
+                w(out, ctx, "if (p.* < s.len and s[p.*] == '{{') {{ {s} = __jobj{s}_{d}(s, p, e, a) orelse return null; }} else {{ e.* = .{{ .message = \"expected an object for '{s}'\", .offset = p.* }}; return null; }} ", .{ dst, ctx.sfx, i, what });
+            },
+        }
+    }
+};

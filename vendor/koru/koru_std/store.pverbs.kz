@@ -1,0 +1,713 @@
+// Koru Standard Library: the `pverbs` part of store.kz.
+// Joined via `~part pverbs` in store.kz; merged into the module at load.
+//
+// The pump-participant verbs (`! step`/`! wait`/`! live` arms and the
+// `<s>-step`/`<s>-live`/`<s>-wait` generated units) — lifted out of the `new`
+// transform to keep store.new.kz under its line baseline. Self-contained:
+// every dependency arrives as a parameter (the qcaps rule); the proc-local
+// helper structs (`H`, `Usage`, the owned-column record) arrive as `anytype`.
+
+    // KORU100 for interceptor payloads: a bound row field must be USED in
+    // the body (or discarded with `_`). flow_checker's unused-binding pass
+    // skips `[transform]` invocations, and `std/store:new` is one, so the
+    // store transform enforces it here — scanning the body's expression /
+    // source text for the field name at a word boundary.
+    const Usage = struct {
+    fn isIdentChar(ch: u8) bool {
+        return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-';
+    }
+        fn inText(text: []const u8, name: []const u8) bool {
+            if (name.len == 0) return false;
+            var i: usize = 0;
+            while (i + name.len <= text.len) : (i += 1) {
+                if (!std.mem.eql(u8, text[i .. i + name.len], name)) continue;
+                const before_ok = ast_find.identBoundaryBefore(text, i);
+                const after_ok = i + name.len == text.len or !isIdentChar(text[i + name.len]);
+                if (before_ok and after_ok) return true;
+            }
+            return false;
+        }
+        // A store-read site nested in the interceptor body transplants its
+        // body into a `__store_sweepbody_<s>_L<n>` / `__store_qbody_<s>_L<n>`
+        // tor whose INPUTS carry the captures the body references. The
+        // interceptor body at create time holds only the spliced loop, so a
+        // body-only use of the payload lives here — the field name shows up
+        // as an tor input, which is exactly the thread that makes it
+        // compile (690_093).
+        fn readBodyEventUses(prog: *const ast_find.Program, text: []const u8, name: []const u8) bool {
+            const markers = [_][]const u8{ "__store_sweepbody_", "__store_qbody_" };
+            for (markers) |m| {
+                var pos: usize = 0;
+                while (std.mem.indexOfPos(u8, text, pos, m)) |at| {
+                    var i = at + m.len;
+                    while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or text[i] == '_')) i += 1;
+                    const ev_name = text[at .. i];
+                    pos = i;
+                    if (findSynthDecl(prog.items, ev_name)) |ed| {
+                        for (ed.input.fields) |f2| {
+                            if (std.mem.eql(u8, f2.name, name)) return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        fn inCont(cont: *const ast_find.Continuation, name: []const u8, prog: *const ast_find.Program) bool {
+            if (cont.condition) |c| {
+                if (inText(c, name)) return true;
+            }
+            if (cont.node) |n| {
+                switch (n) {
+                    .invocation => {
+                        for (n.invocation.args) |a| {
+                            if (inText(a.value, name)) return true;
+                            if (a.expression_value) |ev| {
+                                if (inText(ev.text, name)) return true;
+                            }
+                            if (a.source_value) |sv| {
+                                if (inText(sv.text, name)) return true;
+                            }
+                        }
+                    },
+                    .inline_code => {
+                        // The spliced loop a nested read site leaves behind
+                        // (690_093): its relocated guard carries the payload
+                        // name in the text, and its body call names the
+                        // transplanted tor whose inputs carry the capture.
+                        if (inText(n.inline_code, name)) return true;
+                        if (readBodyEventUses(prog, n.inline_code, name)) return true;
+                    },
+                    else => {},
+                }
+            }
+            for (cont.continuations) |*c| {
+                if (inCont(c, name, prog)) return true;
+            }
+            return false;
+        }
+    };
+
+const PVerbs = struct {
+    const ast = @import("ast");
+    const ast_functional = @import("ast_functional");
+
+    fn modNameEq(a: []const u8, b: []const u8) bool {
+            if (a.len != b.len) return false;
+            for (a, b) |ca, cb| {
+                const na: u8 = if (ca == '/') '.' else ca;
+                const nb: u8 = if (cb == '/') '.' else cb;
+                if (na != nb) return false;
+            }
+            return true;
+        }
+    fn segsEq(a: []const []const u8, b: []const []const u8) bool {
+            if (a.len != b.len) return false;
+            for (a, b) |sa, sb| {
+                if (!std.mem.eql(u8, sa, sb)) return false;
+            }
+            return true;
+        }
+
+    const ArmVerdict = union(enum) {
+        not_mine,
+        ok,
+        refuse: ast.Item,
+    };
+
+    // `! step` / `! wait` arm collection — decl lookup, contract checks and
+    // refusals for the participant rungs, lifted verbatim out of `new`'s
+    // interceptor dispatch. `.ok` means the arm was claimed; `.not_mine`
+    // hands dispatch back to the lifecycle arms.
+    fn collectArm(
+        allocator: std.mem.Allocator,
+        program: *const ast.Program,
+        flow: *const ast.Flow,
+        reporter: anytype,
+        store_name: []const u8,
+        field_names: []const []const u8,
+        field_owned_info: anytype,
+        bname: []const u8,
+        ic: *const ast.Continuation,
+        step_arm: *?ast.Continuation,
+        step_terminal_branches: *std.ArrayList(ast.Branch),
+        wait_arm: *?ast.Continuation,
+        wait_src: *[2][]const u8,
+    ) ArmVerdict {
+        // `! step` — the participant contract (the pump slice). The body
+        // IS the step call; `!` effects ride verbatim into the generated
+        // stepbody unit while the `|` verdicts are the store's to read:
+        // `| complete` retires the row (removed observers fire, then the
+        // drain), every other verdict keeps it for the next pass.
+        if (std.mem.eql(u8, bname, "step")) {
+            if (step_arm.* != null) {
+                return .{ .refuse = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): one `! step` handler per store - a pass steps each row once", .{store_name}) };
+            }
+            // This rung binds the one-owned-column store — the row IS its
+            // obligation, which is what lets `| complete` retire it.
+            if (!(field_names.len == 1 and field_owned_info[0] != null)) {
+                return .{ .refuse = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! step` this rung lives on a one-owned-column store - the row IS its obligation, which is what lets `| complete` retire it; rows of several columns step later", .{store_name}) } ;
+            }
+            if (ic.destructure.len != 0 or ic.binding == null) {
+                return .{ .refuse = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! step` binds the row itself - spell it `! step s |> <module>:<step>(s)`", .{store_name}) };
+            }
+            const sbind = ic.binding.?;
+            const snode = ic.node orelse {
+                return .{ .refuse = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): the `! step` handler needs a body - the step call itself (`|> <module>:<step>({s})`)", .{ store_name, sbind }) };
+            };
+            if (snode != .invocation) {
+                return .{ .refuse = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): the `! step` body starts with the step call this rung", .{store_name}) };
+            }
+            for (ic.continuations) |*cc| {
+                if (cc.kind == .terminal) {
+                    return .{ .refuse = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `| {s}` on the step call is the store's verdict, not the arm's - `| complete` retires the row and every other verdict keeps it for the next pass; the arm carries `!` effects only", .{ store_name, cc.branch }) } ;
+                }
+            }
+            if (!Usage.inCont(ic, sbind, program)) {
+                return .{ .refuse = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! step` binds '{s}' but never steps it - the body is the step call (`|> <module>:<step>({s})`)", .{ store_name, sbind, sbind }) };
+            }
+            // The step tor's `|` terminals become the pass's verdict
+            // vocabulary — the generated stepbody tor re-declares them
+            // and the impl re-raises each one it does not write. `complete`
+            // must be among them: a row with no way out drains nothing.
+            const step_decl = blk_sd: {
+                const smq = sinv_mod: {
+                    const si = &snode.invocation;
+                    break :sinv_mod si.path.module_qualifier;
+                };
+                var found: ?*const ast.EventDecl = null;
+                for (program.items) |*pi| {
+                    if (pi.* == .module_decl) {
+                        const md = &pi.module_decl;
+                        if (smq) |q| {
+                            if (!modNameEq(md.logical_name, q)) continue;
+                        } else if (!modNameEq(md.logical_name, flow.module)) {
+                            continue;
+                        }
+                        for (md.items) |*mi| {
+                            if (mi.* != .event_decl) continue;
+                            const ed = &mi.event_decl;
+                            if (segsEq(ed.path.segments, snode.invocation.path.segments)) {
+                                found = ed;
+                                break;
+                            }
+                        }
+                    } else if (pi.* == .event_decl and smq == null) {
+                        const ed = &pi.event_decl;
+                        if (segsEq(ed.path.segments, snode.invocation.path.segments)) found = ed;
+                    }
+                    if (found != null) break;
+                }
+                break :blk_sd found;
+            };
+            const sed = step_decl orelse {
+                return .{ .refuse = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! step` cannot see the step tor's contract - the callee's `|` verdicts are the store's vocabulary, so its declaration must be in scope", .{store_name}) };
+            };
+            var has_complete = false;
+            for (sed.branches) |br| {
+                if (br.kind != .terminal) continue;
+                if (br.payload.fields.len != 0) {
+                    return .{ .refuse = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! step`'s callee carries a value on `| {s}` - verdicts are words the store reads, not payloads; a payload-carrying verdict is a later slice", .{ store_name, br.name }) } ;
+                }
+                step_terminal_branches.append(allocator, br) catch unreachable;
+                if (std.mem.eql(u8, br.name, "complete")) has_complete = true;
+            }
+            if (!has_complete) {
+                return .{ .refuse = ast.refusal(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:new({s}): `! step`'s callee never answers `| complete` - a participant with no way out can never retire, so a pump over it drains nothing", .{store_name}) };
+            }
+            step_arm.* = ast_functional.cloneContinuation(allocator, ic) catch unreachable;
+            return .ok;
+        }
+        // `! wait` — the interest contract: PWait.collect in store.wait.kz
+        // runs the checks and fills wait_arm / wait_src.
+        if (std.mem.eql(u8, bname, "wait")) {
+            if (PWait.collect(allocator, program, flow, reporter, store_name, field_names, field_owned_info, ic, wait_arm, wait_src)) |ritem|
+                return .{ .refuse = ritem };
+            return .ok;
+        }
+        return .not_mine;
+    }
+
+    // `<s>-step`/`<s>-live`/`<s>-wait` generated-unit emission — the public
+    // participant verbs a pump joins by name. Lifted verbatim out of `new`'s
+    // emission section.
+    fn emit(
+        allocator: std.mem.Allocator,
+        program: *const ast.Program,
+        flow: *const ast.Flow,
+        store_name: []const u8,
+        home_ns: []const u8,
+        field_names: []const []const u8,
+        field_types: []const []const u8,
+        field_owned_info: anytype,
+        pstore_names: []const []const u8,
+        pstore_identity: []const []const u8,
+        discharge_arm: ?ast.Continuation,
+        removed_arms: anytype,
+        step_arm: ?ast.Continuation,
+        step_terminal_branches: []const ast.Branch,
+        wait_arm: ?ast.Continuation,
+        wait_src: [2][]const u8,
+        appended_items: *std.ArrayList(ast.Item),
+        h: anytype,
+        hs: anytype,
+        host_is_js: bool,
+        host_target: anytype,
+        proc_target: []const u8,
+    ) void {
+// ---- `! step` participant units (the pump slice) ----
+// One generated pass steps each row once. The step call's `|` verdicts
+// are the STORE's — the arm never sees them — so they ride the
+// generated `__store_stepbody_<s>` event's own branch set, re-raised by
+// `=>` arms the transform appends under the authored `!` effects. The
+// pass reads the verdict off the union: `complete` retires the row in
+// place — `removed` observers fire on the outgoing value, then the
+// drain (the `! discharge` arm when the column needs one, the
+// discovered unattended discharger otherwise); every other verdict
+// keeps the row for the next pass. The swap-remove is take's handle
+// bookkeeping verbatim; the pass deliberately does NOT advance past a
+// removal — the row swapped in from the tail has not been stepped yet.
+if (step_arm) |*sa| {
+    const sbind = sa.binding.?;
+    const soi = field_owned_info[0].?; // single-owned-column, checked at collection
+    const col_name = field_names[0];
+    const stepbody_name = std.fmt.allocPrint(allocator, "__store_stepbody_{s}", .{store_name}) catch unreachable;
+    // `<s>-step`/`<s>-live`/`<s>-wait` are the store's PUBLIC
+    // participant verbs — how a `! step`/`! wait` store joins a
+    // `std/pump` by name (`std/pump(main) ! step |> tick-step()`).
+    // The pump calls names, not stores: a hand-written unit exposing
+    // the same three verbs participates identically.
+    const steppass_name = std.fmt.allocPrint(allocator, "{s}-step", .{store_name}) catch unreachable;
+    const liveness_name = std.fmt.allocPrint(allocator, "{s}-live", .{store_name}) catch unreachable;
+    const dischargeone_name = std.fmt.allocPrint(allocator, "__store_dischargeone_{s}", .{store_name}) catch unreachable;
+    const retain_ann = blk_ra: {
+        const anns = allocator.alloc([]const u8, 1) catch unreachable;
+        anns[0] = allocator.dupe(u8, "retain") catch unreachable;
+        break :blk_ra anns;
+    };
+    // stepbody and dischargeone live in the DECLARING module (the qbody
+    // convention); the pass unit rides the store's home namespace like
+    // the other generated verbs, and its call sites qualify through it.
+    const body_ns = storeEventQualifier(allocator, flow.module, program.main_module_name);
+
+    // `__store_stepbody_<s>` — input `{ <bind>: <ftype> <dot:state> }`,
+    // the row riding as a borrow; the store keeps the live obligation
+    // until `complete`. Branches mirror the step tor's `|` terminals.
+    {
+        const sb_in = allocator.alloc(ast.Field, 1) catch unreachable;
+        sb_in[0] = ast.Field{
+            .name = allocator.dupe(u8, sbind) catch unreachable,
+            .type = allocator.dupe(u8, field_types[0]) catch unreachable,
+            .module_path = allocator.dupe(u8, soi.module_slash) catch unreachable,
+            .phantom = std.fmt.allocPrint(allocator, "{s}:{s}", .{ soi.module_dot, soi.state }) catch unreachable,
+        };
+        const sb_branches = allocator.alloc(ast.Branch, step_terminal_branches.len) catch unreachable;
+        for (step_terminal_branches, 0..) |*tb, tbi| sb_branches[tbi] = tb.*;
+        appended_items.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+            .path = h.mkPathH(allocator, flow.module, stepbody_name),
+            .input = ast.Shape{ .fields = sb_in },
+            .branches = sb_branches,
+            .is_public = false,
+            .is_implicit_flow = false,
+            .annotations = retain_ann,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+        var body_clone = ast_functional.cloneContinuation(allocator, sa) catch unreachable;
+        const sscope = StoreScope{ .names = pstore_names, .prefixes = blk_spx: {
+            const px = allocator.alloc([]const u8, pstore_names.len) catch unreachable;
+            for (px) |*p| p.* = "";
+            break :blk_spx px;
+        } };
+        h.storeRefsContH(allocator, program, &body_clone, sscope, pstore_identity, &[_][]const u8{});
+        const snode = body_clone.node.?;
+        if (snode == .inline_code) {
+            // A nested store-read site spliced its loop here before
+            // create ran (690_093) — proc impl; inputs bind as consts.
+            appended_items.append(allocator, ast.Item{ .proc_decl = ast.ProcDecl{
+                .path = h.mkPathH(allocator, flow.module, stepbody_name),
+                .body = ast.Source{ .text = snode.inline_code, .location = flow.location, .scope = .{ .bindings = &[_]ast.ScopeBinding{} }, .phantom_type = null },
+                .annotations = &[_][]const u8{},
+                .target = allocator.dupe(u8, if (storeHostTarget() == .js) "js" else "zig") catch unreachable,
+                .location = flow.location,
+                .module = allocator.dupe(u8, flow.module) catch unreachable,
+            } }) catch unreachable;
+        } else {
+            var conts = std.ArrayList(ast.Continuation).initCapacity(allocator, body_clone.continuations.len + step_terminal_branches.len) catch unreachable;
+            for (body_clone.continuations) |*c| conts.append(allocator, c.*) catch unreachable;
+            for (step_terminal_branches) |*tb| {
+                conts.append(allocator, ast.Continuation{
+                    .branch = tb.name,
+                    .binding = null,
+                    .kind = .terminal,
+                    .condition = null,
+                    .node = ast.Node{ .branch_constructor = ast.BranchConstructor{
+                        .branch_name = tb.name,
+                        .fields = &[_]ast.Field{},
+                    } },
+                    .indent = 0,
+                    .continuations = &[_]ast.Continuation{},
+                }) catch unreachable;
+            }
+            appended_items.append(allocator, ast.Item{ .flow = ast.Flow{
+                .body = ast.rootSite(snode.invocation, conts.items, flow.location),
+                .pre_label = null,
+                .impl_of = h.mkPathH(allocator, flow.module, stepbody_name),
+                .super_shape = null,
+                .inline_body = snode.invocation.inline_body,
+                .preamble_code = snode.invocation.preamble_code,
+                .is_pure = false,
+                .is_transitively_pure = false,
+                .location = flow.location,
+                .module = allocator.dupe(u8, flow.module) catch unreachable,
+            } }) catch unreachable;
+        }
+    }
+
+    // `__store_dischargeone_<s>` — the `! discharge` arm as a callable
+    // unit, so a `complete` retirement runs the SAME drain teardown
+    // would. The payload carries the obligation (`<state!>`); the
+    // handler consumes it.
+    if (discharge_arm) |*da| {
+        const dbind = da.binding.?;
+        const d_in = allocator.alloc(ast.Field, 1) catch unreachable;
+        d_in[0] = ast.Field{
+            .name = allocator.dupe(u8, dbind) catch unreachable,
+            .type = allocator.dupe(u8, field_types[0]) catch unreachable,
+            .module_path = allocator.dupe(u8, soi.module_slash) catch unreachable,
+            .phantom = std.fmt.allocPrint(allocator, "{s}:!{s}", .{ soi.module_dot, soi.state }) catch unreachable,
+        };
+        appended_items.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+            .path = h.mkPathH(allocator, flow.module, dischargeone_name),
+            .input = ast.Shape{ .fields = d_in },
+            .branches = &[_]ast.Branch{},
+            .is_public = false,
+            .is_implicit_flow = false,
+            .annotations = retain_ann,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+        var dclone = ast_functional.cloneContinuation(allocator, da) catch unreachable;
+        const dscope = StoreScope{ .names = pstore_names, .prefixes = blk_dpx: {
+            const px = allocator.alloc([]const u8, pstore_names.len) catch unreachable;
+            for (px) |*p| p.* = "";
+            break :blk_dpx px;
+        } };
+        h.storeRefsContH(allocator, program, &dclone, dscope, pstore_identity, &[_][]const u8{});
+        const dnode = dclone.node.?;
+        if (dnode == .inline_code) {
+            appended_items.append(allocator, ast.Item{ .proc_decl = ast.ProcDecl{
+                .path = h.mkPathH(allocator, flow.module, dischargeone_name),
+                .body = ast.Source{ .text = dnode.inline_code, .location = flow.location, .scope = .{ .bindings = &[_]ast.ScopeBinding{} }, .phantom_type = null },
+                .annotations = &[_][]const u8{},
+                .target = allocator.dupe(u8, if (storeHostTarget() == .js) "js" else "zig") catch unreachable,
+                .location = flow.location,
+                .module = allocator.dupe(u8, flow.module) catch unreachable,
+            } }) catch unreachable;
+        } else {
+            appended_items.append(allocator, ast.Item{ .flow = ast.Flow{
+                .body = ast.rootSite(dnode.invocation, dclone.continuations, flow.location),
+                .pre_label = null,
+                .impl_of = h.mkPathH(allocator, flow.module, dischargeone_name),
+                .super_shape = null,
+                .inline_body = dnode.invocation.inline_body,
+                .preamble_code = dnode.invocation.preamble_code,
+                .is_pure = false,
+                .is_transitively_pure = false,
+                .location = flow.location,
+                .module = allocator.dupe(u8, flow.module) catch unreachable,
+            } }) catch unreachable;
+        }
+    }
+
+    // `<s>-step` — one pass: step each row once, retire the
+    // `complete` verdicts in place. The caller (a pump, or nothing —
+    // a store that steps but is never pumped simply sits) is not the
+    // store's business.
+    // The pass returns how many rows made PROGRESS — the pump composes
+    // the counts to know whether a pass ran hot or entirely idle (the
+    // `! idle` seam). `| running` and `| complete` are the only words
+    // the pump reads; every other verdict an author names — `quiet`,
+    // `stalled`, `backoff` — counts as no-progress by absence. There is
+    // no `idle` verdict: a dead poll is not a terminal state of the
+    // row, it is the absence of progress this pass.
+    const step_has_running = blk_run: {
+        for (step_terminal_branches) |tb| {
+            if (std.mem.eql(u8, tb.name, "running")) break :blk_run true;
+        }
+        break :blk_run false;
+    };
+    appended_items.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+        .path = h.mkPathH(allocator, home_ns, steppass_name),
+        .input = ast.Shape{ .fields = &[_]ast.Field{} },
+        .branches = &[_]ast.Branch{},
+        .return_type = allocator.dupe(u8, "i32") catch unreachable,
+        .is_public = true,
+        .is_implicit_flow = false,
+        .annotations = retain_ann,
+        .location = flow.location,
+        .module = allocator.dupe(u8, home_ns) catch unreachable,
+    } }) catch unreachable;
+
+    var pb = std.ArrayList(u8).initCapacity(allocator, 512) catch unreachable;
+    if (host_is_js) {
+        pb.appendSlice(allocator, std.fmt.allocPrint(allocator,
+            \\let __koru_i = 0;
+            \\let __koru_worked = 0;
+            \\while (__koru_i < __koru_store_{s}.len) {{
+            \\    const __koru_res = {s}__store_stepbody_{s}_event.handler({{ {s}: __koru_store_{s}.{s}[__koru_i] }});
+            \\    {s}
+            \\    if (__koru_res.tag === "complete") {{
+            \\        const __koru_out = __koru_store_{s}.{s}[__koru_i];
+            \\        const __koru_gone_slot = __koru_store_{s}.__koru_row_hslot[__koru_i];
+            \\
+        , .{ store_name, body_ns, store_name, sbind, store_name, col_name, if (step_has_running) "if (__koru_res.tag === \"running\" || __koru_res.tag === \"complete\") __koru_worked += 1;" else "if (__koru_res.tag === \"complete\") __koru_worked += 1;", store_name, col_name, store_name }) catch unreachable) catch unreachable;
+    } else {
+        pb.appendSlice(allocator, std.fmt.allocPrint(allocator,
+            \\__koru_store_{s}.__koru_materialize(); var __koru_i: usize = 0;
+            \\var __koru_worked: i32 = 0;
+            \\while (__koru_i < __koru_store_{s}.len) {{
+            \\    const __koru_res = {s}__store_stepbody_{s}_event.handler(.{{ .{s} = __koru_store_{s}.{s}[__koru_i] }});
+            \\    {s}
+            \\    switch (__koru_res) {{
+            \\        .complete => {{
+            \\            const __koru_out = __koru_store_{s}.{s}[__koru_i];
+            \\            const __koru_gone_slot = __koru_store_{s}.__koru_row_hslot[__koru_i];
+            \\
+        , .{ store_name, store_name, body_ns, store_name, sbind, store_name, col_name, if (step_has_running) "__koru_worked += @intFromBool(__koru_res == .running or __koru_res == .complete);" else "__koru_worked += @intFromBool(__koru_res == .complete);", store_name, col_name, store_name }) catch unreachable) catch unreachable;
+    }
+    // `removed` observers fire on the outgoing copy, before the
+    // swap-remove — take's ordering, verbatim.
+    for (removed_arms, 0..) |arm, ai| {
+        const head = std.fmt.allocPrint(allocator, "{s}__store_removed_{s}_{d}_event.handler({s} ", .{ body_ns, store_name, ai, if (host_is_js) "{" else ".{" }) catch unreachable;
+        pb.appendSlice(allocator, head) catch unreachable;
+        for (arm.fields, 0..) |fnm, fi| {
+            if (fi > 0) pb.appendSlice(allocator, ", ") catch unreachable;
+            const p = hs.recField(allocator, host_target, fnm, std.fmt.allocPrint(allocator, "__koru_out_{s}", .{fnm}) catch unreachable);
+            pb.appendSlice(allocator, p) catch unreachable;
+        }
+        for (arm.id_requests, 0..) |idn, ii| {
+            if (arm.fields.len + ii > 0) pb.appendSlice(allocator, ", ") catch unreachable;
+            const p = hs.recField(allocator, host_target, idn, std.fmt.allocPrint(allocator, "__koru_store_{s}.__koru_handle_of(__koru_i)", .{store_name}) catch unreachable);
+            pb.appendSlice(allocator, p) catch unreachable;
+        }
+        pb.appendSlice(allocator, if (host_is_js) " });\n" else " });\n") catch unreachable;
+    }
+    // Swap-remove — the dying row's sparse slot was captured BEFORE the
+    // moved row's slot lands on it; generation bump retires the handle.
+    if (host_is_js) {
+        pb.appendSlice(allocator, std.fmt.allocPrint(allocator,
+            \\        const __koru_last = __koru_store_{s}.len - 1;
+            \\        if (__koru_i !== __koru_last) {{
+            \\            __koru_store_{s}.{s}[__koru_i] = __koru_store_{s}.{s}[__koru_last];
+            \\            const __koru_mv_slot = __koru_store_{s}.__koru_row_hslot[__koru_last];
+            \\            __koru_store_{s}.__koru_hslot_row[__koru_mv_slot] = __koru_i;
+            \\            __koru_store_{s}.__koru_row_hslot[__koru_i] = __koru_mv_slot;
+            \\        }}
+            \\        __koru_store_{s}.len = __koru_last;
+            \\        __koru_store_{s}.__koru_hslot_gen[__koru_gone_slot] = (__koru_store_{s}.__koru_hslot_gen[__koru_gone_slot] + 1) % 2097152;
+            \\        __koru_store_{s}.__koru_hslot_free[__koru_store_{s}.__koru_hslot_free_len] = __koru_gone_slot;
+            \\        __koru_store_{s}.__koru_hslot_free_len += 1;
+            \\
+        , .{ store_name, store_name, col_name, store_name, col_name, store_name, store_name, store_name, store_name, store_name, store_name, store_name, store_name, store_name }) catch unreachable) catch unreachable;
+    } else {
+        pb.appendSlice(allocator, std.fmt.allocPrint(allocator,
+            \\            const __koru_last = __koru_store_{s}.len - 1;
+            \\            if (__koru_i != __koru_last) {{
+            \\                __koru_store_{s}.{s}[__koru_i] = __koru_store_{s}.{s}[__koru_last];
+            \\                const __koru_mv_slot = __koru_store_{s}.__koru_row_hslot[__koru_last];
+            \\                __koru_store_{s}.__koru_hslot_row[__koru_mv_slot] = __koru_i;
+            \\                __koru_store_{s}.__koru_row_hslot[__koru_i] = __koru_mv_slot;
+            \\            }}
+            \\            __koru_store_{s}.len = __koru_last;
+            \\            __koru_store_{s}.__koru_hslot_gen[__koru_gone_slot] +%= 1; __koru_store_{s}.__koru_gen0 = false;
+            \\            __koru_store_{s}.__koru_hslot_free[__koru_store_{s}.__koru_hslot_free_len] = __koru_gone_slot;
+            \\            __koru_store_{s}.__koru_hslot_free_len += 1;
+            \\
+        , .{ store_name, store_name, col_name, store_name, col_name, store_name, store_name, store_name, store_name, store_name, store_name, store_name, store_name, store_name }) catch unreachable) catch unreachable;
+    }
+    // The drain: the `! discharge` arm when the column declared one,
+    // the discovered unattended discharger otherwise.
+    if (discharge_arm) |*da| {
+        const drain = std.fmt.allocPrint(allocator, "{s}__store_dischargeone_{s}_event.handler({s});\n", .{ body_ns, store_name, hs.argRec(allocator, host_target, hs.recField(allocator, host_target, da.binding.?, "__koru_out")) }) catch unreachable;
+        pb.appendSlice(allocator, drain) catch unreachable;
+    } else {
+        const drain = std.fmt.allocPrint(allocator, "{s}{s}.{s}_event.handler({s});\n", .{ if (host_is_js) "" else "_ = ", soi.disch_host, soi.disch_emitted, hs.argRec(allocator, host_target, hs.recField(allocator, host_target, soi.disch_param, "__koru_out")) }) catch unreachable;
+        pb.appendSlice(allocator, drain) catch unreachable;
+    }
+    if (host_is_js) {
+        pb.appendSlice(allocator,
+            \\    } else {
+            \\        __koru_i += 1;
+            \\    }
+            \\}
+            \\return __koru_worked;
+        ) catch unreachable;
+    } else {
+        pb.appendSlice(allocator,
+            \\        },
+            \\        else => { __koru_i += 1; },
+            \\    }
+            \\}
+            \\return __koru_worked;
+        ) catch unreachable;
+    }
+    appended_items.append(allocator, ast.Item{ .proc_decl = ast.ProcDecl{
+        .path = h.mkPathH(allocator, home_ns, steppass_name),
+        .body = ast.Source{ .text = pb.toOwnedSlice(allocator) catch unreachable, .location = flow.location, .scope = .{ .bindings = &[_]ast.ScopeBinding{} }, .phantom_type = null },
+        .annotations = retain_ann,
+        .target = allocator.dupe(u8, proc_target) catch unreachable,
+        .location = flow.location,
+        .module = allocator.dupe(u8, home_ns) catch unreachable,
+    } }) catch unreachable;
+
+    // `<s>-live` — the participant's liveness verb: how many rows
+    // are still in the store. A pump drains when every joined
+    // participant's live count answers 0.
+    appended_items.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+        .path = h.mkPathH(allocator, home_ns, liveness_name),
+        .input = ast.Shape{ .fields = &[_]ast.Field{} },
+        .branches = &[_]ast.Branch{},
+        .return_type = allocator.dupe(u8, "i64") catch unreachable,
+        .is_public = true,
+        .is_implicit_flow = false,
+        .annotations = retain_ann,
+        .location = flow.location,
+        .module = allocator.dupe(u8, home_ns) catch unreachable,
+    } }) catch unreachable;
+    const live_src = if (storeHostTarget() == .js)
+        std.fmt.allocPrint(allocator, "return __koru_store_{s}.len;", .{store_name}) catch unreachable
+    else
+        std.fmt.allocPrint(allocator, "return @as(i64, @intCast(__koru_store_{s}.len));", .{store_name}) catch unreachable;
+    appended_items.append(allocator, ast.Item{ .proc_decl = ast.ProcDecl{
+        .path = h.mkPathH(allocator, home_ns, liveness_name),
+        .body = ast.Source{ .text = live_src, .location = flow.location, .scope = .{ .bindings = &[_]ast.ScopeBinding{} }, .phantom_type = null },
+        .annotations = &[_][]const u8{},
+        .target = allocator.dupe(u8, proc_target) catch unreachable,
+        .location = flow.location,
+        .module = allocator.dupe(u8, home_ns) catch unreachable,
+    } }) catch unreachable;
+}
+
+// `__store_waitone_<s>` — the interest query. Input is the row as a
+// borrow like stepbody's; the callee's presence-record interest is the
+// answer, NORMALIZED to `{ fd: i32, wait_ns: i128 }` (absent fields
+// arrive as -1 / maxInt — internal sentinels only) and handed up
+// through a `->` return binding plus a synthesized bare-return. Lives
+// in the store's home namespace beside the pass unit, so a pump
+// qualifies it the same way.
+if (wait_arm) |*wa| {
+    const wbind = wa.binding.?;
+    const wsoi = field_owned_info[0].?; // single-owned-column, checked at collection
+    const waitone_name = std.fmt.allocPrint(allocator, "__store_waitone_{s}", .{store_name}) catch unreachable;
+    const w_home = home_ns;
+    const w_in = allocator.alloc(ast.Field, 1) catch unreachable;
+    w_in[0] = ast.Field{
+        .name = allocator.dupe(u8, wbind) catch unreachable,
+        .type = allocator.dupe(u8, field_types[0]) catch unreachable,
+        .module_path = allocator.dupe(u8, wsoi.module_slash) catch unreachable,
+        .phantom = std.fmt.allocPrint(allocator, "{s}:{s}", .{ wsoi.module_dot, wsoi.state }) catch unreachable,
+    };
+    const w_ann = blk_wa: {
+        const anns = allocator.alloc([]const u8, 1) catch unreachable;
+        anns[0] = allocator.dupe(u8, "retain") catch unreachable;
+        break :blk_wa anns;
+    };
+    appended_items.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+        .path = h.mkPathH(allocator, w_home, waitone_name),
+        .input = ast.Shape{ .fields = w_in },
+        .branches = &[_]ast.Branch{},
+        .return_type = allocator.dupe(u8, "{ fd: i32, wait_ns: i128 }") catch unreachable,
+        .is_public = false,
+        .is_implicit_flow = false,
+        .annotations = w_ann,
+        .location = flow.location,
+        .module = allocator.dupe(u8, w_home) catch unreachable,
+    } }) catch unreachable;
+    var wbody_clone = ast_functional.cloneContinuation(allocator, wa) catch unreachable;
+    const wscope = StoreScope{ .names = pstore_names, .prefixes = blk_wpx: {
+        const px = allocator.alloc([]const u8, pstore_names.len) catch unreachable;
+        for (px) |*p| p.* = "";
+        break :blk_wpx px;
+    } };
+    h.storeRefsContH(allocator, program, &wbody_clone, wscope, pstore_identity, &[_][]const u8{});
+    const wnode = wbody_clone.node.?;
+    if (wnode == .inline_code) {
+        // A host-proc interest body returns the record itself.
+        appended_items.append(allocator, ast.Item{ .proc_decl = ast.ProcDecl{
+            .path = h.mkPathH(allocator, w_home, waitone_name),
+            .body = ast.Source{ .text = wnode.inline_code, .location = flow.location, .scope = .{ .bindings = &[_]ast.ScopeBinding{} }, .phantom_type = null },
+            .annotations = &[_][]const u8{},
+            .target = allocator.dupe(u8, if (storeHostTarget() == .js) "js" else "zig") catch unreachable,
+            .location = flow.location,
+            .module = allocator.dupe(u8, w_home) catch unreachable,
+        } }) catch unreachable;
+    } else {
+        var wiv = wnode.invocation;
+        wiv.return_binding = allocator.dupe(u8, "__koru_w") catch unreachable;
+        var wconts = std.ArrayList(ast.Continuation).initCapacity(allocator, wbody_clone.continuations.len + 1) catch unreachable;
+        for (wbody_clone.continuations) |*c| wconts.append(allocator, c.*) catch unreachable;
+        wconts.append(allocator, ast.Continuation{
+            .branch = allocator.dupe(u8, "") catch unreachable,
+            .binding = null,
+            .kind = .terminal,
+            .condition = null,
+            .node = ast.Node{ .branch_constructor = ast.BranchConstructor{
+                .branch_name = allocator.dupe(u8, "") catch unreachable,
+                .fields = &[_]ast.Field{},
+                .plain_value = std.fmt.allocPrint(allocator, ".{{ .fd = {s}, .wait_ns = {s} }}", .{ wait_src[0], wait_src[1] }) catch unreachable,
+                .is_bare_return = true,
+            } },
+            .indent = 0,
+            .continuations = &[_]ast.Continuation{},
+        }) catch unreachable;
+        appended_items.append(allocator, ast.Item{ .flow = ast.Flow{
+            .body = ast.rootSite(wiv, wconts.items, flow.location),
+            .pre_label = null,
+            .impl_of = h.mkPathH(allocator, w_home, waitone_name),
+            .super_shape = null,
+            .inline_body = wiv.inline_body,
+            .preamble_code = wiv.preamble_code,
+            .is_pure = false,
+            .is_transitively_pure = false,
+            .location = flow.location,
+            .module = allocator.dupe(u8, w_home) catch unreachable,
+        } }) catch unreachable;
+    }
+
+    // `<s>-wait { i }` — the participant's interest verb: instance i's
+    // normalized `{ fd, wait_ns }`. A thin host-proc bridge — index to
+    // row cell, row to the waitone unit — so callers (a pump's union
+    // wait) enumerate interests 0..`<s>-live()` without knowing what a
+    // row is.
+    const wverb_name = std.fmt.allocPrint(allocator, "{s}-wait", .{store_name}) catch unreachable;
+    const widx_field = allocator.alloc(ast.Field, 1) catch unreachable;
+    widx_field[0] = ast.Field{
+        .name = allocator.dupe(u8, "i") catch unreachable,
+        .type = allocator.dupe(u8, "i64") catch unreachable,
+    };
+    appended_items.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+        .path = h.mkPathH(allocator, w_home, wverb_name),
+        .input = ast.Shape{ .fields = widx_field },
+        .branches = &[_]ast.Branch{},
+        .return_type = allocator.dupe(u8, "{ fd: i32, wait_ns: i128 }") catch unreachable,
+        .is_public = true,
+        .is_implicit_flow = false,
+        .annotations = w_ann,
+        .location = flow.location,
+        .module = allocator.dupe(u8, w_home) catch unreachable,
+    } }) catch unreachable;
+    const wverb_src = std.fmt.allocPrint(allocator,
+        \\const __koru_w = {s}_event.handler(.{{ .{s} = __koru_store_{s}.{s}[@as(usize, @intCast(i))] }});
+        \\return .{{ .fd = __koru_w.fd, .wait_ns = __koru_w.wait_ns }};
+    , .{ waitone_name, wbind, store_name, field_names[0] }) catch unreachable;
+    appended_items.append(allocator, ast.Item{ .proc_decl = ast.ProcDecl{
+        .path = h.mkPathH(allocator, w_home, wverb_name),
+        .body = ast.Source{ .text = wverb_src, .location = flow.location, .scope = .{ .bindings = &[_]ast.ScopeBinding{} }, .phantom_type = null },
+        .annotations = &[_][]const u8{},
+        .target = allocator.dupe(u8, "zig") catch unreachable,
+        .location = flow.location,
+        .module = allocator.dupe(u8, w_home) catch unreachable,
+    } }) catch unreachable;
+}
+    }
+};

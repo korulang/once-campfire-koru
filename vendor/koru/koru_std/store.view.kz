@@ -1,0 +1,77 @@
+// Koru Standard Library: Reactive Stores — the `view` tor.
+// Joined via `~part view` in store.kz; merged into the store module at load.
+
+// ============================================================================
+// STORE.VIEW — a vocabulary of stores, projected for iteration
+// ============================================================================
+//
+//   std/store:view(Entities) { Player, Enemy }
+//
+// A store-view is not a container: it has no capacity, no allocation, no insert,
+// and no SoA cell. The rows live in the member stores. It registers the kind
+// vocabulary and the folded shared schema.
+
+~[keyword|comptime|transform]pub tor view {
+    expr: Expression,
+    source: Source,
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    reporter: *std/compiler:ErrorReporter,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~[transform]proc view|zig {
+    const ast = @import("ast");
+
+    if (item.* != .flow) @panic("store:view transform: containing item is not a flow - walker dispatch contract broken");
+    const flow = &item.flow;
+
+    var view_name: []const u8 = "";
+    var source_text: ?[]const u8 = null;
+    for (invocation.args) |a| {
+        if (std.mem.eql(u8, a.name, "expr")) view_name = storeStripQuotes(a.value);
+        if (std.mem.eql(u8, a.name, "source")) source_text = if (a.source_value) |sv| sv.text else a.value;
+    }
+    if (view_name.len == 0) {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:view requires a view name: view(name)", .{}) };
+    }
+    if (source_text == null) {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:view requires a member block: view(name) {{ Member1, Member2 }}", .{}) };
+    }
+
+    var members = std.ArrayList([]const u8).initCapacity(allocator, 4) catch unreachable;
+    var toks = std.mem.tokenizeAny(u8, source_text.?, "\n\r,\t {}");
+    while (toks.next()) |tok| {
+        const trimmed = std.mem.trim(u8, tok, " \t\r\n,{}");
+        if (trimmed.len == 0) continue;
+        members.append(allocator, allocator.dupe(u8, trimmed) catch unreachable) catch unreachable;
+    }
+    if (members.items.len == 0) {
+        return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:view({s}): a store view must name at least one member store", .{view_name}) };
+    }
+
+    for (members.items) |mem| {
+        const fo = storeFieldOrder(allocator, program, mem);
+        if (fo == null) {
+            return .{ .transformed = ast.refuse(allocator, reporter, .KORU161, flow.location, flow.module, "std/store:view({s}): unknown member store '{s}' — no std/store:new({s}) found", .{ view_name, mem, mem }) };
+        }
+    }
+
+    var code = std.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+    code.appendSlice(allocator, "// store-view ") catch unreachable;
+    code.appendSlice(allocator, view_name) catch unreachable;
+    code.appendSlice(allocator, ": ") catch unreachable;
+    for (members.items, 0..) |m, mi| {
+        if (mi > 0) code.appendSlice(allocator, ", ") catch unreachable;
+        code.appendSlice(allocator, m) catch unreachable;
+    }
+    code.appendSlice(allocator, "\n") catch unreachable;
+
+    return .{ .transformed = .{ .replacement = ast.Item{ .inline_code = ast.InlineCode{
+        .code = code.toOwnedSlice(allocator) catch unreachable,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } } } };
+}
+

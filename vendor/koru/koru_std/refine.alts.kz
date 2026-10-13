@@ -1,0 +1,183 @@
+// Koru Standard Library: the disjunction part of refine — joined via
+// `~part alts` in refine.kz; members land in koru_refine.
+//
+// A set is a lattice element like any other: it meets by INTERSECTION, an
+// empty intersection is a RECORDED conflict (loud, order-independent), and
+// the field's other terms filter it before the canonical form is fixed.
+// One canonicalization rule keeps the lattice small: a set that lands on ONE
+// value IS that equality. So every reader past this file sees either an `eq`
+// or a set of two-or-more — never both, never a singleton set.
+
+const PIPE: u8 = 124;
+
+// An atom carrying a `|`, or opening with the `*` fallback mark, is a
+// disjunction rather than a bound.
+fn isAltsAtom(atom: []const u8) bool {
+    return std.mem.indexOfScalar(u8, atom, PIPE) != null or std.mem.startsWith(u8, atom, "*");
+}
+
+fn containsInt(hay: []const i64, needle: i64) bool {
+    for (hay) |v| {
+        if (v == needle) return true;
+    }
+    return false;
+}
+
+fn starSrc(alloc: std.mem.Allocator, v: i64) []const u8 {
+    return std.fmt.allocPrint(alloc, "*{d}", .{v}) catch unreachable;
+}
+
+// The canonical spelling of a met set: ascending, `*` on the fallback.
+fn altsSrc(alloc: std.mem.Allocator, set: []const i64, default_v: ?i64) []const u8 {
+    var out = std.ArrayList(u8).initCapacity(alloc, set.len * 4) catch unreachable;
+    for (set, 0..) |v, i| {
+        if (i > 0) out.appendSlice(alloc, " | ") catch unreachable;
+        if (default_v) |d| {
+            if (d == v) out.appendSlice(alloc, "*") catch unreachable;
+        }
+        out.appendSlice(alloc, std.fmt.allocPrint(alloc, "{d}", .{v}) catch unreachable) catch unreachable;
+    }
+    return out.toOwnedSlice(alloc) catch unreachable;
+}
+
+// Canonicalize one field's disjunction: filter the set through the field's
+// other terms (a clamp rewrites the value into its range, so a member
+// outside it is unreachable; bounds and equality judge what is left), then
+// rewrite the result — an `eq` subsumes a set containing its value, and a
+// set that lands on ONE value IS that equality. Records the disagreeing
+// pair (and returns it) when the meet is empty.
+//
+// Both readers call this: the transform before it lands the facet, and the
+// explainer before it reports one. The canonical form is what the facet
+// carries, what the marker prints, and what the catalog spells — one shape,
+// no drift between them.
+fn canonAlts(alloc: std.mem.Allocator, f: *Field) ?[2][]const u8 {
+    if (f.alts_conflict) |pair| return pair;
+    const set = f.alts orelse return null;
+    var keep = std.ArrayList(i64).initCapacity(alloc, set.len) catch unreachable;
+    for (set) |v| {
+        if (f.clamp) |c| {
+            if (v < c.lo or v > c.hi) continue;
+        }
+        if (f.lo) |lo| {
+            if (v < lo.value or (v == lo.value and lo.exclusive)) continue;
+        }
+        if (f.hi) |hi| {
+            if (v > hi.value or (v == hi.value and hi.exclusive)) continue;
+        }
+        keep.append(alloc, v) catch unreachable;
+    }
+    const src = f.alts_src orelse "";
+    if (keep.items.len == 0) {
+        const other = if (f.clamp) |c| c.src else if (f.lo) |l| l.src else if (f.hi) |h| h.src else src;
+        const pair = [2][]const u8{ src, other };
+        f.alts_conflict = pair;
+        return pair;
+    }
+    f.alts = keep.toOwnedSlice(alloc) catch unreachable;
+    if (f.alt_default) |d| {
+        if (!containsInt(f.alts.?, d)) f.alt_default = null;
+    }
+    if (f.eq) |e| {
+        if (!containsInt(f.alts.?, e.value)) {
+            const pair = [2][]const u8{ src, e.src };
+            f.alts_conflict = pair;
+            return pair;
+        }
+        f.alts = null;
+        f.alts_src = null;
+        f.alt_default = null;
+        return null;
+    }
+    if (f.alts.?.len == 1) {
+        f.eq = .{ .value = f.alts.?[0], .exclusive = false, .src = std.fmt.allocPrint(alloc, "=={d}", .{f.alts.?[0]}) catch unreachable };
+        f.alts = null;
+        f.alts_src = null;
+        f.alt_default = null;
+        return null;
+    }
+    f.alts_src = altsSrc(alloc, f.alts.?, f.alt_default);
+    return null;
+}
+
+// Parse one disjunction atom onto `f` — `1 | 2 | 3`, at most one value
+// marked `*`. Returns a refusal when the atom is malformed and `strict`;
+// null means handled (the caller moves to the next atom), which is also the
+// lenient answer for a contributor block whose own transform will refuse it.
+fn parseAltsAtom(
+    alloc: std.mem.Allocator,
+    rep: ?*koru_std.koru_compiler.ErrorReporter,
+    fl: ?*const ast.Flow,
+    entry_name: []const u8,
+    atom: []const u8,
+    f: *Field,
+    strict: bool,
+) ?SiteResult {
+    var set = std.ArrayList(i64).initCapacity(alloc, 4) catch unreachable;
+    var default_v: ?i64 = null;
+    var parts = std.mem.splitScalar(u8, atom, PIPE);
+    while (parts.next()) |part_raw| {
+        var part = std.mem.trim(u8, part_raw, " \t");
+        var marked = false;
+        if (std.mem.startsWith(u8, part, "*")) {
+            marked = true;
+            part = std.mem.trim(u8, part[1..], " \t");
+        }
+        const n = std.fmt.parseInt(i64, part, 10) catch {
+            if (!strict) continue;
+            return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): '{s}' is not an alternative — a disjunction lists integer literals, at most one of them marked `*` (e.g. `*1 | 2 | 3`)", .{ entry_name, atom }) };
+        };
+        if (marked) {
+            if (default_v) |d| {
+                if (d != n) {
+                    if (!strict) continue;
+                    return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): '{s}' marks two defaults — `*` selects ONE fallback value", .{ entry_name, atom }) };
+                }
+            }
+            default_v = n;
+        }
+        if (!containsInt(set.items, n)) set.append(alloc, n) catch unreachable;
+    }
+    if (set.items.len == 0) {
+        if (!strict) return null;
+        return .{ .replacement = ast.refusal(alloc, rep.?, .KORU205, fl.?.location, fl.?.module, "std/refine({s}): '{s}' lists no alternatives", .{ entry_name, atom }) };
+    }
+    std.mem.sort(i64, set.items, {}, comptime std.sort.asc(i64));
+    if (f.alts) |prev| {
+        const incoming = altsSrc(alloc, set.items, default_v);
+        var keep = std.ArrayList(i64).initCapacity(alloc, set.items.len) catch unreachable;
+        for (set.items) |v| {
+            if (containsInt(prev, v)) keep.append(alloc, v) catch unreachable;
+        }
+        if (keep.items.len == 0) {
+            // Two disjunctions sharing no value: an empty meet, recorded
+            // exactly as an empty clamp or eq meet is.
+            f.alts_conflict = .{ incoming, f.alts_src orelse incoming };
+            f.alts = keep.toOwnedSlice(alloc) catch unreachable;
+        } else {
+            f.alts = keep.toOwnedSlice(alloc) catch unreachable;
+            // A default survives while it stays reachable, and two
+            // contributors cannot name different fallbacks — the set has one,
+            // so a disagreement is loud rather than whichever block was
+            // written last.
+            if (default_v) |d| {
+                if (containsInt(f.alts.?, d)) {
+                    if (f.alt_default) |existing| {
+                        if (existing != d) f.alts_conflict = .{ starSrc(alloc, d), starSrc(alloc, existing) };
+                    } else {
+                        f.alt_default = d;
+                    }
+                }
+            }
+            if (f.alt_default) |d| {
+                if (!containsInt(f.alts.?, d)) f.alt_default = null;
+            }
+            f.alts_src = altsSrc(alloc, f.alts.?, f.alt_default);
+        }
+    } else {
+        f.alts = set.toOwnedSlice(alloc) catch unreachable;
+        f.alt_default = default_v;
+        f.alts_src = altsSrc(alloc, f.alts.?, f.alt_default);
+    }
+    return null;
+}

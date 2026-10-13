@@ -1,0 +1,34 @@
+// Koru Standard Library: the `wit` part of explain — joined via
+// `~part wit` in explain.kz; members land in koru_explain.
+//
+// Witness rendering for `Property.at`: canonical site_hash coordinates of the
+// sites a row was decided at. json carries the canonical hash so catalogs
+// join across runs; text/html show the shortest-unique prefix (`[deadb]`).
+
+const EW = struct {
+    const std = @import("std");
+    const site_hash = @import("site_hash");
+
+    // `,"key$at":[...]` — canonical hashes, machine-joinable.
+    fn emitAtJson(key: []const u8, at: []const []const u8) void {
+        if (at.len == 0) return;
+        std.debug.print(",\"{s}$at\":[", .{key});
+        for (at, 0..) |h, i| {
+            if (i > 0) std.debug.print(",", .{});
+            printJsonString(h);
+        }
+        std.debug.print("]", .{});
+    }
+
+    // ` [deadb]` per witness in text; `<a href="#canonical">` in html.
+    fn emitAt(sites: []const site_hash.Site, at: []const []const u8, html: bool) void {
+        for (at) |h| {
+            const w = site_hash.displayLen(sites, h);
+            if (html) {
+                std.debug.print(" <a href=\"#{s}\">[{s}]</a>", .{ h, h[0..w] });
+            } else {
+                std.debug.print(" [{s}]", .{h[0..w]});
+            }
+        }
+    }
+};

@@ -1,0 +1,27 @@
+// Koru Standard Library: the `define` part of bridge.kz — install a subflow
+// declaration as a session verb (the REPL define). Joined via `~part define`
+// in bridge.kz; merged into the bridge module at load.
+//
+// The vocabulary grows at runtime: `tor name { args }` + `name = <body>`
+// becomes a verb callable on subsequent runs, held in the session's durable
+// defined-flows table. The body's calls run through the same possession
+// machinery as any dispatch, so a defined flow cannot reach beyond what the
+// session holds. The agent hears "defined name" — or the parse error — fed
+// back into the transcript (the honest-diagnostics rule applies here most of
+// all: a wrong declaration needs a truthful error).
+
+~pub tor define { br: *Bridge<session>, source: string<*> }
+| defined string
+| parse-error { message: string, line: u32, column: u32 }
+
+~proc define|zig {
+    br.touch();
+    return switch (installDefine(br, source)) {
+        .defined => |d| .{ .defined = d },
+        .parse_error => |e| .{ .parse_error = .{
+            .message = e.message,
+            .line = e.line,
+            .column = e.column,
+        } },
+    };
+}

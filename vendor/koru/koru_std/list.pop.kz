@@ -1,0 +1,28 @@
+// Koru Standard Library: the `pop` part of list.kz.
+// Joined via `~part pop` in list.kz; merged into the list module at load.
+
+// binding keeps <list!>), so it can be popped again or freed. `empty` when there
+// is nothing to pop. For scalar elements the popped value carries no obligation.
+~[comptime|transform]pub tor pop {
+    invocation: *const Invocation,
+    item: *const std/compiler:Item,
+    program: *const std/compiler:Program,
+    allocator: std.mem.Allocator
+} -> SiteResult
+
+~proc pop|zig {
+    if (item.* != .flow) @panic("std/list:pop transform: containing item is not a flow");
+    return routeOpCall(allocator, program, &item.flow, "pop", invocation);
+}
+
+~pub tor pop-i64 { xs: *List_i64<list> }
+| item i64
+| empty
+
+~proc pop-i64|zig {
+    if (xs.items.pop()) |v| {
+        return .{ .item = v };
+    }
+    return .empty;
+}
+

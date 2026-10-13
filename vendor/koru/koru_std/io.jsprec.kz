@@ -1,0 +1,48 @@
+// Koru Standard Library: I/O — JS placeholder operand emission.
+// Joined via `~part jsprec` in io.kz; merged into the io module at load.
+
+/// Emit one `{{ … }}` placeholder's VALUE operand for the JS concat
+/// `__printInterpolateJs` is building. The raw text between the braces arrives
+/// untrimmed; the spec after the first `:` is dropped — JS `+` promotes Numbers
+/// to strings on concat, so no per-spec mapping is needed — EXCEPT a `:.N`
+/// precision tail, which emits `Number(x).toFixed(N)`, the same honoring fmt's
+/// jsPlaceholder gives `ln|js` (same parse as it).
+///
+/// A lone/leading operand is parenthesized so a multi-term expr (`{{ c + 1 }}`)
+/// is ONE operand — `"n=" + c + 1` would otherwise fold left-to-right to
+/// `"n=<c>" + 1` = "n=<c>1" instead of the sum.
+fn ioJsPlaceholderOperand(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, raw: []const u8) void {
+    var ws_start: usize = 0;
+    while (ws_start < raw.len and (raw[ws_start] == ' ' or raw[ws_start] == '\t')) : (ws_start += 1) {}
+    var ws_end = raw.len;
+    while (ws_end > ws_start and (raw[ws_end - 1] == ' ' or raw[ws_end - 1] == '\t')) : (ws_end -= 1) {}
+
+    var var_name = raw[ws_start..ws_end];
+    var precision: ?[]const u8 = null;
+    if (std.mem.indexOf(u8, var_name, ":")) |colon_pos| {
+        const spec = var_name[colon_pos + 1 ..];
+        var_name = var_name[0..colon_pos];
+        if (std.mem.indexOf(u8, spec, ":")) |p2| {
+            // `:.N` — the dot is the precision marker, digits after it are N.
+            const rest = spec[p2 + 1 ..];
+            if (rest.len > 1 and rest[0] == '.') {
+                const d = rest[1..];
+                var digits = true;
+                for (d) |c| digits = digits and c >= '0' and c <= '9';
+                if (digits) precision = d;
+            }
+        }
+    }
+
+    if (precision) |d| {
+        buf.appendSlice(allocator, "Number(") catch unreachable;
+        buf.appendSlice(allocator, ioLowerJsExpr(allocator, var_name)) catch unreachable;
+        buf.appendSlice(allocator, ").toFixed(") catch unreachable;
+        buf.appendSlice(allocator, d) catch unreachable;
+        buf.append(allocator, ')') catch unreachable;
+    } else {
+        buf.append(allocator, '(') catch unreachable;
+        buf.appendSlice(allocator, ioLowerJsExpr(allocator, var_name)) catch unreachable;
+        buf.append(allocator, ')') catch unreachable;
+    }
+}

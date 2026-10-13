@@ -1,0 +1,174 @@
+// Koru Standard Library: the `deftable` part of interpreter.kz — the
+// defined-flows table itself: the record, the durable map that owns it,
+// and the install path `define` calls. Joined via `~part deftable` in
+// interpreter.kz; merged into the interpreter module at load.
+//
+// A flow the session defined at runtime (std/runtime:define): its name,
+// its signature parameters, its declared outcome contract, and its body
+// SOURCE. The body is re-parsed per dispatch — cheap, and the definition
+// stays durable text rather than a cloned AST that dies with the turn's
+// arena. Every call the body makes runs through the same
+// possession/obligation machinery as any other dispatch, so a defined
+// flow can never reach beyond what the session holds.
+
+pub const DefinedFlow = struct {
+    name: []const u8,
+    params: []const []const u8,
+    /// Declared types per param, in order — `tor shout { text: string }`
+    /// stores `["string"]`; a phantom carries through as `string<!open>`. The
+    /// vocabulary renderer consumes these so a defined flow appears as
+    /// `shout(text: string)` in the derived prompt; the interpreter itself
+    /// needs only the names (params bind positionally at dispatch) and this
+    /// stays a rendering concern until a rung needs the types for
+    /// definition-time analysis.
+    param_types: []const []const u8,
+    /// The declared outcome contract as the vocabulary renders it —
+    /// ` | ok string | missing string` — built from the tor decl's
+    /// branches at define time in the same spelling `scope-vocabulary`
+    /// uses. Empty for a bare-return flow, which needs no arm names.
+    contract_suffix: []const u8,
+    body_source: []const u8,
+};
+
+// A PLAIN struct, not an alias to a generic instantiation: the tor
+// transformer resolves type names in signatures against the type registry,
+// which can name a plain struct (`HandlePool`) but not an alias to
+// `StringHashMap(DefinedFlow)`. The alias mangled to `Defined__koru_ast.Flows`
+// in emitted signatures. The map lives behind a named struct instead.
+pub const DefinedFlows = struct {
+    map: std.StringHashMap(DefinedFlow),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) DefinedFlows {
+        return .{ .map = std.StringHashMap(DefinedFlow).init(allocator), .allocator = allocator };
+    }
+
+    /// Replace (or insert) a definition, owning all of its memory. The
+    /// callers hand in arena-scratch slices from the interpreter thread
+    /// state; the table must NOT retain them — the arena resets on the next
+    /// interpreter call and would clobber the stored key/body. Everything is
+    /// duped here into the table's own durable allocator, and the previous
+    /// definition (if any) is freed: a redefine fully replaces.
+    pub fn put(self: *DefinedFlows, key: []const u8, value: DefinedFlow) !void {
+        if (self.map.fetchRemove(key)) |old| {
+            self.free(old.key, old.value);
+        }
+        const key_owned = try self.allocator.dupe(u8, key);
+        const name_owned = try self.allocator.dupe(u8, value.name);
+        const body_owned = try self.allocator.dupe(u8, value.body_source);
+        const params = try self.allocator.alloc([]const u8, value.params.len);
+        var params_duped: usize = 0;
+        for (value.params, 0..) |p, i| {
+            params[i] = try self.allocator.dupe(u8, p);
+            params_duped += 1;
+        }
+        const param_types = try self.allocator.alloc([]const u8, value.param_types.len);
+        var types_duped: usize = 0;
+        for (value.param_types, 0..) |p, i| {
+            param_types[i] = try self.allocator.dupe(u8, p);
+            types_duped += 1;
+        }
+        const contract_owned = try self.allocator.dupe(u8, value.contract_suffix);
+        errdefer {
+            self.allocator.free(key_owned);
+            self.allocator.free(name_owned);
+            self.allocator.free(body_owned);
+            for (params[0..params_duped]) |p| self.allocator.free(p);
+            self.allocator.free(params);
+            for (param_types[0..types_duped]) |p| self.allocator.free(p);
+            self.allocator.free(param_types);
+            self.allocator.free(contract_owned);
+        }
+        try self.map.put(key_owned, .{
+            .name = name_owned,
+            .params = params,
+            .param_types = param_types,
+            .contract_suffix = contract_owned,
+            .body_source = body_owned,
+        });
+    }
+
+    fn free(self: *DefinedFlows, key: []const u8, value: DefinedFlow) void {
+        self.allocator.free(key);
+        self.allocator.free(value.name);
+        self.allocator.free(value.body_source);
+        self.allocator.free(value.contract_suffix);
+        for (value.params) |p| self.allocator.free(p);
+        self.allocator.free(value.params);
+        for (value.param_types) |p| self.allocator.free(p);
+        self.allocator.free(value.param_types);
+    }
+
+    pub fn get(self: *const DefinedFlows, key: []const u8) ?DefinedFlow {
+        return self.map.get(key);
+    }
+
+    pub fn deinit(self: *DefinedFlows) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            self.free(entry.key_ptr.*, entry.value_ptr.*);
+        }
+        self.map.deinit();
+    }
+};
+
+/// The outcome contract on one tor decl — ` | ok string | missing string |
+/// ?hint string` — the same spelling `scope-vocabulary` renders for
+/// compiled verbs, built from the parsed `ed.branches`. A `__type_ref`
+/// field is a positional payload (render the type alone); named fields
+/// render as the record the arm binds; `?` marks the omittable outcome.
+pub fn renderDeclContract(allocator: std.mem.Allocator, ed: *const ast.EventDecl) []const u8 {
+    var out = std.ArrayList(u8).initCapacity(allocator, 64) catch unreachable;
+    for (ed.branches) |branch| {
+        out.appendSlice(allocator, " | ") catch unreachable;
+        if (branch.is_optional) out.append(allocator, '?') catch unreachable;
+        out.appendSlice(allocator, branch.name) catch unreachable;
+        const fields = branch.payload.fields;
+        if (fields.len == 1 and std.mem.eql(u8, fields[0].name, "__type_ref")) {
+            out.append(allocator, ' ') catch unreachable;
+            out.appendSlice(allocator, fields[0].type) catch unreachable;
+        } else if (fields.len > 0) {
+            out.appendSlice(allocator, " { ") catch unreachable;
+            for (fields, 0..) |f, i| {
+                if (i > 0) out.appendSlice(allocator, ", ") catch unreachable;
+                out.appendSlice(allocator, f.name) catch unreachable;
+                out.appendSlice(allocator, ": ") catch unreachable;
+                out.appendSlice(allocator, f.type) catch unreachable;
+            }
+            out.appendSlice(allocator, " }") catch unreachable;
+        }
+    }
+    return out.toOwnedSlice(allocator) catch unreachable;
+}
+
+/// Install a parsed definition: extract the argument vocabulary the
+/// vocabulary renderer consumes (`shout(text: string)` — phantoms spelled
+/// the way the enforcement table does), render the declared outcome
+/// contract, and hand both to the table, which dupes into its own durable
+/// allocator. A redefine fully replaces the previous definition.
+pub fn installDefinedFlow(
+    defined: *DefinedFlows,
+    allocator: std.mem.Allocator,
+    ed: *const ast.EventDecl,
+    name: []const u8,
+    body_source: []const u8,
+) !void {
+    const params = try allocator.alloc([]const u8, ed.input.fields.len);
+    const param_types = try allocator.alloc([]const u8, ed.input.fields.len);
+    for (ed.input.fields, 0..) |field, i| {
+        params[i] = allocator.dupe(u8, field.name) catch field.name;
+        if (field.phantom) |p| {
+            param_types[i] = std.fmt.allocPrint(allocator, "{s}<{s}>", .{ field.type, p }) catch field.type;
+        } else {
+            param_types[i] = allocator.dupe(u8, field.type) catch field.type;
+        }
+    }
+    const name_owned = allocator.dupe(u8, name) catch name;
+    try defined.put(name_owned, .{
+        .name = name_owned,
+        .params = params,
+        .param_types = param_types,
+        .contract_suffix = renderDeclContract(allocator, ed),
+        .body_source = body_source,
+    });
+}

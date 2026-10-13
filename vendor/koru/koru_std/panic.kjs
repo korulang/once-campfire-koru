@@ -1,0 +1,8 @@
+// std/panic — JavaScript implementation facet.
+//
+// Events are declared in `panic.kz`. JS has no panic verb — the synthesized
+// hole throws Error; `die` matches it: an owned, messaged throw.
+
+~proc die|js {
+    throw new Error(msg);
+}

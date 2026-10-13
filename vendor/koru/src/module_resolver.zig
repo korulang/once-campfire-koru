@@ -1,0 +1,973 @@
+const std = @import("std");
+const log = @import("log");
+const Config = @import("config").Config;
+const file_types = @import("file_types");
+
+
+/// Try to resolve `base_path` to an existing Koru file on disk.
+///
+/// If `base_path` already has a Koru extension (.k/.kz/.kjs/.kc/.kgpu),
+/// check whether that exact file exists. Otherwise, probe each Koru
+/// extension in canonical (longest-first) order and return the first hit.
+///
+/// Returns an owned, canonicalized path on success, or null if no candidate
+/// exists. Caller owns the result and must free it.
+pub fn resolveKoruFile(allocator: std.mem.Allocator, base_path: []const u8) !?[]u8 {
+    if (file_types.isKoruFile(base_path)) {
+        std.fs.cwd().access(base_path, .{}) catch return null;
+        return try std.fs.path.resolve(allocator, &[_][]const u8{base_path});
+    }
+    for (file_types.koru_extensions) |ext| {
+        const candidate = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_path, ext });
+        defer allocator.free(candidate);
+        std.fs.cwd().access(candidate, .{}) catch continue;
+        return try std.fs.path.resolve(allocator, &[_][]const u8{candidate});
+    }
+    return null;
+}
+
+/// As `resolveKoruFile`, but joins `base` and `name` first. `name` may or
+/// may not already carry a Koru extension.
+///
+/// Returns an owned, canonicalized path on success, or null. Caller owns.
+pub fn resolveKoruFileIn(allocator: std.mem.Allocator, base: []const u8, name: []const u8) !?[]u8 {
+    if (file_types.isKoruFile(name)) {
+        const candidate = try std.fs.path.join(allocator, &[_][]const u8{ base, name });
+        defer allocator.free(candidate);
+        std.fs.cwd().access(candidate, .{}) catch return null;
+        return try std.fs.path.resolve(allocator, &[_][]const u8{candidate});
+    }
+    for (file_types.koru_extensions) |ext| {
+        const name_with_ext = try std.fmt.allocPrint(allocator, "{s}{s}", .{ name, ext });
+        defer allocator.free(name_with_ext);
+        const candidate = try std.fs.path.join(allocator, &[_][]const u8{ base, name_with_ext });
+        defer allocator.free(candidate);
+        std.fs.cwd().access(candidate, .{}) catch continue;
+        return try std.fs.path.resolve(allocator, &[_][]const u8{candidate});
+    }
+    return null;
+}
+
+/// Find Koru companion files for `primary_path`: siblings in the same
+/// directory sharing the same stem but with a different Koru extension.
+///
+/// Phase 2.1: enables the `.k` (contract) + `.kz` (Zig implementation)
+/// sibling layout that Phase 2 promised. `resolveKoruFile` only returns
+/// the first-hit; the loader needs to discover and parse the rest.
+///
+/// `primary_path` must already point at an existing Koru file (carry a
+/// Koru extension); companions are detected via stem-equality. The primary
+/// itself is excluded from the result.
+///
+/// Returns an owned slice of owned, canonicalized paths. Caller frees each
+/// element and the outer slice. Empty slice (not null) when no companions
+/// exist.
+pub fn findCompanionFiles(allocator: std.mem.Allocator, primary_path: []const u8) ![][]u8 {
+    var companions = std.ArrayList([]u8){ .items = &.{}, .capacity = 0 };
+    errdefer {
+        for (companions.items) |c| allocator.free(c);
+        companions.deinit(allocator);
+    }
+
+    const primary_basename = std.fs.path.basename(primary_path);
+    const primary_ext = file_types.koruExtensionOf(primary_basename) orelse {
+        return try companions.toOwnedSlice(allocator);
+    };
+    const stem = primary_basename[0 .. primary_basename.len - primary_ext.len];
+    const dir = std.fs.path.dirname(primary_path) orelse ".";
+
+    for (file_types.koru_extensions) |ext| {
+        if (std.mem.eql(u8, ext, primary_ext)) continue;
+        const name_with_ext = try std.fmt.allocPrint(allocator, "{s}{s}", .{ stem, ext });
+        defer allocator.free(name_with_ext);
+        const candidate = try std.fs.path.join(allocator, &[_][]const u8{ dir, name_with_ext });
+        defer allocator.free(candidate);
+        std.fs.cwd().access(candidate, .{}) catch continue;
+        const resolved = try std.fs.path.resolve(allocator, &[_][]const u8{candidate});
+        try companions.append(allocator, resolved);
+    }
+
+    return try companions.toOwnedSlice(allocator);
+}
+
+/// Probe the sibling files of a part declaration: `stem.tag.<ext>` for every
+/// Koru extension. This is the part-side twin of `findCompanionFiles` — the
+/// same fixed-extension probe, with the tag as an extra stem segment — so a
+/// part's own host facets (`foo.a.k` + `foo.a.kz` + `foo.a.kjs`) join through
+/// one declaration.
+///
+/// Returns an owned slice of owned, resolved paths for the files that exist
+/// (empty, not null, when none do). The loader decides what empty means — a
+/// missing part (KORU201) vs a tag that names a directory (KORU203) — so it
+/// can point the diagnostic at the declaration.
+pub fn probePartFiles(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    stem: []const u8,
+    tag: []const u8,
+) ![][]u8 {
+    var found = std.ArrayList([]u8){ .items = &.{}, .capacity = 0 };
+    errdefer {
+        for (found.items) |f| allocator.free(f);
+        found.deinit(allocator);
+    }
+
+    for (file_types.koru_extensions) |ext| {
+        const name_with_ext = try std.fmt.allocPrint(allocator, "{s}.{s}{s}", .{ stem, tag, ext });
+        defer allocator.free(name_with_ext);
+        const candidate = try std.fs.path.join(allocator, &[_][]const u8{ dir, name_with_ext });
+        defer allocator.free(candidate);
+        std.fs.cwd().access(candidate, .{}) catch continue;
+        const resolved = try std.fs.path.resolve(allocator, &[_][]const u8{candidate});
+        try found.append(allocator, resolved);
+    }
+
+    return try found.toOwnedSlice(allocator);
+}
+
+
+/// ModuleResolver handles finding and loading Koru modules from various locations
+/// Search order:
+/// 1. Relative to the importing file
+/// 2. Project .paths from koru.json
+/// 3. KORU_PATH directories
+/// 4. Standard library location
+/// 5. Absolute paths
+///
+/// Import semantics:
+/// - If both foo.kz and foo/ exist, ~import foo imports BOTH
+/// - foo.kz becomes the main module
+/// - foo/*.kz files become submodules
+pub const ResolveResult = struct {
+    file_path: ?[]const u8,      // Path to foo.kz (if exists)
+    dir_path: ?[]const u8,       // Path to foo/ (if exists)
+
+    pub fn deinit(self: *ResolveResult, allocator: std.mem.Allocator) void {
+        if (self.file_path) |p| allocator.free(p);
+        if (self.dir_path) |p| allocator.free(p);
+    }
+};
+
+pub const ModuleResolver = struct {
+    allocator: std.mem.Allocator,
+    search_paths: std.ArrayList([]const u8),
+    stdlib_path: ?[]const u8,
+    // Mutable: a `std/compiler:paths` declaration adds aliases mid-parse, before
+    // the imports it governs are resolved. Config is something the parse BUILDS,
+    // not something handed to it finished.
+    config: *Config,
+    project_root: []const u8,  // Directory containing koru.json (for resolving alias paths)
+    entry_dir: []const u8,     // Directory of the entry file being compiled (for {{ ENTRY }} interpolation)
+    koru_home: []const u8,     // Directory where koruc is installed (for {{ KORU_HOME }} interpolation)
+    compiler_flags: []const []const u8,  // For {{ flag:name }} interpolation
+    parsing_files: std.StringHashMap(void),  // Track files currently being parsed (for cycle detection)
+    resolved_files: std.StringHashMap(void),  // Every file ever marked — the loaded set, retained after unmark
+
+    fn detectKoruHomeFromExe(allocator: std.mem.Allocator) ![]const u8 {
+        // Development: <project>/zig-out/bin/koruc → koru_home = <project>
+        // npm package: <package>/bin/koruc → koru_home = <package>
+        var exe_path_buf: [4096]u8 = undefined;
+        const exe_path = std.fs.selfExePath(&exe_path_buf) catch "/usr/local/bin/koruc";
+        const exe_dir = std.fs.path.dirname(exe_path) orelse "/usr/local/bin";
+        // Parent of bin/ directory
+        var koru_home_temp = std.fs.path.dirname(exe_dir) orelse exe_dir;
+        // If parent is "zig-out" (development build), go up one more level
+        if (std.fs.path.basename(koru_home_temp).len >= 7 and
+            std.mem.eql(u8, std.fs.path.basename(koru_home_temp)[0..7], "zig-out"))
+        {
+            koru_home_temp = std.fs.path.dirname(koru_home_temp) orelse koru_home_temp;
+        }
+        // Dupe to heap so it survives beyond this function
+        // Normalize backslashes to forward slashes for Windows compatibility
+        // (Zig string literals treat \U etc. as invalid escape sequences)
+        const koru_home = try allocator.dupe(u8, koru_home_temp);
+        for (koru_home) |*c| {
+            if (c.* == '\\') c.* = '/';
+        }
+        return koru_home;
+    }
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        config: *Config,
+        project_root: []const u8,
+        entry_dir: []const u8,
+        compiler_flags: []const []const u8,
+        koru_home_override: ?[]const u8,
+    ) !ModuleResolver {
+        const koru_home = if (koru_home_override) |home|
+            try allocator.dupe(u8, home)
+        else
+            try detectKoruHomeFromExe(allocator);
+
+        var resolver = ModuleResolver{
+            .allocator = allocator,
+            .search_paths = std.ArrayList([]const u8){
+                .items = &.{},
+                .capacity = 0,
+            },
+            .stdlib_path = null,
+            .config = config,
+            .project_root = project_root,
+            .entry_dir = entry_dir,
+            .koru_home = koru_home,
+            .compiler_flags = compiler_flags,
+            .parsing_files = std.StringHashMap(void).init(allocator),
+            .resolved_files = std.StringHashMap(void).init(allocator),
+        };
+
+        // Initialize with default search paths
+        try resolver.initializeSearchPaths();
+
+        return resolver;
+    }
+    
+    pub fn deinit(self: *ModuleResolver) void {
+        for (self.search_paths.items) |path| {
+            self.allocator.free(path);
+        }
+        self.search_paths.deinit(self.allocator);
+
+        if (self.stdlib_path) |path| {
+            self.allocator.free(path);
+        }
+
+        // Free koru_home
+        self.allocator.free(self.koru_home);
+
+        // Clean up parsing_files keys
+        var it = self.parsing_files.keyIterator();
+        while (it.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.parsing_files.deinit();
+
+        var rfit = self.resolved_files.keyIterator();
+        while (rfit.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.resolved_files.deinit();
+    }
+
+    /// Check if a file is currently being parsed (cycle detection)
+    pub fn isBeingParsed(self: *ModuleResolver, file_path: []const u8) bool {
+        return self.parsing_files.contains(file_path);
+    }
+
+    /// Mark a file as being parsed — also records it in the persistent
+    /// loaded set (resolved_files), which survives unmark so callers minting
+    /// or auditing a compiler artifact can ask what this compilation read.
+    pub fn markParsing(self: *ModuleResolver, file_path: []const u8) !void {
+        const key = try self.allocator.dupe(u8, file_path);
+        self.parsing_files.put(key, {}) catch |err| {
+            self.allocator.free(key);
+            return err;
+        };
+        if (!self.resolved_files.contains(file_path)) {
+            try self.resolved_files.put(try self.allocator.dupe(u8, file_path), {});
+        }
+    }
+
+    /// Unmark a file as being parsed
+    pub fn unmarkParsing(self: *ModuleResolver, file_path: []const u8) void {
+        if (self.parsing_files.fetchRemove(file_path)) |kv| {
+            self.allocator.free(kv.key);
+        }
+    }
+
+    /// Loudly refuse a non-relative, non-absolute import that names no
+    /// configured alias — dumping the known set for teaching.
+    fn failUnknownImportAlias(self: *ModuleResolver, alias: []const u8) error{UnknownImportAlias} {
+        log.debug("✗✗✗ FATAL: Unknown import alias: {s}\n", .{alias});
+        log.debug("Available aliases from koru.json:\n", .{});
+        var iter = self.config.paths.iterator();
+        while (iter.next()) |entry| {
+            log.debug("  {s} -> [{} paths]\n", .{ entry.key_ptr.*, entry.value_ptr.*.len });
+        }
+        return error.UnknownImportAlias;
+    }
+
+    /// Interpolate {{ variable }} placeholders in a path string
+    /// Supported variables: ENTRY, KORU_HOME
+    /// Returns new string if interpolation happened, null otherwise
+    fn interpolate(self: *ModuleResolver, path: []const u8) !?[]u8 {
+        var result = try self.allocator.dupe(u8, path);
+        var changed = false;
+
+        // Process {{ ENTRY }}
+        if (std.mem.indexOf(u8, result, "{{ ENTRY }}")) |pos| {
+            const prefix = result[0..pos];
+            const suffix = result[pos + 11..]; // Skip "{{ ENTRY }}"
+            const new_result = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}{s}{s}",
+                .{ prefix, self.entry_dir, suffix }
+            );
+            self.allocator.free(result);
+            result = new_result;
+            changed = true;
+        }
+
+        // Process {{ KORU_HOME }}
+        if (std.mem.indexOf(u8, result, "{{ KORU_HOME }}")) |pos| {
+            const prefix = result[0..pos];
+            const suffix = result[pos + 15..]; // Skip "{{ KORU_HOME }}"
+            const new_result = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}{s}{s}",
+                .{ prefix, self.koru_home, suffix }
+            );
+            self.allocator.free(result);
+            result = new_result;
+            changed = true;
+        }
+
+        // Process every {{ flag:name }} — unlike ENTRY and KORU_HOME there can be
+        // several distinct ones in a single path, so this loops rather than
+        // substituting a single known string once.
+        while (std.mem.indexOf(u8, result, flag_open)) |pos| {
+            const after = result[pos + flag_open.len ..];
+            const close = std.mem.indexOf(u8, after, " }}") orelse break;
+            const flag_name = after[0..close];
+
+            // An unsupplied flag is left standing, NOT emptied. The parser refuses
+            // the declaration up front (KORU172) precisely so this is unreachable
+            // in a real compile; if it is ever reached, resolution must fail loudly
+            // against the literal text rather than quietly resolve somewhere else.
+            const value = flagValueIn(self.compiler_flags, flag_name) orelse break;
+
+            const new_result = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}{s}{s}",
+                .{ result[0..pos], value, after[close + 3 ..] },
+            );
+            self.allocator.free(result);
+            result = new_result;
+            changed = true;
+        }
+
+        if (changed) {
+            return result;
+        } else {
+            self.allocator.free(result);
+            return null;
+        }
+    }
+
+    const flag_open = "{{ flag:";
+
+    /// Value of `--flag name=value`, or null if the flag was never supplied.
+    /// A bare `--flag name` carries no value, so it cannot fill a path segment.
+    pub fn flagValueIn(flags: []const []const u8, name: []const u8) ?[]const u8 {
+        for (flags) |flag| {
+            const eq = std.mem.indexOfScalar(u8, flag, '=') orelse continue;
+            if (std.mem.eql(u8, flag[0..eq], name)) return flag[eq + 1 ..];
+        }
+        return null;
+    }
+
+    pub fn flagValue(self: *const ModuleResolver, name: []const u8) ?[]const u8 {
+        return flagValueIn(self.compiler_flags, name);
+    }
+
+    /// The `{{ flag:name }}` references in a path, in source order. Used by the
+    /// parser to refuse a declaration naming a flag nobody supplied.
+    pub fn flagRefs(path: []const u8, buf: [][]const u8) [][]const u8 {
+        var count: usize = 0;
+        var rest = path;
+        while (std.mem.indexOf(u8, rest, flag_open)) |pos| {
+            if (count == buf.len) break;
+            const after = rest[pos + flag_open.len ..];
+            const close = std.mem.indexOf(u8, after, " }}") orelse break;
+            buf[count] = after[0..close];
+            count += 1;
+            rest = after[close + 3 ..];
+        }
+        return buf[0..count];
+    }
+
+    fn initializeSearchPaths(self: *ModuleResolver) !void {
+        // 1. Check KORU_PATH environment variable
+        if (std.process.getEnvVarOwned(self.allocator, "KORU_PATH")) |koru_path| {
+            defer self.allocator.free(koru_path);
+            
+            // Split by : on Unix, ; on Windows
+            const delimiter = if (@import("builtin").os.tag == .windows) ';' else ':';
+            var it = std.mem.tokenizeAny(u8, koru_path, &[_]u8{delimiter});
+            while (it.next()) |path| {
+                try self.search_paths.append(self.allocator, try self.allocator.dupe(u8, path));
+            }
+        } else |_| {
+            // KORU_PATH not set, that's okay
+        }
+        
+        // 2. Check KORU_STDLIB environment variable
+        if (std.process.getEnvVarOwned(self.allocator, "KORU_STDLIB")) |stdlib| {
+            self.stdlib_path = stdlib; // Take ownership
+        } else |_| {
+            // Try to find stdlib relative to executable
+            self.stdlib_path = try self.findDefaultStdlibPath();
+        }
+    }
+    
+    fn findDefaultStdlibPath(self: *ModuleResolver) !?[]const u8 {
+        log.debug("ModuleResolver: Searching for stdlib (koru_std)...\n", .{});
+
+        // Try: /usr/local/lib/koru_std (global installation)
+        const global_path = "/usr/local/lib/koru_std";
+        log.debug("  Trying: {s}\n", .{global_path});
+        if (std.fs.accessAbsolute(global_path, .{})) |_| {
+            log.debug("  ✓ FOUND stdlib at: {s}\n", .{global_path});
+            return try self.allocator.dupe(u8, global_path);
+        } else |err| {
+            log.debug("  ✗ Not found: {}\n", .{err});
+        }
+
+        // Get the path to the current executable for relative lookups
+        var exe_path_buf: [4096]u8 = undefined;
+        const exe_path = try std.fs.selfExePath(&exe_path_buf);
+        const exe_dir = std.fs.path.dirname(exe_path) orelse return null;
+
+        // Try: executable_dir/../koru_std (for npm package: binaries/../koru_std)
+        const candidate1 = try std.fs.path.join(self.allocator, &[_][]const u8{
+            exe_dir, "..", "koru_std"
+        });
+        defer self.allocator.free(candidate1);
+
+        log.debug("  Trying: {s}\n", .{candidate1});
+        if (std.fs.accessAbsolute(candidate1, .{})) |_| {
+            log.debug("  ✓ FOUND stdlib at: {s}\n", .{candidate1});
+            return try self.allocator.dupe(u8, candidate1);
+        } else |err| {
+            log.debug("  ✗ Not found: {}\n", .{err});
+        }
+
+        // Try: executable_dir/../../koru_std (for zig-out/bin/koruc)
+        const candidate2 = try std.fs.path.join(self.allocator, &[_][]const u8{
+            exe_dir, "..", "..", "koru_std"
+        });
+        defer self.allocator.free(candidate2);
+
+        log.debug("  Trying: {s}\n", .{candidate2});
+        if (std.fs.accessAbsolute(candidate2, .{})) |_| {
+            log.debug("  ✓ FOUND stdlib at: {s}\n", .{candidate2});
+            return try self.allocator.dupe(u8, candidate2);
+        } else |err| {
+            log.debug("  ✗ Not found: {}\n", .{err});
+        }
+
+        // Try: ./koru_std (current directory)
+        log.debug("  Trying: ./koru_std\n", .{});
+        if (std.fs.cwd().access("koru_std", .{})) |_| {
+            log.debug("  ✓ FOUND stdlib at: ./koru_std\n", .{});
+            return try self.allocator.dupe(u8, "koru_std");
+        } else |err| {
+            log.debug("  ✗ Not found: {}\n", .{err});
+        }
+
+        log.debug("  ✗✗✗ STDLIB NOT FOUND ANYWHERE ✗✗✗\n", .{});
+        return null;
+    }
+    
+    /// Every library root this resolver consults, as absolute paths, sorted
+    /// and deduped: KORU_PATH search paths, the stdlib root, and every alias
+    /// path declared by koru.json / `std/compiler:paths` — interpolated and
+    /// resolved against project_root exactly the way resolveBoth resolves
+    /// them. Callers minting or auditing a compiler artifact hash this set;
+    /// the standard library is just another root on it, not a privileged one.
+    /// Caller owns the returned slice and each element.
+    pub fn libraryRoots(self: *ModuleResolver, allocator: std.mem.Allocator) ![][]const u8 {
+        var roots = std.ArrayList([]const u8){};
+
+        // KORU_PATH entries and the stdlib root are env-shaped bases —
+        // resolveBoth joins the import under them relative to cwd.
+        for (self.search_paths.items) |p| {
+            try roots.append(allocator, try std.fs.path.resolve(allocator, &[_][]const u8{p}));
+        }
+        if (self.stdlib_path) |p| {
+            try roots.append(allocator, try std.fs.path.resolve(allocator, &[_][]const u8{p}));
+        }
+
+        // Alias paths: interpolate, then absolute stays and relative lands
+        // on project_root — the same rule resolveBoth applies.
+        var iter = self.config.paths.iterator();
+        while (iter.next()) |entry| {
+            for (entry.value_ptr.*) |raw| {
+                const interpolated = try self.interpolate(raw);
+                defer if (interpolated) |i| self.allocator.free(i);
+                const candidate = interpolated orelse raw;
+                // resolve() normalizes '..' lexically even for absolute
+                // inputs — loaded files come back normalized, so roots must
+                // be too or a prefix match can never fire.
+                const abs = if (std.fs.path.isAbsolute(candidate))
+                    try std.fs.path.resolve(allocator, &[_][]const u8{candidate})
+                else
+                    try std.fs.path.resolve(allocator, &[_][]const u8{ self.project_root, candidate });
+                try roots.append(allocator, abs);
+            }
+        }
+
+        std.mem.sort([]const u8, roots.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        var out = std.ArrayList([]const u8){};
+        for (roots.items) |p| {
+            if (out.items.len > 0 and std.mem.eql(u8, out.items[out.items.len - 1], p)) {
+                allocator.free(p);
+                continue;
+            }
+            try out.append(allocator, p);
+        }
+        roots.deinit(allocator);
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Check if a path is a directory
+    pub fn isDirectory(path: []const u8) bool {
+        const dir = std.fs.cwd().openDir(path, .{}) catch return false;
+        var d = dir;
+        d.close();
+        return true;
+    }
+
+    /// Enumerate all .kz files in a directory
+    /// Returns owned slice that must be freed by caller
+    /// Each string in the slice must also be freed
+    pub fn enumerateDirectory(
+        self: *ModuleResolver,
+        dir_path: []const u8,
+    ) ![][]const u8 {
+        var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+        defer dir.close();
+
+        var files = std.ArrayList([]const u8){
+            .items = &.{},
+            .capacity = 0,
+        };
+        errdefer {
+            for (files.items) |file| self.allocator.free(file);
+            files.deinit(self.allocator);
+        }
+
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (!file_types.isKoruFile(entry.name)) continue;
+
+            // Build full path: dir_path/file.<ext>
+            const full_path = try std.fs.path.join(
+                self.allocator,
+                &[_][]const u8{ dir_path, entry.name }
+            );
+            try files.append(self.allocator, full_path);
+        }
+
+        // readdir order is filesystem-specific; sorting keeps module
+        // enumeration (and therefore emitted declaration order) reproducible
+        // across overlayfs, virtiofs, APFS, etc.
+        const sorted = try files.toOwnedSlice(self.allocator);
+        std.mem.sort([]const u8, sorted, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        return sorted;
+    }
+
+    /// Resolve an import path to BOTH file and directory (if they exist)
+    /// The LONGEST `paths` key that covers `import_path`, matched on segment
+    /// boundaries — `koru/vaxis` beats `koru`, and neither matches `korux`.
+    ///
+    /// A path key used to be read as "everything before the first slash", which
+    /// made it a NAMESPACE rather than a module: `koru/vaxis` was unsayable and
+    /// the finest thing koru.json could express was "send all of `koru/*` here".
+    /// That is too coarse for vendoring, where you redirect the ONE library you
+    /// had to patch and leave its neighbours alone.
+    ///
+    /// Single-segment keys keep their exact old meaning (`std` still covers
+    /// `std/io`), so this is a pure widening of what koru.json can say.
+    fn longestAliasMatch(self: *ModuleResolver, import_path: []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var iter = self.config.paths.iterator();
+        while (iter.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (key.len > import_path.len) continue;
+            if (!std.mem.startsWith(u8, import_path, key)) continue;
+            // Segment boundary: exact match, or the next char is the separator.
+            if (import_path.len != key.len and import_path[key.len] != '/') continue;
+            if (best == null or key.len > best.?.len) best = key;
+        }
+        return best;
+    }
+
+    /// This enables importing both foo.kz and foo/ directory simultaneously
+    /// Returns ResolveResult with file_path and/or dir_path set
+    pub fn resolveBoth(
+        self: *ModuleResolver,
+        import_path: []const u8,
+        base_file: ?[]const u8,
+    ) !ResolveResult {
+        log.debug("\n═══ ModuleResolver.resolveBoth() ═══\n", .{});
+        log.debug("  Import path: '{s}'\n", .{import_path});
+        if (base_file) |bf| {
+            log.debug("  Base file: '{s}'\n", .{bf});
+        } else {
+            log.debug("  Base file: (none)\n", .{});
+        }
+
+        var result = ResolveResult{
+            .file_path = null,
+            .dir_path = null,
+        };
+
+        const alias = self.longestAliasMatch(import_path) orelse blk: {
+            const slash_pos = std.mem.indexOf(u8, import_path, "/");
+            break :blk import_path[0 .. slash_pos orelse import_path.len];
+        };
+
+        log.debug("  Resolving alias: {s}\n", .{alias});
+
+        if (self.config.paths.get(alias)) |alias_paths| {
+            // Iterate through fallback chain - try each path until one exists
+            for (alias_paths, 0..) |alias_path_raw, path_idx| {
+                // Interpolate {{ ENTRY }}, {{ KORU_HOME }} if present
+                const alias_path = if (try self.interpolate(alias_path_raw)) |interpolated|
+                    interpolated
+                else
+                    alias_path_raw;
+                defer if (alias_path.ptr != alias_path_raw.ptr) self.allocator.free(alias_path);
+
+                log.debug("  [FALLBACK {}/{}] Trying: {s}\n", .{ path_idx + 1, alias_paths.len, alias_path });
+
+                // Build the path to check (alias + remainder if any)
+                const path_to_resolve = if (import_path.len != alias.len) blk: {
+                    const remainder = import_path[alias.len + 1 ..];
+                    break :blk try std.fs.path.join(
+                        self.allocator,
+                        &[_][]const u8{ alias_path, remainder }
+                    );
+                } else blk: {
+                    break :blk try self.allocator.dupe(u8, alias_path);
+                };
+                defer self.allocator.free(path_to_resolve);
+
+                // Alias paths are RELATIVE TO PROJECT ROOT (where koru.json is)
+                // Resolve them absolutely using project_root as base
+                const absolute_path = if (std.fs.path.isAbsolute(path_to_resolve))
+                    try self.allocator.dupe(u8, path_to_resolve)
+                else
+                    try std.fs.path.resolve(self.allocator, &[_][]const u8{ self.project_root, path_to_resolve });
+                defer self.allocator.free(absolute_path);
+
+                log.debug("    Resolved to: {s}\n", .{absolute_path});
+
+                // Check for BOTH file and directory
+                var found_something = false;
+
+                // Check directory
+                if (isDirectory(absolute_path)) {
+                    const dir_resolved = try std.fs.path.resolve(
+                        self.allocator,
+                        &[_][]const u8{absolute_path}
+                    );
+                    result.dir_path = dir_resolved;
+                    log.debug("    ✓ FOUND directory: {s}\n", .{dir_resolved});
+                    found_something = true;
+                }
+
+                // Check file (probe all Koru extensions if base doesn't carry one)
+                if (try resolveKoruFile(self.allocator, absolute_path)) |file_resolved| {
+                    result.file_path = file_resolved;
+                    log.debug("    ✓ FOUND file: {s}\n", .{file_resolved});
+                    found_something = true;
+                }
+
+                // If we found something at this fallback path, return it
+                if (found_something) {
+                    log.debug("  ✓ Resolved via fallback {}/{}\n", .{ path_idx + 1, alias_paths.len });
+                    return result;
+                }
+
+                log.debug("    ✗ Nothing found, trying next fallback...\n", .{});
+            }
+
+            // None of the fallback paths worked
+            log.debug("\n✗✗✗ FATAL: Alias {s} - all {} fallback paths exhausted ✗✗✗\n", .{ alias, alias_paths.len });
+            return error.ModuleNotFound;
+        } else if (!std.mem.startsWith(u8, import_path, "./") and !std.mem.startsWith(u8, import_path, "../") and !std.fs.path.isAbsolute(import_path)) {
+            return self.failUnknownImportAlias(import_path);
+        }
+
+        // Helper to check both file and dir at a given base path
+        const checkBoth = struct {
+            fn check(alloc: std.mem.Allocator, base: []const u8, import: []const u8, res: *ResolveResult) !bool {
+                var found_any = false;
+
+                // Check directory
+                const dir_candidate = try std.fs.path.join(
+                    alloc,
+                    &[_][]const u8{ base, import }
+                );
+                defer alloc.free(dir_candidate);
+
+                if (isDirectory(dir_candidate)) {
+                    const resolved = try std.fs.path.resolve(alloc, &[_][]const u8{dir_candidate});
+                    res.dir_path = resolved;
+                    log.debug("      ✓ FOUND directory: {s}\n", .{resolved});
+                    found_any = true;
+                }
+
+                // Check file (probe all Koru extensions if import doesn't carry one)
+                if (try resolveKoruFileIn(alloc, base, import)) |resolved| {
+                    res.file_path = resolved;
+                    log.debug("      ✓ FOUND file: {s}\n", .{resolved});
+                    found_any = true;
+                }
+
+                return found_any;
+            }
+        }.check;
+
+        // 1. Absolute path
+        if (std.fs.path.isAbsolute(import_path)) {
+            if (try checkBoth(self.allocator, "", import_path, &result)) {
+                return result;
+            }
+        }
+
+        // 2. Relative to importing file
+        log.debug("  [2] Trying relative to importing file...\n", .{});
+        if (base_file) |base| {
+            const base_dir = std.fs.path.dirname(base) orelse ".";
+            if (try checkBoth(self.allocator, base_dir, import_path, &result)) {
+                return result;
+            }
+        }
+
+        // 3. KORU_PATH search paths
+        log.debug("  [3] Trying KORU_PATH search paths...\n", .{});
+        for (self.search_paths.items) |search_path| {
+            if (try checkBoth(self.allocator, search_path, import_path, &result)) {
+                return result;
+            }
+        }
+
+        // 4. Standard library
+        log.debug("  [4] Trying standard library...\n", .{});
+        if (self.stdlib_path) |stdlib| {
+            if (try checkBoth(self.allocator, stdlib, import_path, &result)) {
+                return result;
+            }
+        }
+
+        // Nothing found
+        log.debug("\n✗✗✗ FATAL: Module not found: '{s}' ✗✗✗\n", .{import_path});
+        return error.ModuleNotFound;
+    }
+
+    /// Resolve an import path to a full file path
+    /// Returns owned memory that must be freed by the caller
+    /// DEPRECATED: Use resolveBoth() for proper file+directory support
+    pub fn resolve(
+        self: *ModuleResolver,
+        import_path: []const u8,
+        base_file: ?[]const u8,
+    ) ![]u8 {
+        log.debug("\n═══ ModuleResolver.resolve() ═══\n", .{});
+        log.debug("  Import path: '{s}'\n", .{import_path});
+        if (base_file) |bf| {
+            log.debug("  Base file: '{s}'\n", .{bf});
+        } else {
+            log.debug("  Base file: (none)\n", .{});
+        }
+
+        // LONGEST MATCH over full module paths, on segment boundaries.
+        //
+        // The alias used to be "everything before the first slash", which made a
+        // path key a NAMESPACE, not a module: `koru/vaxis` was unsayable, and the
+        // closest koru.json could get was "send all of `koru/*` somewhere". That
+        // is too coarse for the normal vendoring case — you vendor the ONE library
+        // you had to patch and leave its neighbours on the registry.
+        //
+        // Matching the longest key instead makes a key any prefix of a module path,
+        // so `koru` and `koru/vaxis` coexist and the specific one wins. Every
+        // single-segment key keeps its old meaning exactly (`std` still catches
+        // `std/io`), so this is a pure widening.
+        const alias = self.longestAliasMatch(import_path) orelse blk: {
+            const slash_pos = std.mem.indexOf(u8, import_path, "/");
+            break :blk import_path[0 .. slash_pos orelse import_path.len];
+        };
+
+        log.debug("  Resolving alias: {s}\n", .{alias});
+
+        // Look up alias in config.paths (now returns array of fallback paths)
+        if (self.config.paths.get(alias)) |alias_paths| {
+            // Iterate through fallback chain - try each path until one exists
+            for (alias_paths) |alias_path_raw| {
+                // Interpolate {{ ENTRY }}, {{ KORU_HOME }} if present
+                const alias_path = if (try self.interpolate(alias_path_raw)) |interpolated|
+                    interpolated
+                else
+                    alias_path_raw;
+                defer if (alias_path.ptr != alias_path_raw.ptr) self.allocator.free(alias_path);
+
+                log.debug("  ✓ Trying fallback: {s}\n", .{alias_path});
+
+                // Build the path to check (alias + remainder if any)
+                const path_to_resolve = if (import_path.len != alias.len) blk: {
+                    const remainder = import_path[alias.len + 1 ..];
+                    break :blk try std.fs.path.join(
+                        self.allocator,
+                        &[_][]const u8{ alias_path, remainder }
+                    );
+                } else blk: {
+                    break :blk try self.allocator.dupe(u8, alias_path);
+                };
+                defer self.allocator.free(path_to_resolve);
+
+                // Alias paths are RELATIVE TO PROJECT ROOT (where koru.json is)
+                const absolute_path = if (std.fs.path.isAbsolute(path_to_resolve))
+                    try self.allocator.dupe(u8, path_to_resolve)
+                else
+                    try std.fs.path.resolve(self.allocator, &[_][]const u8{ self.project_root, path_to_resolve });
+                defer self.allocator.free(absolute_path);
+
+                log.debug("    Resolved to (absolute): {s}\n", .{absolute_path});
+
+                // Check if it's a directory
+                if (isDirectory(absolute_path)) {
+                    const resolved = try std.fs.path.resolve(
+                        self.allocator,
+                        &[_][]const u8{absolute_path}
+                    );
+                    log.debug("    ✓ FOUND directory: {s}\n", .{resolved});
+                    return resolved;
+                }
+
+                // Check if it's a file (probe all Koru extensions if base doesn't carry one)
+                if (try resolveKoruFile(self.allocator, absolute_path)) |resolved| {
+                    log.debug("    ✓ FOUND file: {s}\n", .{resolved});
+                    return resolved;
+                } else {
+                    log.debug("    ✗ Not found, trying next fallback...\n", .{});
+                }
+            }
+            // None of the fallback paths worked
+            log.debug("\n✗✗✗ FATAL: Alias {s} - all fallback paths exhausted ✗✗✗\n", .{alias});
+            return error.ModuleNotFound;
+        } else if (!std.mem.startsWith(u8, import_path, "./") and !std.mem.startsWith(u8, import_path, "../") and !std.fs.path.isAbsolute(import_path)) {
+            return self.failUnknownImportAlias(import_path);
+        }
+
+        // 1. If it's an absolute path, use it directly
+        if (std.fs.path.isAbsolute(import_path)) {
+            // Check if it's a directory first
+            if (isDirectory(import_path)) {
+                return try self.allocator.dupe(u8, import_path);
+            }
+            // Probe for an existing Koru file (any extension). Phase 2 adds
+            // one stat() per absolute-path import that previously had none —
+            // the old code blindly appended .kz without checking.
+            if (try resolveKoruFile(self.allocator, import_path)) |resolved| {
+                return resolved;
+            }
+            return error.ModuleNotFound;
+        }
+        
+        // 2. Try relative to the importing file
+        log.debug("  [2] Trying relative to importing file...\n", .{});
+        if (base_file) |base| {
+            const base_dir = std.fs.path.dirname(base) orelse ".";
+            if (try self.probeImportIn(base_dir, import_path, "    ", "")) |resolved|
+                return resolved;
+        } else {
+            log.debug("    (skipped - no base file)\n", .{});
+        }
+
+        // 3. Try each search path from KORU_PATH
+        log.debug("  [3] Trying KORU_PATH search paths ({} paths)...\n", .{self.search_paths.items.len});
+        for (self.search_paths.items) |search_path| {
+            log.debug("    Searching in: {s}\n", .{search_path});
+            if (try self.probeImportIn(search_path, import_path, "      ", "")) |resolved|
+                return resolved;
+        }
+
+        // 4. Try the standard library
+        log.debug("  [4] Trying standard library...\n", .{});
+        if (self.stdlib_path) |stdlib| {
+            log.debug("    Stdlib path: {s}\n", .{stdlib});
+            if (try self.probeImportIn(stdlib, import_path, "    ", " stdlib")) |resolved|
+                return resolved;
+        } else {
+            log.debug("    (no stdlib path configured)\n", .{});
+        }
+
+        // Module not found
+        log.debug("\n✗✗✗ FATAL: Module not found: '{s}' ✗✗✗\n", .{import_path});
+        log.debug("Tried:\n", .{});
+        log.debug("  - Absolute path\n", .{});
+        log.debug("  - Relative to base file\n", .{});
+        log.debug("  - KORU_PATH ({} paths)\n", .{self.search_paths.items.len});
+        if (self.stdlib_path) |stdlib| {
+            log.debug("  - Standard library: {s}\n", .{stdlib});
+        }
+        return error.ModuleNotFound;
+    }
+    
+    /// Probe one root for `import_path`: `<root>/<import_path>` as a
+    /// directory first, then `import_path` as a file under `root` (all
+    /// Koru extensions). `pad` indents the debug log for the probe site;
+    /// `file_in` names the root kind in the file-check line ("", " stdlib").
+    fn probeImportIn(
+        self: *ModuleResolver,
+        root: []const u8,
+        import_path: []const u8,
+        comptime pad: []const u8,
+        comptime file_in: []const u8,
+    ) !?[]u8 {
+        const dir_candidate = try std.fs.path.join(
+            self.allocator,
+            &[_][]const u8{ root, import_path },
+        );
+        defer self.allocator.free(dir_candidate);
+
+        log.debug(pad ++ "Checking directory: {s}\n", .{dir_candidate});
+        if (isDirectory(dir_candidate)) {
+            const resolved = try std.fs.path.resolve(
+                self.allocator,
+                &[_][]const u8{dir_candidate},
+            );
+            log.debug(pad ++ "✓ FOUND directory: {s}\n", .{resolved});
+            return resolved;
+        }
+        log.debug(pad ++ "✗ Not a directory\n", .{});
+
+        log.debug(pad ++ "Checking file in" ++ file_in ++ ": {s}\n", .{root});
+        if (try resolveKoruFileIn(self.allocator, root, import_path)) |resolved| {
+            log.debug(pad ++ "✓ FOUND file: {s}\n", .{resolved});
+            return resolved;
+        }
+        log.debug(pad ++ "✗ Not found\n", .{});
+        return null;
+    }
+
+    /// Check if a resolved path is a system/stdlib module
+    pub fn isSystemModule(self: *ModuleResolver, canonical_path: []const u8) bool {
+        // Check if the path is within the stdlib directory
+        if (self.stdlib_path) |stdlib| {
+            // Normalize both paths for comparison
+            const normalized_stdlib = std.fs.path.resolve(
+                self.allocator,
+                &[_][]const u8{stdlib}
+            ) catch return false;
+            defer self.allocator.free(normalized_stdlib);
+            
+            return std.mem.startsWith(u8, canonical_path, normalized_stdlib);
+        }
+        
+        // Fallback: check for koru_std in the path
+        return std.mem.indexOf(u8, canonical_path, "koru_std") != null;
+    }
+};
