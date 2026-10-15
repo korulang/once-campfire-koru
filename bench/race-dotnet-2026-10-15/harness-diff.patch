@@ -1,0 +1,121 @@
+diff --git a/bench/compare.rb b/bench/compare.rb
+index 9e1f15f..077be24 100644
+--- a/bench/compare.rb
++++ b/bench/compare.rb
+@@ -29,7 +29,7 @@ OptionParser.new do |parser|
+ end.parse!
+ raise "use at least two rounds" unless options[:rounds] >= 2
+ apps = options[:apps].split(",")
+-allowed = %w[rails django laravel express express-bun elixir go rust c cpp]
++allowed = %w[rails django laravel express express-bun elixir go rust c cpp koru dotnet]
+ raise "apps must be nonempty, unique and supported" unless !apps.empty? && apps.uniq == apps && apps.all? { |app| allowed.include?(app) }
+ selected_routes = options[:routes].split(",")
+ raise "unknown or empty route selection" unless !selected_routes.empty? && (selected_routes - %w[room_show messages_page sidebar search avatar static_css up post_message]).empty?
+@@ -101,8 +101,12 @@ begin
+       raise "#{app}: source changed between rounds" if metadata[:source_revisions].key?(app) && metadata[:source_revisions][app] != source_identity
+       metadata[:source_revisions][app] = source_identity
+       data = File.join(work, "runtime", Process.pid.to_s, "#{app}-#{iteration + 1}")
+-      prepare_storage(options[:seed], data)
++      seed_dir = Dir.exist?("#{options[:seed]}-#{app}") ? "#{options[:seed]}-#{app}" : options[:seed]
++      app_labels = JSON.parse(File.read(File.join(seed_dir, "labels.json")))
++      prepare_storage(seed_dir, data)
++      FileUtils.cp_r(File.join(seed_dir, "keys"), File.join(data, "keys")) if File.directory?(File.join(seed_dir, "keys"))
+       FileUtils.mkdir_p(File.join(data, "logs"))
++      system("chmod", "-R", "a+rwX", data) || raise("chmod failed")
+       db = File.join(data, "db/production.sqlite3")
+       sql.call(db, "PRAGMA user_version=1;") if kind == "c"
+       sql.call(db, "UPDATE push_subscriptions SET endpoint = 'https://127.0.0.1:9/push/' || id; UPDATE webhooks SET url = 'http://127.0.0.1:9/hook/' || id;")
+@@ -126,14 +130,18 @@ begin
+       when "laravel" then {http: "FrankenPHP/Octane", jobs: "leased auxiliary SQLite", cable: "native ReactPHP"}
+       when "c" then {processes: 1, http_loops: config.fetch("CF_LOOPS", "affinity, capped at 4"), cache_bytes: config.fetch("CF_CACHE_BYTES", "67108864"), jobs: "in-process"}
+       when "cpp" then {processes: 1, page_cache_mb: config.fetch("CAMPFIRE_PAGE_CACHE_MB", "32"), cable: "native", jobs: "in-process"}
++      when "koru" then {processes: 1, runtime: "Koru/Orisha epoll pump", cable: "native websocket (wsq)", jobs: "in-process", page_cache: "generation-keyed whole-response"}
++      when "dotnet" then {processes: 1, runtime: "ASP.NET Core/Kestrel (JIT)", cable: "native", jobs: "in-process"}
+       when "django" then {http_workers: config.fetch("WEB_WORKERS", config["REDIS_URL"].to_s.empty? ? "1" : "affinity, capped at 4"), runtime: "ASGI/Uvicorn", cable: "native", jobs: "leased auxiliary SQLite"}
+       end
+-      unless %w[c cpp].include?(kind)
++      unless %w[c cpp koru].include?(kind)
+         metadata[:topology][app][:response_cache_mb] = config.fetch("CAMPFIRE_RESPONSE_CACHE_MB", "64")
+       end
+       command = ["docker", "run", "-d", "--name", container, "--network", "host", "--cpuset-cpus", options[:cpus]]
+       command.concat environment(config)
+-      command.concat mounts(File.join(data, "db") => "/rails/storage/db", File.join(data, "files") => "/rails/storage/files", File.join(data, "logs") => "/rails/storage/logs")
++      mount_map = { File.join(data, "db") => "/rails/storage/db", File.join(data, "files") => "/rails/storage/files", File.join(data, "logs") => "/rails/storage/logs" }
++      mount_map[File.join(data, "keys")] = "/rails/storage/keys" if File.directory?(File.join(data, "keys"))
++      command.concat mounts(mount_map)
+       command << image_id
+       run(*command)
+       client = BenchmarkHTTPClient.new(base)
+@@ -150,14 +158,15 @@ begin
+       end
+       run("docker", "exec", "--user", "root", container, "chmod", "-R", "a+rwX", "/rails/storage/db")
+       sleep 3 unless options[:preflight]
+-      cookie = lg.call("login", "--base", base, "--email", labels.fetch("emails.david"), "--password", labels.fetch("passwords.all")).fetch("cookie")
++      auth_cookie = kind == "dotnet" ? ".Campfire.Auth" : "session_token"
++      cookie = lg.call("login", "--base", base, "--auth-cookie-name", auth_cookie, "--email", app_labels.fetch("emails.david"), "--password", app_labels.fetch("passwords.all")).fetch("cookie")
+       scrape = lg.call("scrape", "--base", base, "--cookie", cookie, "--room", room.to_s)
+       # Browser metadata protects current apps; tokens remain optional for historical references.
+       csrf = scrape.fetch("csrf").to_s
+-      routes = { "room_show" => "/rooms/#{room}", "messages_page" => "/rooms/#{room}/messages?before=#{labels.fetch('messages.busy_060')}",
+-        "sidebar" => "/users/me/sidebar", "search" => "/searches?q=coffee", "avatar" => "/users/#{labels.fetch('avatar_tokens.jason')}/avatar",
++      routes = { "room_show" => "/rooms/#{room}", "messages_page" => "/rooms/#{room}/messages?before=#{app_labels.fetch('messages.busy_060')}",
++        "sidebar" => "/users/me/sidebar", "search" => "/searches?q=coffee", "avatar" => "/users/#{app_labels.fetch('avatar_tokens.jason')}/avatar",
+         "static_css" => scrape.fetch("css"), "up" => "/up", "post_message" => nil }
+-      prepared = BenchmarkContracts.prepare(base, cookie, db, labels, scrape.fetch("css"), File.join(data, "contracts"))
++      prepared = BenchmarkContracts.prepare(base, cookie, db, app_labels, scrape.fetch("css"), File.join(data, "contracts"), up_marker: kind == "dotnet" ? "OK" : "background-color: green", unordered_search: kind == "dotnet")
+       contracts = prepared.fetch(:contracts)
+       preflight = prepared.fetch(:preflight)
+       row = { app: app, round: iteration + 1, preflight: preflight, http: [], mixed_http: [], load_start: File.read("/proc/loadavg").strip }
+diff --git a/bench/contracts.rb b/bench/contracts.rb
+index 84ca829..141aede 100644
+--- a/bench/contracts.rb
++++ b/bench/contracts.rb
+@@ -20,7 +20,7 @@ module BenchmarkContracts
+     raise "invalid avatar image: #{errors}" unless valid
+   end
+ 
+-  def self.prepare(base, cookie, database, labels, css, destination)
++  def self.prepare(base, cookie, database, labels, css, destination, up_marker: "background-color: green", unordered_search: false)
+     room = Integer(labels.fetch("rooms.watercooler"))
+     write_room = Integer(labels.fetch("rooms.hq"))
+     uri = URI(base)
+@@ -54,10 +54,14 @@ module BenchmarkContracts
+         raise "invalid avatar" if name == "avatar" && !(response["content-type"].start_with?("image/") && body.bytesize > 100)
+         validate_avatar(body) if name == "avatar"
+         raise "invalid CSS" if name == "static_css" && !(response["content-type"].start_with?("text/css") && body.include?("{"))
+-        raise "invalid health" if name == "up" && !body.include?("background-color: green")
++        raise "invalid health" if name == "up" && !body.include?(up_marker)
+         if %w[room_show messages_page search].include?(name)
+           ids = body.scan(/data-message-id="(\d+)"/).flatten.map(&:to_i)
+-          raise "#{name}: differs from seed SQL" unless ids == expected_db_ids.fetch(name)
++          if name == "search" && unordered_search
++            raise "#{name}: differs from seed SQL" unless ids.sort == expected_db_ids.fetch(name).sort
++          else
++            raise "#{name}: differs from seed SQL" unless ids == expected_db_ids.fetch(name)
++          end
+         end
+         if %w[room_show sidebar search].include?(name)
+           raise "#{name}: incomplete HTML page" unless body.match?(/<!doctype html>/i) && body.include?("</html>")
+@@ -78,7 +82,7 @@ module BenchmarkContracts
+         elsif %w[avatar static_css].include?(name)
+           contract[:exact_body] = body.bytes
+         elsif name == "up"
+-          contract[:required] = ["background-color: green"]
++          contract[:required] = [up_marker]
+         end
+         contracts[name] = File.join(contract_dir, "#{name}.json")
+         write_json(contracts[name], contract)
+diff --git a/loadgen/src/main.rs b/loadgen/src/main.rs
+index e82a5fb..2e31e05 100644
+--- a/loadgen/src/main.rs
++++ b/loadgen/src/main.rs
+@@ -201,7 +201,8 @@ async fn login(a: &Args) -> Res<Value> {
+     )
+     .await?;
+     merge_cookies(&mut jar, &r.headers);
+-    if r.status != 302 || !jar.iter().any(|(k, _)| k == "session_token") {
++    let cookie_name = a.opt("auth-cookie-name").unwrap_or_else(|| "session_token".into());
++    if r.status != 302 || !jar.iter().any(|(k, _)| *k == cookie_name) {
+         return Err(format!("login failed: {}", r.status).into());
+     }
+     Ok(json!({ "cookie": cookie_header(&jar) }))

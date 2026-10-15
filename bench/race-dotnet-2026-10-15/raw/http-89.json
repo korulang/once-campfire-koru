@@ -1,0 +1,26 @@
+{
+  "avg_bytes": 3364,
+  "conc": 4,
+  "errors": 0,
+  "gzip": true,
+  "invalid_reasons": {
+  },
+  "invalid_responses": 0,
+  "latency": {
+    "max_ms": 23.439,
+    "mean_ms": 0.63,
+    "n": 12554,
+    "p50_ms": 0.447,
+    "p90_ms": 1.086,
+    "p99_ms": 3.723
+  },
+  "ok": 12554,
+  "path": "/users/CfDJ8LToBhGVzAJDqLt8CcriMN-pZzONw8riLTAokUP4OeYuAyKZ6Ls9WLJDXaEXpoIsWTBMbevOEZm7irfmJznLjuwUb9VjemWXyMjTdxVQreefdaaBqw5C_d-MYdt7WveSXfo2Q3256MO8L8VhJX_axYK82045AXAlH-fB2UzoW6TZ/avatar",
+  "rps": 6271.7,
+  "secs": 2.0,
+  "statuses": {
+    "200": 12554
+  },
+  "validation": "route-contract-v1",
+  "generator_cpu_percent": 67.56888188058062
+}

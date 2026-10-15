@@ -1,0 +1,153 @@
+{
+  "metadata": {
+    "verification_revision": "ec02debb3e44f40b8778a6a42db3c4515b2f9eaf",
+    "response_validation": "route-contract-v1",
+    "started_at": "2026-10-15T23:08:00Z",
+    "seed_sha256": "56d3d3f29572c34db06624b8b7e90077b1f99f7a14eec1482c4940cf31f18b8e",
+    "server_cpus": "0-1",
+    "client_cpus": "2-3",
+    "network": "host",
+    "gzip": true,
+    "duration": 8,
+    "concurrencies": "16",
+    "rounds": 3,
+    "loadgen_sha256": "57689346fede1856f6ecc273c11ef386efd2f08a00f085e287d32343d4b75e45",
+    "routes": "room_show,messages_page,sidebar,search,avatar,static_css,up,post_message",
+    "profile": "read-and-post-v1",
+    "mixed_writer": null,
+    "images": {
+      "koru": "sha256:83d5826b462d035e63557da1e7d1cc36c8eae0ebea61552d478c276954a79836",
+      "dotnet": "sha256:27865424a8277efdd32bd5747cd459a2978e38ae75136f368eb3cb8db8e94d2e"
+    },
+    "image_labels": {
+      "koru": {
+        "org.opencontainers.image.description": "",
+        "org.opencontainers.image.licenses": "MIT",
+        "org.opencontainers.image.source": ""
+      },
+      "dotnet": {
+        "org.opencontainers.image.description": "",
+        "org.opencontainers.image.licenses": "MIT",
+        "org.opencontainers.image.source": ""
+      }
+    },
+    "source_revisions": {
+      "koru": {
+        "head": "63d0fe38f9b274abe73f606a457d35c21b936c2d",
+        "dirty": false
+      },
+      "dotnet": {
+        "head": "b756808073c37a1cc537ce3f6ef5580f2eb4d399",
+        "dirty": false
+      }
+    },
+    "preflight_only": false,
+    "topology": {
+      "koru": {
+        "processes": 1,
+        "runtime": "Koru/Orisha epoll pump",
+        "cable": "native websocket (wsq)",
+        "jobs": "in-process",
+        "page_cache": "generation-keyed whole-response"
+      },
+      "dotnet": {
+        "processes": 1,
+        "runtime": "ASP.NET Core/Kestrel (JIT)",
+        "cable": "native",
+        "jobs": "in-process",
+        "response_cache_mb": "64"
+      }
+    },
+    "runtimes": {
+      "koru": "koru",
+      "dotnet": "dotnet"
+    },
+    "complete": true
+  },
+  "results": {
+    "koru": {
+      "room_show": {
+        "median_rps": 44084.2,
+        "runs": [
+          44084.2,
+          44494.3,
+          37205.2
+        ]
+      },
+      "messages_page": {
+        "median_rps": 47145.7,
+        "runs": [
+          47191.5,
+          47145.7,
+          34500.4
+        ]
+      },
+      "sidebar": {
+        "median_rps": 56522.0,
+        "runs": [
+          57146.7,
+          56522.0,
+          48458.7
+        ]
+      },
+      "search": {
+        "median_rps": 52862.0,
+        "runs": [
+          52862.0,
+          41662.9,
+          55632.5
+        ]
+      },
+      "post_message": {
+        "median_rps": 1807.9,
+        "runs": [
+          1807.9,
+          1895.7,
+          1497.4
+        ]
+      }
+    },
+    "dotnet": {
+      "room_show": {
+        "median_rps": 2716.9,
+        "runs": [
+          3714.9,
+          2716.9,
+          2692.6
+        ]
+      },
+      "messages_page": {
+        "median_rps": 12104.7,
+        "runs": [
+          13607.8,
+          12104.7,
+          10684.6
+        ]
+      },
+      "sidebar": {
+        "median_rps": 11553.9,
+        "runs": [
+          11498.3,
+          15885.4,
+          11553.9
+        ]
+      },
+      "search": {
+        "median_rps": 13065.1,
+        "runs": [
+          10116.4,
+          14986.1,
+          13065.1
+        ]
+      },
+      "post_message": {
+        "median_rps": 330.2,
+        "runs": [
+          348.0,
+          322.4,
+          330.2
+        ]
+      }
+    }
+  }
+}
