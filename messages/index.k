@@ -94,7 +94,7 @@ create =
         | then -> { status: 400, body: "param is missing or the value is empty: message", content_type: "text/plain" }
         | else |> msg-int(s: rid): ridn
                |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-               | db d |> koru/sqlite3:default(conn: d) {
+               | db d |> koru/sqlite3(conn: d) {
                        SELECT u.id, u.name, u.bio, u.updated_at FROM sessions s
                        JOIN users u ON u.id = s.user_id
                        WHERE s.token = {{token}} LIMIT 1
@@ -107,7 +107,7 @@ create =
                    | done d2 |> cr-authed(): authed
                              |> cr-uid(): uidn
                              |> if(authed)
-                             | then |> koru/sqlite3:default(conn: d2) {
+                             | then |> koru/sqlite3(conn: d2) {
                                      SELECT r.name, r.type FROM rooms r
                                      JOIN memberships m ON m.room_id = r.id
                                      WHERE m.user_id = {{uidn}} AND r.id = {{ridn}} LIMIT 1
@@ -122,7 +122,7 @@ create =
                                                   |> cmid-or(supplied: cmid): cmidx
                                                   |> msg-cutoff(): cut
                                                   |> plain-text(html: mbody): ptxt
-                                                  |> koru/sqlite3:default(conn: d3) {
+                                                  |> koru/sqlite3(conn: d3) {
                                                           SELECT m.user_id FROM memberships m WHERE m.room_id = {{ridn}}
                                                       }
                                                       ! row mr |> koru/sqlite3:col.int(stmt: mr, index: 0): muid
@@ -206,7 +206,7 @@ edit =
            |> msg-int(s: mid): midn
            |> pages:page-begin()
            |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-           | db d |> koru/sqlite3:default(conn: d) {
+           | db d |> koru/sqlite3(conn: d) {
                    SELECT m.client_message_id, rt.body
                    FROM messages m
                    JOIN action_text_rich_texts rt
@@ -240,7 +240,7 @@ show =
            |> msg-int(s: mid): midn
            |> pages:page-begin()
            |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-           | db d |> koru/sqlite3:default(conn: d) {
+           | db d |> koru/sqlite3(conn: d) {
                    SELECT m.id, m.client_message_id, m.created_at, m.updated_at,
                           u.name, u.id, u.updated_at, rt.body, u.bio, r.name
                    FROM messages m
@@ -300,7 +300,7 @@ update =
                |> str-or(s: body): nbody
                |> msg-now(): nts
                |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-               | db d |> koru/sqlite3:default(conn: d) {
+               | db d |> koru/sqlite3(conn: d) {
                        SELECT m.client_message_id, r.type, r.name
                        FROM sessions s
                        JOIN users u ON u.id = s.user_id
@@ -317,16 +317,16 @@ update =
                             |> views:stash-room(name: rnm, rtype: rtp)
                    | done d2 |> msg-cmid(): mcmid2
                              |> if(mcmid2 != "")
-                             | then |> koru/sqlite3:default(conn: d2) {
+                             | then |> koru/sqlite3(conn: d2) {
                                          UPDATE action_text_rich_texts
                                          SET body = {{nbody}}, updated_at = {{nts}}
                                          WHERE record_type = 'Message' AND record_id = {{midn}}
                                      }
-                                     | done d3 |> koru/sqlite3:default(conn: d3) {
+                                     | done d3 |> koru/sqlite3(conn: d3) {
                                                      INSERT OR REPLACE INTO message_search_index (rowid, body)
                                                      VALUES ({{midn}}, {{nbody}})
                                                  }
-                                                 | done d3f |> koru/sqlite3:default(conn: d3f) {
+                                                 | done d3f |> koru/sqlite3(conn: d3f) {
                                                                  UPDATE messages SET updated_at = {{nts}}
                                                                  WHERE id = {{midn}}
                                                              }
@@ -360,7 +360,7 @@ bot-create =
     | then -> { status: 400, body: "param is missing or the value is empty: message", content_type: "text/plain" }
     | else |> msg-int(s: rid): ridn
            |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-           | db d |> koru/sqlite3:default(conn: d) {
+           | db d |> koru/sqlite3(conn: d) {
                    SELECT u.id, u.name, u.bio, u.updated_at FROM users u
                    WHERE u.role = 2 AND u.status = 0
                      AND (u.id || '-' || u.bot_token) = {{key}} LIMIT 1
@@ -373,7 +373,7 @@ bot-create =
                | done d2 |> cr-authed(): authed
                          |> cr-uid(): uidn
                          |> if(authed)
-                         | then |> koru/sqlite3:default(conn: d2) {
+                         | then |> koru/sqlite3(conn: d2) {
                                  SELECT r.name, r.type FROM rooms r
                                  JOIN memberships m ON m.room_id = r.id
                                  WHERE m.user_id = {{uidn}} AND r.id = {{ridn}} LIMIT 1
@@ -387,7 +387,7 @@ bot-create =
                                               |> cmid-or(supplied: null): cmidx
                                               |> msg-cutoff(): cut
                                               |> plain-text(html: body): ptxt
-                                              |> koru/sqlite3:default(conn: d3) {
+                                              |> koru/sqlite3(conn: d3) {
                                                       SELECT m.user_id FROM memberships m WHERE m.room_id = {{ridn}}
                                                   }
                                                   ! row mr |> koru/sqlite3:col.int(stmt: mr, index: 0): muid

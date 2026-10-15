@@ -6,7 +6,7 @@ import koru/sqlite3
 import std/io
 
 koru/sqlite3:open(path: "seed/dev.db")
-| db d |> koru/sqlite3:default(conn: d) {
+| db d |> koru/sqlite3(conn: d) {
         SELECT u.name AS who, r.name AS room, COUNT(m.id) AS n
         FROM users u, rooms r, messages m
         WHERE m.room_id = r.id AND m.creator_id = u.id

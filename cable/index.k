@@ -58,7 +58,7 @@ cable-auth =
     if(token == null)
     | then -> 0
     | else |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-           | db d |> koru/sqlite3:default(conn: d) {
+           | db d |> koru/sqlite3(conn: d) {
                    SELECT u.id, u.name FROM sessions s
                    JOIN users u ON u.id = s.user_id
                    WHERE s.token = {{token}} LIMIT 1
@@ -195,7 +195,7 @@ pub tor present { uid: i64, rid: i64 }
 
 present =
     config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             UPDATE memberships SET
               connections = CASE WHEN connected_at IS NOT NULL
                                   AND connected_at >= datetime('now','-60 seconds')
@@ -223,7 +223,7 @@ pub tor membership-disconnect { uid: i64, rid: i64 }
 
 membership-disconnect =
     config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             UPDATE memberships SET
               connections = CASE WHEN connected_at IS NOT NULL
                                   AND connected_at >= datetime('now','-60 seconds')
@@ -231,7 +231,7 @@ membership-disconnect =
               updated_at = datetime('now')
             WHERE user_id = {{uid}} AND room_id = {{rid}}
         }
-        | done d2 |> koru/sqlite3:default(conn: d2) {
+        | done d2 |> koru/sqlite3(conn: d2) {
                     UPDATE memberships SET connected_at = NULL, updated_at = datetime('now')
                     WHERE user_id = {{uid}} AND room_id = {{rid}}
                       AND connections < 1 AND connected_at IS NOT NULL
@@ -247,7 +247,7 @@ pub tor membership-refresh { uid: i64, rid: i64 }
 
 membership-refresh =
     config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             UPDATE memberships SET
               connections = CASE WHEN NOT (connected_at IS NOT NULL
                                   AND connected_at >= datetime('now','-60 seconds'))
@@ -267,7 +267,7 @@ pub tor member-check { uid: i64, rid: i64 } -> i64
 
 member-check =
     config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT r.type FROM rooms r
             JOIN memberships m ON m.room_id = r.id
             WHERE m.user_id = {{uid}} AND r.id = {{rid}} LIMIT 1
@@ -329,7 +329,7 @@ pub tor member-gid-check { uid: i64, rid: i64, gtype: string } -> i64
 
 member-gid-check =
     config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT 1 FROM rooms r
             JOIN memberships m ON m.room_id = r.id
             WHERE m.user_id = {{uid}} AND r.id = {{rid}}

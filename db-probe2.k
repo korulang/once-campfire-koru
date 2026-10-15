@@ -6,7 +6,7 @@ import std/io
 tor probe { id: string }
 
 probe = koru/sqlite3:open(path: "seed/dev.db")
-| db d |> koru/sqlite3:default(conn: d) {
+| db d |> koru/sqlite3(conn: d) {
         SELECT m.id, rt.body FROM messages m
         JOIN action_text_rich_texts rt ON rt.record_type = 'Message' AND rt.record_id = m.id
         WHERE m.room_id = {{id}}

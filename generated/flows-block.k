@@ -8,7 +8,7 @@
 pub tor page-prelude { email: ?string } -> i64
 page-prelude =
     config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT u.id, u.name, u.email_address, COALESCE(u.bio,''), u.role, u.updated_at
             FROM users u WHERE u.email_address = {{email}} AND u.status = 0
         }
@@ -20,7 +20,7 @@ page-prelude =
                  |> koru/sqlite3:col.text(stmt: ur, index: 5): puat
                  |> views:ts-ver(ts: puat): pver
                  |> views:auth-stash(uid: puid, name: pun, email: pem, bio: pbo, role: pro, ver: pver)
-        | done d2 |> koru/sqlite3:default(conn: d2) {
+        | done d2 |> koru/sqlite3(conn: d2) {
                 SELECT name, join_code, COALESCE(custom_styles,''), updated_at,
                        COALESCE(json_extract(settings,'$.restrict_room_creation_to_administrators'),0)
                 FROM accounts LIMIT 1
@@ -63,7 +63,7 @@ profile-page = pages:page-begin()
            |> views:transfer-path(host: hst, sid): turl
            |> qr:path(url: turl): qrp
            |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-           | db m |> koru/sqlite3:default(conn: m) {
+           | db m |> koru/sqlite3(conn: m) {
                    SELECT r.id, COALESCE(r.name,'') FROM memberships ms
                    JOIN rooms r ON r.id = ms.room_id WHERE ms.user_id = {{uid}}
                    ORDER BY LOWER(r.name)
@@ -102,7 +102,7 @@ account-page = pages:page-begin()
            |> qr:path(url: ivu): qrp
            |> views:acct-regen(role: ur): rgn
            |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-           | db m |> koru/sqlite3:default(conn: m) {
+           | db m |> koru/sqlite3(conn: m) {
                    SELECT id, name, role, updated_at FROM users WHERE status = 0
                    ORDER BY role, LOWER(name)
                }
@@ -132,12 +132,12 @@ room-form = pages:page-begin()
     |> page-prelude(email): uid
     |> if(uid > 0)
     | then |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-           | db d |> koru/sqlite3:default(conn: d) {
+           | db d |> koru/sqlite3(conn: d) {
                    SELECT COALESCE(name,'') FROM rooms WHERE id = {{edit_rid}}
                }
                ! row r |> koru/sqlite3:col.text(stmt: r, index: 0): rn
                         |> views:edit-stash(name: rn, wh: "")
-               | done d2 |> koru/sqlite3:default(conn: d2) {
+               | done d2 |> koru/sqlite3(conn: d2) {
                        SELECT id, name, updated_at FROM users WHERE status = 0 AND role != 2 ORDER BY LOWER(name)
                    }
                    ! row u2 |> koru/sqlite3:col.int(stmt: u2, index: 0): uuid
@@ -169,7 +169,7 @@ bots-page = pages:page-begin()
            | then |> views:host-or(h: host): hst
                   |> views:bots-begin()
                   |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-                  | db m |> koru/sqlite3:default(conn: m) {
+                  | db m |> koru/sqlite3(conn: m) {
                           SELECT u.id, u.name, u.bot_token, r.id, COALESCE(r.name,'')
                           FROM users u
                           LEFT JOIN memberships ms ON ms.user_id = u.id
@@ -202,7 +202,7 @@ bot-form = pages:page-begin()
     | then |> views:user-role(): ur
            |> if(ur == 1)
            | then |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-                  | db d |> koru/sqlite3:default(conn: d) {
+                  | db d |> koru/sqlite3(conn: d) {
                           SELECT u.name, COALESCE(w.url,'') FROM users u
                           LEFT JOIN webhooks w ON w.user_id = u.id
                           WHERE u.id = {{edit_bid}} AND u.role = 2
@@ -248,7 +248,7 @@ transfer-page =
 pub tor join-page { code: string } -> string
 join-page =
     config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT name, updated_at, join_code FROM accounts LIMIT 1
         }
         ! row r |> koru/sqlite3:col.text(stmt: r, index: 0): an
@@ -292,7 +292,7 @@ autocomplete-json =
     | then |> views:ac-begin()
            |> session:str-or(s: q): qq
            |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-           | db m |> koru/sqlite3:default(conn: m) {
+           | db m |> koru/sqlite3(conn: m) {
                    SELECT id, name, updated_at FROM users WHERE status = 0 AND role != 2
                      AND name LIKE '%' || {{qq}} || '%' ESCAPE '\'
                    ORDER BY LOWER(name) LIMIT 20
@@ -325,7 +325,7 @@ pub tor session-destroy { token: ?string } -> orisha:Response
 session-destroy =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             DELETE FROM sessions WHERE token = {{vtok}}
         }
         | done d2 |> koru/sqlite3:close.pooled(conn: d2)
@@ -341,7 +341,7 @@ pub tor profile-update { token: ?string, name: ?string, email: ?string,
 profile-update =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT u.id FROM users u JOIN sessions s ON s.user_id = u.id
             WHERE s.token = {{vtok}} LIMIT 1
         }
@@ -355,7 +355,7 @@ profile-update =
                                       |> session:stash-text(text: dg)
                                | else |> session:stash-text(text: "")
                             |> session:take-text(): dg2
-                            |> koru/sqlite3:default(conn: d2) {
+                            |> koru/sqlite3(conn: d2) {
                                 UPDATE users SET name = COALESCE({{name}}, name),
                                     email_address = COALESCE({{email}}, email_address),
                                     bio = {{bio}},
@@ -378,7 +378,7 @@ pub tor account-update { token: ?string, name: ?string, restrict: ?string } -> o
 account-update =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT u.id, u.role FROM users u JOIN sessions s ON s.user_id = u.id
             WHERE s.token = {{vtok}} LIMIT 1
         }
@@ -387,7 +387,7 @@ account-update =
                  |> session:stash-if(ok: urole == 1, uid)
         | done d2 |> session:take-uid(): uid2
                   |> if(uid2 > 0)
-                     | then |> koru/sqlite3:default(conn: d2) {
+                     | then |> koru/sqlite3(conn: d2) {
                              UPDATE accounts SET
                                  name = COALESCE({{name}}, name),
                                  settings = CASE WHEN {{restrict}} IS NOT NULL
@@ -409,7 +409,7 @@ join-reset =
     signing:cookie-verify(raw: token): vtok
     |> views:join-code(): jc
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT u.role FROM users u JOIN sessions s ON s.user_id = u.id
             WHERE s.token = {{vtok}} LIMIT 1
         }
@@ -417,7 +417,7 @@ join-reset =
                  |> session:stash-if(ok: urole == 1, uid: 1)
         | done d2 |> session:take-uid(): ok2
                   |> if(ok2 > 0)
-                     | then |> koru/sqlite3:default(conn: d2) {
+                     | then |> koru/sqlite3(conn: d2) {
                              UPDATE accounts SET join_code = {{jc}}, updated_at = CURRENT_TIMESTAMP
                          }
                          | done d3 |> koru/sqlite3:close.pooled(conn: d3)
@@ -433,7 +433,7 @@ pub tor styles-update { token: ?string, css: ?string } -> orisha:Response
 styles-update =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT u.role FROM users u JOIN sessions s ON s.user_id = u.id
             WHERE s.token = {{vtok}} LIMIT 1
         }
@@ -441,7 +441,7 @@ styles-update =
                  |> session:stash-if(ok: urole == 1, uid: 1)
         | done d2 |> session:take-uid(): ok2
                   |> if(ok2 > 0)
-                     | then |> koru/sqlite3:default(conn: d2) {
+                     | then |> koru/sqlite3(conn: d2) {
                              UPDATE accounts SET custom_styles = {{css}}, updated_at = CURRENT_TIMESTAMP
                          }
                          | done d3 |> koru/sqlite3:close.pooled(conn: d3)
@@ -461,7 +461,7 @@ bot-create =
     |> views:bot-token(): btok
     |> session:str-or(s: webhook): whurl
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT u.role FROM users u JOIN sessions s ON s.user_id = u.id
             WHERE s.token = {{vtok}} LIMIT 1
         }
@@ -469,16 +469,16 @@ bot-create =
                  |> session:stash-if(ok: urole == 1, uid: 1)
         | done d2 |> session:take-uid(): ok2
                   |> if(ok2 > 0)
-                     | then |> koru/sqlite3:default(conn: d2) {
+                     | then |> koru/sqlite3(conn: d2) {
                              INSERT INTO users (name, role, status, bot_token, created_at, updated_at)
                              VALUES ({{name}}, 2, 0, {{btok}}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                          }
-                         | done d3 |> koru/sqlite3:default(conn: d3) {
+                         | done d3 |> koru/sqlite3(conn: d3) {
                                  INSERT INTO memberships (room_id, user_id, involvement, created_at, updated_at)
                                  SELECT r.id, (SELECT MAX(id) FROM users WHERE role = 2), 'mentions', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                                  FROM rooms r WHERE r.type = 'Rooms::Open'
                              }
-                             | done d4 |> koru/sqlite3:default(conn: d4) {
+                             | done d4 |> koru/sqlite3(conn: d4) {
                                      INSERT INTO webhooks (user_id, url, created_at, updated_at)
                                      SELECT (SELECT MAX(id) FROM users WHERE role = 2), {{whurl}}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                                      WHERE {{whurl}} != ''
@@ -500,7 +500,7 @@ bot-update =
     signing:cookie-verify(raw: token): vtok
     |> session:str-or(s: webhook): whurl
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT u.role FROM users u JOIN sessions s ON s.user_id = u.id
             WHERE s.token = {{vtok}} LIMIT 1
         }
@@ -508,14 +508,14 @@ bot-update =
                  |> session:stash-if(ok: urole == 1, uid: 1)
         | done d2 |> session:take-uid(): ok2
                   |> if(ok2 > 0)
-                     | then |> koru/sqlite3:default(conn: d2) {
+                     | then |> koru/sqlite3(conn: d2) {
                              UPDATE users SET name = COALESCE({{name}}, name), updated_at = CURRENT_TIMESTAMP
                              WHERE id = {{bid}} AND role = 2
                          }
-                         | done d3 |> koru/sqlite3:default(conn: d3) {
+                         | done d3 |> koru/sqlite3(conn: d3) {
                                  DELETE FROM webhooks WHERE user_id = {{bid}}
                              }
-                             | done d4 |> koru/sqlite3:default(conn: d4) {
+                             | done d4 |> koru/sqlite3(conn: d4) {
                                      INSERT INTO webhooks (user_id, url, created_at, updated_at)
                                      SELECT {{bid}}, {{whurl}}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                                      WHERE {{whurl}} != ''
@@ -536,7 +536,7 @@ bot-key-reset =
     signing:cookie-verify(raw: token): vtok
     |> views:bot-token(): btok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT u.role FROM users u JOIN sessions s ON s.user_id = u.id
             WHERE s.token = {{vtok}} LIMIT 1
         }
@@ -544,7 +544,7 @@ bot-key-reset =
                  |> session:stash-if(ok: urole == 1, uid: 1)
         | done d2 |> session:take-uid(): ok2
                   |> if(ok2 > 0)
-                     | then |> koru/sqlite3:default(conn: d2) {
+                     | then |> koru/sqlite3(conn: d2) {
                              UPDATE users SET bot_token = {{btok}}, updated_at = CURRENT_TIMESTAMP
                              WHERE id = {{bid}} AND role = 2
                          }
@@ -562,7 +562,7 @@ pub tor room-create { token: ?string, name: ?string, rtype: string } -> orisha:R
 room-create =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT u.id, u.role, (SELECT COALESCE(json_extract(a.settings,'$.restrict_room_creation_to_administrators'),0) FROM accounts a)
             FROM users u JOIN sessions s ON s.user_id = u.id
             WHERE s.token = {{vtok}} LIMIT 1
@@ -573,18 +573,18 @@ room-create =
                  |> session:stash-if(ok: urole == 1 or urst == 0, uid)
         | done d2 |> session:take-uid(): uid2
                   |> if(uid2 > 0)
-                     | then |> koru/sqlite3:default(conn: d2) {
+                     | then |> koru/sqlite3(conn: d2) {
                              INSERT INTO rooms (name, type, creator_id, created_at, updated_at)
                              VALUES ({{name}}, {{rtype}}, {{uid2}}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                          }
-                         | done d3 |> koru/sqlite3:default(conn: d3) {
+                         | done d3 |> koru/sqlite3(conn: d3) {
                                  SELECT MAX(id) FROM rooms
                              }
                              ! row r2 |> koru/sqlite3:col.int(stmt: r2, index: 0): nid
                                        |> session:stash-if(ok: true, uid: nid)
                              | done d4 |> session:take-uid(): rid2
                                        |> if(rtype == "Rooms::Open")
-                                          | then |> koru/sqlite3:default(conn: d4) {
+                                          | then |> koru/sqlite3(conn: d4) {
                                                   INSERT INTO memberships (room_id, user_id, involvement, created_at, updated_at)
                                                   SELECT {{rid2}}, id, 'mentions', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                                                   FROM users WHERE status = 0
@@ -596,7 +596,7 @@ room-create =
                                                         |> session:redirect-to(path: rp): rhdr
                                                         -> { status: 302, body: "", content_type: "text/plain", extra_headers: rhdr }
                                               | err e5 |> koru/sqlite3:close.pooled(e5.conn) -> { status: 500, body: "grant failed", content_type: "text/plain" }
-                                          | else |> koru/sqlite3:default(conn: d4) {
+                                          | else |> koru/sqlite3(conn: d4) {
                                                   INSERT INTO memberships (room_id, user_id, involvement, created_at, updated_at)
                                                   VALUES ({{rid2}}, {{uid2}}, 'mentions', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                                               }
@@ -619,7 +619,7 @@ pub tor room-update { token: ?string, rid: string, name: ?string, rk: string } -
 room-update =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT u.id, u.role FROM users u JOIN sessions s ON s.user_id = u.id
             WHERE s.token = {{vtok}} LIMIT 1
         }
@@ -628,7 +628,7 @@ room-update =
                  |> session:stash-if(ok: urole == 1, uid)
         | done d2 |> session:take-uid(): uid2
                   |> if(uid2 > 0)
-                     | then |> koru/sqlite3:default(conn: d2) {
+                     | then |> koru/sqlite3(conn: d2) {
                              UPDATE rooms SET name = {{name}}, updated_at = CURRENT_TIMESTAMP
                              WHERE id = {{rid}} AND type != 'Rooms::Direct'
                          }
@@ -651,7 +651,7 @@ pub tor direct-create { token: ?string, ids: string } -> orisha:Response
 direct-create =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT u.id FROM users u JOIN sessions s ON s.user_id = u.id
             WHERE s.token = {{vtok}} LIMIT 1
         }
@@ -661,7 +661,7 @@ direct-create =
                   |> if(uid2 > 0)
                      | then |> views:uids-join(ids, uid: uid2): allids
                             |> views:uids-count(ids: allids): nmem
-                            |> koru/sqlite3:default(conn: d2) {
+                            |> koru/sqlite3(conn: d2) {
                                 SELECT r.id FROM rooms r
                                 WHERE r.type = 'Rooms::Direct'
                                   AND (SELECT COUNT(*) FROM memberships m0 WHERE m0.room_id = r.id) = {{nmem}}
@@ -676,15 +676,15 @@ direct-create =
                                                 |> session:room-path(rid: found): rp
                                                 |> session:redirect-to(path: rp): rhdr
                                                 -> { status: 302, body: "", content_type: "text/plain", extra_headers: rhdr }
-                                         | else |> koru/sqlite3:default(conn: d3) {
+                                         | else |> koru/sqlite3(conn: d3) {
                                                  INSERT INTO rooms (name, type, creator_id, created_at, updated_at)
                                                  VALUES (NULL, 'Rooms::Direct', {{uid2}}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                                              }
-                                             | done d4 |> koru/sqlite3:default(conn: d4) { SELECT MAX(id) FROM rooms }
+                                             | done d4 |> koru/sqlite3(conn: d4) { SELECT MAX(id) FROM rooms }
                                                        ! row r2 |> koru/sqlite3:col.int(stmt: r2, index: 0): nid
                                                                 |> session:stash-if(ok: true, uid: nid)
                                                        | done d5 |> session:take-uid(): rid2
-                                                                 |> koru/sqlite3:default(conn: d5) {
+                                                                 |> koru/sqlite3(conn: d5) {
                                                                      INSERT INTO memberships (room_id, user_id, involvement, created_at, updated_at)
                                                                      SELECT {{rid2}}, u.id, 'everything', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                                                                      FROM users u WHERE u.id IN ({{allids}})
@@ -711,7 +711,7 @@ transfer-consume =
     | then |> session:new-token(): tok
            |> signing:cookie-header(token: tok): cv
            |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-           | db d |> koru/sqlite3:default(conn: d) {
+           | db d |> koru/sqlite3(conn: d) {
                    INSERT INTO sessions (user_id, token, user_agent, ip_address, created_at, updated_at)
                    VALUES ({{uid}}, {{tok}}, {{ua}}, '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                }
@@ -733,27 +733,27 @@ join-create =
            |> session:new-token(): tok
            |> signing:cookie-header(token: tok): cv
            |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-           | db d |> koru/sqlite3:default(conn: d) {
+           | db d |> koru/sqlite3(conn: d) {
                    SELECT join_code FROM accounts LIMIT 1
                }
                ! row r |> koru/sqlite3:col.text(stmt: r, index: 0): jc
                         |> session:stash-if(ok: jc == code, uid: 1)
                | done d2 |> session:take-uid(): ok2
                          |> if(ok2 > 0)
-                            | then |> koru/sqlite3:default(conn: d2) {
+                            | then |> koru/sqlite3(conn: d2) {
                                     INSERT INTO users (name, email_address, password_digest, role, status, created_at, updated_at)
                                     VALUES ({{name}}, {{email}}, {{dg}}, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                                 }
-                                | done d3 |> koru/sqlite3:default(conn: d3) { SELECT MAX(id) FROM users }
+                                | done d3 |> koru/sqlite3(conn: d3) { SELECT MAX(id) FROM users }
                                           ! row r2 |> koru/sqlite3:col.int(stmt: r2, index: 0): nid
                                                    |> session:stash-if(ok: true, uid: nid)
                                           | done d4 |> session:take-uid(): uid2
-                                                    |> koru/sqlite3:default(conn: d4) {
+                                                    |> koru/sqlite3(conn: d4) {
                                                         INSERT INTO memberships (room_id, user_id, involvement, created_at, updated_at)
                                                         SELECT r.id, {{uid2}}, 'mentions', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                                                         FROM rooms r WHERE r.type = 'Rooms::Open'
                                                     }
-                                                    | done d5 |> koru/sqlite3:default(conn: d5) {
+                                                    | done d5 |> koru/sqlite3(conn: d5) {
                                                             INSERT INTO sessions (user_id, token, user_agent, ip_address, created_at, updated_at)
                                                             VALUES ({{uid2}}, {{tok}}, {{ua}}, '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                                                         }
@@ -804,7 +804,7 @@ pub tor direct-broadcast { rid: i64 }
 direct-broadcast =
     views:itoa(n: rid): rids
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT m.user_id, ou.id, ou.name, ou.updated_at
             FROM memberships m
             JOIN users ou ON ou.id = (

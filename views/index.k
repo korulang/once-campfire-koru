@@ -896,7 +896,7 @@ pub tor room-page { rid: string, email: ?string, host: ?string } -> string
 room-page = pages:page-begin()
     |> page-reset()
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-    | db d |> koru/sqlite3:default(conn: d) {
+    | db d |> koru/sqlite3(conn: d) {
             SELECT COALESCE(r.name,
                        (SELECT GROUP_CONCAT(u2.name, ', ')
                         FROM memberships m2 JOIN users u2 ON u2.id = m2.user_id
@@ -918,7 +918,7 @@ room-page = pages:page-begin()
                  |> ts-ver(ts: uver0): uver1
                  |> stash-room(name: rn, rtype: rt)
                  |> stash-user(uid: uuid, name: unm, role: urole, ver: uver1)
-        | done d2 |> koru/sqlite3:default(conn: d2) {
+        | done d2 |> koru/sqlite3(conn: d2) {
                 SELECT b.id, b.message_id, b.content, u.id, u.name, u.updated_at
                 FROM boosts b
                 JOIN users u ON u.id = b.booster_id
@@ -942,7 +942,7 @@ room-page = pages:page-begin()
                      |> Boost-render(bid, mid: bmid, buid, bsgid: bsg, bname: bnm, bcontent: bct, bver): bf
                      |> boost-stash(mid: bmid, html: bf)
                      |> std/io:free(content: bf)
-            | done d3 |> koru/sqlite3:default(conn: d3) {
+            | done d3 |> koru/sqlite3(conn: d3) {
                     SELECT m.id, m.client_message_id, m.created_at, m.updated_at,
                            u.name, u.id, u.updated_at, rt.body, u.bio
                     FROM (
