@@ -117,6 +117,47 @@ csrf-strict = signing:cookie-verify(raw: tok): vtok
     |> views:csrf-stash(masked: cmask)
     |> signing:csrf-verify(token: vtok, form, header: hdr): cok -> cok
 
+// REQUEST PRELUDES — the extraction pattern every route arm used to spell
+// by hand. `*orisha:Request` crosses the module boundary (cable:route takes
+// it), so the whole prelude collapses into one call per arm. What lives
+// here is app policy — the cookie name, which session a CSRF mask binds to,
+// gate vs strict. The mechanism (verify, mask, Set-Cookie) is in
+// signing/session/views.
+
+// Authed page prelude: cookie -> CSRF prime (mints + stashes the mask the
+// page's metas/forms read) -> session email.
+pub tor page-ctx { req: *orisha:Request } -> { tok: ?string, cookie_hdr: ?string, email: ?string }
+page-ctx =
+    orisha:cookie(req, name: "session_token"): tok
+    |> csrf-prime(tok): sc
+    |> current-email(token: tok): ue -> { tok, cookie_hdr: sc, email: ue }
+
+// Unauth form-page prelude (sign-in, transfer, join): cookie -> prime, no
+// session lookup — these controllers are allow_unauthenticated.
+pub tor csrf-ctx { req: *orisha:Request } -> { tok: ?string, cookie_hdr: ?string }
+csrf-ctx =
+    orisha:cookie(req, name: "session_token"): tok
+    |> csrf-prime(tok): sc -> { tok, cookie_hdr: sc }
+
+// Authed write prelude: cookie -> both token carriers -> gate verdict ->
+// verified token. Session-authed routes only.
+pub tor write-ctx { req: *orisha:Request } -> { tok: ?string, vtok: ?string, csrf_ok: bool }
+write-ctx =
+    orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): atok
+    |> orisha:header(req, name: "X-CSRF-Token"): xtok
+    |> csrf-gate(tok, form: atok, hdr: xtok): ca
+    |> signing:cookie-verify(raw: tok): vtok -> { tok, vtok, csrf_ok: ca }
+
+// Strict write prelude for unauthenticated surfaces (sign-in, join,
+// first-run, transfers): same carriers, strict verdict.
+pub tor open-write-ctx { req: *orisha:Request } -> { tok: ?string, csrf_ok: bool }
+open-write-ctx =
+    orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): atok
+    |> orisha:header(req, name: "X-CSRF-Token"): xtok
+    |> csrf-strict(tok, form: atok, hdr: xtok): ca -> { tok, csrf_ok: ca }
+
 // Messages index (Message::Pagination): last PAGE_SIZE=40 ordered by
 // created_at. `before=<id>` narrows to created_at < that message's. Same
 // visibility scope and same Msg partial as the room page — the contract
@@ -1726,241 +1767,179 @@ orisha:handler = orisha:router(req)
 ! [GET /up]          -> { status: 200, body: "<!DOCTYPE html><html><body style=\"background-color: green\"></body></html>", content_type: "text/html" }
 ! [GET /first_run]   |> orisha:cookie(req, name: "session_token"): ftok
                      |> first-run-gate(tok: ftok): res -> res
-! [POST /first_run]  |> orisha:cookie(req, name: "session_token"): fc
-                     |> orisha:form(req, name: "authenticity_token"): fat
-                     |> orisha:header(req, name: "X-CSRF-Token"): fxt
-                     |> csrf-strict(tok: fc, form: fat, hdr: fxt): fca
+! [POST /first_run]  |> open-write-ctx(req): fcx
                      |> orisha:form(req, name: "user[name]"): fname
                      |> orisha:form(req, name: "user[email_address]"): femail
                      |> orisha:form(req, name: "user[password]"): fpw
                      |> orisha:header(req, name: "User-Agent"): fua
-                     |> first-run-create(name: fname, email: femail, password: fpw, user_agent: fua, csrf_ok: fca): res -> res
-! [GET /session/new] |> orisha:cookie(req, name: "session_token"): ntok
-                     |> csrf-prime(tok: ntok): nsc
+                     |> first-run-create(name: fname, email: femail, password: fpw, user_agent: fua, fcx.csrf_ok): res -> res
+! [GET /session/new] |> csrf-ctx(req): nc
                      |> orisha:header(req, name: "Host"): nhst
-                     |> sign-in-page(host: nhst): page -> { status: 200, body: page, content_type: "text/html", extra_headers: nsc }
+                     |> sign-in-page(host: nhst): page -> { status: 200, body: page, content_type: "text/html", extra_headers: nc.cookie_hdr }
 ! [POST /session] |> orisha:form(req, name: "_method"): meth
                   |> session:str-or(s: meth): m2
-                  |> orisha:cookie(req, name: "session_token"): stok
-                  |> orisha:form(req, name: "authenticity_token"): satok
-                  |> orisha:header(req, name: "X-CSRF-Token"): sxtok
                   |> if(m2 == "delete")
-                     | then |> csrf-gate(tok: stok, form: satok, hdr: sxtok): dca
-                            |> session-destroy(token: stok, csrf_ok: dca): res -> res
-                     | else |> csrf-strict(tok: stok, form: satok, hdr: sxtok): lca
+                     | then |> write-ctx(req): dcx
+                            |> session-destroy(token: dcx.tok, dcx.csrf_ok): res -> res
+                     | else |> open-write-ctx(req): lcx
                             |> orisha:form(req, name: "email_address"): email
                             |> orisha:form(req, name: "password"): password
                             |> orisha:header(req, name: "User-Agent"): ua
-                            |> session-login(email, password, user_agent: ua, csrf_ok: lca): res -> res
-! [GET /rooms/:id] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): sc |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): hst |> views:room-page(rid: p.id, email: ue, host: hst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: sc }
+                            |> session-login(email, password, user_agent: ua, lcx.csrf_ok): res -> res
+! [GET /rooms/:id] p |> page-ctx(req): c
+    |> if(c.email != null)
+    | then |> orisha:header(req, name: "Host"): hst |> views:room-page(rid: p.id, c.email, host: hst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: c.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /rooms/:id/refresh] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): _ |> current-email(token: tok): ue
+! [GET /rooms/:id/refresh] p |> page-ctx(req): rc
     |> orisha:query-param(req, name: "since"): sn
     |> orisha:header(req, name: "Host"): rhst
-    |> room-refresh(rid: p.id, email: ue, since: sn, host: rhst): res -> res
-! [GET /rooms/:id/messages] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): msc |> current-email(token: tok): ue
+    |> room-refresh(rid: p.id, rc.email, since: sn, host: rhst): res -> res
+! [GET /rooms/:id/messages] p |> page-ctx(req): mc
     |> orisha:query-param(req, name: "before"): before
-    |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): mhst |> messages-page(p.id, before, email: ue, host: mhst): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: msc }
+    |> if(mc.email != null)
+    | then |> orisha:header(req, name: "Host"): mhst |> messages-page(p.id, before, mc.email, host: mhst): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: mc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [POST /rooms/:id/messages] p |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): matok
-    |> orisha:header(req, name: "X-CSRF-Token"): mxtok
-    |> csrf-gate(tok, form: matok, hdr: mxtok): mca
-    |> signing:cookie-verify(raw: tok): vtok
+! [POST /rooms/:id/messages] p |> write-ctx(req): wc
     |> orisha:form(req, name: "message[body]"): mbody
     |> orisha:form(req, name: "message[client_message_id]"): mcmid
     |> orisha:header(req, name: "Host"): phst
-    |> messages:create(rid: p.id, token: vtok, body: mbody, cmid: mcmid, host: phst, csrf_ok: mca): res -> res
-! [GET /rooms/:id/messages/:mid/edit] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): esc |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): ehst |> messages:edit(rid: p.id, p.mid, email: ue, host: ehst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", extra_headers: esc }
+    |> messages:create(rid: p.id, token: wc.vtok, body: mbody, cmid: mcmid, host: phst, wc.csrf_ok): res -> res
+! [GET /rooms/:id/messages/:mid/edit] p |> page-ctx(req): ec
+    |> if(ec.email != null)
+    | then |> orisha:header(req, name: "Host"): ehst |> messages:edit(rid: p.id, p.mid, ec.email, host: ehst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", extra_headers: ec.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /rooms/:id/messages/:mid] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): wsc |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): ehst |> messages:show(rid: p.id, p.mid, email: ue, host: ehst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", extra_headers: wsc }
+! [GET /rooms/:id/messages/:mid] p |> page-ctx(req): scw
+    |> if(scw.email != null)
+    | then |> orisha:header(req, name: "Host"): ehst |> messages:show(rid: p.id, p.mid, scw.email, host: ehst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", extra_headers: scw.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [POST /rooms/:id/messages/:mid] p |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): uatok
-    |> orisha:header(req, name: "X-CSRF-Token"): uxtok
-    |> csrf-gate(tok, form: uatok, hdr: uxtok): uca
-    |> signing:cookie-verify(raw: tok): vtok
+! [POST /rooms/:id/messages/:mid] p |> write-ctx(req): uc
     |> orisha:form(req, name: "message[body]"): mbody
-    |> messages:update(rid: p.id, p.mid, token: vtok, body: mbody, csrf_ok: uca): res -> res
-! [GET /users/me/sidebar] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): ssc |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> sidebar-page(user_email: ue): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: ssc }
+    |> messages:update(rid: p.id, p.mid, token: uc.vtok, body: mbody, uc.csrf_ok): res -> res
+! [GET /users/me/sidebar] |> page-ctx(req): sbc
+    |> if(sbc.email != null)
+    | then |> sidebar-page(user_email: sbc.email): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: sbc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /searches] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): qsc |> orisha:query-param(req, name: "q"): q |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): shst |> search-page(user_email: ue, q, host: shst): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: qsc }
+! [GET /searches] |> page-ctx(req): qc |> orisha:query-param(req, name: "q"): q
+    |> if(qc.email != null)
+    | then |> orisha:header(req, name: "Host"): shst |> search-page(user_email: qc.email, q, host: shst): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: qc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [GET /cable]       |> cable:route(req): res -> res
 ! [GET /users/:token/avatar] p |> signing:sgid-verify(raw: p.token): uid
     |> if(uid > 0)
     | then |> avatar-lookup(uid): res -> res
     | else -> { status: 404, body: "", content_type: "text/plain" }
-! [GET /users/me/profile] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): psc |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): hst |> profile-page(email: ue, host: hst): page -> { status: 200, body: page, content_type: "text/html", extra_headers: psc }
+! [GET /users/me/profile] |> page-ctx(req): pc
+    |> if(pc.email != null)
+    | then |> orisha:header(req, name: "Host"): hst |> profile-page(pc.email, host: hst): page -> { status: 200, body: page, content_type: "text/html", extra_headers: pc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [POST /users/me/profile] |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): patok
-    |> orisha:header(req, name: "X-CSRF-Token"): pxtok
-    |> csrf-gate(tok, form: patok, hdr: pxtok): pca
+! [POST /users/me/profile] |> write-ctx(req): pwc
     |> orisha:form(req, name: "user[name]"): un
     |> orisha:form(req, name: "user[email_address]"): uem
     |> orisha:form(req, name: "user[password]"): upw
     |> orisha:form(req, name: "user[bio]"): ubo
-    |> profile-update(token: tok, name: un, email: uem, password: upw, bio: ubo, csrf_ok: pca): res -> res
-! [GET /account/edit] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): asc |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): hst |> account-page(email: ue, host: hst): page -> { status: 200, body: page, content_type: "text/html", extra_headers: asc }
+    |> profile-update(token: pwc.tok, name: un, email: uem, password: upw, bio: ubo, pwc.csrf_ok): res -> res
+! [GET /account/edit] |> page-ctx(req): ac
+    |> if(ac.email != null)
+    | then |> orisha:header(req, name: "Host"): hst |> account-page(ac.email, host: hst): page -> { status: 200, body: page, content_type: "text/html", extra_headers: ac.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [POST /account] |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): aatok
-    |> orisha:header(req, name: "X-CSRF-Token"): axtok
-    |> csrf-gate(tok, form: aatok, hdr: axtok): aca
+! [POST /account] |> write-ctx(req): awc
     |> orisha:form(req, name: "account[name]"): an
     |> orisha:form(req, name: "account[settings_attributes][restrict_room_creation_to_administrators]"): rst
-    |> account-update(token: tok, name: an, restrict: rst, csrf_ok: aca): res -> res
-! [POST /account/join_code] |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): jatok
-    |> orisha:header(req, name: "X-CSRF-Token"): jxtok
-    |> csrf-gate(tok, form: jatok, hdr: jxtok): jca
-    |> join-reset(token: tok, csrf_ok: jca): res -> res
-! [GET /account/custom_styles/edit] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): csc |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> styles-page(email: ue): page -> { status: 200, body: page, content_type: "text/html", extra_headers: csc }
+    |> account-update(token: awc.tok, name: an, restrict: rst, awc.csrf_ok): res -> res
+! [POST /account/join_code] |> write-ctx(req): jwc
+    |> join-reset(token: jwc.tok, jwc.csrf_ok): res -> res
+! [GET /account/custom_styles/edit] |> page-ctx(req): csc2
+    |> if(csc2.email != null)
+    | then |> styles-page(csc2.email): page -> { status: 200, body: page, content_type: "text/html", extra_headers: csc2.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [POST /account/custom_styles] |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): xatok
-    |> orisha:header(req, name: "X-CSRF-Token"): xxtok
-    |> csrf-gate(tok, form: xatok, hdr: xxtok): xca
+! [POST /account/custom_styles] |> write-ctx(req): xwc
     |> orisha:form(req, name: "account[custom_styles]"): acs
-    |> styles-update(token: tok, css: acs, csrf_ok: xca): res -> res
-! [GET /account/bots] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): bsc |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): hst |> bots-page(email: ue, host: hst): page -> { status: 200, body: page, content_type: "text/html", extra_headers: bsc }
+    |> styles-update(token: xwc.tok, css: acs, xwc.csrf_ok): res -> res
+! [GET /account/bots] |> page-ctx(req): bc
+    |> if(bc.email != null)
+    | then |> orisha:header(req, name: "Host"): hst |> bots-page(bc.email, host: hst): page -> { status: 200, body: page, content_type: "text/html", extra_headers: bc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /account/bots/new] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): nsc |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> bot-form(email: ue, action: "/account/bots", method: "", edit_bid: 0): page -> { status: 200, body: page, content_type: "text/html", extra_headers: nsc }
+! [GET /account/bots/new] |> page-ctx(req): nbc
+    |> if(nbc.email != null)
+    | then |> bot-form(nbc.email, action: "/account/bots", method: "", edit_bid: 0): page -> { status: 200, body: page, content_type: "text/html", extra_headers: nbc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /account/bots/:id/edit] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): edsc |> current-email(token: tok): ue
-    |> if(ue != null)
+! [GET /account/bots/:id/edit] p |> page-ctx(req): edc
+    |> if(edc.email != null)
     | then |> messages:msg-int(s: p.id): bidn
            |> views:bot-action(bid: bidn): bact
-           |> bot-form(email: ue, action: bact, method: "patch", edit_bid: bidn): page -> { status: 200, body: page, content_type: "text/html", extra_headers: edsc }
+           |> bot-form(edc.email, action: bact, method: "patch", edit_bid: bidn): page -> { status: 200, body: page, content_type: "text/html", extra_headers: edc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [POST /account/bots] |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): batok
-    |> orisha:header(req, name: "X-CSRF-Token"): bxtok
-    |> csrf-gate(tok, form: batok, hdr: bxtok): bca
+! [POST /account/bots] |> write-ctx(req): bwc
     |> orisha:form(req, name: "user[name]"): bn
     |> orisha:form(req, name: "user[webhook_url]"): bw
-    |> bot-create(token: tok, name: bn, webhook: bw, csrf_ok: bca): res -> res
-! [POST /account/bots/:id] p |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): buatok
-    |> orisha:header(req, name: "X-CSRF-Token"): buxtok
-    |> csrf-gate(tok, form: buatok, hdr: buxtok): buca
+    |> bot-create(token: bwc.tok, name: bn, webhook: bw, bwc.csrf_ok): res -> res
+! [POST /account/bots/:id] p |> write-ctx(req): buc
     |> orisha:form(req, name: "user[name]"): bn
     |> orisha:form(req, name: "user[webhook_url]"): bw
-    |> bot-update(token: tok, bid: p.id, name: bn, webhook: bw, csrf_ok: buca): res -> res
-! [POST /account/bots/:id/key] p |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): katok
-    |> orisha:header(req, name: "X-CSRF-Token"): kxtok
-    |> csrf-gate(tok, form: katok, hdr: kxtok): kca
-    |> bot-key-reset(token: tok, bid: p.id, csrf_ok: kca): res -> res
-! [GET /rooms/opens/new] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): osc |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> room-form(email: ue, action: "/rooms/opens", method: "", edit_rid: 0): page -> { status: 200, body: page, content_type: "text/html", extra_headers: osc }
+    |> bot-update(token: buc.tok, bid: p.id, name: bn, webhook: bw, buc.csrf_ok): res -> res
+! [POST /account/bots/:id/key] p |> write-ctx(req): kwc
+    |> bot-key-reset(token: kwc.tok, bid: p.id, kwc.csrf_ok): res -> res
+! [GET /rooms/opens/new] |> page-ctx(req): oc
+    |> if(oc.email != null)
+    | then |> room-form(oc.email, action: "/rooms/opens", method: "", edit_rid: 0): page -> { status: 200, body: page, content_type: "text/html", extra_headers: oc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /rooms/opens/:id/edit] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): oesc |> current-email(token: tok): ue
-    |> if(ue != null)
+! [GET /rooms/opens/:id/edit] p |> page-ctx(req): oec
+    |> if(oec.email != null)
     | then |> messages:msg-int(s: p.id): erid
            |> views:room-form-action(plural: "opens", rid: erid): ract
-           |> room-form(email: ue, action: ract, method: "patch", edit_rid: erid): page -> { status: 200, body: page, content_type: "text/html", extra_headers: oesc }
+           |> room-form(oec.email, action: ract, method: "patch", edit_rid: erid): page -> { status: 200, body: page, content_type: "text/html", extra_headers: oec.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /rooms/closeds/new] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): closc |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> room-form(email: ue, action: "/rooms/closeds", method: "", edit_rid: 0): page -> { status: 200, body: page, content_type: "text/html", extra_headers: closc }
+! [GET /rooms/closeds/new] |> page-ctx(req): clc
+    |> if(clc.email != null)
+    | then |> room-form(clc.email, action: "/rooms/closeds", method: "", edit_rid: 0): page -> { status: 200, body: page, content_type: "text/html", extra_headers: clc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /rooms/closeds/:id/edit] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): clesc |> current-email(token: tok): ue
-    |> if(ue != null)
+! [GET /rooms/closeds/:id/edit] p |> page-ctx(req): clec
+    |> if(clec.email != null)
     | then |> messages:msg-int(s: p.id): erid
            |> views:room-form-action(plural: "closeds", rid: erid): ract
-           |> room-form(email: ue, action: ract, method: "patch", edit_rid: erid): page -> { status: 200, body: page, content_type: "text/html", extra_headers: clesc }
+           |> room-form(clec.email, action: ract, method: "patch", edit_rid: erid): page -> { status: 200, body: page, content_type: "text/html", extra_headers: clec.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [POST /rooms/opens] |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): roatok
-    |> orisha:header(req, name: "X-CSRF-Token"): roxtok
-    |> csrf-gate(tok, form: roatok, hdr: roxtok): roca
+! [POST /rooms/opens] |> write-ctx(req): roc
     |> orisha:form(req, name: "room[name]"): rn
-    |> room-create(token: tok, name: rn, rtype: "Rooms::Open", csrf_ok: roca): res -> res
-! [POST /rooms/opens/:id] p |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): ruatok
-    |> orisha:header(req, name: "X-CSRF-Token"): ruxtok
-    |> csrf-gate(tok, form: ruatok, hdr: ruxtok): ruca
+    |> room-create(token: roc.tok, name: rn, rtype: "Rooms::Open", roc.csrf_ok): res -> res
+! [POST /rooms/opens/:id] p |> write-ctx(req): ruc
     |> orisha:form(req, name: "room[name]"): rn
-    |> room-update(token: tok, rid: p.id, name: rn, rk: "rooms_open", csrf_ok: ruca): res -> res
-! [POST /rooms/closeds] |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): rcatok
-    |> orisha:header(req, name: "X-CSRF-Token"): rcxtok
-    |> csrf-gate(tok, form: rcatok, hdr: rcxtok): rcca
+    |> room-update(token: ruc.tok, rid: p.id, name: rn, rk: "rooms_open", ruc.csrf_ok): res -> res
+! [POST /rooms/closeds] |> write-ctx(req): rcc
     |> orisha:form(req, name: "room[name]"): rn
-    |> room-create(token: tok, name: rn, rtype: "Rooms::Closed", csrf_ok: rcca): res -> res
-! [POST /rooms/closeds/:id] p |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): ru2atok
-    |> orisha:header(req, name: "X-CSRF-Token"): ru2xtok
-    |> csrf-gate(tok, form: ru2atok, hdr: ru2xtok): ru2ca
+    |> room-create(token: rcc.tok, name: rn, rtype: "Rooms::Closed", rcc.csrf_ok): res -> res
+! [POST /rooms/closeds/:id] p |> write-ctx(req): ru2c
     |> orisha:form(req, name: "room[name]"): rn
-    |> room-update(token: tok, rid: p.id, name: rn, rk: "rooms_closed", csrf_ok: ru2ca): res -> res
-! [GET /rooms/directs/new] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): dsc |> current-email(token: tok): ue
-    |> if(ue != null)
-    | then |> directs-page(email: ue): page -> { status: 200, body: page, content_type: "text/html", extra_headers: dsc }
+    |> room-update(token: ru2c.tok, rid: p.id, name: rn, rk: "rooms_closed", ru2c.csrf_ok): res -> res
+! [GET /rooms/directs/new] |> page-ctx(req): dc
+    |> if(dc.email != null)
+    | then |> directs-page(dc.email): page -> { status: 200, body: page, content_type: "text/html", extra_headers: dc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [POST /rooms/directs] |> orisha:cookie(req, name: "session_token"): tok
-    |> orisha:form(req, name: "authenticity_token"): datok
-    |> orisha:header(req, name: "X-CSRF-Token"): dxtok
-    |> csrf-gate(tok, form: datok, hdr: dxtok): dca2
+! [POST /rooms/directs] |> write-ctx(req): dwc
     |> orisha:form-ids(req, name: "user_ids[]"): fids
     |> orisha:query-param(req, name: "user_ids[]"): qid
     |> session:str-or(s: qid): qids
     |> messages:ids-or(form: fids, query: qids): ids
-    |> direct-create(token: tok, ids, csrf_ok: dca2): res -> res
-! [GET /session/transfers/:id] p |> orisha:cookie(req, name: "session_token"): ttok
-    |> csrf-prime(tok: ttok): tsc
-    |> transfer-page(code: p.id): page -> { status: 200, body: page, content_type: "text/html", extra_headers: tsc }
-! [POST /session/transfers/:id] p |> orisha:cookie(req, name: "session_token"): tc
-    |> orisha:form(req, name: "authenticity_token"): tatok
-    |> orisha:header(req, name: "X-CSRF-Token"): txtok
-    |> csrf-strict(tok: tc, form: tatok, hdr: txtok): tca
+    |> direct-create(token: dwc.tok, ids, dwc.csrf_ok): res -> res
+! [GET /session/transfers/:id] p |> csrf-ctx(req): tc
+    |> transfer-page(code: p.id): page -> { status: 200, body: page, content_type: "text/html", extra_headers: tc.cookie_hdr }
+! [POST /session/transfers/:id] p |> open-write-ctx(req): toc
     |> orisha:header(req, name: "User-Agent"): tua
-    |> transfer-consume(token: null, code: p.id, ua: tua, csrf_ok: tca): res -> res
-! [PUT /session/transfers/:id] p |> orisha:cookie(req, name: "session_token"): tc2
-    |> orisha:form(req, name: "authenticity_token"): ta2tok
-    |> orisha:header(req, name: "X-CSRF-Token"): tx2tok
-    |> csrf-strict(tok: tc2, form: ta2tok, hdr: tx2tok): tca2
+    |> transfer-consume(token: null, code: p.id, ua: tua, toc.csrf_ok): res -> res
+! [PUT /session/transfers/:id] p |> open-write-ctx(req): toc2
     |> orisha:header(req, name: "User-Agent"): tua2
-    |> transfer-consume(token: null, code: p.id, ua: tua2, csrf_ok: tca2): res -> res
-! [GET /join/:code] p |> orisha:cookie(req, name: "session_token"): jtok2
-    |> csrf-prime(tok: jtok2): jsc2
+    |> transfer-consume(token: null, code: p.id, ua: tua2, toc2.csrf_ok): res -> res
+! [GET /join/:code] p |> csrf-ctx(req): jc
     |> join-page(p.code): page
     |> if(page == "")
     | then -> { status: 404, body: "", content_type: "text/plain" }
-    | else -> { status: 200, body: page, content_type: "text/html", extra_headers: jsc2 }
-! [POST /join/:code] p |> orisha:cookie(req, name: "session_token"): jc2
-    |> orisha:form(req, name: "authenticity_token"): joatok
-    |> orisha:header(req, name: "X-CSRF-Token"): joxtok
-    |> csrf-strict(tok: jc2, form: joatok, hdr: joxtok): jca2
+    | else -> { status: 200, body: page, content_type: "text/html", extra_headers: jc.cookie_hdr }
+! [POST /join/:code] p |> open-write-ctx(req): joc
     |> orisha:form(req, name: "user[name]"): jn
     |> orisha:form(req, name: "user[email_address]"): je
     |> orisha:form(req, name: "user[password]"): jp
     |> orisha:header(req, name: "User-Agent"): jua
-    |> join-create(p.code, name: jn, email: je, password: jp, ua: jua, csrf_ok: jca2): res -> res
+    |> join-create(p.code, name: jn, email: je, password: jp, ua: jua, joc.csrf_ok): res -> res
 ! [GET /qr_code/:id] p -> qr-page(enc: p.id)
 ! [GET /autocompletable/users] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
     |> orisha:query-param(req, name: "query"): aq
