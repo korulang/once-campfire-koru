@@ -1,0 +1,12 @@
+date: 2026-10-16T04:20:45+00:00
+app source: once-campfire-koru @ 91bae1a (post-CSRF + request-prelude refactor; shipped via git archive)
+rust source: once-campfire-rust @ 6dae2fd (reference submodule 90b3300; built cargo --release on droplet)
+shared verification source: ec02debb3e44f40b8778a6a42db3c4515b2f9eaf (shipped via git archive; recorded post-hoc from local checkout)
+shared response gates sha256: 0c218c728843469020e91cd8bedeca0c72f23206a5372ee9d607dab3b677593d
+host: 6.12.111+deb13-amd64, DO-Premium-AMD, 8 threads, 15GB (droplet campfire-bench-1016, fra1, s-8vcpu-16gb-amd — destroyed after run)
+server cpus: 0-3; loadgen cpus: 4-7; pinned: 1
+koru bin: /root/ship/app/a.out (koruc build main.k --build=linux --release=fast, vendored toolchain @ zig-out/bin/koruc)
+rust bin: /root/ship/rust-src/target/release/campfire
+gate: parity_probe 0 divergences (pre-run, local); contracts generated per-rep on droplet; 0 invalid / 0 errors all cells
+writes audited persisted: koru 228,726 (3 reps), rust 37,598 (1 canary rep)
+rust rep is a hardware-equivalence canary, not a comparison rep set
