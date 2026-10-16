@@ -1,0 +1,7 @@
+date: 2026-10-16T04:23:23+02:00
+shared verification source: ec02debb3e44f40b8778a6a42db3c4515b2f9eaf (dirty: 1 files)
+shared response gates sha256: 140aa4dcb93a2e4d2ac0d951098b89ce55acadda0111738d4976a3236141c090
+host: Darwin arm64, Apple M2 Pro, 12 threads — UNPINNED DRY RUN, smoke tier only
+server cpus: 8-11; loadgen cpus: 12-15; pinned: 0
+koru bin: /Users/larsde/src/once-campfire-koru/a.out
+rust bin: /Users/larsde/src/once-campfire-rust/target/release/campfire
