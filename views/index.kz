@@ -192,12 +192,14 @@ threadlocal var ver_buf: [16]u8 = undefined;
     return Msg_render_event.handler(.{ .cmid = cmid, .mid = mid, .uid = uid,
         .rid = rid, .ms = ms, .ums = ums, .iso = iso, .author = author,
         .atitle = atitle, .uver = uver, .usgid = usgid, .roomname = roomname,
-        .body = body, .boosts = boosts, .host = originFor(host) });
+        .body = body, .boosts = boosts, .host = originFor(host),
+        .csrf = csrfTok() });
 }
 
 ~proc edit-render|zig {
     return EditMsg_render_event.handler(.{ .cmid = cmid, .rid = rid,
-        .mid = mid, .body = body, .host = originFor(host) });
+        .mid = mid, .body = body, .host = originFor(host),
+        .csrf = csrfTok() });
 }
 
 // "rooms_<key>_<rid>" — the room dom_id body, shared by messages_, edit_,
@@ -344,6 +346,120 @@ threadlocal var metas_buf: [512]u8 = undefined;
     escInto(&metas_buf, &n, name);
     appendInto(&metas_buf, &n, "\" />");
     return metas_buf[0..n];
+}
+
+// ── CSRF surface ──────────────────────────────────────────────────────────
+// The request's masked authenticity token, stashed by the route after the
+// session cookie verifies (signing:csrf-token produces the mask). One mask
+// per page — Rails re-pads per form; the pad is per-emission obfuscation of
+// the same session-bound secret, so a shared page mask verifies identically
+// and is honest about the weaker replay shape. Empty stash → empty tokens,
+// which can never verify (csrf-verify rejects empty/absent presentations).
+threadlocal var csrf_buf: [96]u8 = undefined;
+threadlocal var csrf_len: usize = 0;
+
+~proc csrf-stash|zig {
+    if (masked) |m| {
+        const n = @min(m.len, csrf_buf.len);
+        @memcpy(csrf_buf[0..n], m[0..n]);
+        csrf_len = n;
+    } else csrf_len = 0;
+}
+
+fn csrfTok() []const u8 {
+    return csrf_buf[0..csrf_len];
+}
+
+~proc csrf-get|zig {
+    return csrfTok();
+}
+
+// csrf_meta_tags — inside <head> through the metas slot, after the page's
+// own metas (`pre`: the current-user pair, the room meta).
+threadlocal var csrf_meta_buf: [2048]u8 = undefined;
+
+~proc csrf-metas|zig {
+    var n: usize = 0;
+    appendInto(&csrf_meta_buf, &n, pre);
+    if (csrf_len > 0) {
+        appendInto(&csrf_meta_buf, &n,
+            "<meta name=\"csrf-param\" content=\"authenticity_token\" /><meta name=\"csrf-token\" content=\"");
+        appendInto(&csrf_meta_buf, &n, csrfTok());
+        appendInto(&csrf_meta_buf, &n, "\" />");
+    }
+    return csrf_meta_buf[0..n];
+}
+
+threadlocal var metacat_buf: [4096]u8 = undefined;
+
+~proc meta-cat|zig {
+    var n: usize = 0;
+    appendInto(&metacat_buf, &n, a);
+    appendInto(&metacat_buf, &n, b);
+    return metacat_buf[0..n];
+}
+
+// tag.meta(name: "current-room-id") — the reference layout emits it inside
+// <head> on room pages; component markup can't splice there, so it joins
+// the metas string. Own buffer: `pre` may be metacat_buf's own contents.
+threadlocal var roommeta_buf: [4096]u8 = undefined;
+
+~proc room-meta|zig {
+    var n: usize = 0;
+    appendInto(&roommeta_buf, &n, pre);
+    appendInto(&roommeta_buf, &n, "<meta name=\"current-room-id\" content=\"");
+    escInto(&roommeta_buf, &n, rid);
+    appendInto(&roommeta_buf, &n, "\">");
+    return roommeta_buf[0..n];
+}
+
+// The form helper's hidden input — first child of every non-GET form.
+// Components take the token as a `csrf` field; proc-built forms splice
+// csrfInputZ directly.
+fn csrfInputZ(buf: []u8) []const u8 {
+    if (csrf_len == 0) return "";
+    return std.fmt.bufPrint(buf,
+        "<input type=\"hidden\" name=\"authenticity_token\" value=\"{s}\" />",
+        .{csrfTok()}) catch "";
+}
+
+threadlocal var csrf_in_buf: [192]u8 = undefined;
+
+~proc csrf-input|zig {
+    return csrfInputZ(&csrf_in_buf);
+}
+
+// body_classes for the turbo-frame pages the reference renders inside the
+// app layout (sidebar, searches): the class list is [page classes] ++
+// admin flag — "admin"/"" for the sidebar, "sidebar searches[ admin]" for
+// search. base is the page classes prefix.
+threadlocal var acls_buf: [64]u8 = undefined;
+
+~proc admin-cls|zig {
+    if (role != 1) return base;
+    if (base.len == 0) return "admin";
+    return std.fmt.bufPrint(&acls_buf, "{s} admin", .{base}) catch base;
+}
+
+// public/422.html verbatim — the reference's InvalidAuthenticityToken page
+// (and the failed-login surface). Read once, cached for the process: the
+// body is process-owned, never per-request-allocated, so responses must
+// NOT set body_allocated (the pump would free the cache).
+threadlocal var unp_body: ?[]const u8 = null;
+
+~proc unprocessable-body|zig {
+    if (unp_body) |b| return b;
+    const f = std.fs.cwd().openFile("public/422.html", .{}) catch return "";
+    defer f.close();
+    const b = f.readToEndAlloc(koru_allocator(), 1 << 20) catch return "";
+    unp_body = b;
+    return b;
+}
+
+// The 422 Response itself — flows can't yield a bare record literal at
+// chain end, so the shape lives here like respond-created's.
+~proc respond-unprocessable|zig {
+    return .{ .status = 422, .body = body, .content_type = "text/html" };
 }
 
 // custom_styles_tag — `tag.style(css.html_safe, data-turbo-track: reload)`.
@@ -718,7 +834,9 @@ threadlocal var pbtn_buf: [2048]u8 = undefined;
     appendInto(&pbtn_buf, &n, "<form class=\"button_to\" method=\"post\" action=\"/rooms/directs?user_ids%5B%5D=");
     const unum = std.fmt.bufPrint(pbtn_buf[n..], "{d}", .{uid}) catch return "";
     n += unum.len;
-    appendInto(&pbtn_buf, &n, "\"><button class=\"direct borderless fill-transparent unpad\" type=\"submit\"><span class=\"avatar\"><img aria-hidden=\"true\" src=\"/users/");
+    appendInto(&pbtn_buf, &n, "\">");
+    appendInto(&pbtn_buf, &n, csrfInputZ(&csrf_in_buf));
+    appendInto(&pbtn_buf, &n, "<button class=\"direct borderless fill-transparent unpad\" type=\"submit\"><span class=\"avatar\"><img aria-hidden=\"true\" src=\"/users/");
     appendInto(&pbtn_buf, &n, sgid);
     appendInto(&pbtn_buf, &n, "/avatar?v=");
     appendInto(&pbtn_buf, &n, ver);
@@ -832,9 +950,13 @@ threadlocal var ablock_buf: [6144]u8 = undefined;
 ~proc acct-admin-block|zig {
     if (role != 1) return "";
     var n: usize = 0;
-    appendInto(&ablock_buf, &n, "<form class=\"flex flex-column gap\" action=\"/account\" accept-charset=\"UTF-8\" method=\"post\" data-controller=\"form\"><input type=\"hidden\" name=\"_method\" value=\"patch\" /><div class=\"flex align-center gap\"><label class=\"flex align-center gap flex-item-grow\"><input type=\"text\" name=\"account[name]\" id=\"account_name\" value=\"");
+    appendInto(&ablock_buf, &n, "<form class=\"flex flex-column gap\" action=\"/account\" accept-charset=\"UTF-8\" method=\"post\" data-controller=\"form\"><input type=\"hidden\" name=\"_method\" value=\"patch\" />");
+    appendInto(&ablock_buf, &n, csrfInputZ(&csrf_in_buf));
+    appendInto(&ablock_buf, &n, "<div class=\"flex align-center gap\"><label class=\"flex align-center gap flex-item-grow\"><input type=\"text\" name=\"account[name]\" id=\"account_name\" value=\"");
     escInto(&ablock_buf, &n, name);
-    appendInto(&ablock_buf, &n, "\" autocomplete=\"off\" placeholder=\"Name this account\" autofocus=\"autofocus\" data-action=\"keydown.enter-&gt;form#submit\" class=\"input txt-large\" /></label><button class=\"btn btn--reversed center\" type=\"submit\"><img aria-hidden=\"true\" src=\"/assets/check-7897ff7e.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Save changes</span></button></div></form><div class=\"margin-block-start pad-block pad-inline-double fill-shade border-radius\"><form class=\"flex align-center gap center\" action=\"/account\" accept-charset=\"UTF-8\" method=\"post\" data-controller=\"form\"><input type=\"hidden\" name=\"_method\" value=\"put\" /><div class=\"flex-item-grow flex align-center gap txt-align-start\"><img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/crown-00d190cb.svg\" width=\"18\" height=\"18\" /> Must be admin to create new rooms</div><input type=\"hidden\" name=\"account[settings_attributes][restrict_room_creation_to_administrators]\" value=\"");
+    appendInto(&ablock_buf, &n, "\" autocomplete=\"off\" placeholder=\"Name this account\" autofocus=\"autofocus\" data-action=\"keydown.enter-&gt;form#submit\" class=\"input txt-large\" /></label><button class=\"btn btn--reversed center\" type=\"submit\"><img aria-hidden=\"true\" src=\"/assets/check-7897ff7e.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Save changes</span></button></div></form><div class=\"margin-block-start pad-block pad-inline-double fill-shade border-radius\"><form class=\"flex align-center gap center\" action=\"/account\" accept-charset=\"UTF-8\" method=\"post\" data-controller=\"form\"><input type=\"hidden\" name=\"_method\" value=\"put\" />");
+    appendInto(&ablock_buf, &n, csrfInputZ(&csrf_in_buf));
+    appendInto(&ablock_buf, &n, "<div class=\"flex-item-grow flex align-center gap txt-align-start\"><img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/crown-00d190cb.svg\" width=\"18\" height=\"18\" /> Must be admin to create new rooms</div><input type=\"hidden\" name=\"account[settings_attributes][restrict_room_creation_to_administrators]\" value=\"");
     appendInto(&ablock_buf, &n, if (restrict == 0) "true" else "false");
     appendInto(&ablock_buf, &n, "\" /><label class=\"switch\"><input type=\"checkbox\" class=\"switch__input\" ");
     if (restrict != 0) appendInto(&ablock_buf, &n, "checked=\"checked\" ");
@@ -853,9 +975,15 @@ threadlocal var mblock_buf: [1024]u8 = undefined;
     return mblock_buf[0..n];
 }
 
+threadlocal var regen_buf: [1024]u8 = undefined;
+
 ~proc acct-regen|zig {
     if (role != 1) return "";
-    return "<form class=\"button_to\" method=\"post\" action=\"/account/join_code\"><button class=\"btn btn--regenerate\" type=\"submit\"><img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/refresh-249f0509.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Regenerate join link</span></button></form>";
+    var n: usize = 0;
+    appendInto(&regen_buf, &n, "<form class=\"button_to\" method=\"post\" action=\"/account/join_code\">");
+    appendInto(&regen_buf, &n, csrfInputZ(&csrf_in_buf));
+    appendInto(&regen_buf, &n, "<button class=\"btn btn--regenerate\" type=\"submit\"><img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/refresh-249f0509.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Regenerate join link</span></button></form>");
+    return regen_buf[0..n];
 }
 
 // ── Direct-room user_ids plumbing ───────────────────────────────────────────
@@ -951,7 +1079,8 @@ const head_b =
 const head_c =
     \\
     \\    <meta name="action-cable-url" content="/cable">
-    \\    <meta name="vapid-public-key">
+    ;
+const head_c2 =
     \\    <meta name="turbo-prefetch" content="true">
     \\    <link rel="manifest" href="/webmanifest.json">
     \\    <link rel="icon" href="/account/logo?v=
@@ -1191,6 +1320,17 @@ const head_f =
     appendInto(&head_buf, &n, head_b);
     appendInto(&head_buf, &n, metas);
     appendInto(&head_buf, &n, head_c);
+    // vapid_public_key_tag — VAPID_PUBLIC_KEY from the environment like the
+    // reference; absent the env the meta keeps its empty content rather
+    // than inventing a key.
+    if (std.posix.getenv("VAPID_PUBLIC_KEY")) |vpk| {
+        appendInto(&head_buf, &n, "    <meta name=\"vapid-public-key\" content=\"");
+        escInto(&head_buf, &n, vpk);
+        appendInto(&head_buf, &n, "\">\n");
+    } else {
+        appendInto(&head_buf, &n, "    <meta name=\"vapid-public-key\">\n");
+    }
+    appendInto(&head_buf, &n, head_c2);
     appendInto(&head_buf, &n, logo);
     appendInto(&head_buf, &n, head_d);
     appendInto(&head_buf, &n, logo);
@@ -1213,22 +1353,22 @@ threadlocal var nrb_buf: [1024]u8 = undefined;
 }
 
 ~proc profile-render|zig {
-    return ProfilePage_render_event.handler(.{ .uid = uid, .name = name, .email = email, .bio = bio, .turl = turl, .qrpath = qrpath, .memberships = memberships });
+    return ProfilePage_render_event.handler(.{ .uid = uid, .name = name, .email = email, .bio = bio, .turl = turl, .qrpath = qrpath, .memberships = memberships, .csrf = csrfTok() });
 }
 ~proc account-render|zig {
     return AccountPage_render_event.handler(.{ .navadmin = navadmin, .admin = admin, .member = member, .inviteurl = inviteurl, .qrpath = qrpath, .regen = regen, .users = users });
 }
 ~proc roomform-render|zig {
-    return RoomFormPage_render_event.handler(.{ .action = action, .method = method, .name = name, .users = users });
+    return RoomFormPage_render_event.handler(.{ .action = action, .method = method, .name = name, .users = users, .csrf = csrfTok() });
 }
 ~proc bots-render|zig {
     return BotsPage_render_event.handler(.{ .bots = bots });
 }
 ~proc botform-render|zig {
-    return BotFormPage_render_event.handler(.{ .action = action, .method = method, .name = name, .webhook = webhook });
+    return BotFormPage_render_event.handler(.{ .action = action, .method = method, .name = name, .webhook = webhook, .csrf = csrfTok() });
 }
 ~proc styles-render|zig {
-    return StylesPage_render_event.handler(.{ .css = css });
+    return StylesPage_render_event.handler(.{ .css = css, .csrf = csrfTok() });
 }
 // The auto-submit form's action — session_transfer_path, the page's own URL.
 threadlocal var tact_buf: [1024]u8 = undefined;
@@ -1238,11 +1378,44 @@ threadlocal var tact_buf: [1024]u8 = undefined;
 }
 
 ~proc transfer-render|zig {
-    return TransferPage_render_event.handler(.{ .action = action });
+    return TransferPage_render_event.handler(.{ .action = action, .csrf = csrfTok() });
 }
 ~proc join-render|zig {
-    return JoinPage_render_event.handler(.{ .action = action, .acctname = acctname });
+    return JoinPage_render_event.handler(.{ .action = action, .acctname = acctname, .csrf = csrfTok() });
 }
 ~proc directs-render|zig {
-    return DirectsPage_render_event.handler(.{});
+    return DirectsPage_render_event.handler(.{ .csrf = csrfTok() });
+}
+
+// ── sessions/new ────────────────────────────────────────────────────────────
+// The reference's sessions/new.html body verbatim — language menus, panel,
+// support mailto, version badge — with the per-request slots spliced: the
+// masked token (first form child, as form_with emits), the absolute form
+// action Rails builds from the request host, the account name in the legend,
+// the administrator mailto, the logo version, and APP_VERSION's badge.
+threadlocal var signin_buf: [16384]u8 = undefined;
+
+~proc signin-body|zig {
+    var n: usize = 0;
+    const B = &signin_buf;
+    appendInto(B, &n, "<body class=\"\" data-controller=\"local-time lightbox\">\n    <a href=\"#main-content\" class=\"skip-navigation btn\">Skip to main content</a>\n\n    <nav id=\"nav\">\n      \n    </nav>\n\n\n    <main id=\"main-content\">\n      \n<section class=\"txt-align-center\">\n  <div class=\"panel \">\n    <figure class=\"account-logo avatar center margin-block-end txt-xx-large\"><img alt=\"Account logo\" src=\"/account/logo?v=");
+    appendInto(B, &n, logo);
+    appendInto(B, &n, "\" width=\"300\" height=\"300\" /></figure>\n\n    <form class=\"flex flex-column gap\" action=\"http://");
+    appendInto(B, &n, host);
+    appendInto(B, &n, "/session\" accept-charset=\"UTF-8\" method=\"post\">");
+    if (csrf_len > 0) appendInto(B, &n, csrfInputZ(&csrf_in_buf));
+    appendInto(B, &n, "\n      <fieldset class=\"flex flex-column gap center-block upad\">\n        <legend class=\"txt-large txt-align-center\"><strong>");
+    escInto(B, &n, acct);
+    appendInto(B, &n, "</strong></legend>\n\n        <div class=\"flex align-center gap\">\n          <details class=\"position-relative\" data-controller=\"popup\" data-action=\"keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside\" data-popup-orientation-top-class=\"popup-orientation-top\"><summary class=\"btn\" tabindex=\"-1\"><img aria-hidden=\"true\" class=\"color-icon\" src=\"/assets/globe-8c54d23b.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Translate</span></summary><div class=\"language-list-menu shadow\" data-popup-target=\"menu\"><dl class=\"language-list\"><dt>🇺🇸</dt><dd class=\"margin-none\">Enter your email address</dd><dt>🇪🇸</dt><dd class=\"margin-none\">Introduce tu correo electrónico</dd><dt>🇫🇷</dt><dd class=\"margin-none\">Entrez votre adresse courriel</dd><dt>🇮🇳</dt><dd class=\"margin-none\">अपना ईमेल पता दर्ज करें</dd><dt>🇩🇪</dt><dd class=\"margin-none\">Geben Sie Ihre E-Mail-Adresse ein</dd><dt>🇧🇷</dt><dd class=\"margin-none\">Insira seu endereço de email</dd><dt>🇯🇵</dt><dd class=\"margin-none\">メールアドレスを入力してください</dd></dl></div></details>\n          <label class=\"flex align-center gap input input--actor txt-large\">\n            <input required=\"required\" class=\"input\" autofocus=\"autofocus\" autocomplete=\"username\" placeholder=\"Enter your email address\" type=\"email\" name=\"email_address\" id=\"email_address\" />\n            <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/email-6c595bc5.svg\" width=\"24\" height=\"24\" />\n          </label>\n        </div>\n\n        <div class=\"flex align-center gap\">\n          <details class=\"position-relative\" data-controller=\"popup\" data-action=\"keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside\" data-popup-orientation-top-class=\"popup-orientation-top\"><summary class=\"btn\" tabindex=\"-1\"><img aria-hidden=\"true\" class=\"color-icon\" src=\"/assets/globe-8c54d23b.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Translate</span></summary><div class=\"language-list-menu shadow\" data-popup-target=\"menu\"><dl class=\"language-list\"><dt>🇺🇸</dt><dd class=\"margin-none\">Enter your password</dd><dt>🇪🇸</dt><dd class=\"margin-none\">Introduce tu contraseña</dd><dt>🇫🇷</dt><dd class=\"margin-none\">Saisissez votre mot de passe</dd><dt>🇮🇳</dt><dd class=\"margin-none\">अपना पासवर्ड दर्ज करें</dd><dt>🇩🇪</dt><dd class=\"margin-none\">Geben Sie Ihr Passwort ein</dd><dt>🇧🇷</dt><dd class=\"margin-none\">Insira sua senha</dd><dt>🇯🇵</dt><dd class=\"margin-none\">パスワードを入力してください</dd></dl></div></details>\n          <label class=\"flex align-center gap input input--actor txt-large\">\n            <input required=\"required\" class=\"input\" autocomplete=\"current-password\" placeholder=\"Enter your password\" maxlength=\"72\" size=\"72\" type=\"password\" name=\"password\" id=\"password\" />\n            <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/password-0896da4e.svg\" width=\"24\" height=\"24\" />\n          </label>\n        </div>\n\n        <button name=\"log_in\" type=\"submit\" class=\"btn btn--reversed center txt-large\">\n          <img aria-hidden=\"true\" src=\"/assets/arrow-right-8f3eb40d.svg\" />\n          <span class=\"for-screen-reader\">Go</span>\n</button>      </fieldset>\n</form>  </div>\n\n    <div class=\"txt-align-center margin-block-double full-width\">\n    <a class=\"btn center\" title=\"Email ");
+    escInto(B, &n, mailname);
+    appendInto(B, &n, "\" href=\"mailto:&quot;");
+    escInto(B, &n, mailname);
+    appendInto(B, &n, "&quot; &lt;");
+    escInto(B, &n, mailemail);
+    appendInto(B, &n, "&gt;\">\n      <img aria-hidden=\"true\" src=\"/assets/lifebuoy-f31f26aa.svg\" />\n      <span>");
+    escInto(B, &n, mailemail);
+    appendInto(B, &n, "</span>\n</a>\n    <div class=\"txt-align-center center margin-block txt-subtle\">Campfire&trade; version <span class=\"version-badge\">");
+    escInto(B, &n, std.posix.getenv("APP_VERSION") orelse "");
+    appendInto(B, &n, "</span></div>\n  </div>\n\n</section>\n\n\n      <footer id=\"footer\">\n        \n      </footer>\n    </main>\n\n    <aside id=\"sidebar\" data-controller=\"toggle-class\" data-toggle-class-toggle-class=\"open\">\n      \n    </aside>\n\n    <dialog class=\"lightbox\" aria-label=\"Image Viewer (Press escape to close)\" data-lightbox-target=\"dialog\" data-action=\"close-&gt;lightbox#reset\">\n  <img src=\"\" class=\"lightbox__image\" data-lightbox-target=\"zoomedImage\" />\n\n  <form method=\"dialog\" class=\"lightbox__btn\">\n    <button class=\"btn\">\n      <img aria-hidden=\"true\" src=\"/assets/remove-0e7a045d.svg\" />\n      <span class=\"for-screen-reader\">Close image viewer</span>\n    </button>\n  </form>\n\n  <a href=\"\" class=\"lightbox__btn--download btn hide-in-ios-pwa\" data-lightbox-target=\"download\">\n    <img aria-hidden=\"true\" src=\"/assets/download-04029899.svg\" />\n    <span class=\"for-screen-reader\">Download file</span>\n  </a>\n\n  <button class=\"lightbox__btn--share btn\"\n      data-controller=\"web-share\"\n      data-action=\"web-share#share\"\n      data-web-share-files-value=\"\"\n      data-lightbox-target=\"share\">\n    <img aria-hidden=\"true\" src=\"/assets/share-bf28da4f.svg\" />\n    <span class=\"for-screen-reader\">Share file</span>\n  </button>\n</dialog>\n\n\n    <a href=\"https://once.com\" id=\"app-logo\" target=\"_blank\" aria-label=\"Once software from 37signals home page\">\n      <img alt=\"Campfire logo\" width=\"256\" height=\"216\" src=\"/assets/campfire-icon-3d9986c5.png\" />\n    </a>\n  </body>\n</html>\n");
+    return signin_buf[0..n];
 }

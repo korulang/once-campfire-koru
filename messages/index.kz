@@ -33,6 +33,7 @@ threadlocal var cr_ver_len: usize = 0;
     cr_bio_len = 0;
     cr_ver_len = 0;
     cmid_len = 0;
+    bot_via = 0;
 }
 
 fn stashStr(buf: []u8, len: *usize, s: []const u8) void {
@@ -53,6 +54,24 @@ fn stashStr(buf: []u8, len: *usize, s: []const u8) void {
 ~proc cr-name|zig { return cr_name_buf[0..cr_name_len]; }
 ~proc cr-bio|zig { return cr_bio_buf[0..cr_bio_len]; }
 ~proc cr-ver|zig { return cr_ver_buf[0..cr_ver_len]; }
+
+// ── By-bots auth ──────────────────────────────────────────────────────────
+// Messages::ByBotsController: restore_authentication || bot_authentication ||
+// request_authentication — a session cookie wins over the path's bot key, and
+// protect_from_forgery applies unless the bot key authenticated. via==1 means
+// the row came from the bot-key arm, via==0 from the session arm.
+threadlocal var bot_via: i64 = 0;
+
+~proc bot-via-stash|zig { bot_via = via; }
+~proc bot-via|zig { return bot_via; }
+
+// 0 = no credential (302 to sign-in), 1 = proceed, 2 = session auth lacking
+// CSRF (the forgery exception → 422). Resets via the same msg-reset lifecycle.
+~proc bot-gate|zig {
+    if (!authed) return 0;
+    if (via == 1) return 1;
+    return if (csrf_ok) 1 else 2;
+}
 
 // ── Timestamps ───────────────────────────────────────────────────────────
 // tx.now() — the reference's database clock truncates to microseconds and

@@ -73,19 +73,29 @@ pub tor render-stream {} -> string
 pub tor render-payload {} -> string
 
 pub tor create { rid: string, token: ?string, body: ?string, cmid: ?string,
-                 host: ?string } -> orisha:Response
+                 host: ?string, csrf_ok: bool } -> orisha:Response
+create =
+    if(csrf_ok)
+    | then |> create-impl(rid, token, body, cmid, host): r -> r
+    | else |> views:unprocessable-body(): ub |> views:respond-unprocessable(body: ub): res -> res
+
+pub tor create-impl { rid: string, token: ?string, body: ?string, cmid: ?string,
+                      host: ?string } -> orisha:Response
 pub tor broadcast-render { rid: string, ridn: i64, midn: i64, uidn: i64,
                            cmidx: string, ts: string, mbody: string,
                            host: ?string } -> string
 pub tor broadcast-send { rid: i64, body: string } -> orisha:Response
 pub tor bot-send { rid: i64, mid: i64 } -> orisha:Response
+pub tor bot-via-stash { via: i64 }
+pub tor bot-via {} -> i64
+pub tor bot-gate { authed: bool, via: i64, csrf_ok: bool } -> i64
 pub tor bot-create { rid: string, key: string, body: string,
-                     host: ?string } -> orisha:Response
+                     host: ?string, stok: ?string, csrf_ok: bool } -> orisha:Response
 pub tor bot-location { mid: i64 } -> string
 pub tor respond-located { loc: string } -> orisha:Response
 pub tor ids-or { form: string, query: string } -> string
 
-create =
+create-impl =
     msg-reset()
     |> cable:members-reset()
     |> if(token == null)
@@ -193,7 +203,14 @@ pub tor edit { rid: string, mid: string, email: ?string,
 pub tor show { rid: string, mid: string, email: ?string,
                host: ?string } -> string
 pub tor update { rid: string, mid: string, token: ?string,
-                 body: ?string } -> orisha:Response
+                 body: ?string, csrf_ok: bool } -> orisha:Response
+update =
+    if(csrf_ok)
+    | then |> update-impl(rid, mid, token, body): r -> r
+    | else |> views:unprocessable-body(): ub |> views:respond-unprocessable(body: ub): res -> res
+
+pub tor update-impl { rid: string, mid: string, token: ?string,
+                      body: ?string } -> orisha:Response
 
 // edit — ensure_can_administer lives in the query: creator or account
 // administrator. The frame renders the reference's messages/edit.html —
@@ -288,7 +305,7 @@ show =
 // a missing row means not found or forbidden, both a bare 403 here. Writes
 // the Action Text body + message.updated_at, broadcast_replace_to's the
 // presentation target, then the html-format redirect to the message.
-update =
+update-impl =
     msg-reset()
     |> cable:members-reset()
     |> if(token == null)
@@ -353,60 +370,76 @@ update =
 // the response is 201 + Location, not the HTML form's turbo-stream. The
 // write/broadcast pipeline is create's unchanged: enqueue, render between
 // mid and done, fan out after COMMIT.
+// Authentication is the reference's require_authentication chain: a signed
+// session cookie authenticates the session user first (bot-gate then demands
+// CSRF — protect_from_forgery is waived only for bot_key auth), else the key
+// identifies the bot, else request_authentication's 302 to /session/new.
 bot-create =
     msg-reset()
     |> cable:members-reset()
-    |> if(body == "")
-    | then -> { status: 400, body: "param is missing or the value is empty: message", content_type: "text/plain" }
-    | else |> msg-int(s: rid): ridn
-           |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
-           | db d |> koru/sqlite3(conn: d) {
-                   SELECT u.id, u.name, u.bio, u.updated_at FROM users u
-                   WHERE u.role = 2 AND u.status = 0
-                     AND (u.id || '-' || u.bot_token) = {{key}} LIMIT 1
-               }
-               ! row ar |> koru/sqlite3:col.int(stmt: ar, index: 0): cuid
-                        |> koru/sqlite3:col.text(stmt: ar, index: 1): cnm
-                        |> koru/sqlite3:col.text(stmt: ar, index: 2): cbio
-                        |> koru/sqlite3:col.text(stmt: ar, index: 3): cver
-                        |> stash-creator(uid: cuid, name: cnm, bio: cbio, ver: cver)
-               | done d2 |> cr-authed(): authed
-                         |> cr-uid(): uidn
-                         |> if(authed)
-                         | then |> koru/sqlite3(conn: d2) {
-                                 SELECT r.name, r.type FROM rooms r
-                                 JOIN memberships m ON m.room_id = r.id
-                                 WHERE m.user_id = {{uidn}} AND r.id = {{ridn}} LIMIT 1
-                             }
-                             ! row rr |> koru/sqlite3:col.text(stmt: rr, index: 0): rnm
-                                      |> koru/sqlite3:col.text(stmt: rr, index: 1): rtp
-                                      |> views:stash-room(name: rnm, rtype: rtp)
-                             | done d3 |> views:room-present(): rf
-                                       |> if(rf)
-                                       | then |> msg-now(): ts
-                                              |> cmid-or(supplied: null): cmidx
-                                              |> msg-cutoff(): cut
-                                              |> plain-text(html: body): ptxt
-                                              |> koru/sqlite3(conn: d3) {
-                                                      SELECT m.user_id FROM memberships m WHERE m.room_id = {{ridn}}
-                                                  }
-                                                  ! row mr |> koru/sqlite3:col.int(stmt: mr, index: 0): muid
-                                                           |> cable:member-stash(uid: muid)
-                                                  | done d4 |> koru/sqlite3:close.pooled(conn: d4)
-                                                            |> msg-enqueue(uid: uidn, rid: ridn, cmid: cmidx, ts, body, cut, ptext: ptxt)
-                                                            |> msg-wait-mid(): midn
-                                                            |> broadcast-render(rid, ridn, midn, uidn, cmidx, ts, mbody: body, host): _
-                                                            |> msg-wait-done(): wok
-                                                            |> if(wok)
-                                                               | then |> orisha:generation-bump()
-                                                                      |> bot-send(rid: ridn, mid: midn): res -> res
-                                                               | else -> { status: 500, body: "write failed", content_type: "text/plain" }
-                                                  | err e4 |> koru/sqlite3:close.pooled(e4.conn) -> { status: 500, body: "member read failed", content_type: "text/plain" }
-                                       | else |> koru/sqlite3:close.pooled(conn: d3) -> { status: 404, body: "Room not found", content_type: "text/plain" }
-                             | err e2 |> koru/sqlite3:close.pooled(e2.conn) -> { status: 500, body: "room lookup failed", content_type: "text/plain" }
-                         | else |> koru/sqlite3:close.pooled(conn: d2) -> { status: 401, body: "", content_type: "text/plain" }
-               | err e |> koru/sqlite3:close.pooled(e.conn) -> { status: 401, body: "", content_type: "text/plain" }
-           | err _ -> { status: 500, body: "db open failed", content_type: "text/plain" }
+    |> msg-int(s: rid): ridn
+    |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
+    | db d |> koru/sqlite3(conn: d) {
+            SELECT u.id, u.name, u.bio, u.updated_at, 1 AS via_key FROM users u
+            WHERE u.role = 2 AND u.status = 0
+              AND (u.id || '-' || u.bot_token) = {{key}}
+            UNION ALL
+            SELECT u.id, u.name, u.bio, u.updated_at, 0 FROM users u
+            JOIN sessions s ON s.user_id = u.id
+            WHERE s.token = {{stok}} AND u.status = 0
+            ORDER BY via_key LIMIT 1
+        }
+        ! row ar |> koru/sqlite3:col.int(stmt: ar, index: 0): cuid
+                 |> koru/sqlite3:col.text(stmt: ar, index: 1): cnm
+                 |> koru/sqlite3:col.text(stmt: ar, index: 2): cbio
+                 |> koru/sqlite3:col.text(stmt: ar, index: 3): cver
+                 |> koru/sqlite3:col.int(stmt: ar, index: 4): cvia
+                 |> stash-creator(uid: cuid, name: cnm, bio: cbio, ver: cver)
+                 |> bot-via-stash(via: cvia)
+        | done d2 |> cr-authed(): authed
+                  |> cr-uid(): uidn
+                  |> bot-via(): bvk
+                  |> bot-gate(authed, via: bvk, csrf_ok): baz
+                  |> if(baz == 1)
+                  | then |> koru/sqlite3(conn: d2) {
+                          SELECT r.name, r.type FROM rooms r
+                          JOIN memberships m ON m.room_id = r.id
+                          WHERE m.user_id = {{uidn}} AND r.id = {{ridn}} LIMIT 1
+                      }
+                      ! row rr |> koru/sqlite3:col.text(stmt: rr, index: 0): rnm
+                               |> koru/sqlite3:col.text(stmt: rr, index: 1): rtp
+                               |> views:stash-room(name: rnm, rtype: rtp)
+                      | done d3 |> views:room-present(): rf
+                                |> if(rf)
+                                | then |> if(body == "")
+                                        | then |> koru/sqlite3:close.pooled(conn: d3) -> { status: 400, body: "param is missing or the value is empty: message", content_type: "text/plain" }
+                                        | else |> msg-now(): ts
+                                           |> cmid-or(supplied: null): cmidx
+                                           |> msg-cutoff(): cut
+                                           |> plain-text(html: body): ptxt
+                                           |> koru/sqlite3(conn: d3) {
+                                                   SELECT m.user_id FROM memberships m WHERE m.room_id = {{ridn}}
+                                               }
+                                               ! row mr |> koru/sqlite3:col.int(stmt: mr, index: 0): muid
+                                                        |> cable:member-stash(uid: muid)
+                                               | done d4 |> koru/sqlite3:close.pooled(conn: d4)
+                                                         |> msg-enqueue(uid: uidn, rid: ridn, cmid: cmidx, ts, body, cut, ptext: ptxt)
+                                                         |> msg-wait-mid(): midn
+                                                         |> broadcast-render(rid, ridn, midn, uidn, cmidx, ts, mbody: body, host): _
+                                                         |> msg-wait-done(): wok
+                                                         |> if(wok)
+                                                            | then |> orisha:generation-bump()
+                                                                   |> bot-send(rid: ridn, mid: midn): res -> res
+                                                            | else -> { status: 500, body: "write failed", content_type: "text/plain" }
+                                               | err e4 |> koru/sqlite3:close.pooled(e4.conn) -> { status: 500, body: "member read failed", content_type: "text/plain" }
+                                | else |> koru/sqlite3:close.pooled(conn: d3) -> { status: 404, body: "Room not found", content_type: "text/plain" }
+                      | err e2 |> koru/sqlite3:close.pooled(e2.conn) -> { status: 500, body: "room lookup failed", content_type: "text/plain" }
+                  | else |> koru/sqlite3:close.pooled(conn: d2)
+                         |> if(baz == 2)
+                            | then |> views:unprocessable-body(): ub |> views:respond-unprocessable(body: ub): res -> res
+                            | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
+        | err e |> koru/sqlite3:close.pooled(e.conn) -> { status: 500, body: "auth lookup failed", content_type: "text/plain" }
+    | err _ -> { status: 500, body: "db open failed", content_type: "text/plain" }
 
 // 201 + Location — the fanout half is broadcast-send's verbatim, the
 // response is a bare head where the HTML path answers the stream markup.

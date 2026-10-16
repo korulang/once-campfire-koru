@@ -29,7 +29,7 @@ koru/dom:component(Boost) {
     <a title="{{ bname:s }}" class="btn avatar" data-turbo-frame="_top" href="/users/{{ buid:d }}"><img aria-label="{{ bname:s }} boosted {{ bcontent:s }}" src="/users/{{ bsgid:s }}/avatar?v={{ bver:s }}" width="48" height="48" /></a>
     </figure>
     <span role="button" class="txt-small txt-medium" data-action="click-&gt;boost-delete#reveal keydown.enter-&gt;boost-delete#reveal:prevent" data-boost-delete-target="content">{{ bcontent:s }}</span>
-    <form class="button_to" method="post" action="/messages/{{ mid:d }}/boosts/{{ bid:d }}"><input type="hidden" name="_method" value="delete" /><button data-action="boost-delete#perform" data-boost-delete-target="button" class="btn btn--negative flex-item-justify-end boost__delete" type="submit">
+    <form class="button_to" method="post" action="/messages/{{ mid:d }}/boosts/{{ bid:d }}"><input type="hidden" name="_method" value="delete" /><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" /><button data-action="boost-delete#perform" data-boost-delete-target="button" class="btn btn--negative flex-item-justify-end boost__delete" type="submit">
     <img aria-hidden="true" src="/assets/minus-b31a1093.svg" width="20" height="20" />
     <span class="for-screen-reader">Delete this boost</span>
     </button></form>
@@ -63,35 +63,35 @@ koru/dom:component(Msg) {
     </summary>
     <div class="message__actions-menu border shadow" data-popup-target="menu">
     <div class="quick-boosts">
-    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post">
+    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="boost[content]" id="boost_content" value="👍" />
     <button name="button" type="submit" title="Thumbs up" class="btn message__action-btn" data-emoji="👍"><figure class="margin-none boost-character">👍</figure><span class="for-screen-reader">Thumbs up</span></button>
     </form>
-    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post">
+    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="boost[content]" id="boost_content" value="👏" />
     <button name="button" type="submit" title="Clapping" class="btn message__action-btn" data-emoji="👏"><figure class="margin-none boost-character">👏</figure><span class="for-screen-reader">Clapping</span></button>
     </form>
-    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post">
+    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="boost[content]" id="boost_content" value="👋" />
     <button name="button" type="submit" title="Waving hand" class="btn message__action-btn" data-emoji="👋"><figure class="margin-none boost-character">👋</figure><span class="for-screen-reader">Waving hand</span></button>
     </form>
-    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post">
+    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="boost[content]" id="boost_content" value="💪" />
     <button name="button" type="submit" title="Muscle" class="btn message__action-btn" data-emoji="💪"><figure class="margin-none boost-character">💪</figure><span class="for-screen-reader">Muscle</span></button>
     </form>
-    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post">
+    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="boost[content]" id="boost_content" value="❤️" />
     <button name="button" type="submit" title="Red heart" class="btn message__action-btn" data-emoji="❤️"><figure class="margin-none boost-character">❤️</figure><span class="for-screen-reader">Red heart</span></button>
     </form>
-    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post">
+    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="boost[content]" id="boost_content" value="😂" />
     <button name="button" type="submit" title="Face with tears of joy" class="btn message__action-btn" data-emoji="😂"><figure class="margin-none boost-character">😂</figure><span class="for-screen-reader">Face with tears of joy</span></button>
     </form>
-    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post">
+    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="boost[content]" id="boost_content" value="🎉" />
     <button name="button" type="submit" title="Party popper" class="btn message__action-btn" data-emoji="🎉"><figure class="margin-none boost-character">🎉</figure><span class="for-screen-reader">Party popper</span></button>
     </form>
-    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post">
+    <form data-turbo-frame="boosting_message_{{ cmid:s }}" data-action="popup#close" action="/messages/{{ mid:d }}/boosts" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="boost[content]" id="boost_content" value="🔥" />
     <button name="button" type="submit" title="Fire" class="btn message__action-btn" data-emoji="🔥"><figure class="margin-none boost-character">🔥</figure><span class="for-screen-reader">Fire</span></button>
     </form>
@@ -144,7 +144,7 @@ koru/dom:component(EditMsg) {
     <div class="message__body position-relative" data-controller="scroll-into-view">
     <div class="message__body-content message__body-content--editing gap">
     <div class="composer--edit composer--rich-text">
-    <form id="form_message_{{ cmid:s }}" data-controller="form" data-action="lexxy:file-accept->form#preventAttachment keydown.esc->form#cancel keydown.ctrl+enter->form#submit:prevent keydown.meta+enter->form#submit:prevent" action="/rooms/{{ rid:s }}/messages/{{ mid:d }}" accept-charset="UTF-8" method="post">
+    <form id="form_message_{{ cmid:s }}" data-controller="form" data-action="lexxy:file-accept->form#preventAttachment keydown.esc->form#cancel keydown.ctrl+enter->form#submit:prevent keydown.meta+enter->form#submit:prevent" action="/rooms/{{ rid:s }}/messages/{{ mid:d }}" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="_method" value="patch" />
     <div class="full-width input input--actor min-width fill-white">
     <lexxy-editor rows="1" class="input lexxy-content" aria-multiline="true" aria-label="Edit message" autofocus="autofocus" permitted-attachment-types="application/vnd.campfire.mention application/vnd.actiontext.opengraph-embed" data-action="lexxy:change->typing-notifications#start keydown->composer#submitByKeyboard:capture" data-direct-upload-url="{{ host:s }}/rails/active_storage/direct_uploads" data-blob-url-template="{{ host:s }}/rails/active_storage/blobs/redirect/:signed_id/:filename" id="message_body" input="message_body_trix_input_message_{{ cmid:s }}" name="message[body]" value="{{ body:s }}">
@@ -172,7 +172,7 @@ koru/dom:component(EditMsg) {
     <span class="for-screen-reader">Close editor and discard changes</span>
     </a>
     </div>
-    <form id="delete_form_message_{{ cmid:s }}" data-turbo-frame="edit_message_{{ cmid:s }}" action="/rooms/{{ rid:s }}/messages/{{ mid:d }}" accept-charset="UTF-8" method="post">
+    <form id="delete_form_message_{{ cmid:s }}" data-turbo-frame="edit_message_{{ cmid:s }}" action="/rooms/{{ rid:s }}/messages/{{ mid:d }}" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="_method" value="delete" />
     </form>
     </div>
@@ -206,7 +206,7 @@ koru/dom:component(ProfilePage) {
     </a>
     </div>
     <div class="flex-item-justify-end">
-    <form method="post" action="/session" data-controller="sessions">
+    <form method="post" action="/session" data-controller="sessions"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="_method" value="delete" />
     <button class="btn" data-action="sessions#logout:prevent">
     <img aria-hidden="true" src="/assets/logout-a6131db1.svg" width="20" height="20" />
@@ -217,7 +217,7 @@ koru/dom:component(ProfilePage) {
     </nav>
     <main id="main-content">
     <section class="panel flex flex-column gap center-block" style="view-transition-name: avatar-{{ uid:d }}">
-    <form class="txt-medium" data-controller="form" action="/users/me/profile" accept-charset="UTF-8" method="post">
+    <form class="txt-medium" data-controller="form" action="/users/me/profile" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="_method" value="patch" />
     <div class="flex flex-column gap">
     <div class="flex align-center gap">
@@ -355,7 +355,7 @@ koru/dom:component(RoomFormPage) {
     </nav>
     <main id="main-content">
     <section class="panel flex flex-column gap center-block">
-    <form action="{{ action:s }}" accept-charset="UTF-8" method="post">
+    <form action="{{ action:s }}" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="_method" value="{{ method:s }}" />
     <div class="flex align-center gap">
     <label class="flex-item-grow txt-large">
@@ -447,7 +447,7 @@ koru/dom:component(BotFormPage) {
     <main id="main-content">
     <section class="panel panel--wide txt-align-center flex flex-column position-relative">
     <h1 class="for-screen-reader">Chat Bot Setup</h1>
-    <form class="flex flex-column gap" action="{{ action:s }}" accept-charset="UTF-8" method="post">
+    <form class="flex flex-column gap" action="{{ action:s }}" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="_method" value="{{ method:s }}" />
     <div class="flex align-center gap">
     <label class="flex align-center gap flex-item-grow txt-large input input--actor">
@@ -485,7 +485,7 @@ koru/dom:component(StylesPage) {
     </nav>
     <main id="main-content">
     <section class="panel panel--wide txt-align-center flex flex-column position-relative" style="view-transition-name: custom-styles">
-    <form class="flex flex-column gap" action="/account/custom_styles" accept-charset="UTF-8" method="post" data-controller="form" data-action="keydown.ctrl+enter-&gt;form#submit keydown.meta+enter-&gt;form#submit">
+    <form class="flex flex-column gap" action="/account/custom_styles" accept-charset="UTF-8" method="post" data-controller="form" data-action="keydown.ctrl+enter-&gt;form#submit keydown.meta+enter-&gt;form#submit"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <div class="pad-inline-double margin-inline">
     <h1 class="margin-none">Custom CSS</h1>
     <p class="flex flex-wrap align-center justify-center gap margin-none-block-start" style="--column-gap: 0.5ch; --row-gap: 0">
@@ -513,7 +513,7 @@ koru/dom:component(StylesPage) {
 koru/dom:component(TransferPage) {
     <body class="admin" data-controller="local-time lightbox">
     <main id="main-content">
-    <form data-controller="auto-submit" action="{{ action:s }}" accept-charset="UTF-8" method="post">
+    <form data-controller="auto-submit" action="{{ action:s }}" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <input type="hidden" name="_method" value="put" />
     </form>
     </main>
@@ -534,7 +534,7 @@ koru/dom:component(JoinPage) {
     </div>
     </nav>
     <main id="main-content">
-    <form class="center" action="{{ action:s }}" accept-charset="UTF-8" method="post">
+    <form class="center" action="{{ action:s }}" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <section class="nametag u-relative">
     <div class="nametag__inner flex flex-column gap">
     <fieldset class="flex flex-column center-block">
@@ -582,7 +582,7 @@ koru/dom:component(DirectsPage) {
     <main id="main-content">
     <turbo-frame id="direct_rooms_control" target="_top">
     <div class="directs directs--new flex flex-column gap">
-    <form class="flex gap flex-item-grow" data-controller="form" data-action="keydown.esc-&gt;form#cancel" action="/rooms/directs" accept-charset="UTF-8" method="post">
+    <form class="flex gap flex-item-grow" data-controller="form" data-action="keydown.esc-&gt;form#cancel" action="/rooms/directs" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <a class="btn flex-item-no-shrink" data-turbo-frame="user_sidebar" data-form-target="cancel" href="/users/me/sidebar">
     <img aria-hidden="true" src="/assets/arrow-left-abe40556.svg" width="20" height="20" />
     <span class="for-screen-reader">Cancel changes</span>
@@ -620,7 +620,6 @@ koru/dom:component(DirectsPage) {
 }
 
 koru/dom:component(RoomPage) {
-    <meta name="current-room-id" content="{{ rid:s }}">
     <body class="{{ bodyclass:s }}" data-controller="local-time lightbox">
     <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
     <nav id="nav">
@@ -731,7 +730,7 @@ koru/dom:component(RoomPage) {
     <span class="for-screen-reader">Search</span>
     </a>
     <turbo-frame id="composer-frame">
-    <form id="composer" class="margin-block flex-item-grow contain" data-controller="composer drop-target" data-action="dragenter-&gt;drop-target#dragenter dragover-&gt;drop-target#dragover drop-&gt;drop-target#drop drop-target:drop@window-&gt;composer#dropFiles lexxy:file-accept-&gt;composer#preventAttachment refresh-room:online@window-&gt;composer#online typing-notifications#stop paste-&gt;composer#pasteFiles turbo:submit-end-&gt;composer#submitEnd refresh-room:offline@window-&gt;composer#offline" data-composer-messages-outlet="#message-area" data-composer-toolbar-class="composer--rich-text" data-composer-room-id-value="{{ rid:s }}" action="/rooms/{{ rid:s }}/messages" accept-charset="UTF-8" method="post">
+    <form id="composer" class="margin-block flex-item-grow contain" data-controller="composer drop-target" data-action="dragenter-&gt;drop-target#dragenter dragover-&gt;drop-target#dragover drop-&gt;drop-target#drop drop-target:drop@window-&gt;composer#dropFiles lexxy:file-accept-&gt;composer#preventAttachment refresh-room:online@window-&gt;composer#online typing-notifications#stop paste-&gt;composer#pasteFiles turbo:submit-end-&gt;composer#submitEnd refresh-room:offline@window-&gt;composer#offline" data-composer-messages-outlet="#message-area" data-composer-toolbar-class="composer--rich-text" data-composer-room-id-value="{{ rid:s }}" action="/rooms/{{ rid:s }}/messages" accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="{{ csrf:s }}" />
     <fieldset data-composer-target="fields" contents>
     <div class="flex flex-column">
     <div class="composer__filelist flex flex--align-center gap flex-wrap" data-composer-target="fileList"></div>
@@ -869,6 +868,16 @@ pub tor first-name { name: string } -> string
 pub tor transfer-path { host: string, sid: string } -> string
 pub tor invite-path { host: string, code: string } -> string
 pub tor head-build { title: string, metas: string, logo: string, styles: string } -> string
+pub tor csrf-stash { masked: ?string }
+pub tor csrf-get {} -> string
+pub tor csrf-metas { pre: string } -> string
+pub tor meta-cat { a: string, b: string } -> string
+pub tor room-meta { pre: string, rid: string } -> string
+pub tor csrf-input {} -> string
+pub tor admin-cls { base: string, role: i64 } -> string
+pub tor unprocessable-body {} -> string
+pub tor respond-unprocessable { body: string } -> orisha:Response
+pub tor signin-body { logo: string, host: string, acct: string, mailname: string, mailemail: string } -> string
 pub tor profile-render { uid: i64, name: string, email: string, bio: string,
                          turl: string, qrpath: string, memberships: string } -> string<std/io:allocated!>
 pub tor account-render { navadmin: string, admin: string, member: string,
@@ -939,7 +948,8 @@ room-page = pages:page-begin()
                      |> koru/sqlite3:col.text(stmt: br, index: 5): buat
                      |> ts-ver(ts: buat): bver
                      |> signing:user-sgid(id: buid): bsg
-                     |> Boost-render(bid, mid: bmid, buid, bsgid: bsg, bname: bnm, bcontent: bct, bver): bf
+                     |> csrf-get(): bcsrf
+                     |> Boost-render(bid, mid: bmid, buid, bsgid: bsg, bname: bnm, bcontent: bct, bver, csrf: bcsrf): bf
                      |> boost-stash(mid: bmid, html: bf)
                      |> std/io:free(content: bf)
             | done d3 |> koru/sqlite3(conn: d3) {
@@ -980,10 +990,11 @@ room-page = pages:page-begin()
                         |> boost-rows(mid): brow
                         |> signing:user-sgid(id: uid): usg
                         |> host-or(h: host): rh
+                        |> csrf-get(): mcsrf
                         |> Msg-render(cmid: cid, mid, uid, rid, ms, ums, iso,
                                       author: anm, atitle, uver, usgid: usg,
                                       roomname: rn3, body, boosts: brow,
-                                      host: rh): mt
+                                      host: rh, csrf: mcsrf): mt
                         |> pages:page-write(text: mt)
                         |> std/io:free(content: mt)
                 | done d4 |> room-present(): has
@@ -1019,15 +1030,18 @@ page-shell = pages:page-take(): rows
     |> body-class(): bc
     |> now-ms(): lat
     |> user-metas(uid, name: unm): hmet
+    |> room-meta(pre: hmet, rid): hmet2
+    |> csrf-metas(pre: hmet2): hmet3
+    |> csrf-get(): hcsrf
     |> css-take(): hcss
     |> style-wrap(css: hcss): hsty
     |> acct-ver(): hver
-    |> head-build(title: rn, metas: hmet, logo: hver, styles: hsty): hd
+    |> head-build(title: rn, metas: hmet3, logo: hver, styles: hsty): hd
     |> RoomPage-render(navtitle: nt, settingslabel: sl, rid, msgdom: md,
                        uid, uname: unm, uver, usgid: usg,
                        bodyclass: bc, loaded: lat,
                        host: hst, editpath: ep,
-                       stream: stm, rows): page
+                       stream: stm, rows, csrf: hcsrf): page
     |> pages:page-begin()
     |> pages:page-write(text: hd)
     |> pages:page-write(text: page)

@@ -157,6 +157,80 @@ threadlocal var verify_buf: [512]u8 = undefined;
 }
 
 // ============================================================================
+// csrf — Rails's authenticity-token discipline, bound to the session cookie
+// ============================================================================
+//
+// Rails keeps a 32-byte secret in the session (`session[:_csrf_token]`) and
+// emits it masked — one-time-pad XOR — per form/meta; verify accepts the
+// masked form (unmask → compare) or the raw secret. Our session state is the
+// signed session_token cookie's raw value, so the real token is derived:
+//   real = HMAC-SHA256(csrf key, raw_session_token)
+// Emission masks with a fresh pad, urlsafe-b64-nopad → 86-char token;
+// verification unmasks and constant-time-compares. A request carrying no
+// verifiable cookie has no bound token — verify answers false, never an
+// error.
+
+threadlocal var csrf_key: [64]u8 = undefined;
+threadlocal var csrf_key_ok: bool = false;
+threadlocal var csrf_emit_buf: [128]u8 = undefined;
+
+fn csrfKey() ?*const [64]u8 {
+    return derivedKey("campfire/csrf_token", &csrf_key, &csrf_key_ok);
+}
+
+fn realCsrf(key: *const [64]u8, session_token: []const u8) [32]u8 {
+    var real: [32]u8 = undefined;
+    HmacSha256.create(&real, session_token, key);
+    return real;
+}
+
+// masked_authenticity_token — the value forms and the csrf-token meta emit.
+~pub tor csrf-token { token: ?string } -> string
+~proc csrf-token|zig {
+    const t = token orelse return "";
+    const key = csrfKey() orelse return "";
+    const real = realCsrf(key, t);
+    var masked: [64]u8 = undefined;
+    std.crypto.random.bytes(masked[0..32]);
+    for (0..32) |i| masked[32 + i] = masked[i] ^ real[i];
+    const n = std.base64.url_safe_no_pad.Encoder.calcSize(masked.len);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(csrf_emit_buf[0..n], &masked);
+    return csrf_emit_buf[0..n];
+}
+
+// valid_authenticity_token? — try each presented candidate (the param and
+// the header are both candidates in Rails). 64 decoded bytes = masked
+// (otp ++ otp^real); 32 = the raw real token, also accepted upstream.
+fn csrfCheck(real: *const [32]u8, presented: []const u8) bool {
+    if (presented.len == 0) return false;
+    const dlen = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(presented) catch return false;
+    if (dlen != 32 and dlen != 64) return false;
+    var decoded: [64]u8 = undefined;
+    std.base64.url_safe_no_pad.Decoder.decode(decoded[0..dlen], presented) catch return false;
+    var candidate: [32]u8 = undefined;
+    if (dlen == 64) {
+        for (0..32) |i| candidate[i] = decoded[32 + i] ^ decoded[i];
+    } else {
+        @memcpy(&candidate, decoded[0..32]);
+    }
+    return std.crypto.timing_safe.eql([32]u8, candidate, real.*);
+}
+
+// `token` is the cookie-verified session token; `form`/`header` are the
+// presented authenticity_token param and X-CSRF-Token header. No session
+// token → false (the caller decides whether that means 422 or the auth
+// redirect — CSRF itself is only ever a verdict on a bound pair).
+~pub tor csrf-verify { token: ?string, form: ?string, header: ?string } -> bool
+~proc csrf-verify|zig {
+    const t = token orelse return false;
+    const key = csrfKey() orelse return false;
+    const real = realCsrf(key, t);
+    if (form) |f| if (csrfCheck(&real, f)) return true;
+    if (header) |h| if (csrfCheck(&real, h)) return true;
+    return false;
+}
+
+// ============================================================================
 // signed cookies — cookies.signed (ActionDispatch::Cookies) both directions
 // ============================================================================
 //

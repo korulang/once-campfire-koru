@@ -29,8 +29,7 @@ threadlocal var auth_uid: i64 = -1;
 // ever round-trips through our own session lookup, so the raw token is
 // the value — Rails' cookies.signed HMAC wrapper is a separate concern
 // (cookie signing, not yet needed for the bench surface).
-~pub tor new-token {} -> string
-~proc new-token|zig {
+fn mintTok() []u8 {
     const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     var rand: [24]u8 = undefined;
     std.crypto.random.bytes(&rand);
@@ -39,11 +38,57 @@ threadlocal var auth_uid: i64 = -1;
     return tok;
 }
 
+~pub tor new-token {} -> string
+~proc new-token|zig {
+    return mintTok();
+}
+
+// The CSRF-bound raw token for a form-serving GET: the verified session
+// token when the request carried a signed cookie, else a fresh mint for the
+// anonymous "session" — Rails's session cookie exists pre-login for exactly
+// this reason; the anon value signs nothing in the sessions table, it only
+// gives the CSRF token a cookie to bind to.
+~pub tor raw-or { token: ?string } -> string
+~proc raw-or|zig {
+    if (token) |t| return t;
+    return mintTok();
+}
+
+// extra_headers for a page that binds CSRF to a cookie: a Set-Cookie only
+// when the request arrived without a verifiable one (Rails's jar already
+// exists otherwise — re-setting it would rotate the session out from under
+// the presented token). Nullable answer: a null extra_headers is omitted,
+// while an empty string fails orisha's well-formed check.
+threadlocal var setck_buf: [2048]u8 = undefined;
+
+~pub tor set-cookie-hdr { cookie: string, present: ?string } -> ?string
+~proc set-cookie-hdr|zig {
+    if (present != null) return null;
+    return std.fmt.bufPrint(&setck_buf, "Set-Cookie: {s}\r\n", .{cookie}) catch null;
+}
+
+// The authed-POST verdict: proceed when the CSRF pair matched, or when the
+// request carried no verifiable session cookie at all — the handler's own
+// auth lookup then answers the 302, matching the reference's
+// require_authentication-first ordering (no-cookie POSTs redirect, they do
+// not 422).
+~pub tor csrf-allow { token: ?string, ok: bool } -> bool
+~proc csrf-allow|zig {
+    return ok or token == null;
+}
+
 // Optional payload unwrap for required-param gates — an `!= null` guard
 // doesn't narrow `?string` to `string` for tor params, so the payload
 // crosses through a proc. Missing -> "".
 ~pub tor str-or { s: ?string } -> string
 ~proc str-or|zig { return s orelse ""; }
+
+// The nullable passthrough — str-or collapses null to "", but a verified
+// session token must STAY null (absent != empty) so downstream `x != null`
+// guards keep meaning "no session". Produces its input unchanged so a flow
+// can rebind a ?string across a `|>` boundary.
+~pub tor opt-or { s: ?string } -> ?string
+~proc opt-or|zig { return s; }
 
 // The 302's extra_headers block — Location + Set-Cookie spliced into the
 // response head. Built in a request-local buffer (same scoping argument

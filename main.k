@@ -32,9 +32,90 @@ import std/build
 // still a stub string (a real component when it earns one).
 // ============================================================================
 
-pub tor sign-in-page {} -> string
+// SessionsController#new — the reference's sessions/new verbatim via
+// views:signin-body. The head is the same composed head-build every page
+// uses (title "Sign in", csrf metas, no current-user pair); the account
+// row supplies the legend name, logo version, custom styles, and the
+// administrator mailto (lowest-id admin, as the reference's support link).
+pub tor sign-in-page { host: ?string } -> string
+sign-in-page = pages:page-begin()
+    |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
+    | db d |> koru/sqlite3(conn: d) {
+            SELECT a.name, a.updated_at, COALESCE(a.custom_styles,''),
+                   u.name, u.email_address
+            FROM users u CROSS JOIN accounts a
+            WHERE u.role = 1 AND u.status = 0
+            ORDER BY u.id LIMIT 1
+        }
+        ! row r |> koru/sqlite3:col.text(stmt: r, index: 0): anm
+                |> koru/sqlite3:col.text(stmt: r, index: 1): aat
+                |> koru/sqlite3:col.text(stmt: r, index: 2): acs
+                |> koru/sqlite3:col.text(stmt: r, index: 3): unm
+                |> koru/sqlite3:col.text(stmt: r, index: 4): uem
+                |> views:ts-ver(ts: aat): aver
+                |> views:csrf-metas(pre: ""): smet
+                |> views:style-wrap(css: acs): ssty
+                |> views:head-build(title: "Sign in", metas: smet, logo: aver, styles: ssty): shd
+                |> pages:page-write(text: shd)
+                |> views:host-or(h: host): shst
+                |> views:signin-body(logo: aver, host: shst, acct: anm,
+                                     mailname: unm, mailemail: uem): sbd
+                |> pages:page-write(text: sbd)
+        | done d2 |> koru/sqlite3:close.pooled(conn: d2)
+                  |> pages:page-take(): pg -> pg
+        | err e |> koru/sqlite3:close.pooled(e.conn)
+                |> pages:page-take(): pg2 -> pg2
+    | err _ |> pages:page-take(): pg3 -> pg3
 
-sign-in-page -> "<!DOCTYPE html><html><head><meta name=\"csrf-token\" content=\"dev-token\"></head><body><h1>Sign in</h1><form action=\"/session\" method=\"post\"><input name=\"email_address\"><input name=\"password\" type=\"password\"><button>Sign in</button></form></body></html>"
+// ── CSRF plumbing ───────────────────────────────────────────────────────────
+// csrf-prime runs on every form-serving GET: verify the session_token
+// cookie, or mint+sign an anonymous one when absent — the reference binds
+// CSRF to its always-on _campfire_session jar, so a form page must leave
+// the visitor holding SOME verifiable token or no POST it serves can ever
+// pass. The masked authenticity token is stashed where the components'
+// {{ csrf }} slots and the head's csrf metas read it. Yields the
+// Set-Cookie block to splice into extra_headers (null when the presented
+// cookie already verified — re-setting it would rotate the session out
+// from under the token just emitted).
+pub tor csrf-prime { tok: ?string } -> ?string
+csrf-prime = signing:cookie-verify(raw: tok): vtok
+    |> if(vtok == null)
+       | then |> session:new-token(): ntok
+              |> signing:csrf-token(token: ntok): cmask
+              |> views:csrf-stash(masked: cmask)
+              |> signing:cookie-header(token: ntok): cv
+              |> session:set-cookie-hdr(cookie: cv, present: vtok): hdr -> hdr
+       | else |> signing:csrf-token(token: vtok): cmask2
+              |> views:csrf-stash(masked: cmask2)
+              |> session:set-cookie-hdr(cookie: "", present: vtok): hdr2 -> hdr2
+
+// verify_authenticity_token's answer — the reference's public/422.html,
+// verbatim bytes, cached process-wide by views:unprocessable-body.
+pub tor unprocessable {} -> orisha:Response
+unprocessable =
+    views:unprocessable-body(): ub |> views:respond-unprocessable(body: ub): res -> res
+
+// The write-route gate prologue: present the cookie's verified raw token
+// plus both token carriers (the authenticity_token form param and the
+// X-CSRF-Token header, extracted by the route) to the verdict. csrf-allow
+// keeps Rails's auth-first ordering — a request with NO session cookie
+// proceeds to the handler's own 302 rather than 422.
+pub tor csrf-gate { tok: ?string, form: ?string, hdr: ?string } -> bool
+csrf-gate = signing:cookie-verify(raw: tok): vtok
+    |> signing:csrf-verify(token: vtok, form, header: hdr): cok
+    |> signing:csrf-token(token: vtok): cmask
+    |> views:csrf-stash(masked: cmask)
+    |> session:csrf-allow(token: vtok, ok: cok): ca -> ca
+
+// The strict variant for unauthenticated surfaces (sign-in, join,
+// first-run): no session cookie means no bound token, so the verdict is
+// 422 — matching the reference's CSRF-before-anything on those
+// controllers.
+pub tor csrf-strict { tok: ?string, form: ?string, hdr: ?string } -> bool
+csrf-strict = signing:cookie-verify(raw: tok): vtok
+    |> signing:csrf-token(token: vtok): cmask
+    |> views:csrf-stash(masked: cmask)
+    |> signing:csrf-verify(token: vtok, form, header: hdr): cok -> cok
 
 // Messages index (Message::Pagination): last PAGE_SIZE=40 ordered by
 // created_at. `before=<id>` narrows to created_at < that message's. Same
@@ -110,7 +191,8 @@ sidebar-page = pages:page-begin()
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
             SELECT u.id, u.name, u.role, u.updated_at,
-                   COALESCE(json_extract(a.settings,'$.restrict_room_creation_to_administrators'),0)
+                   COALESCE(json_extract(a.settings,'$.restrict_room_creation_to_administrators'),0),
+                   a.updated_at
             FROM users u CROSS JOIN accounts a
             WHERE u.email_address = {{user_email}} AND u.status = 0
         }
@@ -119,10 +201,22 @@ sidebar-page = pages:page-begin()
                  |> koru/sqlite3:col.int(stmt: ur, index: 2): urole
                  |> koru/sqlite3:col.text(stmt: ur, index: 3): uat0
                  |> koru/sqlite3:col.int(stmt: ur, index: 4): urst
+                 |> koru/sqlite3:col.text(stmt: ur, index: 5): auat
                  |> views:ts-ver(ts: uat0): uver1
+                 |> views:ts-ver(ts: auat): aver
                  |> views:stash-user(uid: uuid, name: unm, role: urole, ver: uver1)
-                 |> views:acct-stash(name: "", join: "", restrict: urst)
-        | done d2 |> pages:page-write(text: "<!DOCTYPE html><html><body><turbo-frame data-turbo-permanent=\"true\" data-controller=\"rooms-list read-rooms turbo-frame\" data-rooms-list-unread-class=\"unread\" data-action=\"presence:present@window-&gt;rooms-list#read read-rooms:read-&gt;rooms-list#read turbo:frame-load-&gt;rooms-list#loaded refresh-room:visible@window-&gt;turbo-frame#reload\" id=\"user_sidebar\" target=\"_top\">")
+                 |> views:acct-stash(name: "", join: "", restrict: urst, ver: aver)
+        | done d2 |> views:user-id(): suid
+                  |> views:user-name(): sunm
+                  |> views:user-metas(uid: suid, name: sunm): smu
+                  |> views:csrf-metas(pre: ""): smc
+                  |> views:meta-cat(a: smc, b: smu): smetas
+                  |> views:acct-ver(): sver
+                  |> views:css-take(): scss
+                  |> views:style-wrap(css: scss): ssty
+                  |> views:head-build(title: "Campfire", metas: smetas, logo: sver, styles: ssty): shd
+                  |> pages:page-write(text: shd)
+                  |> pages:page-write(text: "<body class=\"admin\" data-controller=\"local-time lightbox\"><turbo-frame data-turbo-permanent=\"true\" data-controller=\"rooms-list read-rooms turbo-frame\" data-rooms-list-unread-class=\"unread\" data-action=\"presence:present@window-&gt;rooms-list#read read-rooms:read-&gt;rooms-list#read turbo:frame-load-&gt;rooms-list#loaded refresh-room:visible@window-&gt;turbo-frame#reload\" id=\"user_sidebar\" target=\"_top\">")
                   |> signing:rooms-stream(): rs
                   |> pages:page-write(text: "<turbo-cable-stream-source channel=\"Turbo::StreamsChannel\" signed-stream-name=\"")
                   |> pages:page-write(text: rs)
@@ -229,8 +323,36 @@ pub tor search-page { user_email: ?string, q: ?string, host: ?string } -> string
 search-page = pages:page-begin()
     |> if(q == null)
     | then -> ""
-    | else |> pages:page-write(text: "<!DOCTYPE html><html><body><div id=\"search-results\" class=\"messages searches__results\">")
-           |> search-rows(user_email, q, host): body -> body
+    | else |> config:db-path(): dbp0 |> koru/sqlite3:open.pooled(path: dbp0)
+           | db du |> koru/sqlite3(conn: du) {
+                   SELECT u.id, u.name, u.role, u.updated_at, a.updated_at
+                   FROM users u CROSS JOIN accounts a
+                   WHERE u.email_address = {{user_email}} AND u.status = 0
+               }
+               ! row sr |> koru/sqlite3:col.int(stmt: sr, index: 0): quid
+                        |> koru/sqlite3:col.text(stmt: sr, index: 1): qnm
+                        |> koru/sqlite3:col.int(stmt: sr, index: 2): qrole
+                        |> koru/sqlite3:col.text(stmt: sr, index: 3): quat
+                        |> koru/sqlite3:col.text(stmt: sr, index: 4): qaat
+                        |> views:ts-ver(ts: quat): qver
+                        |> views:ts-ver(ts: qaat): qaver
+                        |> views:stash-user(uid: quid, name: qnm, role: qrole, ver: qver)
+                        |> views:acct-stash(name: "", join: "", restrict: 0, ver: qaver)
+               | done duz |> koru/sqlite3:close.pooled(conn: duz)
+                          |> views:user-id(): suid
+                          |> views:user-name(): sunm
+                          |> views:user-metas(uid: suid, name: sunm): qmu
+                          |> views:csrf-metas(pre: ""): qmc
+                          |> views:meta-cat(a: qmc, b: qmu): qmetas
+                          |> views:acct-ver(): qver2
+                          |> views:css-take(): qcss
+                          |> views:style-wrap(css: qcss): qsty
+                          |> views:head-build(title: "Search", metas: qmetas, logo: qver2, styles: qsty): qhd
+                          |> pages:page-write(text: qhd)
+                          |> pages:page-write(text: "<body class=\"sidebar searches admin\" data-controller=\"local-time lightbox\"><div id=\"search-results\" class=\"messages searches__results\">")
+                          |> search-rows(user_email, q, host): body -> body
+               | err qe |> koru/sqlite3:close.pooled(qe.conn) -> "user query failed"
+           | err _ -> "db open failed"
 
 tor search-rows { user_email: ?string, q: ?string, host: ?string } -> string
 search-rows = config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
@@ -290,8 +412,15 @@ search-rows = config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
 // `if` lives here (a tor continuation, the sanctioned place) rather than
 // in the route arm where __koru_continue splices leak.
 // extra_headers carries Location + Set-Cookie; NULL user_agent binds NULL.
-pub tor session-login { email: ?string, password: ?string, user_agent: ?string } -> orisha:Response
+pub tor session-login { email: ?string, password: ?string, user_agent: ?string,
+                        csrf_ok: bool } -> orisha:Response
 session-login =
+    if(csrf_ok)
+    | then |> session-login-impl(email, password, user_agent): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor session-login-impl { email: ?string, password: ?string, user_agent: ?string } -> orisha:Response
+session-login-impl =
     config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
             SELECT id, password_digest FROM users
@@ -315,7 +444,8 @@ session-login =
                            }
                            | done d3 |> koru/sqlite3:close.pooled(conn: d3) -> { status: 302, body: "", content_type: "text/plain", extra_headers: hdr }
                            | err e3 |> koru/sqlite3:close.pooled(e3.conn) -> { status: 500, body: "session insert failed", content_type: "text/plain", extra_headers: null }
-                    | else |> koru/sqlite3:close.pooled(conn: d2) -> { status: 401, body: "unauthorized", content_type: "text/html", extra_headers: null }
+                    | else |> koru/sqlite3:close.pooled(conn: d2)
+                           |> unprocessable(): res -> res
         | err e |> koru/sqlite3:close.pooled(e.conn) -> { status: 500, body: "query failed", content_type: "text/plain", extra_headers: null }
     | err _ -> { status: 500, body: "db open failed", content_type: "text/plain", extra_headers: null }
 
@@ -387,10 +517,23 @@ landing =
 
 pub tor first-run-page {} -> string
 
-first-run-page -> "<!DOCTYPE html><html><head><title>Set up Campfire</title><meta name=\"csrf-token\" content=\"dev-token\"></head><body class=\"signup\"><form action=\"/first_run\" accept-charset=\"UTF-8\" method=\"post\" class=\"center max-width\"><fieldset><legend><strong>Set up Campfire</strong></legend><input class=\"input\" name=\"user[name]\" autocomplete=\"name\" placeholder=\"Name\" required=\"required\"><input class=\"input\" name=\"user[email_address]\" type=\"email\" autocomplete=\"username\" placeholder=\"Email address\" required=\"required\"><input class=\"input\" name=\"user[password]\" type=\"password\" autocomplete=\"new-password\" placeholder=\"Password\" required=\"required\" maxlength=\"72\"><button type=\"submit\">Save</button></fieldset></form></body></html>"
+first-run-page =
+    views:csrf-metas(pre: ""): cm
+    |> views:csrf-input(): ci
+    |> views:meta-cat(a: "<!DOCTYPE html><html><head><title>Set up Campfire</title>", b: cm): h1
+    |> views:meta-cat(a: h1, b: "</head><body class=\"signup\"><form action=\"/first_run\" accept-charset=\"UTF-8\" method=\"post\" class=\"center max-width\">"): h2
+    |> views:meta-cat(a: h2, b: ci): h3
+    |> views:meta-cat(a: h3, b: "<fieldset><legend><strong>Set up Campfire</strong></legend><input class=\"input\" name=\"user[name]\" autocomplete=\"name\" placeholder=\"Name\" required=\"required\"><input class=\"input\" name=\"user[email_address]\" type=\"email\" autocomplete=\"username\" placeholder=\"Email address\" required=\"required\"><input class=\"input\" name=\"user[password]\" type=\"password\" autocomplete=\"new-password\" placeholder=\"Password\" required=\"required\" maxlength=\"72\"><button type=\"submit\">Save</button></fieldset></form></body></html>"): pg -> pg
 
-pub tor first-run-create { name: ?string, email: ?string, password: ?string, user_agent: ?string } -> orisha:Response
+pub tor first-run-create { name: ?string, email: ?string, password: ?string, user_agent: ?string,
+                           csrf_ok: bool } -> orisha:Response
 first-run-create =
+    if(csrf_ok)
+    | then |> first-run-create-impl(name, email, password, user_agent): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor first-run-create-impl { name: ?string, email: ?string, password: ?string, user_agent: ?string } -> orisha:Response
+first-run-create-impl =
     if(name != null and email != null and password != null)
     | then |> session:str-or(s: password): pw |> bcrypt:hash(password: pw, cost: 12): dg
            |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
@@ -449,9 +592,10 @@ first-run-create =
            | err _ -> { status: 500, body: "db open failed", content_type: "text/plain" }
     | else -> { status: 400, body: "param is missing or the value is empty: user", content_type: "text/plain" }
 
-pub tor first-run-gate {} -> orisha:Response
+pub tor first-run-gate { tok: ?string } -> orisha:Response
 first-run-gate =
-    config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
+    csrf-prime(tok): sc
+    |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
             SELECT COUNT(*) FROM accounts
         }
@@ -459,7 +603,7 @@ first-run-gate =
         | done d2 |> koru/sqlite3:close.pooled(conn: d2) |> session:take-uid(): accts
                   |> if(accts > 0)
                     | then -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /\r\n" }
-                    | else |> first-run-page(): page -> { status: 200, body: page, content_type: "text/html" }
+                    | else |> first-run-page(): page -> { status: 200, body: page, content_type: "text/html", extra_headers: sc }
         | err e |> koru/sqlite3:close.pooled(e.conn) -> { status: 500, body: "account check failed", content_type: "text/plain" }
     | err _ -> { status: 500, body: "db open failed", content_type: "text/plain" }
 
@@ -871,8 +1015,14 @@ qr-page =
 
 // SessionsController#destroy — POST /session _method=delete. Row delete,
 // clearing cookie, back to sign-in.
-pub tor session-destroy { token: ?string } -> orisha:Response
+pub tor session-destroy { token: ?string, csrf_ok: bool } -> orisha:Response
 session-destroy =
+    if(csrf_ok)
+    | then |> session-destroy-impl(token): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor session-destroy-impl { token: ?string } -> orisha:Response
+session-destroy-impl =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
@@ -895,8 +1045,16 @@ digest-of =
 // ProfilesController#update — name/email/bio always; password_digest only
 // when the field carries a non-empty value.
 pub tor profile-update { token: ?string, name: ?string, email: ?string,
-                         password: ?string, bio: ?string } -> orisha:Response
+                         password: ?string, bio: ?string,
+                         csrf_ok: bool } -> orisha:Response
 profile-update =
+    if(csrf_ok)
+    | then |> profile-update-impl(token, name, email, password, bio): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor profile-update-impl { token: ?string, name: ?string, email: ?string,
+                              password: ?string, bio: ?string } -> orisha:Response
+profile-update-impl =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
@@ -925,8 +1083,14 @@ profile-update =
 
 // AccountsController#update — PATCH carries account[name], PUT carries the
 // restrict-rooms settings flag. Both are admin-only writes.
-pub tor account-update { token: ?string, name: ?string, restrict: ?string } -> orisha:Response
+pub tor account-update { token: ?string, name: ?string, restrict: ?string, csrf_ok: bool } -> orisha:Response
 account-update =
+    if(csrf_ok)
+    | then |> account-update-impl(token, name, restrict): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor account-update-impl { token: ?string, name: ?string, restrict: ?string } -> orisha:Response
+account-update-impl =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
@@ -954,8 +1118,14 @@ account-update =
     | err _ -> { status: 500, body: "db open failed", content_type: "text/plain" }
 
 // Accounts::JoinCodesController#create — reset_join_code.
-pub tor join-reset { token: ?string } -> orisha:Response
+pub tor join-reset { token: ?string, csrf_ok: bool } -> orisha:Response
 join-reset =
+    if(csrf_ok)
+    | then |> join-reset-impl(token): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor join-reset-impl { token: ?string } -> orisha:Response
+join-reset-impl =
     signing:cookie-verify(raw: token): vtok
     |> views:join-code(): jc
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
@@ -978,8 +1148,14 @@ join-reset =
     | err _ -> { status: 500, body: "db open failed", content_type: "text/plain" }
 
 // Accounts::CustomStylesController#update.
-pub tor styles-update { token: ?string, css: ?string } -> orisha:Response
+pub tor styles-update { token: ?string, css: ?string, csrf_ok: bool } -> orisha:Response
 styles-update =
+    if(csrf_ok)
+    | then |> styles-update-impl(token, css): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor styles-update-impl { token: ?string, css: ?string } -> orisha:Response
+styles-update-impl =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
@@ -1003,8 +1179,14 @@ styles-update =
 // Accounts::BotsController#create — insert the bot user, grant it every
 // open room (grant_membership_to_open_rooms), webhook row when the URL is
 // present.
-pub tor bot-create { token: ?string, name: ?string, webhook: ?string } -> orisha:Response
+pub tor bot-create { token: ?string, name: ?string, webhook: ?string, csrf_ok: bool } -> orisha:Response
 bot-create =
+    if(csrf_ok)
+    | then |> bot-create-impl(token, name, webhook): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor bot-create-impl { token: ?string, name: ?string, webhook: ?string } -> orisha:Response
+bot-create-impl =
     signing:cookie-verify(raw: token): vtok
     |> views:bot-token(): btok
     |> session:str-or(s: webhook): whurl
@@ -1042,8 +1224,14 @@ bot-create =
 
 // Accounts::BotsController#update — user[name] + user[webhook_url] (webhook
 // row upserted; empty URL deletes it, matching update_webhook_url!).
-pub tor bot-update { token: ?string, bid: string, name: ?string, webhook: ?string } -> orisha:Response
+pub tor bot-update { token: ?string, bid: string, name: ?string, webhook: ?string, csrf_ok: bool } -> orisha:Response
 bot-update =
+    if(csrf_ok)
+    | then |> bot-update-impl(token, bid, name, webhook): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor bot-update-impl { token: ?string, bid: string, name: ?string, webhook: ?string } -> orisha:Response
+bot-update-impl =
     signing:cookie-verify(raw: token): vtok
     |> session:str-or(s: webhook): whurl
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
@@ -1077,8 +1265,14 @@ bot-update =
     | err _ -> { status: 500, body: "db open failed", content_type: "text/plain" }
 
 // Accounts::Bots::KeysController#update — reset_bot_key.
-pub tor bot-key-reset { token: ?string, bid: string } -> orisha:Response
+pub tor bot-key-reset { token: ?string, bid: string, csrf_ok: bool } -> orisha:Response
 bot-key-reset =
+    if(csrf_ok)
+    | then |> bot-key-reset-impl(token, bid): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor bot-key-reset-impl { token: ?string, bid: string } -> orisha:Response
+bot-key-reset-impl =
     signing:cookie-verify(raw: token): vtok
     |> views:bot-token(): btok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
@@ -1103,8 +1297,14 @@ bot-key-reset =
 // Rooms::OpensController#create — insert the open room, grant every active
 // user (the model's grant_access_to_all_users), prepend the sidebar link on
 // the shared "rooms" turbo stream, then redirect.
-pub tor room-create { token: ?string, name: ?string, rtype: string } -> orisha:Response
+pub tor room-create { token: ?string, name: ?string, rtype: string, csrf_ok: bool } -> orisha:Response
 room-create =
+    if(csrf_ok)
+    | then |> room-create-impl(token, name, rtype): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor room-create-impl { token: ?string, name: ?string, rtype: string } -> orisha:Response
+room-create-impl =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
@@ -1158,8 +1358,14 @@ room-create =
 
 // Rooms::*Controller#update — rename + broadcast_replace the sidebar link.
 // rk arrives "rooms_open"/"rooms_closed" and selects the list-id prefix.
-pub tor room-update { token: ?string, rid: string, name: ?string, rk: string } -> orisha:Response
+pub tor room-update { token: ?string, rid: string, name: ?string, rk: string, csrf_ok: bool } -> orisha:Response
 room-update =
+    if(csrf_ok)
+    | then |> room-update-impl(token, rid, name, rk): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor room-update-impl { token: ?string, rid: string, name: ?string, rk: string } -> orisha:Response
+room-update-impl =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
@@ -1189,8 +1395,14 @@ room-update =
 // Rooms::DirectsController#create — find-for exact member set or create,
 // grant the full set (direct involvement = 'everything'), prepend the
 // direct link on each member's user_<gid>:rooms stream.
-pub tor direct-create { token: ?string, ids: string } -> orisha:Response
+pub tor direct-create { token: ?string, ids: string, csrf_ok: bool } -> orisha:Response
 direct-create =
+    if(csrf_ok)
+    | then |> direct-create-impl(token, ids): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor direct-create-impl { token: ?string, ids: string } -> orisha:Response
+direct-create-impl =
     signing:cookie-verify(raw: token): vtok
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
@@ -1299,7 +1511,8 @@ room-refresh = pages:page-begin()
                                   |> koru/sqlite3:col.text(stmt: br, index: 5): buat
                                   |> views:ts-ver(ts: buat): bver
                                   |> signing:user-sgid(id: buid): bsg
-                                  |> views:Boost-render(bid, mid: bmid, buid, bsgid: bsg, bname: bnm, bcontent: bct, bver): bf
+                                  |> views:csrf-get(): bcsrf
+                                  |> views:Boost-render(bid, mid: bmid, buid, bsgid: bsg, bname: bnm, bcontent: bct, bver, csrf: bcsrf): bf
                                   |> views:boost-stash(mid: bmid, html: bf)
                                   |> std/io:free(content: bf)
                          | done d3 |> koru/sqlite3(conn: d3) {
@@ -1362,8 +1575,14 @@ room-refresh = pages:page-begin()
 
 // Sessions::TransfersController#update — the auto-submitted PUT: verify the
 // signed transfer id, open a session for that user, land on /.
-pub tor transfer-consume { token: ?string, code: string, ua: ?string } -> orisha:Response
+pub tor transfer-consume { token: ?string, code: string, ua: ?string, csrf_ok: bool } -> orisha:Response
 transfer-consume =
+    if(csrf_ok)
+    | then |> transfer-consume-impl(token, code, ua): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor transfer-consume-impl { token: ?string, code: string, ua: ?string } -> orisha:Response
+transfer-consume-impl =
     signing:transfer-verify(raw: code): uid
     |> if(uid > 0)
     | then |> session:new-token(): tok
@@ -1382,8 +1601,15 @@ transfer-consume =
 // UsersController#create — verified join_code, create user + open-room
 // memberships + session, land on /.
 pub tor join-create { code: string, name: ?string, email: ?string,
-                      password: ?string, ua: ?string } -> orisha:Response
+                      password: ?string, ua: ?string, csrf_ok: bool } -> orisha:Response
 join-create =
+    if(csrf_ok)
+    | then |> join-create-impl(code, name, email, password, ua): r -> r
+    | else |> unprocessable(): res -> res
+
+pub tor join-create-impl { code: string, name: ?string, email: ?string,
+                           password: ?string, ua: ?string } -> orisha:Response
+join-create-impl =
     session:str-or(s: password): pw
     |> if(name != null and email != null and pw != "")
     | then |> bcrypt:hash(password: pw, cost: 12): dg
@@ -1498,173 +1724,243 @@ orisha:static(name: "assets", root: "public")
 orisha:handler = orisha:router(req)
 ! [GET /]            |> orisha:cookie(req, name: "session_token"): tok |> landing(token: tok): res -> res
 ! [GET /up]          -> { status: 200, body: "<!DOCTYPE html><html><body style=\"background-color: green\"></body></html>", content_type: "text/html" }
-! [GET /first_run]   |> first-run-gate(): res -> res
-! [POST /first_run]  |> orisha:form(req, name: "user[name]"): fname
+! [GET /first_run]   |> orisha:cookie(req, name: "session_token"): ftok
+                     |> first-run-gate(tok: ftok): res -> res
+! [POST /first_run]  |> orisha:cookie(req, name: "session_token"): fc
+                     |> orisha:form(req, name: "authenticity_token"): fat
+                     |> orisha:header(req, name: "X-CSRF-Token"): fxt
+                     |> csrf-strict(tok: fc, form: fat, hdr: fxt): fca
+                     |> orisha:form(req, name: "user[name]"): fname
                      |> orisha:form(req, name: "user[email_address]"): femail
                      |> orisha:form(req, name: "user[password]"): fpw
                      |> orisha:header(req, name: "User-Agent"): fua
-                     |> first-run-create(name: fname, email: femail, password: fpw, user_agent: fua): res -> res
-! [GET /session/new] |> sign-in-page(): page -> { status: 200, body: page, content_type: "text/html" }
+                     |> first-run-create(name: fname, email: femail, password: fpw, user_agent: fua, csrf_ok: fca): res -> res
+! [GET /session/new] |> orisha:cookie(req, name: "session_token"): ntok
+                     |> csrf-prime(tok: ntok): nsc
+                     |> orisha:header(req, name: "Host"): nhst
+                     |> sign-in-page(host: nhst): page -> { status: 200, body: page, content_type: "text/html", extra_headers: nsc }
 ! [POST /session] |> orisha:form(req, name: "_method"): meth
                   |> session:str-or(s: meth): m2
+                  |> orisha:cookie(req, name: "session_token"): stok
+                  |> orisha:form(req, name: "authenticity_token"): satok
+                  |> orisha:header(req, name: "X-CSRF-Token"): sxtok
                   |> if(m2 == "delete")
-                     | then |> orisha:cookie(req, name: "session_token"): dtok
-                            |> session-destroy(token: dtok): res -> res
-                     | else |> orisha:form(req, name: "email_address"): email
+                     | then |> csrf-gate(tok: stok, form: satok, hdr: sxtok): dca
+                            |> session-destroy(token: stok, csrf_ok: dca): res -> res
+                     | else |> csrf-strict(tok: stok, form: satok, hdr: sxtok): lca
+                            |> orisha:form(req, name: "email_address"): email
                             |> orisha:form(req, name: "password"): password
                             |> orisha:header(req, name: "User-Agent"): ua
-                            |> session-login(email, password, user_agent: ua): res -> res
-! [GET /rooms/:id] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+                            |> session-login(email, password, user_agent: ua, csrf_ok: lca): res -> res
+! [GET /rooms/:id] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): sc |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): hst |> views:room-page(rid: p.id, email: ue, host: hst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", cacheable: true }
+    | then |> orisha:header(req, name: "Host"): hst |> views:room-page(rid: p.id, email: ue, host: hst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: sc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /rooms/:id/refresh] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+! [GET /rooms/:id/refresh] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): _ |> current-email(token: tok): ue
     |> orisha:query-param(req, name: "since"): sn
     |> orisha:header(req, name: "Host"): rhst
     |> room-refresh(rid: p.id, email: ue, since: sn, host: rhst): res -> res
-! [GET /rooms/:id/messages] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+! [GET /rooms/:id/messages] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): msc |> current-email(token: tok): ue
     |> orisha:query-param(req, name: "before"): before
     |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): mhst |> messages-page(p.id, before, email: ue, host: mhst): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true }
+    | then |> orisha:header(req, name: "Host"): mhst |> messages-page(p.id, before, email: ue, host: mhst): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: msc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [POST /rooms/:id/messages] p |> orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): matok
+    |> orisha:header(req, name: "X-CSRF-Token"): mxtok
+    |> csrf-gate(tok, form: matok, hdr: mxtok): mca
     |> signing:cookie-verify(raw: tok): vtok
     |> orisha:form(req, name: "message[body]"): mbody
     |> orisha:form(req, name: "message[client_message_id]"): mcmid
     |> orisha:header(req, name: "Host"): phst
-    |> messages:create(rid: p.id, token: vtok, body: mbody, cmid: mcmid, host: phst): res -> res
-! [GET /rooms/:id/messages/:mid/edit] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+    |> messages:create(rid: p.id, token: vtok, body: mbody, cmid: mcmid, host: phst, csrf_ok: mca): res -> res
+! [GET /rooms/:id/messages/:mid/edit] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): esc |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): ehst |> messages:edit(rid: p.id, p.mid, email: ue, host: ehst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html" }
+    | then |> orisha:header(req, name: "Host"): ehst |> messages:edit(rid: p.id, p.mid, email: ue, host: ehst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", extra_headers: esc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /rooms/:id/messages/:mid] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+! [GET /rooms/:id/messages/:mid] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): wsc |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): ehst |> messages:show(rid: p.id, p.mid, email: ue, host: ehst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html" }
+    | then |> orisha:header(req, name: "Host"): ehst |> messages:show(rid: p.id, p.mid, email: ue, host: ehst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", extra_headers: wsc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [POST /rooms/:id/messages/:mid] p |> orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): uatok
+    |> orisha:header(req, name: "X-CSRF-Token"): uxtok
+    |> csrf-gate(tok, form: uatok, hdr: uxtok): uca
     |> signing:cookie-verify(raw: tok): vtok
     |> orisha:form(req, name: "message[body]"): mbody
-    |> messages:update(rid: p.id, p.mid, token: vtok, body: mbody): res -> res
-! [GET /users/me/sidebar] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+    |> messages:update(rid: p.id, p.mid, token: vtok, body: mbody, csrf_ok: uca): res -> res
+! [GET /users/me/sidebar] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): ssc |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> sidebar-page(user_email: ue): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true }
+    | then |> sidebar-page(user_email: ue): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: ssc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /searches] |> orisha:cookie(req, name: "session_token"): tok |> orisha:query-param(req, name: "q"): q |> current-email(token: tok): ue
+! [GET /searches] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): qsc |> orisha:query-param(req, name: "q"): q |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): shst |> search-page(user_email: ue, q, host: shst): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true }
+    | then |> orisha:header(req, name: "Host"): shst |> search-page(user_email: ue, q, host: shst): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: qsc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [GET /cable]       |> cable:route(req): res -> res
 ! [GET /users/:token/avatar] p |> signing:sgid-verify(raw: p.token): uid
     |> if(uid > 0)
     | then |> avatar-lookup(uid): res -> res
     | else -> { status: 404, body: "", content_type: "text/plain" }
-! [GET /users/me/profile] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+! [GET /users/me/profile] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): psc |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): hst |> profile-page(email: ue, host: hst): page -> { status: 200, body: page, content_type: "text/html" }
+    | then |> orisha:header(req, name: "Host"): hst |> profile-page(email: ue, host: hst): page -> { status: 200, body: page, content_type: "text/html", extra_headers: psc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [POST /users/me/profile] |> orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): patok
+    |> orisha:header(req, name: "X-CSRF-Token"): pxtok
+    |> csrf-gate(tok, form: patok, hdr: pxtok): pca
     |> orisha:form(req, name: "user[name]"): un
     |> orisha:form(req, name: "user[email_address]"): uem
     |> orisha:form(req, name: "user[password]"): upw
     |> orisha:form(req, name: "user[bio]"): ubo
-    |> profile-update(token: tok, name: un, email: uem, password: upw, bio: ubo): res -> res
-! [GET /account/edit] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+    |> profile-update(token: tok, name: un, email: uem, password: upw, bio: ubo, csrf_ok: pca): res -> res
+! [GET /account/edit] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): asc |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): hst |> account-page(email: ue, host: hst): page -> { status: 200, body: page, content_type: "text/html" }
+    | then |> orisha:header(req, name: "Host"): hst |> account-page(email: ue, host: hst): page -> { status: 200, body: page, content_type: "text/html", extra_headers: asc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [POST /account] |> orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): aatok
+    |> orisha:header(req, name: "X-CSRF-Token"): axtok
+    |> csrf-gate(tok, form: aatok, hdr: axtok): aca
     |> orisha:form(req, name: "account[name]"): an
     |> orisha:form(req, name: "account[settings_attributes][restrict_room_creation_to_administrators]"): rst
-    |> account-update(token: tok, name: an, restrict: rst): res -> res
+    |> account-update(token: tok, name: an, restrict: rst, csrf_ok: aca): res -> res
 ! [POST /account/join_code] |> orisha:cookie(req, name: "session_token"): tok
-    |> join-reset(token: tok): res -> res
-! [GET /account/custom_styles/edit] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+    |> orisha:form(req, name: "authenticity_token"): jatok
+    |> orisha:header(req, name: "X-CSRF-Token"): jxtok
+    |> csrf-gate(tok, form: jatok, hdr: jxtok): jca
+    |> join-reset(token: tok, csrf_ok: jca): res -> res
+! [GET /account/custom_styles/edit] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): csc |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> styles-page(email: ue): page -> { status: 200, body: page, content_type: "text/html" }
+    | then |> styles-page(email: ue): page -> { status: 200, body: page, content_type: "text/html", extra_headers: csc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [POST /account/custom_styles] |> orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): xatok
+    |> orisha:header(req, name: "X-CSRF-Token"): xxtok
+    |> csrf-gate(tok, form: xatok, hdr: xxtok): xca
     |> orisha:form(req, name: "account[custom_styles]"): acs
-    |> styles-update(token: tok, css: acs): res -> res
-! [GET /account/bots] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+    |> styles-update(token: tok, css: acs, csrf_ok: xca): res -> res
+! [GET /account/bots] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): bsc |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> orisha:header(req, name: "Host"): hst |> bots-page(email: ue, host: hst): page -> { status: 200, body: page, content_type: "text/html" }
+    | then |> orisha:header(req, name: "Host"): hst |> bots-page(email: ue, host: hst): page -> { status: 200, body: page, content_type: "text/html", extra_headers: bsc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /account/bots/new] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+! [GET /account/bots/new] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): nsc |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> bot-form(email: ue, action: "/account/bots", method: "", edit_bid: 0): page -> { status: 200, body: page, content_type: "text/html" }
+    | then |> bot-form(email: ue, action: "/account/bots", method: "", edit_bid: 0): page -> { status: 200, body: page, content_type: "text/html", extra_headers: nsc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /account/bots/:id/edit] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+! [GET /account/bots/:id/edit] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): edsc |> current-email(token: tok): ue
     |> if(ue != null)
     | then |> messages:msg-int(s: p.id): bidn
            |> views:bot-action(bid: bidn): bact
-           |> bot-form(email: ue, action: bact, method: "patch", edit_bid: bidn): page -> { status: 200, body: page, content_type: "text/html" }
+           |> bot-form(email: ue, action: bact, method: "patch", edit_bid: bidn): page -> { status: 200, body: page, content_type: "text/html", extra_headers: edsc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [POST /account/bots] |> orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): batok
+    |> orisha:header(req, name: "X-CSRF-Token"): bxtok
+    |> csrf-gate(tok, form: batok, hdr: bxtok): bca
     |> orisha:form(req, name: "user[name]"): bn
     |> orisha:form(req, name: "user[webhook_url]"): bw
-    |> bot-create(token: tok, name: bn, webhook: bw): res -> res
+    |> bot-create(token: tok, name: bn, webhook: bw, csrf_ok: bca): res -> res
 ! [POST /account/bots/:id] p |> orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): buatok
+    |> orisha:header(req, name: "X-CSRF-Token"): buxtok
+    |> csrf-gate(tok, form: buatok, hdr: buxtok): buca
     |> orisha:form(req, name: "user[name]"): bn
     |> orisha:form(req, name: "user[webhook_url]"): bw
-    |> bot-update(token: tok, bid: p.id, name: bn, webhook: bw): res -> res
+    |> bot-update(token: tok, bid: p.id, name: bn, webhook: bw, csrf_ok: buca): res -> res
 ! [POST /account/bots/:id/key] p |> orisha:cookie(req, name: "session_token"): tok
-    |> bot-key-reset(token: tok, bid: p.id): res -> res
-! [GET /rooms/opens/new] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+    |> orisha:form(req, name: "authenticity_token"): katok
+    |> orisha:header(req, name: "X-CSRF-Token"): kxtok
+    |> csrf-gate(tok, form: katok, hdr: kxtok): kca
+    |> bot-key-reset(token: tok, bid: p.id, csrf_ok: kca): res -> res
+! [GET /rooms/opens/new] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): osc |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> room-form(email: ue, action: "/rooms/opens", method: "", edit_rid: 0): page -> { status: 200, body: page, content_type: "text/html" }
+    | then |> room-form(email: ue, action: "/rooms/opens", method: "", edit_rid: 0): page -> { status: 200, body: page, content_type: "text/html", extra_headers: osc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /rooms/opens/:id/edit] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+! [GET /rooms/opens/:id/edit] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): oesc |> current-email(token: tok): ue
     |> if(ue != null)
     | then |> messages:msg-int(s: p.id): erid
            |> views:room-form-action(plural: "opens", rid: erid): ract
-           |> room-form(email: ue, action: ract, method: "patch", edit_rid: erid): page -> { status: 200, body: page, content_type: "text/html" }
+           |> room-form(email: ue, action: ract, method: "patch", edit_rid: erid): page -> { status: 200, body: page, content_type: "text/html", extra_headers: oesc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /rooms/closeds/new] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+! [GET /rooms/closeds/new] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): closc |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> room-form(email: ue, action: "/rooms/closeds", method: "", edit_rid: 0): page -> { status: 200, body: page, content_type: "text/html" }
+    | then |> room-form(email: ue, action: "/rooms/closeds", method: "", edit_rid: 0): page -> { status: 200, body: page, content_type: "text/html", extra_headers: closc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
-! [GET /rooms/closeds/:id/edit] p |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+! [GET /rooms/closeds/:id/edit] p |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): clesc |> current-email(token: tok): ue
     |> if(ue != null)
     | then |> messages:msg-int(s: p.id): erid
            |> views:room-form-action(plural: "closeds", rid: erid): ract
-           |> room-form(email: ue, action: ract, method: "patch", edit_rid: erid): page -> { status: 200, body: page, content_type: "text/html" }
+           |> room-form(email: ue, action: ract, method: "patch", edit_rid: erid): page -> { status: 200, body: page, content_type: "text/html", extra_headers: clesc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [POST /rooms/opens] |> orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): roatok
+    |> orisha:header(req, name: "X-CSRF-Token"): roxtok
+    |> csrf-gate(tok, form: roatok, hdr: roxtok): roca
     |> orisha:form(req, name: "room[name]"): rn
-    |> room-create(token: tok, name: rn, rtype: "Rooms::Open"): res -> res
+    |> room-create(token: tok, name: rn, rtype: "Rooms::Open", csrf_ok: roca): res -> res
 ! [POST /rooms/opens/:id] p |> orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): ruatok
+    |> orisha:header(req, name: "X-CSRF-Token"): ruxtok
+    |> csrf-gate(tok, form: ruatok, hdr: ruxtok): ruca
     |> orisha:form(req, name: "room[name]"): rn
-    |> room-update(token: tok, rid: p.id, name: rn, rk: "rooms_open"): res -> res
+    |> room-update(token: tok, rid: p.id, name: rn, rk: "rooms_open", csrf_ok: ruca): res -> res
 ! [POST /rooms/closeds] |> orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): rcatok
+    |> orisha:header(req, name: "X-CSRF-Token"): rcxtok
+    |> csrf-gate(tok, form: rcatok, hdr: rcxtok): rcca
     |> orisha:form(req, name: "room[name]"): rn
-    |> room-create(token: tok, name: rn, rtype: "Rooms::Closed"): res -> res
+    |> room-create(token: tok, name: rn, rtype: "Rooms::Closed", csrf_ok: rcca): res -> res
 ! [POST /rooms/closeds/:id] p |> orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): ru2atok
+    |> orisha:header(req, name: "X-CSRF-Token"): ru2xtok
+    |> csrf-gate(tok, form: ru2atok, hdr: ru2xtok): ru2ca
     |> orisha:form(req, name: "room[name]"): rn
-    |> room-update(token: tok, rid: p.id, name: rn, rk: "rooms_closed"): res -> res
-! [GET /rooms/directs/new] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
+    |> room-update(token: tok, rid: p.id, name: rn, rk: "rooms_closed", csrf_ok: ru2ca): res -> res
+! [GET /rooms/directs/new] |> orisha:cookie(req, name: "session_token"): tok |> csrf-prime(tok): dsc |> current-email(token: tok): ue
     |> if(ue != null)
-    | then |> directs-page(email: ue): page -> { status: 200, body: page, content_type: "text/html" }
+    | then |> directs-page(email: ue): page -> { status: 200, body: page, content_type: "text/html", extra_headers: dsc }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [POST /rooms/directs] |> orisha:cookie(req, name: "session_token"): tok
+    |> orisha:form(req, name: "authenticity_token"): datok
+    |> orisha:header(req, name: "X-CSRF-Token"): dxtok
+    |> csrf-gate(tok, form: datok, hdr: dxtok): dca2
     |> orisha:form-ids(req, name: "user_ids[]"): fids
     |> orisha:query-param(req, name: "user_ids[]"): qid
     |> session:str-or(s: qid): qids
     |> messages:ids-or(form: fids, query: qids): ids
-    |> direct-create(token: tok, ids): res -> res
-! [GET /session/transfers/:id] p |> transfer-page(code: p.id): page -> { status: 200, body: page, content_type: "text/html" }
-! [POST /session/transfers/:id] p |> orisha:header(req, name: "User-Agent"): tua
-    |> transfer-consume(token: null, code: p.id, ua: tua): res -> res
-! [PUT /session/transfers/:id] p |> orisha:header(req, name: "User-Agent"): tua
-    |> transfer-consume(token: null, code: p.id, ua: tua): res -> res
-! [GET /join/:code] p |> join-page(p.code): page
+    |> direct-create(token: tok, ids, csrf_ok: dca2): res -> res
+! [GET /session/transfers/:id] p |> orisha:cookie(req, name: "session_token"): ttok
+    |> csrf-prime(tok: ttok): tsc
+    |> transfer-page(code: p.id): page -> { status: 200, body: page, content_type: "text/html", extra_headers: tsc }
+! [POST /session/transfers/:id] p |> orisha:cookie(req, name: "session_token"): tc
+    |> orisha:form(req, name: "authenticity_token"): tatok
+    |> orisha:header(req, name: "X-CSRF-Token"): txtok
+    |> csrf-strict(tok: tc, form: tatok, hdr: txtok): tca
+    |> orisha:header(req, name: "User-Agent"): tua
+    |> transfer-consume(token: null, code: p.id, ua: tua, csrf_ok: tca): res -> res
+! [PUT /session/transfers/:id] p |> orisha:cookie(req, name: "session_token"): tc2
+    |> orisha:form(req, name: "authenticity_token"): ta2tok
+    |> orisha:header(req, name: "X-CSRF-Token"): tx2tok
+    |> csrf-strict(tok: tc2, form: ta2tok, hdr: tx2tok): tca2
+    |> orisha:header(req, name: "User-Agent"): tua2
+    |> transfer-consume(token: null, code: p.id, ua: tua2, csrf_ok: tca2): res -> res
+! [GET /join/:code] p |> orisha:cookie(req, name: "session_token"): jtok2
+    |> csrf-prime(tok: jtok2): jsc2
+    |> join-page(p.code): page
     |> if(page == "")
     | then -> { status: 404, body: "", content_type: "text/plain" }
-    | else -> { status: 200, body: page, content_type: "text/html" }
-! [POST /join/:code] p |> orisha:form(req, name: "user[name]"): jn
+    | else -> { status: 200, body: page, content_type: "text/html", extra_headers: jsc2 }
+! [POST /join/:code] p |> orisha:cookie(req, name: "session_token"): jc2
+    |> orisha:form(req, name: "authenticity_token"): joatok
+    |> orisha:header(req, name: "X-CSRF-Token"): joxtok
+    |> csrf-strict(tok: jc2, form: joatok, hdr: joxtok): jca2
+    |> orisha:form(req, name: "user[name]"): jn
     |> orisha:form(req, name: "user[email_address]"): je
     |> orisha:form(req, name: "user[password]"): jp
     |> orisha:header(req, name: "User-Agent"): jua
-    |> join-create(p.code, name: jn, email: je, password: jp, ua: jua): res -> res
+    |> join-create(p.code, name: jn, email: je, password: jp, ua: jua, csrf_ok: jca2): res -> res
 ! [GET /qr_code/:id] p -> qr-page(enc: p.id)
 ! [GET /autocompletable/users] |> orisha:cookie(req, name: "session_token"): tok |> current-email(token: tok): ue
     |> orisha:query-param(req, name: "query"): aq
@@ -1675,8 +1971,14 @@ orisha:handler = orisha:router(req)
         | else |> autocomplete-json(email: ue, q: aq): js -> { status: 200, body: js, content_type: "application/json" }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [POST /rooms/:id/:key/messages] p |> orisha:raw-body(req): bbody
+    |> orisha:cookie(req, name: "session_token"): btok
+    |> signing:cookie-verify(raw: btok): bvtok
+    |> orisha:form(req, name: "authenticity_token"): batok
+    |> orisha:header(req, name: "X-CSRF-Token"): bxtok
+    |> signing:csrf-verify(token: bvtok, form: batok, header: bxtok): bcok
     |> orisha:header(req, name: "Host"): bhst
-    |> messages:bot-create(rid: p.id, p.key, body: bbody, host: bhst): res -> res
+    |> messages:bot-create(rid: p.id, p.key, body: bbody, host: bhst,
+                         stok: bvtok, csrf_ok: bcok): res -> res
 ! [*] |> orisha:static-router(name: "assets")
 
 // Cable seams — a complete client message dispatches on the connection's fd;
