@@ -70,24 +70,28 @@ repository.
 ## What our numbers look like
 
 Dedicated `s-8vcpu-16gb-amd` droplet (since destroyed), server pinned to
-cores 0–3, shared loadgen pinned to 4–7, three alternating reps per
-implementation, 8-second cells, contracts generated per app per rep from the
-seed SQL, every acknowledged write audited against the database. Median
-requests/sec at concurrency 64:
+cores 0–3, shared loadgen pinned to 4–7, three reps for Koru plus one Rust
+canary rep confirming box equivalence with the October 13 run, 8-second
+cells, contracts generated per app per rep from the seed SQL, every
+acknowledged write audited against the database. This build carries the
+full security layer — CSRF verification on every write, real login page,
+complete heads — and measures flat-to-faster versus the earlier run that
+skipped it. Median requests/sec at concurrency 64:
 
 | route | Koru | Rust | ratio |
 |-------|-----:|-----:|------:|
-| room_show | 86,021 | 13,587 | 6.3x |
-| messages_page | 87,570 | 14,055 | 6.2x |
-| sidebar | 105,484 | 17,752 | 5.9x |
-| search | 98,731 | 17,075 | 5.8x |
-| avatar | 75,371 | 70,215 | 1.07x |
-| static_css | 108,831 | 81,030 | 1.34x |
-| up | 114,126 | 30,216 | 3.8x |
-| post_message | 3,203 | 1,812 | 1.8x |
+| room_show | 89,908 | 16,304 | 5.5x |
+| messages_page | 97,901 | 15,045 | 6.5x |
+| sidebar | 104,751 | 19,755 | 5.3x |
+| search | 106,175 | 17,947 | 5.9x |
+| avatar | 75,138 | 76,482 | 0.98x |
+| static_css | 106,114 | 85,827 | 1.24x |
+| up | 102,837 | 32,758 | 3.1x |
+| post_message | 3,415 | 1,915 | 1.8x |
 
-144 cells, zero invalid responses, zero transport errors, 341k audited
+96 cells, zero invalid responses, zero transport errors, 266k audited
 writes verified. Full cells, manifests and audits are committed under
+`bench/droplet-run-2026-10-16/`; the earlier pre-CSRF run is at
 `bench/droplet-run-2026-10-13/`.
 
 **What the read-route rows measure.** Both implementations cache whole
