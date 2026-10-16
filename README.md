@@ -69,6 +69,11 @@ repository.
 
 ## What our numbers look like
 
+*A measurement, not a spec — the numbers below describe the build at
+`91bae1a` (2026-10-16). Later commits may move them; `bench/` is where the
+latest verified run lives, and `bench/RUNBOOK.md` is the full recipe to
+produce a new one.*
+
 Dedicated `s-8vcpu-16gb-amd` droplet (since destroyed), server pinned to
 cores 0–3, shared loadgen pinned to 4–7, three reps for Koru plus one Rust
 canary rep confirming box equivalence with the October 13 run, 8-second
