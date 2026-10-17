@@ -7,9 +7,12 @@ same contract as every other port in the family: the SQLite schema, storage
 layout, signed/encrypted sessions, Turbo frontend, Action Cable channels, and
 the shared verification suite.
 
-- ~8,100 lines of application source (`.k`/`.kz`), 49 routes — ~6.3 KLOC
+- ~8,900 lines of application source (`.k`/`.kz`), 49 routes — ~6.8 KLOC
   by the suite's counting method (nonblank, noncomment backend lines; the
-  templates are Koru code, so there is no separate template count).
+  templates are Koru code, so there is no separate template count). For
+  context, the published backend counts: Rails 5.5, Laravel 4.1, Express 6.8,
+  Elixir 11.6, Go 23.2, Rust 30.7, C 94.8 — Rails-sized source carrying
+  Rust-class throughput.
 - Passes the shared browser gate (Playwright, two tabs, zero console errors).
 - Passes all eight route contracts in
   [once-campfire-verification](https://github.com/basecamp/once-campfire-verification),
