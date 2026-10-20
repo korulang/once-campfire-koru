@@ -70,54 +70,20 @@ The `koru` app kind requires a one-line registration in `bench/compare.rb`
 (`allowed` list plus topology metadata); see `bench/submission.patch` in this
 repository.
 
-## What our numbers look like
+## Response cache
 
-*A measurement, not a spec — the numbers below describe the build at
-`91bae1a` (2026-10-16). Later commits may move them; `bench/` is where the
-latest verified run lives, and `bench/RUNBOOK.md` is the full recipe to
-produce a new one.*
+Whole GET 200 responses are cached in-process. The key is a SHA256 over
+method + path + query + Cookie + Host + negotiated content encoding, so the
+session cookie is already inside the key; a hit returns stored pre-gzipped
+bytes without dispatch or database access. Every write path bumps a
+generation counter that retires the map, so staleness is bounded by the
+next write, not a TTL.
 
-Dedicated `s-8vcpu-16gb-amd` droplet (since destroyed), server pinned to
-cores 0–3, shared loadgen pinned to 4–7, three reps for Koru plus one Rust
-canary rep confirming box equivalence with the October 13 run, 8-second
-cells, contracts generated per app per rep from the seed SQL, every
-acknowledged write audited against the database. This build carries the
-full security layer — CSRF verification on every write, real login page,
-complete heads — and measures flat-to-faster versus the earlier run that
-skipped it. Median requests/sec at concurrency 64:
+## Measured numbers
 
-| route | Koru | Rust | ratio |
-|-------|-----:|-----:|------:|
-| room_show | 89,908 | 16,304 | 5.5x |
-| messages_page | 97,901 | 15,045 | 6.5x |
-| sidebar | 104,751 | 19,755 | 5.3x |
-| search | 106,175 | 17,947 | 5.9x |
-| avatar | 75,138 | 76,482 | 0.98x |
-| static_css | 106,114 | 85,827 | 1.24x |
-| up | 102,837 | 32,758 | 3.1x |
-| post_message | 3,415 | 1,915 | 1.8x |
-
-96 cells, zero invalid responses, zero transport errors, 266k audited
-writes verified. Full cells, manifests and audits are committed under
-`bench/droplet-run-2026-10-16/`; the earlier pre-CSRF run is at
-`bench/droplet-run-2026-10-13/`.
-
-**What the read-route rows measure.** Both implementations cache whole
-authenticated responses. The difference is hit cost: Orisha's cache key is a
-SHA256 over method + path + query + Cookie + Host + negotiated encoding, and
-a hit returns stored pre-gzipped bytes without dispatch or database access —
-the session cookie is already inside the key, and every write path bumps a
-generation counter that retires the map. The Rust cache deliberately re-runs
-cookie verification, session, user and membership checks plus
-`PRAGMA data_version` before a hit can serve, so a mid-hit revocation cannot
-leak a page. The GET rows therefore measure hit-cost plus request path — an
-architecture gap, not a renderer gap. The rows that cannot be hit-shaped —
-`post_message` (real write path), `/up` (raw request path), cold start
-(50ms vs 180ms) and peak RSS (37MB vs 127MB) — are the like-for-like core.
-
-Absolute throughput is machine-bound: the published suite measures on an
-AMD Ryzen AI MAX+ 395; this droplet is a shared-vCPU box roughly an order of
-magnitude slower per core on this workload. Same-box ratios are the claim.
+Verified runs live under `bench/droplet-run-*/` — full cells, manifests,
+write audits and the SHAs they measured. `bench/RUNBOOK.md` is the recipe
+to produce a new one.
 
 ## Layout
 
