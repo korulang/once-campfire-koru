@@ -1,28 +1,13 @@
-// session — login-flow helpers.
+// session — the zig half.
 //
-// The SELECT user + bcrypt verify happens inside a `! row` arm, which
-// cannot produce the tor's terminal — so the authenticated user id rides
-// a threadlocal cell from the row body to the `| done` continuation.
-// Same worker-thread scoping argument as the pages buffer: a handler
-// runs to completion on one worker thread, so the cell is request-scoped.
-// If handlers ever interleave mid-request this must move into an explicit
-// request record threaded through the flow.
+// What remains here is what Koru cannot yet spell or should not spell this
+// way: the base58 token mint (crypto random), the `?string` narrowing
+// launderers, and the response-head builders whose outputs must outlive
+// later fmt:ln calls — fmt renders into one shared scratch buffer, so these
+// keep dedicated buffers. The cells and booleans moved to index.k on
+// orisha/ctx. Declarations all live in the companion (KORU111).
 
 const std = @import("std");
-
-threadlocal var auth_uid: i64 = -1;
-
-~pub tor stash-if { ok: bool, uid: i64 }
-~proc stash-if|zig {
-    if (ok) auth_uid = uid;
-}
-
-~pub tor take-uid {} -> i64
-~proc take-uid|zig {
-    const v = auth_uid;
-    auth_uid = -1;
-    return v;
-}
 
 // Rails `has_secure_token` is SecureRandom.base58(24): 24 chars over the
 // alphabet with 0, O, I, l removed to stay unambiguous. The cookie only
@@ -38,112 +23,44 @@ fn mintTok() []u8 {
     return tok;
 }
 
-~pub tor new-token {} -> string
 ~proc new-token|zig {
     return mintTok();
 }
 
-// The CSRF-bound raw token for a form-serving GET: the verified session
-// token when the request carried a signed cookie, else a fresh mint for the
-// anonymous "session" — Rails's session cookie exists pre-login for exactly
-// this reason; the anon value signs nothing in the sessions table, it only
-// gives the CSRF token a cookie to bind to.
-~pub tor raw-or { token: ?string } -> string
 ~proc raw-or|zig {
     if (token) |t| return t;
     return mintTok();
 }
 
-// extra_headers for a page that binds CSRF to a cookie: a Set-Cookie only
-// when the request arrived without a verifiable one (Rails's jar already
-// exists otherwise — re-setting it would rotate the session out from under
-// the presented token). Nullable answer: a null extra_headers is omitted,
-// while an empty string fails orisha's well-formed check.
 threadlocal var setck_buf: [2048]u8 = undefined;
 
-~pub tor set-cookie-hdr { cookie: string, present: ?string } -> ?string
 ~proc set-cookie-hdr|zig {
     if (present != null) return null;
     return std.fmt.bufPrint(&setck_buf, "Set-Cookie: {s}\r\n", .{cookie}) catch null;
 }
 
-// The authed-POST verdict: proceed when the CSRF pair matched, or when the
-// request carried no verifiable session cookie at all — the handler's own
-// auth lookup then answers the 302, matching the reference's
-// require_authentication-first ordering (no-cookie POSTs redirect, they do
-// not 422).
-~pub tor csrf-allow { token: ?string, ok: bool } -> bool
-~proc csrf-allow|zig {
-    return ok or token == null;
-}
-
-// Optional payload unwrap for required-param gates — an `!= null` guard
-// doesn't narrow `?string` to `string` for tor params, so the payload
-// crosses through a proc. Missing -> "".
-~pub tor str-or { s: ?string } -> string
 ~proc str-or|zig { return s orelse ""; }
 
-// The nullable passthrough — str-or collapses null to "", but a verified
-// session token must STAY null (absent != empty) so downstream `x != null`
-// guards keep meaning "no session". Produces its input unchanged so a flow
-// can rebind a ?string across a `|>` boundary.
-~pub tor opt-or { s: ?string } -> ?string
-~proc opt-or|zig { return s; }
-
-// The 302's extra_headers block — Location + Set-Cookie spliced into the
-// response head. Built in a request-local buffer (same scoping argument
-// as the pages buffer) so the produced string carries no <allocated!>
-// obligation the response pipeline would have to settle.
 threadlocal var hdr_buf: [1024]u8 = undefined;
 
-~pub tor redirect-headers { token: string } -> string
 ~proc redirect-headers|zig {
     return std.fmt.bufPrint(&hdr_buf,
         "Location: /\r\nSet-Cookie: session_token={s}; HttpOnly; SameSite=Lax; Path=/\r\n",
         .{token}) catch unreachable;
 }
 
-// The row/done boundary again, this time carrying text: column text
-// borrows die with the row, so the cell owns a copy. Empty cell = no
-// session row matched (bad/expired cookie).
-threadlocal var email_buf: [256]u8 = undefined;
-threadlocal var email_len: usize = 0;
-
-// Bare redirect — Location only. WelcomeController#show and the auth
-// gate both spell redirects this way.
-~pub tor redirect-to { path: string } -> string
 ~proc redirect-to|zig {
     return std.fmt.bufPrint(&hdr_buf, "Location: {s}\r\n", .{path}) catch unreachable;
 }
 
-// Room id -> "/rooms/<id>" — its own buffer: `redirect-to` consumes the
-// path while writing hdr_buf, so the two can't share.
+// Its own buffer: `redirect-to` consumes the path while writing hdr_buf,
+// so the two can't share.
 threadlocal var path_buf: [256]u8 = undefined;
 
-~pub tor room-path { rid: i64 } -> string
 ~proc room-path|zig {
     return std.fmt.bufPrint(&path_buf, "/rooms/{d}", .{rid}) catch unreachable;
 }
 
-~pub tor stash-text { text: string<*> }
-~proc stash-text|zig {
-    const n = @min(text.len, email_buf.len);
-    @memcpy(email_buf[0..n], text[0..n]);
-    email_len = n;
-}
-
-~pub tor take-text {} -> ?string
-~proc take-text|zig {
-    if (email_len == 0) return null;
-    const v = email_buf[0..email_len];
-    email_len = 0;
-    return v;
-}
-
-// The signed-cookie variant of redirect-headers — the Set-Cookie value
-// arrives already built by signing:cookie-header (Rack's attribute order:
-// path, expires, httponly, samesite — lowercase, escaped value).
-~pub tor redirect-signed { cookie: string } -> string
 ~proc redirect-signed|zig {
     return std.fmt.bufPrint(&hdr_buf,
         "Location: /\r\nSet-Cookie: {s}\r\n", .{cookie}) catch unreachable;

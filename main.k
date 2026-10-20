@@ -12,7 +12,7 @@ import bcrypt
 import cable
 import config
 import messages
-import pages
+import orisha/ctx
 import session
 import signing
 import views
@@ -38,7 +38,7 @@ import std/build
 // row supplies the legend name, logo version, custom styles, and the
 // administrator mailto (lowest-id admin, as the reference's support link).
 pub tor sign-in-page { host: ?string } -> string
-sign-in-page = pages:page-begin()
+sign-in-page = orisha/ctx:begin()
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
             SELECT a.name, a.updated_at, COALESCE(a.custom_styles,''),
@@ -56,16 +56,16 @@ sign-in-page = pages:page-begin()
                 |> views:csrf-metas(pre: ""): smet
                 |> views:style-wrap(css: acs): ssty
                 |> views:head-build(title: "Sign in", metas: smet, logo: aver, styles: ssty): shd
-                |> pages:page-write(text: shd)
+                |> orisha/ctx:body-write(text: shd)
                 |> views:host-or(h: host): shst
                 |> views:signin-body(logo: aver, host: shst, acct: anm,
                                      mailname: unm, mailemail: uem): sbd
-                |> pages:page-write(text: sbd)
+                |> orisha/ctx:body-write(text: sbd)
         | done d2 |> koru/sqlite3:close.pooled(conn: d2)
-                  |> pages:page-take(): pg -> pg
+                  |> orisha/ctx:body-take(): pg -> pg
         | err e |> koru/sqlite3:close.pooled(e.conn)
-                |> pages:page-take(): pg2 -> pg2
-    | err _ |> pages:page-take(): pg3 -> pg3
+                |> orisha/ctx:body-take(): pg2 -> pg2
+    | err _ |> orisha/ctx:body-take(): pg3 -> pg3
 
 // ── CSRF plumbing ───────────────────────────────────────────────────────────
 // csrf-prime runs on every form-serving GET: verify the session_token
@@ -165,10 +165,10 @@ open-write-ctx =
 // Empty page -> 204, matching the controller's head :no_content. (`if`
 // inside a route-branch continuation leaks __koru_continue_N splices —
 // repro/if-in-route-branch.k — so the 200/204 decision lives in
-// pages:page-status.)
+// orisha/ctx:body-status.)
 pub tor messages-page { id: string, before: ?string, email: ?string,
                         host: ?string } -> string
-messages-page = pages:page-begin()
+messages-page = orisha/ctx:begin()
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
         SELECT m.id, m.client_message_id, m.created_at, m.updated_at,
@@ -212,9 +212,9 @@ messages-page = pages:page-begin()
                                         author: anm, atitle, uver, usgid: usg,
                                         roomname: rname, body, boosts: "",
                                         host): mt
-                |> pages:page-write(text: mt)
+                |> orisha/ctx:body-write(text: mt)
                 |> std/io:free(content: mt)
-        | done d2 |> koru/sqlite3:close.pooled(conn: d2) |> pages:page-take(): body -> body
+        | done d2 |> koru/sqlite3:close.pooled(conn: d2) |> orisha/ctx:body-take(): body -> body
         | err e |> koru/sqlite3:close.pooled(e.conn) -> "query failed"
     | err _ -> "db open failed"
 
@@ -228,7 +228,7 @@ messages-page = pages:page-begin()
 // Contract surface: the literal shared_rooms section id and every visible
 // Rooms::Open name, escaped.
 pub tor sidebar-page { user_email: ?string } -> string
-sidebar-page = pages:page-begin()
+sidebar-page = orisha/ctx:begin()
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
             SELECT u.id, u.name, u.role, u.updated_at,
@@ -256,17 +256,17 @@ sidebar-page = pages:page-begin()
                   |> views:css-take(): scss
                   |> views:style-wrap(css: scss): ssty
                   |> views:head-build(title: "Campfire", metas: smetas, logo: sver, styles: ssty): shd
-                  |> pages:page-write(text: shd)
-                  |> pages:page-write(text: "<body class=\"admin\" data-controller=\"local-time lightbox\"><turbo-frame data-turbo-permanent=\"true\" data-controller=\"rooms-list read-rooms turbo-frame\" data-rooms-list-unread-class=\"unread\" data-action=\"presence:present@window-&gt;rooms-list#read read-rooms:read-&gt;rooms-list#read turbo:frame-load-&gt;rooms-list#loaded refresh-room:visible@window-&gt;turbo-frame#reload\" id=\"user_sidebar\" target=\"_top\">")
+                  |> orisha/ctx:body-write(text: shd)
+                  |> orisha/ctx:body-write(text: "<body class=\"admin\" data-controller=\"local-time lightbox\"><turbo-frame data-turbo-permanent=\"true\" data-controller=\"rooms-list read-rooms turbo-frame\" data-rooms-list-unread-class=\"unread\" data-action=\"presence:present@window-&gt;rooms-list#read read-rooms:read-&gt;rooms-list#read turbo:frame-load-&gt;rooms-list#loaded refresh-room:visible@window-&gt;turbo-frame#reload\" id=\"user_sidebar\" target=\"_top\">")
                   |> signing:rooms-stream(): rs
-                  |> pages:page-write(text: "<turbo-cable-stream-source channel=\"Turbo::StreamsChannel\" signed-stream-name=\"")
-                  |> pages:page-write(text: rs)
-                  |> pages:page-write(text: "\"></turbo-cable-stream-source>")
+                  |> orisha/ctx:body-write(text: "<turbo-cable-stream-source channel=\"Turbo::StreamsChannel\" signed-stream-name=\"")
+                  |> orisha/ctx:body-write(text: rs)
+                  |> orisha/ctx:body-write(text: "\"></turbo-cable-stream-source>")
                   |> views:user-id(): uid0
                   |> signing:user-rooms-stream(id: uid0): urs
-                  |> pages:page-write(text: "<turbo-cable-stream-source channel=\"Turbo::StreamsChannel\" signed-stream-name=\"")
-                  |> pages:page-write(text: urs)
-                  |> pages:page-write(text: "\"></turbo-cable-stream-source><div class=\"sidebar__container overflow-y overflow-hide-scrollbar\" data-controller=\"badge-dot\" data-badge-dot-unread-class=\"unread\" data-action=\"rooms-list:unread@window-&gt;badge-dot#update rooms-list:read@window-&gt;badge-dot#update turbo:submit-start-&gt;turbo-frame#unpermanize\"><turbo-frame id=\"direct_rooms_control\" target=\"_top\"><div class=\"directs gap overflow-x overflow-hide-scrollbar\"><a class=\"direct direct__new\" data-turbo-frame=\"_self\" href=\"/rooms/directs/new\"><span class=\"avatar avatar--icon\"><img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/messages-add-d229e6c2.svg\" width=\"20\" height=\"20\" /></span><span class=\"direct__author flex max-width min-width border-radius pad-inline-half\"><span class=\"for-screen-reader\">New</span><span class=\"txt-small overflow-clip\">Ping</span></span></a><div id=\"direct_rooms\" contents data-controller=\"sorted-list\" data-action=\"rooms-list:unread@window-&gt;sorted-list#updateItem\">")
+                  |> orisha/ctx:body-write(text: "<turbo-cable-stream-source channel=\"Turbo::StreamsChannel\" signed-stream-name=\"")
+                  |> orisha/ctx:body-write(text: urs)
+                  |> orisha/ctx:body-write(text: "\"></turbo-cable-stream-source><div class=\"sidebar__container overflow-y overflow-hide-scrollbar\" data-controller=\"badge-dot\" data-badge-dot-unread-class=\"unread\" data-action=\"rooms-list:unread@window-&gt;badge-dot#update rooms-list:read@window-&gt;badge-dot#update turbo:submit-start-&gt;turbo-frame#unpermanize\"><turbo-frame id=\"direct_rooms_control\" target=\"_top\"><div class=\"directs gap overflow-x overflow-hide-scrollbar\"><a class=\"direct direct__new\" data-turbo-frame=\"_self\" href=\"/rooms/directs/new\"><span class=\"avatar avatar--icon\"><img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/messages-add-d229e6c2.svg\" width=\"20\" height=\"20\" /></span><span class=\"direct__author flex max-width min-width border-radius pad-inline-half\"><span class=\"for-screen-reader\">New</span><span class=\"txt-small overflow-clip\">Ping</span></span></a><div id=\"direct_rooms\" contents data-controller=\"sorted-list\" data-action=\"rooms-list:unread@window-&gt;sorted-list#updateItem\">")
                   |> koru/sqlite3(conn: d2) {
                       SELECT r.id, COALESCE(ou.name, ''), ou.id, ou.updated_at
                       FROM memberships m
@@ -287,8 +287,8 @@ sidebar-page = pages:page-begin()
                               |> views:first-name(name: dn): dfn
                               |> views:itoa(n: drid): drids
                               |> views:direct-link(rid: drids, name: dfn, sgid: dsg, ver: dver): dlink
-                              |> pages:page-write(text: dlink)
-                      | done d3 |> pages:page-write(text: "</div><div contents>")
+                              |> orisha/ctx:body-write(text: dlink)
+                      | done d3 |> orisha/ctx:body-write(text: "</div><div contents>")
                               |> koru/sqlite3(conn: d3) {
                                   SELECT u.id, u.name, u.updated_at FROM users u
                                   WHERE u.status = 0 AND u.role != 2
@@ -309,8 +309,8 @@ sidebar-page = pages:page-begin()
                                           |> signing:user-sgid(id: puid): psg
                                           |> views:first-name(name: pn): pfn
                                           |> views:ping-btn(uid: puid, name: pfn, sgid: psg, ver: pver): pbtn
-                                          |> pages:page-write(text: pbtn)
-                                  | done d4 |> pages:page-write(text: "</div></div></turbo-frame><div class=\"rooms position-relative flex flex-column gap\"><div id=\"shared_rooms\" contents data-controller=\"sorted-list\">")
+                                          |> orisha/ctx:body-write(text: pbtn)
+                                  | done d4 |> orisha/ctx:body-write(text: "</div></div></turbo-frame><div class=\"rooms position-relative flex flex-column gap\"><div id=\"shared_rooms\" contents data-controller=\"sorted-list\">")
                                           |> koru/sqlite3(conn: d4) {
                                               SELECT r.id, r.name,
                                                 CASE r.type WHEN 'Rooms::Open' THEN 'rooms_open'
@@ -328,26 +328,26 @@ sidebar-page = pages:page-begin()
                                                       |> koru/sqlite3:col.text(stmt: r2, index: 2): rk
                                                       |> views:itoa(n: srid): srids
                                                       |> views:room-link(rk, rid: srids, name: rn2): rlink
-                                                      |> pages:page-write(text: rlink)
+                                                      |> orisha/ctx:body-write(text: rlink)
                                               | done d5 |> koru/sqlite3:close.pooled(conn: d5)
-                                                      |> pages:page-write(text: "</div>")
+                                                      |> orisha/ctx:body-write(text: "</div>")
                                                       |> views:user-role(): uro
                                                       |> views:acct-restrict(): rst
                                                       |> views:new-room-btn(role: uro, restrict: rst): nrb
-                                                      |> pages:page-write(text: nrb)
-                                                      |> pages:page-write(text: "</div><button class=\"btn sidebar__toggle\" data-action=\"toggle-class#toggle\"><img aria-hidden=\"true\" src=\"/assets/menu-5462dfd3.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Open menu</span></button></div><div class=\"flex align-end sidebar__tools gap justify-end\">")
+                                                      |> orisha/ctx:body-write(text: nrb)
+                                                      |> orisha/ctx:body-write(text: "</div><button class=\"btn sidebar__toggle\" data-action=\"toggle-class#toggle\"><img aria-hidden=\"true\" src=\"/assets/menu-5462dfd3.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Open menu</span></button></div><div class=\"flex align-end sidebar__tools gap justify-end\">")
                                                       |> views:user-id(): tuid
                                                       |> signing:user-sgid(id: tuid): tsg
                                                       |> views:user-ver(): tv
-                                                      |> pages:page-write(text: "<a href=\"/users/me/profile\" class=\"btn avatar flex-item-no-shrink sidebar__tool\"><img aria-hidden=\"true\" src=\"/users/")
-                                                      |> pages:page-write(text: tsg)
-                                                      |> pages:page-write(text: "/avatar?v=")
-                                                      |> pages:page-write(text: tv)
-                                                      |> pages:page-write(text: "\" width=\"48\" height=\"48\" style=\"view-transition-name: avatar-")
+                                                      |> orisha/ctx:body-write(text: "<a href=\"/users/me/profile\" class=\"btn avatar flex-item-no-shrink sidebar__tool\"><img aria-hidden=\"true\" src=\"/users/")
+                                                      |> orisha/ctx:body-write(text: tsg)
+                                                      |> orisha/ctx:body-write(text: "/avatar?v=")
+                                                      |> orisha/ctx:body-write(text: tv)
+                                                      |> orisha/ctx:body-write(text: "\" width=\"48\" height=\"48\" style=\"view-transition-name: avatar-")
                                                       |> views:itoa(n: tuid): tuids
-                                                      |> pages:page-write(text: tuids)
-                                                      |> pages:page-write(text: "\" /></a><a href=\"/account/edit\" class=\"btn align-center gap txt-reversed sidebar__tool\"><img aria-hidden=\"true\" src=\"/assets/settings-aee56972.svg\" width=\"20\" height=\"20\" style=\"view-transition-name: account-settings\" /><span class=\"for-screen-reader\">Account Settings</span></a></div></turbo-frame></body></html>")
-                                                      |> pages:page-take(): body -> body
+                                                      |> orisha/ctx:body-write(text: tuids)
+                                                      |> orisha/ctx:body-write(text: "\" /></a><a href=\"/account/edit\" class=\"btn align-center gap txt-reversed sidebar__tool\"><img aria-hidden=\"true\" src=\"/assets/settings-aee56972.svg\" width=\"20\" height=\"20\" style=\"view-transition-name: account-settings\" /><span class=\"for-screen-reader\">Account Settings</span></a></div></turbo-frame></body></html>")
+                                                      |> orisha/ctx:body-take(): body -> body
                                               | err e5 |> koru/sqlite3:close.pooled(e5.conn) -> "q4 failed"
                                   | err e4 |> koru/sqlite3:close.pooled(e4.conn) -> "q3 failed"
                       | err e3 |> koru/sqlite3:close.pooled(e3.conn) -> "q2 failed"
@@ -361,7 +361,7 @@ sidebar-page = pages:page-begin()
 // `@messages = Message.none`. Rows render through the same Msg partial as
 // the room page — DOM identity and data-message-id ride along.
 pub tor search-page { user_email: ?string, q: ?string, host: ?string } -> string
-search-page = pages:page-begin()
+search-page = orisha/ctx:begin()
     |> if(q == null)
     | then -> ""
     | else |> config:db-path(): dbp0 |> koru/sqlite3:open.pooled(path: dbp0)
@@ -389,8 +389,8 @@ search-page = pages:page-begin()
                           |> views:css-take(): qcss
                           |> views:style-wrap(css: qcss): qsty
                           |> views:head-build(title: "Search", metas: qmetas, logo: qver2, styles: qsty): qhd
-                          |> pages:page-write(text: qhd)
-                          |> pages:page-write(text: "<body class=\"sidebar searches admin\" data-controller=\"local-time lightbox\"><div id=\"search-results\" class=\"messages searches__results\">")
+                          |> orisha/ctx:body-write(text: qhd)
+                          |> orisha/ctx:body-write(text: "<body class=\"sidebar searches admin\" data-controller=\"local-time lightbox\"><div id=\"search-results\" class=\"messages searches__results\">")
                           |> search-rows(user_email, q, host): body -> body
                | err qe |> koru/sqlite3:close.pooled(qe.conn) -> "user query failed"
            | err _ -> "db open failed"
@@ -438,11 +438,11 @@ search-rows = config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
                                         author: anm, atitle, uver, usgid: usg,
                                         roomname: rname, body, boosts: "",
                                         host): mt
-                |> pages:page-write(text: mt)
+                |> orisha/ctx:body-write(text: mt)
                 |> std/io:free(content: mt)
         | done d2 |> koru/sqlite3:close.pooled(conn: d2)
-                |> pages:page-write(text: "</div></body></html>")
-                |> pages:page-take(): body -> body
+                |> orisha/ctx:body-write(text: "</div></body></html>")
+                |> orisha/ctx:body-take(): body -> body
         | err e |> koru/sqlite3:close.pooled(e.conn) -> "query failed"
     | err _ -> "db open failed"
 
@@ -760,7 +760,7 @@ app-head =
 
 // ── Profile ─────────────────────────────────────────────────────────────────
 pub tor profile-page { email: ?string, host: ?string } -> string
-profile-page = pages:page-begin()
+profile-page = orisha/ctx:begin()
     |> page-prelude(email): uid
     |> if(uid > 0)
     | then |> views:auth-email(): em
@@ -780,23 +780,23 @@ profile-page = pages:page-begin()
                         |> koru/sqlite3:col.text(stmt: mr, index: 1): mrn
                         |> views:itoa(n: mrid): mris
                         |> views:memb-link(rid: mris, name: mrn): ml
-                        |> pages:frag-write(text: ml)
+                        |> orisha/ctx:frag-write(text: ml)
                | done m2 |> koru/sqlite3:close.pooled(conn: m2)
-                         |> pages:frag-take(): membs
+                         |> orisha/ctx:frag-take(): membs
                          |> app-head(title: unm): hd
-                         |> pages:page-write(text: hd)
+                         |> orisha/ctx:body-write(text: hd)
                          |> views:profile-render(uid, name: unm, email: em, bio: bo,
                                                  turl, qrpath: qrp, memberships: membs): pg
-                         |> pages:page-write(text: pg)
-                         |> pages:page-write(text: "</html>")
-                         |> pages:page-take(): pageout -> pageout
+                         |> orisha/ctx:body-write(text: pg)
+                         |> orisha/ctx:body-write(text: "</html>")
+                         |> orisha/ctx:body-take(): pageout -> pageout
                | err emm |> koru/sqlite3:close.pooled(emm.conn) -> ""
            | err _ -> ""
     | else -> ""
 
 // ── Account edit ────────────────────────────────────────────────────────────
 pub tor account-page { email: ?string, host: ?string } -> string
-account-page = pages:page-begin()
+account-page = orisha/ctx:begin()
     |> page-prelude(email): uid
     |> if(uid > 0)
     | then |> views:user-role(): ur
@@ -822,17 +822,17 @@ account-page = pages:page-begin()
                         |> views:ts-ver(ts: muat): mver
                         |> signing:user-sgid(id: muid): msg
                         |> views:acct-user(uid: muid, uname: mun, role: mro, sgid: msg, ver: mver): arow
-                        |> pages:frag-write(text: arow)
+                        |> orisha/ctx:frag-write(text: arow)
                | done m2 |> koru/sqlite3:close.pooled(conn: m2)
-                         |> pages:frag-take(): usrs
+                         |> orisha/ctx:frag-take(): usrs
                          |> app-head(title: anm): hd
-                         |> pages:page-write(text: hd)
+                         |> orisha/ctx:body-write(text: hd)
                          |> views:account-render(navadmin: nva, admin: adm, member: mem,
                                                  inviteurl: ivu, qrpath: qrp, regen: rgn, users: usrs): pg
-                         |> pages:page-write(text: pg)
-                         |> pages:page-write(text: "</html>")
+                         |> orisha/ctx:body-write(text: pg)
+                         |> orisha/ctx:body-write(text: "</html>")
                          |> std/io:free(content: pg)
-                         |> pages:page-take(): body -> body
+                         |> orisha/ctx:body-take(): body -> body
                | err emm |> koru/sqlite3:close.pooled(emm.conn) -> ""
            | err _ -> ""
     | else -> ""
@@ -840,7 +840,7 @@ account-page = pages:page-begin()
 // ── Room form (opens/closeds new+edit shared) ────────────────────────────────
 // edit_rid == 0 renders the blank new form; >0 pre-fills the current name.
 pub tor room-form { email: ?string, action: string, method: string, edit_rid: i64 } -> string
-room-form = pages:page-begin()
+room-form = orisha/ctx:begin()
     |> page-prelude(email): uid
     |> if(uid > 0)
     | then |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
@@ -858,17 +858,17 @@ room-form = pages:page-begin()
                             |> views:ts-ver(ts: uuat): uuver
                             |> signing:user-sgid(id: uuid): uusg
                             |> views:room-user(uid: uuid, uname: uun, sgid: uusg, ver: uuver): ulab
-                            |> pages:frag-write(text: ulab)
+                            |> orisha/ctx:frag-write(text: ulab)
                    | done d3 |> koru/sqlite3:close.pooled(conn: d3)
-                             |> pages:frag-take(): usrs
+                             |> orisha/ctx:frag-take(): usrs
                              |> views:edit-name(): rn2
                              |> app-head(title: rn2): hd
-                         |> pages:page-write(text: hd)
+                         |> orisha/ctx:body-write(text: hd)
                              |> views:roomform-render(action, method, name: rn2, users: usrs): pg
-                             |> pages:page-write(text: pg)
-                             |> pages:page-write(text: "</html>")
+                             |> orisha/ctx:body-write(text: pg)
+                             |> orisha/ctx:body-write(text: "</html>")
                              |> std/io:free(content: pg)
-                             |> pages:page-take(): body -> body
+                             |> orisha/ctx:body-take(): body -> body
                    | err e3 |> koru/sqlite3:close.pooled(e3.conn) -> ""
                | err e2 |> koru/sqlite3:close.pooled(e2.conn) -> ""
            | err _ -> ""
@@ -876,7 +876,7 @@ room-form = pages:page-begin()
 
 // ── Bots ────────────────────────────────────────────────────────────────────
 pub tor bots-page { email: ?string, host: ?string } -> string
-bots-page = pages:page-begin()
+bots-page = orisha/ctx:begin()
     |> page-prelude(email): uid
     |> if(uid > 0)
     | then |> views:user-role(): ur
@@ -902,19 +902,19 @@ bots-page = pages:page-begin()
                       | done m2 |> koru/sqlite3:close.pooled(conn: m2)
                                 |> views:bots-take(): brows
                                 |> app-head(title: "Chat bots"): hd
-                         |> pages:page-write(text: hd)
+                         |> orisha/ctx:body-write(text: hd)
                                 |> views:bots-render(bots: brows): pg
-                                |> pages:page-write(text: pg)
-                                |> pages:page-write(text: "</html>")
+                                |> orisha/ctx:body-write(text: pg)
+                                |> orisha/ctx:body-write(text: "</html>")
                                 |> std/io:free(content: pg)
-                                |> pages:page-take(): body -> body
+                                |> orisha/ctx:body-take(): body -> body
                       | err emm |> koru/sqlite3:close.pooled(emm.conn) -> ""
                   | err _ -> ""
            | else -> ""
     | else -> ""
 
 pub tor bot-form { email: ?string, action: string, method: string, edit_bid: i64 } -> string
-bot-form = pages:page-begin()
+bot-form = orisha/ctx:begin()
     |> page-prelude(email): uid
     |> if(uid > 0)
     | then |> views:user-role(): ur
@@ -932,12 +932,12 @@ bot-form = pages:page-begin()
                                 |> views:edit-name(): bn2
                                 |> views:edit-wh(): bw2
                                 |> app-head(title: bn2): hd
-                         |> pages:page-write(text: hd)
+                         |> orisha/ctx:body-write(text: hd)
                                 |> views:botform-render(action, method, name: bn2, webhook: bw2): pg
-                                |> pages:page-write(text: pg)
-                                |> pages:page-write(text: "</html>")
+                                |> orisha/ctx:body-write(text: pg)
+                                |> orisha/ctx:body-write(text: "</html>")
                                 |> std/io:free(content: pg)
-                                |> pages:page-take(): body -> body
+                                |> orisha/ctx:body-take(): body -> body
                       | err e2 |> koru/sqlite3:close.pooled(e2.conn) -> ""
                   | err _ -> ""
            | else -> ""
@@ -945,36 +945,36 @@ bot-form = pages:page-begin()
 
 // ── Custom styles ───────────────────────────────────────────────────────────
 pub tor styles-page { email: ?string } -> string
-styles-page = pages:page-begin()
+styles-page = orisha/ctx:begin()
     |> page-prelude(email): uid
     |> if(uid > 0)
     | then |> views:acct-name(): anm
            |> views:css-take(): css0
            |> session:str-or(s: css0): css
            |> app-head(title: anm): hd
-                         |> pages:page-write(text: hd)
+                         |> orisha/ctx:body-write(text: hd)
            |> views:styles-render(css): pg
-           |> pages:page-write(text: pg)
-           |> pages:page-write(text: "</html>")
+           |> orisha/ctx:body-write(text: pg)
+           |> orisha/ctx:body-write(text: "</html>")
            |> std/io:free(content: pg)
-           |> pages:page-take(): body -> body
+           |> orisha/ctx:body-take(): body -> body
     | else -> ""
 
 // ── Session transfer (unauthenticated — the QR'd link's landing) ────────────
 pub tor transfer-page { code: string } -> string
-transfer-page = pages:page-begin()
+transfer-page = orisha/ctx:begin()
     |> views:head-build(title: "Campfire", metas: "", logo: "", styles: ""): hd
-    |> pages:page-write(text: hd)
+    |> orisha/ctx:body-write(text: hd)
     |> views:transfer-action(sid: code): act
     |> views:transfer-render(action: act): pg
-    |> pages:page-write(text: pg)
-    |> pages:page-write(text: "</html>")
+    |> orisha/ctx:body-write(text: pg)
+    |> orisha/ctx:body-write(text: "</html>")
     |> std/io:free(content: pg)
-    |> pages:page-take(): body -> body
+    |> orisha/ctx:body-take(): body -> body
 
 // ── Join (invite) page — unauthenticated, verified by the join_code ─────────
 pub tor join-page { code: string } -> string
-join-page = pages:page-begin()
+join-page = orisha/ctx:begin()
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
             SELECT name, updated_at, join_code FROM accounts LIMIT 1
@@ -991,29 +991,29 @@ join-page = pages:page-begin()
                      | then |> views:acct-ver(): av2
                             |> views:edit-name(): an2
                             |> views:head-build(title: "Sign up", metas: "", logo: av2, styles: ""): hd
-                            |> pages:page-write(text: hd)
+                            |> orisha/ctx:body-write(text: hd)
                             |> views:join-render(action: code, acctname: an2): pg
-                            |> pages:page-write(text: pg)
-                            |> pages:page-write(text: "</html>")
+                            |> orisha/ctx:body-write(text: pg)
+                            |> orisha/ctx:body-write(text: "</html>")
                             |> std/io:free(content: pg)
-                            |> pages:page-take(): body -> body
+                            |> orisha/ctx:body-take(): body -> body
                      | else -> ""
         | err e |> koru/sqlite3:close.pooled(e.conn) -> ""
     | err _ -> ""
 
 // ── New ping (direct room) ──────────────────────────────────────────────────
 pub tor directs-page { email: ?string } -> string
-directs-page = pages:page-begin()
+directs-page = orisha/ctx:begin()
     |> page-prelude(email): uid
     |> if(uid > 0)
     | then |> views:user-name(): unm
            |> app-head(title: unm): hd
-                         |> pages:page-write(text: hd)
+                         |> orisha/ctx:body-write(text: hd)
            |> views:directs-render(): pg
-           |> pages:page-write(text: pg)
-           |> pages:page-write(text: "</html>")
+           |> orisha/ctx:body-write(text: pg)
+           |> orisha/ctx:body-write(text: "</html>")
            |> std/io:free(content: pg)
-           |> pages:page-take(): body -> body
+           |> orisha/ctx:body-take(): body -> body
     | else -> ""
 
 // ── Autocomplete JSON ───────────────────────────────────────────────────────
@@ -1517,11 +1517,11 @@ refresh-msg =
     |> signing:user-sgid(id: uid): usg
     |> views:message-render(cmid, mid, uid, rid, ms, ums, iso, author: anm, atitle, uver, usgid: usg, roomname: rname, body, boosts: brow, host): mhtml
     |> views:stream-wrap(action, target: tgt): shtml
-    |> pages:frag-write()
+    |> orisha/ctx:frag-write()
     |> std/io:free(content: mhtml)
 
 pub tor room-refresh { rid: string, email: ?string, since: ?string, host: ?string } -> orisha:Response
-room-refresh = pages:page-begin()
+room-refresh = orisha/ctx:begin()
     |> views:page-reset()
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
@@ -1606,7 +1606,7 @@ room-refresh = pages:page-begin()
                                           |> views:mdom(cmid: mcmid): tgt
                                           |> refresh-msg(mid, cmid: mcmid, cat: mcat, uat: muat, anm: manm, uid: muid, auat: muuat, body: mbody, abio: mbio, rid, action: "replace", tgt, host)
                                  | done d5 |> koru/sqlite3:close.pooled(conn: d5)
-                                           |> pages:frag-take(): sbody -> { status: 200, body: sbody, content_type: "text/vnd.turbo-stream.html" }
+                                           |> orisha/ctx:frag-take(): sbody -> { status: 200, body: sbody, content_type: "text/vnd.turbo-stream.html" }
                                  | err e5 |> koru/sqlite3:close.pooled(e5.conn) -> { status: 500, body: "refresh failed", content_type: "text/plain" }
                              | err e4 |> koru/sqlite3:close.pooled(e4.conn) -> { status: 500, body: "refresh failed", content_type: "text/plain" }
                          | err e3 |> koru/sqlite3:close.pooled(e3.conn) -> { status: 500, body: "refresh failed", content_type: "text/plain" }
@@ -1788,7 +1788,7 @@ orisha:handler = orisha:router(req)
                             |> session-login(email, password, user_agent: ua, lcx.csrf_ok): res -> res
 ! [GET /rooms/:id] p |> page-ctx(req): c
     |> if(c.email != null)
-    | then |> orisha:header(req, name: "Host"): hst |> views:room-page(rid: p.id, c.email, host: hst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: c.cookie_hdr }
+    | then |> orisha:header(req, name: "Host"): hst |> views:room-page(rid: p.id, c.email, host: hst): page |> orisha/ctx:body-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: c.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [GET /rooms/:id/refresh] p |> page-ctx(req): rc
     |> orisha:query-param(req, name: "since"): sn
@@ -1797,7 +1797,7 @@ orisha:handler = orisha:router(req)
 ! [GET /rooms/:id/messages] p |> page-ctx(req): mc
     |> orisha:query-param(req, name: "before"): before
     |> if(mc.email != null)
-    | then |> orisha:header(req, name: "Host"): mhst |> messages-page(p.id, before, mc.email, host: mhst): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: mc.cookie_hdr }
+    | then |> orisha:header(req, name: "Host"): mhst |> messages-page(p.id, before, mc.email, host: mhst): page |> orisha/ctx:body-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: mc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [POST /rooms/:id/messages] p |> write-ctx(req): wc
     |> orisha:form(req, name: "message[body]"): mbody
@@ -1806,22 +1806,22 @@ orisha:handler = orisha:router(req)
     |> messages:create(rid: p.id, token: wc.vtok, body: mbody, cmid: mcmid, host: phst, wc.csrf_ok): res -> res
 ! [GET /rooms/:id/messages/:mid/edit] p |> page-ctx(req): ec
     |> if(ec.email != null)
-    | then |> orisha:header(req, name: "Host"): ehst |> messages:edit(rid: p.id, p.mid, ec.email, host: ehst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", extra_headers: ec.cookie_hdr }
+    | then |> orisha:header(req, name: "Host"): ehst |> messages:edit(rid: p.id, p.mid, ec.email, host: ehst): page |> orisha/ctx:body-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", extra_headers: ec.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [GET /rooms/:id/messages/:mid] p |> page-ctx(req): scw
     |> if(scw.email != null)
-    | then |> orisha:header(req, name: "Host"): ehst |> messages:show(rid: p.id, p.mid, scw.email, host: ehst): page |> pages:page-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", extra_headers: scw.cookie_hdr }
+    | then |> orisha:header(req, name: "Host"): ehst |> messages:show(rid: p.id, p.mid, scw.email, host: ehst): page |> orisha/ctx:body-status-or(status: 404): code -> { status: code, body: page, content_type: "text/html", extra_headers: scw.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [POST /rooms/:id/messages/:mid] p |> write-ctx(req): uc
     |> orisha:form(req, name: "message[body]"): mbody
     |> messages:update(rid: p.id, p.mid, token: uc.vtok, body: mbody, uc.csrf_ok): res -> res
 ! [GET /users/me/sidebar] |> page-ctx(req): sbc
     |> if(sbc.email != null)
-    | then |> sidebar-page(user_email: sbc.email): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: sbc.cookie_hdr }
+    | then |> sidebar-page(user_email: sbc.email): page |> orisha/ctx:body-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: sbc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [GET /searches] |> page-ctx(req): qc |> orisha:query-param(req, name: "q"): q
     |> if(qc.email != null)
-    | then |> orisha:header(req, name: "Host"): shst |> search-page(user_email: qc.email, q, host: shst): page |> pages:page-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: qc.cookie_hdr }
+    | then |> orisha:header(req, name: "Host"): shst |> search-page(user_email: qc.email, q, host: shst): page |> orisha/ctx:body-status(): code -> { status: code, body: page, content_type: "text/html", cacheable: true, extra_headers: qc.cookie_hdr }
     | else -> { status: 302, body: "", content_type: "text/plain", extra_headers: "Location: /session/new\r\n" }
 ! [GET /cable]       |> cable:route(req): res -> res
 ! [GET /users/:token/avatar] p |> signing:sgid-verify(raw: p.token): uid

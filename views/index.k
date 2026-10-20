@@ -788,7 +788,7 @@ koru/dom:component(RoomPage) {
 // ── Page flows ──────────────────────────────────────────────────────────────
 import koru/sqlite3
 import config
-import pages
+import orisha/ctx
 import signing
 import std/io
 
@@ -902,7 +902,7 @@ pub tor boost-rows { mid: i64 } -> string
 // window, one query) -> message rows render Msg with boost-rows(mid)
 // lookup -> RoomPage with the accumulated buffer injected raw.
 pub tor room-page { rid: string, email: ?string, host: ?string } -> string
-room-page = pages:page-begin()
+room-page = orisha/ctx:begin()
     |> page-reset()
     |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
     | db d |> koru/sqlite3(conn: d) {
@@ -995,7 +995,7 @@ room-page = pages:page-begin()
                                       author: anm, atitle, uver, usgid: usg,
                                       roomname: rn3, body, boosts: brow,
                                       host: rh, csrf: mcsrf): mt
-                        |> pages:page-write(text: mt)
+                        |> orisha/ctx:body-write(text: mt)
                         |> std/io:free(content: mt)
                 | done d4 |> room-present(): has
                           |> if(has)
@@ -1003,18 +1003,18 @@ room-page = pages:page-begin()
                                  |> page-shell(rid, host): page -> page
                           | else |> koru/sqlite3:close.pooled(conn: d4) -> ""
                 | err e3 |> koru/sqlite3:close.pooled(e3.conn)
-                         |> pages:page-take(): partial -> partial
+                         |> orisha/ctx:body-take(): partial -> partial
             | err e2 |> koru/sqlite3:close.pooled(e2.conn)
-                     |> pages:page-take(): partial -> partial
+                     |> orisha/ctx:body-take(): partial -> partial
         | err e1 |> koru/sqlite3:close.pooled(e1.conn)
-                 |> pages:page-take(): partial -> partial
+                 |> orisha/ctx:body-take(): partial -> partial
     | err _ -> "db open failed"
 
 // Assemble the shell: take the accumulated message rows, render RoomPage
 // around them, and rewrite the buffer as doctype + page. Runs only on the
 // member path (the caller's `if` arms it); a non-member reaches this never.
 pub tor page-shell { rid: string, host: ?string } -> string
-page-shell = pages:page-take(): rows
+page-shell = orisha/ctx:body-take(): rows
     |> room-name(): rn
     |> msgdom(rid): md
     |> room-edit-path(rid): ep
@@ -1042,12 +1042,12 @@ page-shell = pages:page-take(): rows
                        bodyclass: bc, loaded: lat,
                        host: hst, editpath: ep,
                        stream: stm, rows, csrf: hcsrf): page
-    |> pages:page-begin()
-    |> pages:page-write(text: hd)
-    |> pages:page-write(text: page)
-    |> pages:page-write(text: "</html>")
+    |> orisha/ctx:begin()
+    |> orisha/ctx:body-write(text: hd)
+    |> orisha/ctx:body-write(text: page)
+    |> orisha/ctx:body-write(text: "</html>")
     |> std/io:free(content: page)
-    |> pages:page-take(): body -> body
+    |> orisha/ctx:body-take(): body -> body
 
 // Detached render of one message row — the partial `messages/create`
 // broadcasts and re-renders (`render @message` outside a request). The Msg

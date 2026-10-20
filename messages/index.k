@@ -33,7 +33,7 @@ import cable
 import signing
 import views
 import session
-import pages
+import orisha/ctx
 import std/io
 
 pub tor msg-reset {}
@@ -221,7 +221,7 @@ edit =
     | then -> ""
     | else |> msg-int(s: rid): ridn
            |> msg-int(s: mid): midn
-           |> pages:page-begin()
+           |> orisha/ctx:begin()
            |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
            | db d |> koru/sqlite3(conn: d) {
                    SELECT m.client_message_id, rt.body
@@ -239,13 +239,13 @@ edit =
                         |> koru/sqlite3:col.text(stmt: mr, index: 1): ebody
                         |> views:edit-render(cmid: ecmid, rid, mid: midn,
                                              body: ebody, host): mt
-                        |> pages:page-write(text: mt)
+                        |> orisha/ctx:body-write(text: mt)
                         |> std/io:free(content: mt)
                | done d2 |> koru/sqlite3:close.pooled(conn: d2)
-                         |> pages:page-take(): page -> page
+                         |> orisha/ctx:body-take(): page -> page
                | err e |> koru/sqlite3:close.pooled(e.conn)
-                         |> pages:page-take(): partial -> partial
-           | err _ |> pages:page-take(): partial -> partial
+                         |> orisha/ctx:body-take(): partial -> partial
+           | err _ |> orisha/ctx:body-take(): partial -> partial
 
 // show — render @message. The turbo-frame navigation after update (and the
 // edit close link) extracts edit_message_<cmid> out of this response.
@@ -255,7 +255,7 @@ show =
     | then -> ""
     | else |> msg-int(s: rid): ridn
            |> msg-int(s: mid): midn
-           |> pages:page-begin()
+           |> orisha/ctx:begin()
            |> config:db-path(): dbp |> koru/sqlite3:open.pooled(path: dbp)
            | db d |> koru/sqlite3(conn: d) {
                    SELECT m.id, m.client_message_id, m.created_at, m.updated_at,
@@ -293,13 +293,13 @@ show =
                                                 author: anm, atitle, uver,
                                                 usgid: usg, roomname: rname,
                                                 body, boosts: "", host): mt
-                        |> pages:page-write(text: mt)
+                        |> orisha/ctx:body-write(text: mt)
                         |> std/io:free(content: mt)
                | done d2 |> koru/sqlite3:close.pooled(conn: d2)
-                         |> pages:page-take(): page -> page
+                         |> orisha/ctx:body-take(): page -> page
                | err e |> koru/sqlite3:close.pooled(e.conn)
-                         |> pages:page-take(): partial -> partial
-           | err _ |> pages:page-take(): partial -> partial
+                         |> orisha/ctx:body-take(): partial -> partial
+           | err _ |> orisha/ctx:body-take(): partial -> partial
 
 // update — permissioned row (creator or administrator) carries the cmid;
 // a missing row means not found or forbidden, both a bare 403 here. Writes
