@@ -49,6 +49,30 @@ void *calloc(size_t a, size_t b) { record(CALLOC, a * b); return __libc_calloc(a
 void *realloc(void *p, size_t n) { record(REALLOC, n); return __libc_realloc(p, n); }
 void free(void *p) { if (p) record(FREE, 0); __libc_free(p); }
 
+// Zig's c_allocator allocates via posix_memalign/aligned_alloc, never plain
+// malloc — without these hooks a koru app shows frees with no matching
+// allocations (observed: 5 free/response, 0 malloc, on the avatar route).
+static int (*real_posix_memalign)(void **, size_t, size_t);
+int posix_memalign(void **memptr, size_t alignment, size_t size) {
+    if (!real_posix_memalign) real_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
+    record(MALLOC, size);
+    return real_posix_memalign(memptr, alignment, size);
+}
+
+static void *(*real_aligned_alloc)(size_t, size_t);
+void *aligned_alloc(size_t alignment, size_t size) {
+    if (!real_aligned_alloc) real_aligned_alloc = dlsym(RTLD_NEXT, "aligned_alloc");
+    record(MALLOC, size);
+    return real_aligned_alloc(alignment, size);
+}
+
+static void *(*real_memalign)(size_t, size_t);
+void *memalign(size_t alignment, size_t size) {
+    if (!real_memalign) real_memalign = dlsym(RTLD_NEXT, "memalign");
+    record(MALLOC, size);
+    return real_memalign(alignment, size);
+}
+
 static ssize_t (*real_writev)(int, const struct iovec *, int);
 ssize_t writev(int fd, const struct iovec *iov, int count) {
     if (!real_writev) real_writev = dlsym(RTLD_NEXT, "writev");

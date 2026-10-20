@@ -1,0 +1,39 @@
+date: 2026-10-20T03:19:00+00:00
+app source: once-campfire-koru @ 663f0e4 (avatar cacheable fix + bench/sol + bench/allocs; shipped via git archive)
+shared verification source: ec02debb3e44f40b8778a6a42db3c4515b2f9eaf
+fixture: identical to droplet-run-2026-10-16 (ship-fixture.tar.gz reused; seed_sha256 b118b0ceb9a2f0332f820b54e331c58ce95913878f4b145e20b48c05d4a6dc1a)
+host: debian-13, DO-Premium-AMD, 8 vCPU, 15GB (droplet campfire-bench-1020, lon1, s-8vcpu-16gb-amd — destroyed after run, list verified empty)
+server cpus: 0-3; loadgen cpus: 4-7; pinned: 1
+koru bin: /root/ship/app/a.out (koruc build main.k --build=linux --release=fast, vendored toolchain)
+suite: bench/compare-host.sh --apps koru --reps 1, HTTP_SECS=8, 0 invalid / 0 errors all cells
+
+HEADLINE — avatar 117,257 rps c16 / 117,492 c64 (was 66,517–74,080 on 10-16)
+The three 200 arms of avatar-respond now carry cacheable: true, putting the
+route on the generation-keyed page cache. Verified semantics on-box and
+locally: miss renders/reads once, hits serve the stored response (proved by
+mutating user name AND blob file behind the app's back), and an app write
+(bot POST) bumps generation and forces re-render.
+
+sol.c floor (same box, replay server on 0-3, loadgen on 4-7, c16):
+  avatar replay 118,727 | static_css replay 122,257 | /up replay 126,530 | room_show replay 99,129
+  app avatar 117,257 ≈ 98.8% of its replay ceiling — the route is now
+  harness-saturated, not app-bound. Jai's >=204k figure used his rewritten
+  per-CPU loadgen on a different box; this harness rev (ec02deb) plateaus
+  ~120-127k for small responses under a 4/4 pinned split.
+
+allocshim (avatar cache hit): 5.0 malloc, 5.0 free, 7,049 B/response.
+  Sites: 4 pageCacheGet dupes (body 3,276B + content_type/encoding/headers)
+  + 1 pump staging copy ~3,771B (pendingAppendSegs — body is copied into
+  send_buf because body_allocated negates body_static). Jai reports 1
+  malloc on a cached page; the zero-copy headroom is real but unmeasurable
+  under this harness ceiling.
+allocshim (post_message): 65.9 malloc, 65.9 free, ~577 KB/response —
+  zlib deflate stream allocs dominate bytes (5.14 × ~294KB per post;
+  Jai's "pooled deflate streams" lever applies verbatim). malloc == free
+  exactly at steady state, no leak.
+
+NOTE — allocshim.c needed a koru-specific fix vs the Jai original: Zig's
+c_allocator allocates via posix_memalign/aligned_alloc, never malloc.
+First run showed frees with zero allocations. Hooks added; report.py now
+takes the denominator from loadgen's `ok` count (writev-per-response is
+exact here but fragile).

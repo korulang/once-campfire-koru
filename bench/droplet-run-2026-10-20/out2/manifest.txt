@@ -1,0 +1,7 @@
+date: 2026-10-20T03:09:58+00:00
+shared verification source:  (dirty: 0 files)
+shared response gates sha256: 0c218c728843469020e91cd8bedeca0c72f23206a5372ee9d607dab3b677593d
+host: 6.12.111+deb13-amd64, DO-Premium-AMD, 8 threads, 15GB
+server cpus: 0-3; loadgen cpus: 4-7; pinned: 1
+koru bin: /root/ship/app/a.out
+rust bin: /root/ship/once-campfire-rust/target/release/campfire
