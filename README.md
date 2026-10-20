@@ -81,9 +81,40 @@ next write, not a TTL.
 
 ## Measured numbers
 
-Verified runs live under `bench/droplet-run-*/` — full cells, manifests,
-write audits and the SHAs they measured. `bench/RUNBOOK.md` is the recipe
-to produce a new one.
+*A measurement, not a spec — this table describes the build at `663f0e4`
+(2026-10-20). Later commits may move it; `bench/droplet-run-*/` is where
+verified runs live with their own dates and SHAs.*
+
+Dedicated `s-8vcpu-16gb-amd` droplet (DO-Premium-AMD, since destroyed),
+app pinned to cores 0–3, shared loadgen pinned to 4–7, 8-second cells,
+route contracts generated per app from the seed SQL, every acknowledged
+write audited against the database (85,745 verified). One rep; the
+same-suite Rust canary lives in `bench/droplet-run-2026-10-16/`.
+Requests/sec, whole validated responses:
+
+| route | c16 | c64 |
+|-------|----:|----:|
+| room_show | 103,729 | 104,191 |
+| messages_page | 104,546 | 100,487 |
+| sidebar | 110,929 | 119,002 |
+| search | 111,291 | 114,216 |
+| avatar | 117,257 | 117,492 |
+| static_css | 118,094 | 119,139 |
+| up | 110,422 | 116,152 |
+| post_message | 4,512 | 3,326 |
+
+Cold start 39ms; peak RSS 36MB (idle 16MB). Zero invalid responses, zero
+transport errors across all cells.
+
+The instrument ceiling matters here: `bench/sol` — a replay server that
+only re-emits captured response bytes — tops out at ~120–127k rps on
+this box under this harness rev, so sidebar, static_css, up and avatar
+are pressing the loadgen, not the app. `bench/allocs` counts per request:
+5 mallocs / 7KB per avatar cache hit; 66 mallocs / ~577KB per posted
+message (zlib deflate dominates).
+
+Full cells, manifests and audits: `bench/droplet-run-2026-10-20/`.
+Recipe to produce a new run: `bench/RUNBOOK.md`.
 
 ## Layout
 
