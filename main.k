@@ -696,15 +696,15 @@ avatar-respond =
     | else |> if(key != "")
         | then |> avatar:blob-path(key): fp
                |> avatar:read-blob(path: fp)
-               | ok blob -> { status: 200, body: blob, content_type: "image/webp", body_allocated: true, extra_headers: "Cache-Control: max-age=1800, public, stale-while-revalidate=604800\r\n" }
+               | ok blob -> { status: 200, body: blob, content_type: "image/webp", body_allocated: true, cacheable: true, extra_headers: "Cache-Control: max-age=1800, public, stale-while-revalidate=604800\r\n" }
                | missing -> { status: 500, body: "blob missing on disk", content_type: "text/plain", extra_headers: null }
                | failed -> { status: 500, body: "blob read failed", content_type: "text/plain", extra_headers: null }
         | else |> if(role == 2)
             | then |> avatar:read-blob(path: "public/assets/default-bot-avatar-de1d12f7.svg")
-                   | ok svg -> { status: 200, body: svg, content_type: "image/svg+xml", body_allocated: true, extra_headers: null }
+                   | ok svg -> { status: 200, body: svg, content_type: "image/svg+xml", body_allocated: true, cacheable: true, extra_headers: null }
                    | missing -> { status: 404, body: "", content_type: "text/plain", extra_headers: null }
                    | failed -> { status: 500, body: "asset read failed", content_type: "text/plain", extra_headers: null }
-            | else |> avatar:initials-svg(uid): svg -> { status: 200, body: svg, content_type: "image/svg+xml; charset=utf-8", extra_headers: "Cache-Control: max-age=1800, public, stale-while-revalidate=604800\r\n" }
+            | else |> avatar:initials-svg(uid): svg -> { status: 200, body: svg, content_type: "image/svg+xml; charset=utf-8", cacheable: true, extra_headers: "Cache-Control: max-age=1800, public, stale-while-revalidate=604800\r\n" }
 
 // ────────────────────────────────────────────────────────────────────────────
 // APP PAGES — profile / account / rooms / bots / joins. page-prelude opens
