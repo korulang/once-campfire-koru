@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Heap allocations per response for one route, on a native build of the app.
+# Ported from lucasmeijer/once-campfire-jai tools/allocs/run (same protocol,
+# our binary and env).
+#
+#   bench/allocs/run ROUTE [SECS]     ROUTE: room_show, messages_page, sidebar,
+#                                     search, post_message, avatar, static_css, up
+#
+# Builds bench/allocs/allocshim.so, starts $APP_BIN on a copy of the seed with
+# the shim preloaded, signs in, warms the route, records SECS (default 4) of
+# 16 clients with the verification harness's loadgen ($LOADGEN, or the one in
+# $VERIFICATION_ROOT), and prints report.py's breakdown. tmp/allocs/ output.
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+ROUTE=${1:?route}
+SECS=${2:-4}
+VERIFICATION_ROOT=${VERIFICATION_ROOT:-$(dirname "$ROOT")/once-campfire-verification}
+LOADGEN=${LOADGEN:-$VERIFICATION_ROOT/loadgen/target/release/loadgen}
+APP_BIN=${APP_BIN:-$ROOT/a.out}
+PORT=${PORT:-4390}
+WORK=$ROOT/tmp/allocs
+mkdir -p "$WORK"
+gcc -O2 -fPIC -shared -o "$WORK/allocshim.so" "$ROOT/bench/allocs/allocshim.c" -ldl -pthread
+
+seed=$ROOT/seed
+rm -rf "$WORK/storage" && mkdir -p "$WORK/storage"
+cp -r "$seed" "$WORK/storage/db" 2>/dev/null || cp -r "$seed/db" "$WORK/storage/db"
+mkdir -p "$WORK/storage/files"
+[ -d "$seed/files" ] && cp -r "$seed/files/." "$WORK/storage/files/"
+sqlite3 "$WORK/storage/db/production.sqlite3" "UPDATE push_subscriptions SET endpoint = 'https://127.0.0.1:9/push/' || id; UPDATE webhooks SET url = 'http://127.0.0.1:9/hook/' || id;" 2>/dev/null || true
+label() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$seed/labels.json" "$1"; }
+
+export HTTP_PORT=$PORT CAMPFIRE_STORAGE_PATH=$WORK/storage
+export CAMPFIRE_DATABASE_PATH=$WORK/storage/db/production.sqlite3
+export CAMPFIRE_FILES_PATH=$WORK/storage/files
+export SECRET_KEY_BASE=${SECRET_KEY_BASE:-bench-secret-key-base-for-alloc-measurement}
+export ALLOCSHIM_OUT=$WORK/$ROUTE.txt
+LD_PRELOAD=$WORK/allocshim.so taskset -c "${SERVER_CPUS:-8-11}" "$APP_BIN" > "$WORK/app.log" 2>&1 &
+APP=$!
+trap 'kill $APP 2>/dev/null || true' EXIT
+base=http://127.0.0.1:$PORT
+until curl -sf "$base/up" > /dev/null; do sleep 0.1; done
+
+lg() { taskset -c "${LOADGEN_CPUS:-12-15}" "$LOADGEN" "$@"; }
+cookie=$(lg login --base "$base" --email "$(label emails.david)" --password "$(label passwords.all)" | python3 -c 'import json,sys; print(json.load(sys.stdin)["cookie"])')
+room=$(label rooms.watercooler)
+scrape=$(lg scrape --base "$base" --cookie "$cookie" --room "$room")
+field() { python3 -c 'import json,sys; v=json.loads(sys.argv[1])[sys.argv[2]]; print(v or "")' "$scrape" "$1"; }
+case "$ROUTE" in
+  room_show)     args=(--path "/rooms/$room") ;;
+  messages_page) args=(--path "/rooms/$room/messages?before=$(label messages.busy_060)") ;;
+  sidebar)       args=(--path /users/me/sidebar) ;;
+  search)        args=(--path "/searches?q=coffee") ;;
+  avatar)        args=(--path "/users/$(label avatar_tokens.jason)/avatar") ;;
+  static_css)    args=(--path "$(field css)") ;;
+  up)            args=(--path /up) ;;
+  post_message)  args=(--post-room "$(label rooms.hq)" --csrf "$(field csrf)") ;;
+  *) echo "unknown route $ROUTE" >&2; exit 2 ;;
+esac
+lg http --base "$base" --cookie "$cookie" "${args[@]}" --conc 4 --duration 2 > /dev/null
+kill -USR2 $APP
+lg http --base "$base" --cookie "$cookie" "${args[@]}" --conc 16 --duration "$SECS" > "$WORK/$ROUTE.loadgen.json"
+kill -USR2 $APP
+for _ in $(seq 50); do [ -s "$ALLOCSHIM_OUT" ] && break; sleep 0.1; done
+APP_BIN=$APP_BIN RESPONSES_JSON="$WORK/$ROUTE.loadgen.json" python3 "$ROOT/bench/allocs/report.py" "$ALLOCSHIM_OUT" 4 30
+echo "unresolved app frames (?@ADDR): addr2line -f -e $APP_BIN ADDR"
